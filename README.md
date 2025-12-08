@@ -13,7 +13,10 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
    - `python -m jxd.cli sync-static` (countries/leagues/seasons/venues)
    - `python -m jxd.cli sync-teams --season-id 19734`
    - `python -m jxd.cli sync-players --season-id 19734`
-   - `python -m jxd.cli sync-fixtures --season-id 19734`
+   - `python -m jxd.cli sync-fixtures --season-id 19734` (lightweight fixtures + participants)
+   - `python -m jxd.cli sync-fixture-details --season-id 19734 --limit 200` (fixtures + stats + lineups)
+   - `python -m jxd.cli sync-bookmakers`
+   - `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82` (Bet365 odds)
    - `python -m jxd.cli sync-h2h --team-a 8 --team-b 14`
 5. Use Postgres for production; SQLite is fine for local prototyping.
 
@@ -21,19 +24,22 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
 - Requests are rate-limited to stay under SportMonks’ 4,000/hour cap.
 - Upserts keep records fresh; rerunning syncs is safe.
 - Default DB is SQLite for quick runs; use Postgres for production or bigger volumes.
+- Odds default to Bet365 (bookmaker_id=2). Override with `BOOKMAKER_ID` env or CLI flag.
 
 ## Data model (tables)
 - `countries`, `leagues`, `seasons`, `venues`
 - `teams` (venue, country, logo, founded, national flag)
 - `players` (name pieces, nationality, position, physicals, team, photo)
-- `fixtures` (league/season, teams, status, scores, venue, weather, raw payload)
+- `fixtures` + `fixture_participants` (teams per fixture with locations/results)
+- `team_stats` (per fixture raw stats blob) and `player_stats` (lineups + detail rows)
+- `bookmakers`, `markets`, `odds_outcomes` (Bet365 odds preserved per outcome)
 - `head_to_head` (pair-wise cached responses + fixtures list)
-All tables store the raw API payload in `extra`/`summary`/`fixtures` JSON columns to keep future fields available.
+All tables store the raw API payload in JSON columns to keep future fields available.
 
 ## Scheduling
 Run the sync commands via cron/systemd/GitHub Actions. Example cron (once daily at 04:00):
 ```
-0 4 * * * cd /path/to/JXD987 && . .venv/bin/activate && python -m jxd.cli sync-static && python -m jxd.cli sync-teams --season-id 19734 && python -m jxd.cli sync-players --season-id 19734 && python -m jxd.cli sync-fixtures --season-id 19734
+0 4 * * * cd /path/to/JXD987 && . .venv/bin/activate && python -m jxd.cli sync-static && python -m jxd.cli sync-teams --season-id 19734 && python -m jxd.cli sync-players --season-id 19734 && python -m jxd.cli sync-fixtures --season-id 19734 && python -m jxd.cli sync-fixture-details --season-id 19734 --limit 400 && python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82,384,387
 ```
 Adjust season IDs per league/year. `sync-h2h` can be run ad hoc for upcoming matches.
 
@@ -42,3 +48,8 @@ Adjust season IDs per league/year. `sync-h2h` can be run ad hoc for upcoming mat
 - If using Postgres, ensure the user has minimal privileges on the target database.
 - The client uses `Authorization: Bearer <token>` and sleeps between calls to respect rate limits.
 
+## SportMonks best-practice mapping
+- Uses `filters=populate` automatically for bulk endpoints without includes (per docs: raises page size to 1000).
+- Keeps includes on heavy endpoints (`statistics`, `lineups`) only when needed.
+- Odds fetcher supports per-bookmaker filtering (Bet365 default).
+- League defaults mirror your old repo (`LEAGUE_IDS` in `.env`), but CLI flags can narrow scope to save requests.

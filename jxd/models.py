@@ -13,6 +13,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     Index,
+    BigInteger,
 )
 
 from .db import Base
@@ -140,3 +141,113 @@ class HeadToHead(Base):
         Index("idx_head_to_head_pair", "team_a_id", "team_b_id"),
     )
 
+
+class FixtureParticipant(Base):
+    __tablename__ = "fixture_participants"
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), primary_key=True)
+    team_id = Column(Integer, ForeignKey("teams.id"), primary_key=True)
+    location = Column(String(10))
+    result = Column(String(20))
+    score = Column(String(20))
+    extra = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TeamStatLine(Base):
+    """
+    Team-level statistics for a fixture (raw stats JSON preserved).
+    """
+
+    __tablename__ = "team_stats"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), index=True, nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), index=True, nullable=False)
+    location = Column(String(10))
+    stats = Column(JSON)  # raw list of statistics rows from SportMonks
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (UniqueConstraint("fixture_id", "team_id", name="uq_team_stats_fixture"),)
+
+
+class PlayerStatLine(Base):
+    """
+    Player-level statistics for a fixture (lineups + details preserved).
+    """
+
+    __tablename__ = "player_stats"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), index=True, nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), index=True, nullable=False)
+    player_id = Column(Integer, ForeignKey("players.id"), index=True, nullable=False)
+    position = Column(String(100))
+    jersey_number = Column(Integer)
+    is_starting = Column(Boolean)
+    minutes = Column(Integer)
+    stats = Column(JSON)  # raw list of detail rows from SportMonks
+    extra = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("fixture_id", "player_id", name="uq_player_stats_fixture"),
+        Index("idx_player_stats_team_fixture", "fixture_id", "team_id"),
+    )
+
+
+class Bookmaker(Base):
+    __tablename__ = "bookmakers"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False)
+    slug = Column(String(255))
+    extra = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Market(Base):
+    __tablename__ = "markets"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False)
+    grouping = Column(String(255))
+    extra = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class OddsOutcome(Base):
+    __tablename__ = "odds_outcomes"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    provider_outcome_id = Column(BigInteger, index=True)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), index=True, nullable=False)
+    bookmaker_id = Column(Integer, ForeignKey("bookmakers.id"), index=True, nullable=False)
+    market_id = Column(Integer, ForeignKey("markets.id"), index=True, nullable=False)
+    market_description = Column(String(255))
+    label = Column(String(255))
+    name = Column(String(255))
+    participant = Column(String(255))
+    participant_type = Column(String(50))
+    participant_id = Column(Integer)
+    handicap = Column(String(64))
+    total = Column(String(64))
+    decimal_odds = Column(Float)
+    american_odds = Column(String(20))
+    fractional_odds = Column(String(50))
+    probability = Column(String(50))
+    stopped = Column(Boolean)
+    is_winning = Column(Boolean)
+    raw = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (
+        Index("idx_odds_fixture_market", "fixture_id", "market_id"),
+        UniqueConstraint(
+            "fixture_id",
+            "bookmaker_id",
+            "market_id",
+            "label",
+            "participant",
+            "handicap",
+            "total",
+            name="uq_odds_outcome_key",
+        ),
+    )

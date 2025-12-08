@@ -6,7 +6,22 @@ from typing import Dict, Iterable, List, Optional
 from sqlalchemy.orm import Session
 
 from .api import SportMonksClient
-from .models import Country, Fixture, HeadToHead, League, Player, Season, Team, Venue
+from .models import (
+    Bookmaker,
+    Country,
+    Fixture,
+    FixtureParticipant,
+    HeadToHead,
+    League,
+    Market,
+    OddsOutcome,
+    Player,
+    PlayerStatLine,
+    Season,
+    Team,
+    TeamStatLine,
+    Venue,
+)
 from .utils import parse_dt
 
 log = logging.getLogger(__name__)
@@ -22,7 +37,7 @@ def _upsert(session: Session, model, data: Dict):
         session.add(obj)
 
 
-def _merge_raw(model_name: str, raw: Dict) -> Dict:
+def _merge_raw(raw: Dict) -> Dict:
     return {"extra": raw}
 
 
@@ -32,7 +47,7 @@ def _country_mapper(raw: Dict) -> Dict:
         "name": raw.get("name"),
         "code": raw.get("code") or raw.get("iso2"),
         "continent": raw.get("continent"),
-        **_merge_raw("country", raw),
+        **_merge_raw(raw),
     }
 
 
@@ -43,7 +58,7 @@ def _league_mapper(raw: Dict) -> Dict:
         "type": raw.get("type"),
         "country_id": (raw.get("country") or {}).get("id") or raw.get("country_id"),
         "logo_path": raw.get("logo"),
-        **_merge_raw("league", raw),
+        **_merge_raw(raw),
     }
 
 
@@ -52,10 +67,10 @@ def _season_mapper(raw: Dict) -> Dict:
         "id": raw.get("id"),
         "name": raw.get("name"),
         "league_id": (raw.get("league") or {}).get("id") or raw.get("league_id"),
-        "start_date": parse_dt(raw.get("start_date")),
-        "end_date": parse_dt(raw.get("end_date")),
+        "start_date": parse_dt(raw.get("start_date") or raw.get("starting_at")),
+        "end_date": parse_dt(raw.get("end_date") or raw.get("ending_at")),
         "is_current": raw.get("is_current") or raw.get("current"),
-        **_merge_raw("season", raw),
+        **_merge_raw(raw),
     }
 
 
@@ -70,7 +85,7 @@ def _venue_mapper(raw: Dict) -> Dict:
         "latitude": coordinates.get("latitude") or raw.get("latitude"),
         "longitude": coordinates.get("longitude") or raw.get("longitude"),
         "image_path": raw.get("image_path"),
-        **_merge_raw("venue", raw),
+        **_merge_raw(raw),
     }
 
 
@@ -85,7 +100,7 @@ def _team_mapper(raw: Dict) -> Dict:
         "venue_id": raw.get("venue_id") or venue.get("id"),
         "logo_path": raw.get("logo_path") or raw.get("logo"),
         "is_national": raw.get("national_team") or raw.get("is_national"),
-        **_merge_raw("team", raw),
+        **_merge_raw(raw),
     }
 
 
@@ -103,7 +118,7 @@ def _player_mapper(raw: Dict) -> Dict:
         "position_name": (raw.get("position") or {}).get("name"),
         "image_path": raw.get("image_path") or raw.get("image"),
         "current_team_id": raw.get("team_id") or (raw.get("team") or {}).get("id"),
-        **_merge_raw("player", raw),
+        **_merge_raw(raw),
     }
 
 
@@ -128,8 +143,28 @@ def _fixture_mapper(raw: Dict) -> Dict:
         "away_score": scores.get("visitorteam_score") or scores.get("away"),
         "scores": scores,
         "weather_report": weather,
-        **_merge_raw("fixture", raw),
+        **_merge_raw(raw),
     }
+
+
+def _safe_int(val) -> Optional[int]:
+    try:
+        return int(val)
+    except Exception:
+        try:
+            return int(float(val))
+        except Exception:
+            return None
+
+
+def _group_team_stats(stats: Iterable[Dict]) -> Dict[int, List[Dict]]:
+    grouped: Dict[int, List[Dict]] = {}
+    for stat in stats or []:
+        tid = stat.get("team_id")
+        if tid is None:
+            continue
+        grouped.setdefault(int(tid), []).append(stat)
+    return grouped
 
 
 class SyncService:
@@ -137,12 +172,12 @@ class SyncService:
         self.client = client
         self.session = session
 
+    # ---- reference data ----
     def sync_countries(self) -> int:
         log.info("Syncing countries")
         count = 0
         for item in self.client.fetch_collection("countries"):
-            mapped = _country_mapper(item)
-            _upsert(self.session, Country, mapped)
+            _upsert(self.session, Country, _country_mapper(item))
             count += 1
         self.session.commit()
         log.info("Countries synced: %s", count)
@@ -152,8 +187,7 @@ class SyncService:
         log.info("Syncing leagues")
         count = 0
         for item in self.client.fetch_collection("leagues", includes=["country"]):
-            mapped = _league_mapper(item)
-            _upsert(self.session, League, mapped)
+            _upsert(self.session, League, _league_mapper(item))
             count += 1
         self.session.commit()
         log.info("Leagues synced: %s", count)
@@ -163,8 +197,7 @@ class SyncService:
         log.info("Syncing seasons")
         count = 0
         for item in self.client.fetch_collection("seasons", includes=["league"]):
-            mapped = _season_mapper(item)
-            _upsert(self.session, Season, mapped)
+            _upsert(self.session, Season, _season_mapper(item))
             count += 1
         self.session.commit()
         log.info("Seasons synced: %s", count)
@@ -174,23 +207,21 @@ class SyncService:
         log.info("Syncing venues")
         count = 0
         for item in self.client.fetch_collection("venues"):
-            mapped = _venue_mapper(item)
-            _upsert(self.session, Venue, mapped)
+            _upsert(self.session, Venue, _venue_mapper(item))
             count += 1
         self.session.commit()
         log.info("Venues synced: %s", count)
         return count
 
+    # ---- entities ----
     def sync_teams(self, season_id: Optional[int] = None) -> int:
         log.info("Syncing teams%s", f" for season {season_id}" if season_id else "")
         path = "teams"
-        params: Dict[str, object] = {}
         if season_id:
             path = f"teams/seasons/{season_id}"
         count = 0
-        for item in self.client.fetch_collection(path, params=params, includes=["venue"]):
-            mapped = _team_mapper(item)
-            _upsert(self.session, Team, mapped)
+        for item in self.client.fetch_collection(path, includes=["venue"]):
+            _upsert(self.session, Team, _team_mapper(item))
             count += 1
         self.session.commit()
         log.info("Teams synced: %s", count)
@@ -211,41 +242,144 @@ class SyncService:
 
         count = 0
         for item in self.client.fetch_collection(path, params=params, includes=["team", "position"]):
-            mapped = _player_mapper(item)
-            _upsert(self.session, Player, mapped)
+            _upsert(self.session, Player, _player_mapper(item))
             count += 1
         self.session.commit()
         log.info("Players synced: %s", count)
         return count
 
+    # ---- fixtures & details ----
     def sync_fixtures(
-        self, season_id: Optional[int] = None, team_ids: Optional[List[int]] = None
+        self, season_id: Optional[int] = None, team_ids: Optional[List[int]] = None, league_ids: Optional[List[int]] = None
     ) -> int:
         log.info(
-            "Syncing fixtures%s%s",
+            "Syncing fixtures%s%s%s",
             f" for season {season_id}" if season_id else "",
             f" filtered by teams {team_ids}" if team_ids else "",
+            f" filtered by leagues {league_ids}" if league_ids else "",
         )
         path = "fixtures"
         params: Dict[str, object] = {}
+        filters = None
         if season_id:
             path = f"fixtures/seasons/{season_id}"
         if team_ids:
             params["team_ids"] = ",".join(str(t) for t in team_ids)
+        if league_ids:
+            filters = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
 
         count = 0
         for item in self.client.fetch_collection(
             path,
             params=params,
-            includes=["league", "season", "scores", "weather_report", "venue"],
+            includes=["scores", "participants"],
+            filters=filters,
+            per_page=50,
         ):
-            mapped = _fixture_mapper(item)
-            _upsert(self.session, Fixture, mapped)
+            _upsert(self.session, Fixture, _fixture_mapper(item))
+            self._store_participants(item)
             count += 1
         self.session.commit()
         log.info("Fixtures synced: %s", count)
         return count
 
+    def sync_fixture_details(
+        self,
+        season_id: Optional[int] = None,
+        league_ids: Optional[List[int]] = None,
+        limit: Optional[int] = None,
+    ) -> int:
+        """
+        Fetch fixtures with heavy includes (participants, statistics, lineups) to persist team/player stats.
+        """
+        log.info(
+            "Syncing fixture details%s%s%s",
+            f" for season {season_id}" if season_id else "",
+            f" filtered by leagues {league_ids}" if league_ids else "",
+            f" limit {limit}" if limit else "",
+        )
+        path = "fixtures"
+        filters = None
+        params: Dict[str, object] = {}
+        if season_id:
+            path = f"fixtures/seasons/{season_id}"
+        if league_ids:
+            filters = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
+
+        count = 0
+        for item in self.client.fetch_collection(
+            path,
+            params=params,
+            includes=["participants", "scores", "statistics.type", "lineups.player", "lineups.details"],
+            filters=filters,
+            per_page=50,
+        ):
+            _upsert(self.session, Fixture, _fixture_mapper(item))
+            self._store_participants(item)
+            self._store_team_stats(item)
+            self._store_player_stats(item)
+            count += 1
+            if limit and count >= limit:
+                break
+        self.session.commit()
+        log.info("Fixture details synced: %s", count)
+        return count
+
+    # ---- odds ----
+    def sync_bookmakers(self) -> int:
+        log.info("Syncing bookmakers")
+        count = 0
+        for row in self.client.fetch_collection("odds/bookmakers", per_page=1000):
+            if not row:
+                continue
+            data = {
+                "id": row.get("id"),
+                "name": row.get("name") or row.get("bookmaker"),
+                "slug": row.get("slug"),
+                "extra": row,
+            }
+            _upsert(self.session, Bookmaker, data)
+            count += 1
+        self.session.commit()
+        log.info("Bookmakers synced: %s", count)
+        return count
+
+    def sync_odds(
+        self,
+        fixture_ids: Optional[List[int]] = None,
+        bookmaker_id: Optional[int] = None,
+        league_ids: Optional[List[int]] = None,
+        limit: Optional[int] = None,
+    ) -> int:
+        bookmaker_id = bookmaker_id or 2
+        ids = fixture_ids or self._fixture_ids_for_leagues(league_ids, limit)
+        if not ids:
+            log.warning("No fixtures found to fetch odds for.")
+            return 0
+
+        log.info("Syncing odds for %s fixtures (bookmaker %s)", len(ids), bookmaker_id)
+        processed = 0
+        for fid in ids:
+            payload = self.client.get_raw(
+                f"odds/pre-match/fixtures/{fid}",
+                params={"filter": f"bookmakers:{bookmaker_id}"} if bookmaker_id else {},
+            )
+            rows = payload.get("data") if isinstance(payload, dict) else None
+            if rows is None:
+                rows = payload.get("odds") if isinstance(payload, dict) else None
+            if rows is None and isinstance(payload, list):
+                rows = payload
+            if rows is None:
+                continue
+            self._store_odds_rows(fid, rows)
+            processed += 1
+            if limit and processed >= limit:
+                break
+        self.session.commit()
+        log.info("Odds synced for %s fixtures", processed)
+        return processed
+
+    # ---- H2H ----
     def sync_h2h(self, team_a_id: int, team_b_id: int) -> Dict:
         """
         Fetch head-to-head fixtures and store summary + fixture list as JSON.
@@ -283,9 +417,179 @@ class SyncService:
         log.info("Stored H2H for %s vs %s", team_a_id, team_b_id)
         return data
 
+    # ---- helpers ----
+    def _fixture_ids_for_leagues(self, league_ids: Optional[List[int]], limit: Optional[int]) -> List[int]:
+        query = self.session.query(Fixture.id)
+        if league_ids:
+            query = query.filter(Fixture.league_id.in_(league_ids))
+        query = query.order_by(Fixture.starting_at.desc().nulls_last())
+        if limit:
+            query = query.limit(limit)
+        return [row[0] for row in query.all()]
+
+    def _store_participants(self, fixture_raw: Dict) -> None:
+        participants = fixture_raw.get("participants") or []
+        fixture_id = fixture_raw.get("id")
+        if not fixture_id:
+            return
+        for p in participants:
+            team_id = p.get("id") or p.get("team_id")
+            if not team_id:
+                continue
+            meta = p.get("meta") or {}
+            obj = (
+                self.session.query(FixtureParticipant)
+                .filter_by(fixture_id=fixture_id, team_id=team_id)
+                .one_or_none()
+            )
+            data = {
+                "fixture_id": fixture_id,
+                "team_id": team_id,
+                "location": meta.get("location"),
+                "result": meta.get("result"),
+                "score": meta.get("score") or meta.get("outcome"),
+                "extra": p,
+            }
+            if obj:
+                for k, v in data.items():
+                    setattr(obj, k, v)
+            else:
+                self.session.add(FixtureParticipant(**data))
+
+    def _store_team_stats(self, fixture_raw: Dict) -> None:
+        fixture_id = fixture_raw.get("id")
+        stats_grouped = _group_team_stats(fixture_raw.get("statistics") or [])
+        for team_id, rows in stats_grouped.items():
+            obj = (
+                self.session.query(TeamStatLine)
+                .filter_by(fixture_id=fixture_id, team_id=team_id)
+                .one_or_none()
+            )
+            data = {
+                "fixture_id": fixture_id,
+                "team_id": team_id,
+                "location": (rows[0].get("location") if rows else None),
+                "stats": rows,
+            }
+            if obj:
+                for k, v in data.items():
+                    setattr(obj, k, v)
+            else:
+                self.session.add(TeamStatLine(**data))
+
+    def _store_player_stats(self, fixture_raw: Dict) -> None:
+        fixture_id = fixture_raw.get("id")
+        for lu in fixture_raw.get("lineups") or []:
+            player = lu.get("player") or {}
+            player_id = player.get("id") or lu.get("player_id")
+            team_id = lu.get("team_id") or (lu.get("team") or {}).get("id")
+            if not (fixture_id and player_id and team_id):
+                continue
+            _upsert(self.session, Player, _player_mapper(player))
+            stats_rows = lu.get("details") or []
+            minutes = None
+            for d in stats_rows:
+                if d.get("type_id") in (119,):
+                    minutes = minutes or _safe_int(d.get("value") or d.get("data"))
+            data = {
+                "fixture_id": fixture_id,
+                "team_id": team_id,
+                "player_id": player_id,
+                "position": lu.get("position"),
+                "jersey_number": lu.get("number"),
+                "is_starting": lu.get("is_starting") or lu.get("formation_position") is not None,
+                "minutes": minutes,
+                "stats": stats_rows,
+                "extra": lu,
+            }
+            obj = (
+                self.session.query(PlayerStatLine)
+                .filter_by(fixture_id=fixture_id, player_id=player_id)
+                .one_or_none()
+            )
+            if obj:
+                for k, v in data.items():
+                    setattr(obj, k, v)
+            else:
+                self.session.add(PlayerStatLine(**data))
+
+    def _store_odds_rows(self, fixture_id: int, rows: List[Dict]) -> None:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            bookmaker_id = row.get("bookmaker_id")
+            market_id = row.get("market_id")
+            provider_outcome_id = row.get("id")
+
+            if bookmaker_id and not self.session.get(Bookmaker, bookmaker_id):
+                bm = {
+                    "id": bookmaker_id,
+                    "name": row.get("bookmaker_name") or row.get("bookmaker"),
+                    "slug": None,
+                    "extra": {"source": "odds_row"},
+                }
+                self.session.add(Bookmaker(**bm))
+
+            if market_id and not self.session.get(Market, market_id):
+                mk = {
+                    "id": market_id,
+                    "name": row.get("market_description") or row.get("market_name") or str(market_id),
+                    "grouping": None,
+                    "extra": {"source": "odds_row"},
+                }
+                self.session.add(Market(**mk))
+
+            obj = None
+            if provider_outcome_id:
+                obj = (
+                    self.session.query(OddsOutcome)
+                    .filter_by(provider_outcome_id=provider_outcome_id)
+                    .one_or_none()
+                )
+            if obj is None:
+                obj = (
+                    self.session.query(OddsOutcome)
+                    .filter_by(
+                        fixture_id=fixture_id,
+                        bookmaker_id=bookmaker_id,
+                        market_id=market_id,
+                        label=row.get("label"),
+                        participant=row.get("name") or row.get("participant") or row.get("total"),
+                        handicap=row.get("handicap"),
+                        total=str(row.get("total")) if row.get("total") is not None else None,
+                    )
+                    .one_or_none()
+                )
+
+            data = {
+                "provider_outcome_id": provider_outcome_id,
+                "fixture_id": fixture_id,
+                "bookmaker_id": bookmaker_id,
+                "market_id": market_id,
+                "market_description": row.get("market_description") or row.get("market_name"),
+                "label": row.get("label"),
+                "name": row.get("name"),
+                "participant": row.get("participant") or row.get("name") or row.get("total"),
+                "participant_type": row.get("participant_type"),
+                "participant_id": row.get("participant_id"),
+                "handicap": row.get("handicap"),
+                "total": str(row.get("total")) if row.get("total") is not None else None,
+                "decimal_odds": float(row.get("value")) if row.get("value") not in (None, "") else None,
+                "american_odds": row.get("american"),
+                "fractional_odds": row.get("fractional"),
+                "probability": row.get("probability"),
+                "stopped": row.get("stopped"),
+                "is_winning": row.get("winning"),
+                "raw": row,
+            }
+            if obj:
+                for k, v in data.items():
+                    setattr(obj, k, v)
+            else:
+                self.session.add(OddsOutcome(**data))
+
 
 def bootstrap_schema(session: Session) -> None:
     from .db import Base
 
     Base.metadata.create_all(session.get_bind())
-

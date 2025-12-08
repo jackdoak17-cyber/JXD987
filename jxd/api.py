@@ -39,9 +39,11 @@ class SportMonksClient:
         base_url: str = "https://api.sportmonks.com/v3/football",
         requests_per_hour: int = 3500,
         timeout: int = 30,
+        use_filters_populate: bool = True,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.use_filters_populate = use_filters_populate
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -68,13 +70,23 @@ class SportMonksClient:
         self,
         path: str,
         params: Optional[Dict[str, object]] = None,
-        includes: Optional[List[str]] = None,
+        includes: Optional[Iterable[str] | str] = None,
         per_page: int = 200,
+        filters: Optional[str] = None,
     ) -> Iterable[Dict]:
         params = params.copy() if params else {}
         params.setdefault("per_page", per_page)
         if includes:
-            params["include"] = ",".join(includes)
+            if isinstance(includes, str):
+                params["include"] = includes
+            else:
+                params["include"] = ",".join(includes)
+        if filters:
+            params["filters"] = filters
+        elif self.use_filters_populate and not includes:
+            # Best-practice from SportMonks docs: populate allows per_page=1000
+            params["filters"] = "populate"
+            params["per_page"] = max(per_page, 1000)
 
         page = 1
         while True:
@@ -115,3 +127,8 @@ class SportMonksClient:
             raise SportMonksError(f"No data returned for {path}")
         return data
 
+    def get_raw(self, path: str, params: Optional[Dict[str, object]] = None) -> Dict:
+        """
+        Low-level GET when the endpoint shape is not standard (odds endpoints, etc.).
+        """
+        return self._request(path, params=params or {})
