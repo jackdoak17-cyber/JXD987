@@ -210,6 +210,33 @@ class PlayerStatLine(Base):
     )
 
 
+class PlayerOdds(Base):
+    """
+    Player-level odds (e.g., shots, shots on target).
+    """
+
+    __tablename__ = "player_odds"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), index=True, nullable=False)
+    player_id = Column(Integer, ForeignKey("players.id"), index=True, nullable=False)
+    market_id = Column(Integer, index=True, nullable=True)
+    market_name = Column(String(255))
+    selection = Column(String(255))
+    line = Column(Float)
+    decimal_odds = Column(Float)
+    american_odds = Column(String(20))
+    fractional_odds = Column(String(50))
+    extra = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint(
+            "fixture_id", "player_id", "market_id", "line", "selection", name="uq_player_odds_key"
+        ),
+        Index("idx_player_odds_fixture_market", "fixture_id", "market_id"),
+    )
+
+
 class Bookmaker(Base):
     __tablename__ = "bookmakers"
     id = Column(Integer, primary_key=True)

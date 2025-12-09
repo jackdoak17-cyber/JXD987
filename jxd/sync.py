@@ -20,6 +20,7 @@ from .models import (
     OddsOutcome,
     Player,
     PlayerStatLine,
+    PlayerOdds,
     Season,
     Team,
     TeamStatLine,
@@ -47,6 +48,9 @@ def _upsert(session: Session, model, data: Dict):
 
 def _merge_raw(raw: Dict) -> Dict:
     return {"extra": raw}
+
+def _normalize_name(val: str) -> str:
+    return "".join(ch for ch in (val or "").lower() if ch.isalnum() or ch.isspace()).strip()
 
 
 def _country_mapper(raw: Dict) -> Dict:
@@ -612,6 +616,94 @@ class SyncService:
         self.session.commit()
         log.info("Odds synced for %s fixtures", processed)
         return processed
+
+    def sync_player_odds(
+        self,
+        days_forward: int = 7,
+        bookmaker_id: int = 2,
+        league_ids: Optional[List[int]] = None,
+        limit: Optional[int] = 200,
+    ) -> int:
+        """
+        Fetch player prop odds (shots/SOT) for upcoming fixtures in the next N days.
+        """
+        now = datetime.utcnow()
+        future_cutoff = now + timedelta(days=days_forward)
+        query = self.session.query(Fixture.id)
+        query = query.filter(Fixture.starting_at != None)  # noqa: E711
+        query = query.filter(Fixture.starting_at >= now, Fixture.starting_at <= future_cutoff)
+        if league_ids:
+            query = query.filter(Fixture.league_id.in_(league_ids))
+        query = query.order_by(Fixture.starting_at.asc())
+        if limit:
+            query = query.limit(limit)
+        fixture_ids = [row[0] for row in query.all()]
+        if not fixture_ids:
+            log.info("No upcoming fixtures found for player odds.")
+            return 0
+
+        # Build name lookup for player matching
+        players = self.session.query(Player.id, Player.display_name, Player.first_name, Player.last_name).all()
+        name_to_id: Dict[str, int] = {}
+        for pid, dname, fname, lname in players:
+            for nm in (dname, fname, lname, f"{fname or ''} {lname or ''}".strip()):
+                key = _normalize_name(nm)
+                if key:
+                    name_to_id.setdefault(key, pid)
+
+        processed_rows = 0
+        for fid in fixture_ids:
+            payload = self.client.get_raw(
+                f"{ODDS}pre-match/fixtures/{fid}",
+                params={"filter": f"bookmakers:{bookmaker_id}"} if bookmaker_id else {},
+            )
+            rows = payload.get("data") if isinstance(payload, dict) else None
+            if rows is None and isinstance(payload, list):
+                rows = payload
+            if not rows:
+                continue
+            for row in rows:
+                market_name = (row.get("market_name") or row.get("market_description") or "").lower()
+                # crude filter for player shots/SOT markets
+                if not any(k in market_name for k in ["player", "shot"]):
+                    continue
+                label = _normalize_name(str(row.get("label") or row.get("name") or ""))
+                player_id = name_to_id.get(label)
+                if not player_id:
+                    continue
+                data = {
+                    "fixture_id": fid,
+                    "player_id": player_id,
+                    "market_id": row.get("market_id"),
+                    "market_name": row.get("market_name") or row.get("market_description"),
+                    "selection": row.get("label") or row.get("name"),
+                    "line": to_float(row.get("handicap") or row.get("line") or row.get("total")),
+                    "decimal_odds": to_float(row.get("value")),
+                    "american_odds": row.get("american"),
+                    "fractional_odds": row.get("fractional"),
+                    "extra": row,
+                }
+                # Upsert manually because UniqueConstraint is composite
+                obj = (
+                    self.session.query(PlayerOdds)
+                    .filter_by(
+                        fixture_id=data["fixture_id"],
+                        player_id=data["player_id"],
+                        market_id=data["market_id"],
+                        line=data["line"],
+                        selection=data["selection"],
+                    )
+                    .one_or_none()
+                )
+                if obj:
+                    for k, v in data.items():
+                        setattr(obj, k, v)
+                else:
+                    self.session.add(PlayerOdds(**data))
+                processed_rows += 1
+        self.session.commit()
+        log.info("Player odds synced rows=%s fixtures=%s", processed_rows, len(fixture_ids))
+        return processed_rows
 
     def sync_inplay_odds(
         self,

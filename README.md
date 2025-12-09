@@ -20,6 +20,7 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
    - `python -m jxd.cli sync-history --days-back 450 --days-forward 14 --with-details --league-ids 8,9,82` (rolling history with stats/lineups)
    - `python -m jxd.cli sync-bookmakers`
    - `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82` (Bet365 odds)
+   - `python -m jxd.cli sync-player-odds --days-forward 7 --league-ids 8,9,82` (player prop odds)
    - `python -m jxd.cli sync-inplay-odds --bookmaker-id 2 --limit 200` (latest inplay odds snapshot)
    - `python -m jxd.cli sync-livescores` (live fixtures window)
    - `python -m jxd.cli sync-h2h --team-a 8 --team-b 14`

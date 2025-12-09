@@ -234,6 +234,26 @@ def sync_odds(
     )
 
 
+@app.command("sync-player-odds")
+def sync_player_odds(
+    days_forward: int = typer.Option(7, help="Lookahead window (days) for upcoming fixtures"),
+    league_ids: str = typer.Option(None, help="Comma-separated league IDs to pull odds for (optional)"),
+    bookmaker_id: int = typer.Option(None, help="Bookmaker ID (default Bet365=2)"),
+    limit: int = typer.Option(200, help="Max fixtures to process"),
+) -> None:
+    """
+    Sync player prop odds (shots/SOT) for upcoming fixtures.
+    """
+    service = get_service()
+    leagues = _parse_csv(league_ids) or league_ids_from_settings(settings)
+    service.sync_player_odds(
+        days_forward=days_forward,
+        bookmaker_id=bookmaker_id or settings.bookmaker_id,
+        league_ids=leagues,
+        limit=limit,
+    )
+
+
 @app.command("sync-inplay-odds")
 def sync_inplay_odds(
     bookmaker_id: int = typer.Option(None, help="Bookmaker ID (default Bet365=2)"),
