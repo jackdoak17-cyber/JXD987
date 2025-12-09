@@ -14,6 +14,7 @@ from .models import (
     PlayerForm,
     PlayerStatLine,
     TeamForm,
+    PlayerAvailability,
 )
 from .utils import parse_dt
 
@@ -41,6 +42,7 @@ def compute_team_form(session: Session, team_id: int, sample_size: int = 10) -> 
     goals_for = []
     goals_against = []
     over25 = 0
+    wins = draws = losses = 0
     league_id = None
     season_id = None
     for fx, part in rows:
@@ -57,6 +59,13 @@ def compute_team_form(session: Session, team_id: int, sample_size: int = 10) -> 
         total_goals = (gf or 0) + (ga or 0)
         if total_goals >= 3:
             over25 += 1
+        # approximate W/D/L from goals
+        if (gf or 0) > (ga or 0):
+            wins += 1
+        elif (gf or 0) == (ga or 0):
+            draws += 1
+        else:
+            losses += 1
         fixtures_raw.append({"fixture_id": fx.id, "gf": gf, "ga": ga, "date": fx.starting_at.isoformat() if fx.starting_at else None})
 
     games_played = len(goals_for)
@@ -82,6 +91,9 @@ def compute_team_form(session: Session, team_id: int, sample_size: int = 10) -> 
         "goals_against_avg": ga_avg,
         "over_2_5_pct": over25_pct,
         "under_2_5_pct": under25_pct,
+        "win_pct": wins / games_played,
+        "draw_pct": draws / games_played,
+        "loss_pct": losses / games_played,
         "raw_fixtures": fixtures_raw,
     }
     if obj:
@@ -112,7 +124,9 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
 
     shots_total = []
     shots_on = []
+    minutes_list = []
     ge1 = ge2 = ge3 = 0
+    assists = []
     fixtures_raw = []
     league_id = season_id = team_id = None
 
@@ -122,6 +136,9 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
         team_id = team_id or stat.team_id
         shots = 0
         shots_on_target = 0
+        assists_val = 0
+        minutes_val = stat.minutes or 0
+        minutes_list.append(minutes_val)
         for d in stat.stats or []:
             t = d.get("type") or {}
             name = t.get("developer_name") or t.get("name") or ""
@@ -135,8 +152,11 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
                 shots = val
             elif name in ("SHOTS_ON_TARGET", "Shots On Target"):
                 shots_on_target = val
+            elif name in ("ASSISTS", "Assists"):
+                assists_val = val
         shots_total.append(shots)
         shots_on.append(shots_on_target)
+        assists.append(assists_val)
         if shots >= 1:
             ge1 += 1
         if shots >= 2:
@@ -144,7 +164,14 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
         if shots >= 3:
             ge3 += 1
         fixtures_raw.append(
-            {"fixture_id": fx.id, "shots": shots, "shots_on": shots_on_target, "date": fx.starting_at.isoformat() if fx.starting_at else None}
+            {
+                "fixture_id": fx.id,
+                "shots": shots,
+                "shots_on": shots_on_target,
+                "assists": assists_val,
+                "minutes": minutes_val,
+                "date": fx.starting_at.isoformat() if fx.starting_at else None,
+            }
         )
 
     games_played = len(shots_total)
@@ -152,6 +179,8 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
         return None
     shots_avg = sum(shots_total) / games_played
     shots_on_avg = sum(shots_on) / games_played
+    assists_avg = sum(assists) / games_played if assists else 0
+    minutes_avg = sum(minutes_list) / games_played if minutes_list else None
     obj = (
         session.query(PlayerForm)
         .filter(PlayerForm.player_id == player_id, PlayerForm.sample_size == sample_size)
@@ -169,7 +198,8 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
         "shots_ge_1_pct": ge1 / games_played,
         "shots_ge_2_pct": ge2 / games_played,
         "shots_ge_3_pct": ge3 / games_played,
-        "minutes_avg": None,
+        "assists_avg": assists_avg,
+        "minutes_avg": minutes_avg,
         "raw_fixtures": fixtures_raw,
     }
     if obj:
@@ -181,9 +211,9 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
     return obj
 
 
-def bulk_compute_forms(session: Session, sample_size: int = 10) -> Tuple[int, int]:
+def bulk_compute_forms(session: Session, sample_size: int = 10, availability_sample: int = 2) -> Tuple[int, int, int]:
     """
-    Recompute team and player forms for all IDs present.
+    Recompute team and player forms for all IDs present. Also computes availability.
     """
     team_ids = [row[0] for row in session.query(FixtureParticipant.team_id).distinct().all()]
     player_ids = [row[0] for row in session.query(PlayerStatLine.player_id).distinct().all()]
@@ -195,8 +225,16 @@ def bulk_compute_forms(session: Session, sample_size: int = 10) -> Tuple[int, in
         if compute_player_form(session, pid, sample_size):
             p_count += 1
     session.commit()
-    log.info("Computed forms: teams=%s players=%s (sample=%s)", t_count, p_count, sample_size)
-    return t_count, p_count
+    avail_count = compute_availability(session, sample_size=availability_sample)
+    log.info(
+        "Computed forms: teams=%s players=%s (sample=%s), availability=%s (sample=%s)",
+        t_count,
+        p_count,
+        sample_size,
+        avail_count,
+        availability_sample,
+    )
+    return t_count, p_count, avail_count
 
 
 # ---- Odds normalization ----
@@ -264,3 +302,51 @@ def normalize_odds(session: Session) -> int:
     session.commit()
     log.info("Normalized odds rows: %s", count)
     return count
+
+
+def compute_availability(session: Session, sample_size: int = 2) -> int:
+    """
+    Mark likely starters based on appearances in last N fixtures.
+    """
+    players = session.query(PlayerStatLine.player_id, PlayerStatLine.team_id).distinct().all()
+    total = 0
+    for pid, tid in players:
+        rows = (
+            session.query(PlayerStatLine, Fixture)
+            .join(Fixture, PlayerStatLine.fixture_id == Fixture.id)
+            .filter(PlayerStatLine.player_id == pid, PlayerStatLine.team_id == tid)
+            .order_by(Fixture.starting_at.desc())
+            .limit(sample_size)
+            .all()
+        )
+        if not rows:
+            continue
+        appearances = 0
+        starts = 0
+        for stat, _ in rows:
+            appearances += 1
+            if stat.is_starting:
+                starts += 1
+        likely = starts / sample_size >= 0.5
+        obj = (
+            session.query(PlayerAvailability)
+            .filter(PlayerAvailability.player_id == pid, PlayerAvailability.sample_size == sample_size)
+            .one_or_none()
+        )
+        data = {
+            "player_id": pid,
+            "team_id": tid,
+            "likely_starter": likely,
+            "confidence": starts / sample_size,
+            "reason": f"started {starts}/{sample_size} recent",
+            "sample_size": sample_size,
+        }
+        if obj:
+            for k, v in data.items():
+                setattr(obj, k, v)
+        else:
+            session.add(PlayerAvailability(**data))
+        total += 1
+    session.commit()
+    log.info("Computed availability entries: %s", total)
+    return total

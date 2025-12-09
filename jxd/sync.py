@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from .api import SportMonksClient
 from .models import (
+    SyncState,
     Bookmaker,
     Country,
     Fixture,
@@ -22,7 +23,7 @@ from .models import (
     TeamStatLine,
     Venue,
 )
-from .utils import parse_dt, to_float
+from .utils import parse_dt, to_float, dict_hash
 
 log = logging.getLogger(__name__)
 FOOTBALL = "football/"
@@ -190,6 +191,19 @@ class SyncService:
         self.client = client
         self.session = session
 
+    # ---- sync state helpers ----
+    def _get_state(self, key: str) -> Optional[str]:
+        row = self.session.get(SyncState, key)
+        return row.value if row else None
+
+    def _set_state(self, key: str, value: str) -> None:
+        row = self.session.get(SyncState, key)
+        if row:
+            row.value = value
+        else:
+            self.session.add(SyncState(key=key, value=value))
+        self.session.commit()
+
     # ---- reference data ----
     def sync_countries(self) -> int:
         log.info("Syncing countries")
@@ -238,9 +252,19 @@ class SyncService:
         if season_id:
             path = f"{FOOTBALL}teams/seasons/{season_id}"
         count = 0
-        for item in self.client.fetch_collection(path, includes=["venue"]):
+        id_after = None
+        if not season_id:
+            state_key = "teams_id_after"
+            try:
+                id_after_val = self._get_state(state_key)
+                id_after = int(id_after_val) if id_after_val else None
+            except Exception:
+                id_after = None
+        for item in self.client.fetch_collection(path, includes=["venue"], id_after=id_after):
             _upsert(self.session, Team, _team_mapper(item))
             count += 1
+            if not season_id:
+                self._set_state("teams_id_after", str(item.get("id")))
         self.session.commit()
         log.info("Teams synced: %s", count)
         return count
@@ -259,9 +283,20 @@ class SyncService:
             params["team_id"] = team_id
 
         count = 0
-        for item in self.client.fetch_collection(path, params=params, includes=["team", "position"]):
+        id_after = None
+        if season_id and not team_id:
+            state_key = f"players_id_after_season_{season_id}"
+            try:
+                id_after_val = self._get_state(state_key)
+                id_after = int(id_after_val) if id_after_val else None
+            except Exception:
+                id_after = None
+
+        for item in self.client.fetch_collection(path, params=params, includes=["team", "position"], id_after=id_after):
             _upsert(self.session, Player, _player_mapper(item))
             count += 1
+            if season_id and not team_id:
+                self._set_state(f"players_id_after_season_{season_id}", str(item.get("id")))
         self.session.commit()
         log.info("Players synced: %s", count)
         return count
@@ -286,6 +321,13 @@ class SyncService:
         if league_ids:
             filters = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
 
+        id_after = None
+        try:
+            id_after_val = self._get_state("fixtures_id_after")
+            id_after = int(id_after_val) if id_after_val else None
+        except Exception:
+            id_after = None
+
         count = 0
         for item in self.client.fetch_collection(
             path,
@@ -293,10 +335,12 @@ class SyncService:
             includes=["scores", "participants"],
             filters=filters,
             per_page=50,
+            id_after=id_after,
         ):
             _upsert(self.session, Fixture, _fixture_mapper(item))
             self._store_participants(item)
             count += 1
+            self._set_state("fixtures_id_after", str(item.get("id")))
         self.session.commit()
         log.info("Fixtures synced: %s", count)
         return count
@@ -581,6 +625,7 @@ class SyncService:
             bookmaker_id = row.get("bookmaker_id")
             market_id = row.get("market_id")
             provider_outcome_id = row.get("id")
+            raw_hash = dict_hash(row)
 
             if bookmaker_id and not self.session.get(Bookmaker, bookmaker_id):
                 bm = {
@@ -621,6 +666,9 @@ class SyncService:
                     )
                     .one_or_none()
                 )
+                if obj and obj.raw_hash == raw_hash:
+                    # identical payload, skip
+                    continue
 
             data = {
                 "provider_outcome_id": provider_outcome_id,
@@ -642,6 +690,7 @@ class SyncService:
                 "stopped": row.get("stopped"),
                 "is_winning": row.get("winning"),
                 "raw": row,
+                "raw_hash": raw_hash,
             }
             if obj:
                 for k, v in data.items():

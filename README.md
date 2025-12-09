@@ -19,6 +19,8 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
    - `python -m jxd.cli sync-bookmakers`
    - `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82` (Bet365 odds)
    - `python -m jxd.cli sync-h2h --team-a 8 --team-b 14`
+   - `python -m jxd.cli compute-forms --sample-size 10 --availability-sample 2`
+   - `python -m jxd.cli normalize-odds`
 5. Use Postgres for production; SQLite is fine for local prototyping.
 
 ## Notes
@@ -35,6 +37,8 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
 - `fixtures` + `fixture_participants` (teams per fixture with locations/results)
 - `team_stats` (per fixture raw stats blob) and `player_stats` (lineups + detail rows)
 - `bookmakers`, `markets`, `odds_outcomes` (Bet365 odds preserved per outcome)
+- `odds_latest` (snapshot of latest odds per market/selection)
+- `team_forms`, `player_forms` (aggregated form percentages/averages) and `player_availability`
 - `head_to_head` (pair-wise cached responses + fixtures list)
 All tables store the raw API payload in JSON columns to keep future fields available.
 

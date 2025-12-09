@@ -34,3 +34,17 @@ def to_float(value: Any) -> Optional[float]:
         except Exception:
             return None
     return None
+
+
+def dict_hash(data: Any) -> str:
+    """
+    Stable hash for JSON-serializable data.
+    """
+    import hashlib
+    import json
+
+    try:
+        payload = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        payload = str(data)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

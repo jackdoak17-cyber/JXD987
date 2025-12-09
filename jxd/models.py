@@ -14,6 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Index,
     BigInteger,
+    Text,
 )
 
 from .db import Base
@@ -236,6 +237,7 @@ class OddsOutcome(Base):
     stopped = Column(Boolean)
     is_winning = Column(Boolean)
     raw = Column(JSON)
+    raw_hash = Column(String(64), index=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (
@@ -246,9 +248,9 @@ class OddsOutcome(Base):
             "market_id",
             "label",
             "participant",
-        "handicap",
-        "total",
-        name="uq_odds_outcome_key",
+            "handicap",
+            "total",
+            name="uq_odds_outcome_key",
         ),
     )
 
@@ -265,6 +267,9 @@ class TeamForm(Base):
     goals_against_avg = Column(Float)
     over_2_5_pct = Column(Float)
     under_2_5_pct = Column(Float)
+    win_pct = Column(Float)
+    draw_pct = Column(Float)
+    loss_pct = Column(Float)
     raw_fixtures = Column(JSON)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     __table_args__ = (
@@ -286,6 +291,7 @@ class PlayerForm(Base):
     shots_ge_1_pct = Column(Float)
     shots_ge_2_pct = Column(Float)
     shots_ge_3_pct = Column(Float)
+    assists_avg = Column(Float)
     minutes_avg = Column(Float)
     raw_fixtures = Column(JSON)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -313,4 +319,27 @@ class OddsLatest(Base):
             "fixture_id", "bookmaker_id", "market_id", "selection", "line", name="uq_odds_latest_key"
         ),
         Index("idx_odds_latest_fixture_market", "fixture_id", "market_id"),
+    )
+
+
+class SyncState(Base):
+    __tablename__ = "sync_state"
+    key = Column(String(255), primary_key=True)
+    value = Column(String(255))
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PlayerAvailability(Base):
+    __tablename__ = "player_availability"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    player_id = Column(Integer, ForeignKey("players.id"), index=True, nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), index=True, nullable=False)
+    likely_starter = Column(Boolean)
+    confidence = Column(Float)
+    reason = Column(String(255))
+    sample_size = Column(Integer, default=2)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("player_id", "sample_size", name="uq_player_availability_player_sample"),
+        Index("idx_player_availability_team", "team_id"),
     )

@@ -185,14 +185,21 @@ def sync_h2h(team_a: int = typer.Argument(...), team_b: int = typer.Argument(...
 
 
 @app.command("compute-forms")
-def compute_forms(sample_size: int = typer.Option(10, help="Number of recent games to average")) -> None:
+def compute_forms(
+    sample_size: int = typer.Option(10, help="Number of recent games to average"),
+    availability_sample: int = typer.Option(2, help="Number of recent games to gauge availability"),
+) -> None:
     """
-    Compute team/player form aggregates (shots/goals percentages) for quick querying.
+    Compute team/player form aggregates and availability for quick querying.
     """
     session = make_session(settings.database_url)
     bootstrap_schema(session)
-    t_count, p_count = bulk_compute_forms(session, sample_size=sample_size)
-    typer.echo(f"Computed forms: teams={t_count}, players={p_count}, sample={sample_size}")
+    t_count, p_count, a_count = bulk_compute_forms(
+        session, sample_size=sample_size, availability_sample=availability_sample
+    )
+    typer.echo(
+        f"Computed forms: teams={t_count}, players={p_count}, availability={a_count}, sample={sample_size}, availability_sample={availability_sample}"
+    )
 
 
 @app.command("normalize-odds")
