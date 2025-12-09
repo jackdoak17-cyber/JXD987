@@ -301,6 +301,49 @@ class SyncService:
         log.info("Fixtures synced: %s", count)
         return count
 
+    def sync_fixtures_between(
+        self,
+        start_date: str,
+        end_date: str,
+        league_ids: Optional[List[int]] = None,
+        with_details: bool = False,
+    ) -> int:
+        """
+        Fetch fixtures between dates (inclusive). Dates are YYYY-MM-DD.
+        with_details=True pulls statistics/lineups (heavier).
+        """
+        log.info(
+            "Syncing fixtures between %s and %s%s%s",
+            start_date,
+            end_date,
+            " with details" if with_details else "",
+            f" leagues {league_ids}" if league_ids else "",
+        )
+        path = f"{FOOTBALL}fixtures/between/{start_date}/{end_date}"
+        filters = None
+        if league_ids:
+            filters = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
+        includes = ["participants", "scores"]
+        if with_details:
+            includes.extend(["statistics.type", "lineups.player", "lineups.details"])
+
+        count = 0
+        for item in self.client.fetch_collection(
+            path,
+            filters=filters,
+            includes=includes,
+            per_page=50,
+        ):
+            _upsert(self.session, Fixture, _fixture_mapper(item))
+            self._store_participants(item)
+            if with_details:
+                self._store_team_stats(item)
+                self._store_player_stats(item)
+            count += 1
+        self.session.commit()
+        log.info("Fixtures between synced: %s", count)
+        return count
+
     def sync_fixture_details(
         self,
         season_id: Optional[int] = None,

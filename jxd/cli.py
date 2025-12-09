@@ -96,6 +96,29 @@ def sync_fixtures(
     service = get_service()
     service.sync_fixtures(season_id=season_id, team_ids=teams, league_ids=leagues)
 
+@app.command("sync-fixtures-between")
+def sync_fixtures_between(
+    start_date: str = typer.Argument(..., help="Start date YYYY-MM-DD"),
+    end_date: str = typer.Argument(..., help="End date YYYY-MM-DD"),
+    league_ids: str = typer.Option(
+        None, help="Comma-separated league IDs to filter fixtures (optional)"
+    ),
+    with_details: bool = typer.Option(
+        False, help="Include statistics + lineups (heavier, fewer per-hour)"
+    ),
+) -> None:
+    """
+    Sync fixtures between two dates (useful for upcoming/past windows).
+    """
+    leagues = _parse_csv(league_ids) or league_ids_from_settings(settings)
+    service = get_service()
+    service.sync_fixtures_between(
+        start_date=start_date,
+        end_date=end_date,
+        league_ids=leagues,
+        with_details=with_details,
+    )
+
 
 @app.command("sync-fixture-details")
 def sync_fixture_details(

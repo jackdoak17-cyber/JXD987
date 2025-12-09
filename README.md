@@ -15,6 +15,7 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
    - `python -m jxd.cli sync-players --season-id 19734`
    - `python -m jxd.cli sync-fixtures --season-id 19734` (lightweight fixtures + participants)
    - `python -m jxd.cli sync-fixture-details --season-id 19734 --limit 200` (fixtures + stats + lineups)
+   - `python -m jxd.cli sync-fixtures-between 2025-01-01 2025-01-31 --with-details --league-ids 8,9`
    - `python -m jxd.cli sync-bookmakers`
    - `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82` (Bet365 odds)
    - `python -m jxd.cli sync-h2h --team-a 8 --team-b 14`
@@ -25,6 +26,7 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
 - Upserts keep records fresh; rerunning syncs is safe.
 - Default DB is SQLite for quick runs; use Postgres for production or bigger volumes.
 - Odds default to Bet365 (bookmaker_id=2). Override with `BOOKMAKER_ID` env or CLI flag.
+- Includes use `;` per SportMonks spec. `filters=populate` is applied automatically when safe.
 
 ## Data model (tables)
 - `countries`, `leagues`, `seasons`, `venues`
@@ -40,6 +42,14 @@ All tables store the raw API payload in JSON columns to keep future fields avail
 Run the sync commands via cron/systemd/GitHub Actions. Example cron (once daily at 04:00):
 ```
 0 4 * * * cd /path/to/JXD987 && . .venv/bin/activate && python -m jxd.cli sync-static && python -m jxd.cli sync-teams --season-id 19734 && python -m jxd.cli sync-players --season-id 19734 && python -m jxd.cli sync-fixtures --season-id 19734 && python -m jxd.cli sync-fixture-details --season-id 19734 --limit 400 && python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82,384,387
+```
+Hourly odds refresh (lighter, scoped to leagues):  
+```
+0 * * * * cd /path/to/JXD987 && . .venv/bin/activate && python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82 --limit 200
+```
+Midday stats refresh for upcoming 7 days (with details, capped):  
+```
+0 12 * * * cd /path/to/JXD987 && . .venv/bin/activate && python -m jxd.cli sync-fixtures-between $(date +\%F) $(date -v+7d +\%F) --with-details --league-ids 8,9,82 --limit 400
 ```
 Adjust season IDs per league/year. `sync-h2h` can be run ad hoc for upcoming matches.
 

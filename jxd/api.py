@@ -78,6 +78,7 @@ class SportMonksClient:
         includes: Optional[Iterable[str] | str] = None,
         per_page: int = 200,
         filters: Optional[str] = None,
+        id_after: Optional[int] = None,
     ) -> Iterable[Dict]:
         params = params.copy() if params else {}
         params.setdefault("per_page", per_page)
@@ -92,6 +93,13 @@ class SportMonksClient:
             # Best-practice from SportMonks docs: populate allows per_page=1000
             params["filters"] = "populate"
             params["per_page"] = max(per_page, 1000)
+        if id_after is not None:
+            filters_current = params.get("filters")
+            extra = f"idAfter:{id_after}"
+            if filters_current:
+                params["filters"] = f"{filters_current};{extra}"
+            else:
+                params["filters"] = extra
 
         page = 1
         while True:
