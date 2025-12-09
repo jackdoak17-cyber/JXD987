@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from .models import (
     Fixture,
     FixtureParticipant,
+    TeamStatLine,
     OddsLatest,
     OddsOutcome,
     PlayerForm,
@@ -24,7 +25,7 @@ log = logging.getLogger(__name__)
 # ---- Team form ----
 def compute_team_form(session: Session, team_id: int, sample_size: int = 10) -> Optional[TeamForm]:
     """
-    Compute simple team form stats over last N fixtures (goals, over/under 2.5).
+    Compute team form stats over last N fixtures (goals, shots, corners, cards) with for/against and home/away.
     """
     query = (
         session.query(Fixture, FixtureParticipant)
@@ -37,6 +38,53 @@ def compute_team_form(session: Session, team_id: int, sample_size: int = 10) -> 
     rows = query.all()
     if not rows:
         return None
+
+    fixture_ids = [fx.id for fx, _ in rows]
+    part_map: Dict[int, List[FixtureParticipant]] = {}
+    for fp in session.query(FixtureParticipant).filter(FixtureParticipant.fixture_id.in_(fixture_ids)).all():
+        part_map.setdefault(fp.fixture_id, []).append(fp)
+
+    # Preload team stats per fixture
+    stats_map: Dict[int, Dict[int, Dict[str, float]]] = {}
+    stat_rows = session.query(TeamStatLine).filter(TeamStatLine.fixture_id.in_(fixture_ids)).all()
+
+    def parse_team_stats(stats: List[Dict]) -> Dict[str, float]:
+        out = {
+            "shots": 0.0,
+            "shots_on": 0.0,
+            "corners": 0.0,
+            "yellows": 0.0,
+            "reds": 0.0,
+            "fouls": 0.0,
+        }
+        for row in stats or []:
+            t = row.get("type") or {}
+            name = (t.get("developer_name") or t.get("name") or "").lower()
+            val = 0.0
+            data = row.get("data")
+            if isinstance(data, dict) and "value" in data:
+                try:
+                    val = float(data.get("value") or 0)
+                except Exception:
+                    val = 0.0
+            elif isinstance(data, (int, float)):
+                val = float(data)
+            if "shots_total" in name or "shots total" in name:
+                out["shots"] = val
+            elif "shots_on_target" in name or "shots on target" in name:
+                out["shots_on"] = val
+            elif "corner" in name:
+                out["corners"] = val
+            elif "yellow" in name:
+                out["yellows"] = val
+            elif "red" in name:
+                out["reds"] = val
+            elif "foul" in name:
+                out["fouls"] = val
+        return out
+
+    for st in stat_rows:
+        stats_map.setdefault(st.fixture_id, {})[st.team_id] = parse_team_stats(st.stats or [])
 
     fixtures_raw = []
     goals_for = []
@@ -66,7 +114,34 @@ def compute_team_form(session: Session, team_id: int, sample_size: int = 10) -> 
             draws += 1
         else:
             losses += 1
-        fixtures_raw.append({"fixture_id": fx.id, "gf": gf, "ga": ga, "date": fx.starting_at.isoformat() if fx.starting_at else None})
+        stats_for = (stats_map.get(fx.id, {}) or {}).get(team_id, {}) if team_id else {}
+        opp_id = None
+        for p in part_map.get(fx.id, []):
+            if p.team_id != team_id:
+                opp_id = p.team_id
+                break
+        stats_against = (stats_map.get(fx.id, {}) or {}).get(opp_id, {}) if opp_id else {}
+        fixtures_raw.append(
+            {
+                "fixture_id": fx.id,
+                "gf": gf,
+                "ga": ga,
+                "shots_for": stats_for.get("shots"),
+                "shots_against": stats_against.get("shots"),
+                "sot_for": stats_for.get("shots_on"),
+                "sot_against": stats_against.get("shots_on"),
+                "corners_for": stats_for.get("corners"),
+                "corners_against": stats_against.get("corners"),
+                "yellows_for": stats_for.get("yellows"),
+                "yellows_against": stats_against.get("yellows"),
+                "reds_for": stats_for.get("reds"),
+                "reds_against": stats_against.get("reds"),
+                "fouls_for": stats_for.get("fouls"),
+                "fouls_against": stats_against.get("fouls"),
+                "location": part.location,
+                "date": fx.starting_at.isoformat() if fx.starting_at else None,
+            }
+        )
 
     games_played = len(goals_for)
     if games_played == 0:

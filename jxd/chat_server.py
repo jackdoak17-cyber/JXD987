@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import make_session
 from .sync import ensure_player_form_columns
-from .models import PlayerForm, Player, Team, Fixture, FixtureParticipant, OddsLatest, League
+from .models import PlayerForm, TeamForm, Player, Team, Fixture, FixtureParticipant, OddsLatest, League
 
 app = FastAPI(title="JXD Chat", version="0.1")
 
@@ -46,17 +46,37 @@ def parse_query(text: str) -> Dict[str, Any]:
       - exclude_favorites (True if mentions not favorites/underdogs)
     """
     lowered = text.lower()
-    # stat type
-    stat_type = "shots"
-    if "sot" in lowered or "on target" in lowered:
-        stat_type = "sot"
-    elif "goals" in lowered or "goal " in lowered:
-        stat_type = "goals"
-    elif "assist" in lowered:
-        stat_type = "assists"
+
+    def resolve_stat() -> Tuple[str, str]:
+        # Returns (entity, stat_key). entity: player|team. stat_key for players: shots,sot,goals,assists. teams: shots_for/against, sot_for/against, goals_for/against, corners_for/against, yellows_for/against, reds_for/against.
+        against = any(word in lowered for word in ["concede", "allowed", "against", "allow", "conceded"])
+        if "corner" in lowered:
+            return "team", "corners_against" if against else "corners_for"
+        if "booking" in lowered or "card" in lowered:
+            if "red" in lowered:
+                return "team", "reds_against" if against else "reds_for"
+            # default to yellows for generic "cards"
+            return "team", "yellows_against" if against else "yellows_for"
+        if "goal" in lowered and not "assist" in lowered:
+            if "team" in lowered or against:
+                return "team", "goals_against" if against else "goals_for"
+            return "player", "goals"
+        if "assist" in lowered:
+            return "player", "assists"
+        if "sot" in lowered or "on target" in lowered:
+            if "team" in lowered or against:
+                return "team", "sot_against" if against else "sot_for"
+            return "player", "sot"
+        # shots default
+        if "team" in lowered or against:
+            return "team", "shots_against" if against else "shots_for"
+        return "player", "shots"
+
+    entity, stat_key = resolve_stat()
+
     # threshold
     min_value = 2
-    m = re.search(r"(\d+)\+?\s*(shot|sot|on target|goal|assist)", lowered)
+    m = re.search(r"(\d+)\+?\s*(shot|sot|on target|goal|assist|corner|card)", lowered)
     if m:
         try:
             min_value = int(m.group(1))
@@ -106,8 +126,12 @@ def parse_query(text: str) -> Dict[str, Any]:
         location = "home"
     elif " away " in lowered or "away only" in lowered or "away games" in lowered or "away fixtures" in lowered:
         location = "away"
+    # entity hints
+    if "team" in lowered and entity != "team":
+        entity = "team"
     return {
-        "stat_type": stat_type,
+        "entity": entity,
+        "stat_key": stat_key,
         "min_value": min_value,
         "sample_size": sample_size,
         "min_pct": min_pct,
@@ -243,8 +267,37 @@ def stat_pass(
     }
 
 
+def stat_pass_team(
+    form: TeamForm, stat_key: str, threshold: int, sample_size: int, min_pct: float, location: Optional[str] = None
+) -> Dict[str, Any]:
+    fixtures = form.raw_fixtures or []
+    if location:
+        fixtures = [fx for fx in fixtures if fx.get("location") == location]
+    if not fixtures:
+        return {"hit_all": False, "pct": 0, "avg": 0, "values": []}
+    fixtures = fixtures[:sample_size]
+    values = []
+    for fx in fixtures:
+        values.append(fx.get(stat_key, 0) or 0)
+    games = len(values)
+    if games < sample_size:
+        return {"hit_all": False, "pct": 0, "avg": 0, "values": values}
+    hits = sum(1 for v in values if v >= threshold)
+    avg = sum(values) / games if games else 0
+    pct = hits / games if games else 0
+    return {
+        "hit_all": hits == games,
+        "pct": pct,
+        "avg": avg,
+        "hits": hits,
+        "games": games,
+        "meets_pct": pct >= min_pct,
+        "values": values,
+    }
+
+
 def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
-    stat_type = parsed["stat_type"]
+    stat_type = parsed["stat_key"]
     min_value = parsed["min_value"]
     sample_size = parsed["sample_size"]
     min_pct = parsed["min_pct"]
@@ -313,6 +366,55 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
     return results
 
 
+def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
+    stat_key = parsed["stat_key"]
+    min_value = parsed["min_value"]
+    sample_size = parsed["sample_size"]
+    min_pct = parsed["min_pct"]
+    league_ids: Optional[List[int]] = parsed.get("league_ids")
+    location = parsed.get("location")
+    require_today = parsed["require_today"]
+
+    today_teams = set(teams_playing_today(session)) if require_today else set()
+
+    query = (
+        session.query(TeamForm, Team)
+        .join(Team, Team.id == TeamForm.team_id)
+        .filter(TeamForm.games_played >= sample_size)
+        .order_by(TeamForm.sample_size.asc(), TeamForm.updated_at.desc())
+    )
+    if league_ids:
+        query = query.filter(TeamForm.league_id.in_(league_ids))
+    if require_today:
+        if not today_teams:
+            return []
+        query = query.filter(TeamForm.team_id.in_(today_teams))
+
+    rows = query.all()
+    results = []
+    for form, team in rows:
+        fixtures = form.raw_fixtures or []
+        if not fixtures or len(fixtures) < sample_size:
+            continue
+        stat_eval = stat_pass_team(form, stat_key, min_value, sample_size, min_pct, location=location)
+        if not stat_eval["meets_pct"]:
+            continue
+        results.append(
+            {
+                "team": team.name if team else f"Team {form.team_id}",
+                "stat_type": stat_key,
+                "threshold": min_value,
+                "avg": stat_eval["avg"],
+                "pct": stat_eval["pct"],
+                "hits": stat_eval.get("hits"),
+                "games": stat_eval.get("games"),
+                "sample_size": sample_size,
+                "values": stat_eval.get("values"),
+            }
+        )
+    return results
+
+
 @app.post("/api/chat")
 async def chat_api(payload: Dict[str, str]):
     text = payload.get("query", "") if isinstance(payload, dict) else ""
@@ -322,11 +424,15 @@ async def chat_api(payload: Dict[str, str]):
     session = get_session()
     try:
         parsed["league_ids"] = detect_league_ids(session, text)
-        results = search_players(session, parsed)
+        if parsed.get("entity") == "team":
+            results = search_teams(session, parsed)
+        else:
+            results = search_players(session, parsed)
     finally:
         session.close()
     interpretation = {
-        "stat": parsed["stat_type"],
+        "entity": parsed.get("entity"),
+        "stat": parsed["stat_key"],
         "threshold": parsed["min_value"],
         "sample_size": parsed["sample_size"],
         "min_pct": parsed["min_pct"],
@@ -393,7 +499,8 @@ async function send() {
     const games = r.games != null ? r.games : r.sample_size;
     const values = Array.isArray(r.values) ? r.values.join(',') : '';
     const pct = typeof r.pct === 'number' ? (r.pct * 100).toFixed(0) + '%' : '';
-    return `${r.player} (${r.team}) - ${r.stat_type} ${r.threshold}+ in ${hits}/${games} (${pct}) | values: ${values}`;
+    const name = r.player ? `${r.player} (${r.team || ''})` : r.team;
+    return `${name} - ${r.stat_type} ${r.threshold}+ in ${hits}/${games} (${pct}) | values: ${values}`;
   }).join('<br>');
   log.innerHTML += `<div class='msg'>Results:<br>${rows}</div>`;
 }
