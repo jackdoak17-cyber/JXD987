@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from .config import settings
 from .db import make_session
+from .sync import ensure_player_form_columns
 from .models import PlayerForm, Player, Team, Fixture, FixtureParticipant, OddsLatest
 
 app = FastAPI(title="JXD Chat", version="0.1")
@@ -21,36 +22,75 @@ def get_session() -> Session:
     return make_session(settings.database_url)
 
 
+@app.on_event("startup")
+def _startup_schema():
+    # Ensure newer columns exist for older SQLite files.
+    session = get_session()
+    try:
+        ensure_player_form_columns(session)
+    finally:
+        session.close()
+
+
 def parse_query(text: str) -> Dict[str, Any]:
     """
     Very light parser for common betting-style phrases.
     Extracts:
-      - min_shots (default 2)
+      - stat_type (shots, sot, goals, assists)
+      - min_value (threshold, default 2 shots)
       - sample_size (default 10)
+      - min_pct (default 100%, can be 80% or 4/5)
       - odds_max (optional)
       - require_today (True if mentions today/tonight)
       - require_favorites (True if mentions favorites)
+      - exclude_favorites (True if mentions not favorites/underdogs)
     """
     lowered = text.lower()
-    # shots threshold
-    min_shots = 2
-    m = re.search(r"(\\d+)\\+?\\s*shot", lowered)
+    # stat type
+    stat_type = "shots"
+    if "sot" in lowered or "on target" in lowered:
+        stat_type = "sot"
+    elif "goals" in lowered or "goal " in lowered:
+        stat_type = "goals"
+    elif "assist" in lowered:
+        stat_type = "assists"
+    # threshold
+    min_value = 2
+    m = re.search(r"(\d+)\+?\s*(shot|sot|on target|goal|assist)", lowered)
     if m:
         try:
-            min_shots = int(m.group(1))
+            min_value = int(m.group(1))
         except Exception:
             pass
     # sample size
     sample_size = 10
-    m = re.search(r"last\\s+(\\d+)", lowered)
+    m = re.search(r"last\s+(\d+)", lowered)
     if m:
         try:
             sample_size = int(m.group(1))
         except Exception:
             pass
+    # percentage or fraction (e.g., 4/5, 80%)
+    min_pct = 1.0
+    m = re.search(r"(\d+)\s*/\s*(\d+)", lowered)
+    if m:
+        try:
+            num, den = int(m.group(1)), int(m.group(2))
+            if den > 0:
+                min_pct = num / den
+                sample_size = den
+        except Exception:
+            pass
+    m = re.search(r"(\d+)\s*%", lowered)
+    if m:
+        try:
+            pct = int(m.group(1))
+            min_pct = pct / 100.0
+        except Exception:
+            pass
     # odds cap
     odds_max: Optional[float] = None
-    m = re.search(r"odds[^\\d]*([0-9]+\\.?[0-9]*)", lowered)
+    m = re.search(r"odds[^\d]*([0-9]+\.?[0-9]*)", lowered)
     if m:
         try:
             odds_max = float(m.group(1))
@@ -58,12 +98,18 @@ def parse_query(text: str) -> Dict[str, Any]:
             odds_max = None
     require_today = "today" in lowered or "tonight" in lowered
     require_fav = "favorite" in lowered or "favourite" in lowered
+    exclude_fav = "not favorite" in lowered or "non favorite" in lowered or "underdog" in lowered or "exclude favorites" in lowered
+    if exclude_fav:
+        require_fav = False
     return {
-        "min_shots": min_shots,
+        "stat_type": stat_type,
+        "min_value": min_value,
         "sample_size": sample_size,
+        "min_pct": min_pct,
         "odds_max": odds_max,
         "require_today": require_today,
         "require_favorites": require_fav,
+        "exclude_favorites": exclude_fav,
     }
 
 
@@ -118,23 +164,56 @@ def shot_predicate(min_shots: int):
     return PlayerForm.shots_ge_1_pct >= 1
 
 
+def stat_pass(form: PlayerForm, stat_type: str, threshold: int, sample_size: int, min_pct: float) -> Dict[str, Any]:
+    """
+    Evaluate whether the form meets the threshold for the chosen stat across its sample.
+    Returns dict with hit_all, pct, avg.
+    """
+    fixtures = form.raw_fixtures or []
+    if not fixtures:
+        return {"hit_all": False, "pct": 0, "avg": 0}
+    # Use the most recent fixtures (raw_fixtures are newest-first)
+    fixtures = fixtures[:sample_size]
+    values = []
+    for fx in fixtures:
+        if stat_type == "shots":
+            values.append(fx.get("shots", 0))
+        elif stat_type == "sot":
+            values.append(fx.get("shots_on", 0))
+        elif stat_type == "goals":
+            values.append(fx.get("goals", 0))
+        elif stat_type == "assists":
+            values.append(fx.get("assists", 0))
+    if not values:
+        return {"hit_all": False, "pct": 0, "avg": 0}
+    games = len(values)
+    if games < sample_size:
+        return {"hit_all": False, "pct": 0, "avg": 0}
+    hits = sum(1 for v in values if v >= threshold)
+    avg = sum(values) / games if games else 0
+    pct = hits / games if games else 0
+    return {"hit_all": hits == games, "pct": pct, "avg": avg, "hits": hits, "games": games, "meets_pct": pct >= min_pct}
+
+
 def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
-    min_shots = parsed["min_shots"]
+    stat_type = parsed["stat_type"]
+    min_value = parsed["min_value"]
     sample_size = parsed["sample_size"]
+    min_pct = parsed["min_pct"]
     odds_max = parsed["odds_max"]
     require_today = parsed["require_today"]
     require_fav = parsed["require_favorites"]
+    exclude_fav = parsed["exclude_favorites"]
 
     today_teams = set(teams_playing_today(session)) if require_today else set()
-    fav_map = favorite_teams_today(session, odds_max) if require_fav or odds_max is not None else {}
+    fav_map = favorite_teams_today(session, odds_max) if require_fav or exclude_fav or odds_max is not None else {}
 
     query = (
         session.query(PlayerForm, Player, Team)
         .join(Player, Player.id == PlayerForm.player_id)
-        .join(Team, Team.id == PlayerForm.team_id)
-        .filter(PlayerForm.sample_size >= sample_size)
+        .outerjoin(Team, Team.id == PlayerForm.team_id)
         .filter(PlayerForm.games_played >= sample_size)
-        .filter(shot_predicate(min_shots))
+        .order_by(PlayerForm.updated_at.desc())
     )
     if require_today:
         if not today_teams:
@@ -144,20 +223,29 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
         if not fav_map:
             return []
         query = query.filter(PlayerForm.team_id.in_(fav_map.keys()))
+    if exclude_fav and fav_map:
+        query = query.filter(~PlayerForm.team_id.in_(fav_map.keys()))
 
-    rows = query.limit(200).all()
+    rows = query.all()
     results = []
     for form, player, team in rows:
         odds_val = fav_map.get(team.id) if fav_map else None
         if odds_max is not None and odds_val is not None and odds_val > odds_max:
             continue
+        stat_eval = stat_pass(form, stat_type, min_value, sample_size, min_pct)
+        if not stat_eval["meets_pct"]:
+            continue
         results.append(
             {
-                "player": player.display_name or f\"{player.first_name or ''} {player.last_name or ''}\".strip(),
-                "team": team.name,
-                "shots_avg": form.shots_total_avg,
-                "shots_on_avg": form.shots_on_target_avg,
-                "sample_size": form.sample_size,
+                "player": player.display_name or f"{player.first_name or ''} {player.last_name or ''}".strip(),
+                "team": team.name if team else f"Team {form.team_id}",
+                "stat_type": stat_type,
+                "threshold": min_value,
+                "avg": stat_eval["avg"],
+                "pct": stat_eval["pct"],
+                "hits": stat_eval.get("hits"),
+                "games": stat_eval.get("games"),
+                "sample_size": sample_size,
                 "games_played": form.games_played,
                 "odds": odds_val,
             }
@@ -176,7 +264,18 @@ async def chat_api(payload: Dict[str, str]):
         results = search_players(session, parsed)
     finally:
         session.close()
-    return {"query": parsed, "results": results}
+    interpretation = {
+        "stat": parsed["stat_type"],
+        "threshold": parsed["min_value"],
+        "sample_size": parsed["sample_size"],
+        "min_pct": parsed["min_pct"],
+        "today_only": parsed["require_today"],
+        "favorites_only": parsed["require_favorites"],
+        "exclude_favorites": parsed["exclude_favorites"],
+        "odds_cap": parsed["odds_max"],
+        "note": "Uses most recent games; requires hit rate >= min_pct",
+    }
+    return {"query": parsed, "interpretation": interpretation, "results": results}
 
 
 INDEX_HTML = """
@@ -219,11 +318,20 @@ async function send() {
     log.innerHTML += `<div class='msg'>Error: ${data.error}</div>`;
     return;
   }
+  if (data.interpretation) {
+    log.innerHTML += `<div class='msg'>Query understood as: ${JSON.stringify(data.interpretation)}</div>`;
+  }
   if (!data.results || data.results.length === 0) {
     log.innerHTML += `<div class='msg'>No matches.</div>`;
     return;
   }
-  const rows = data.results.map(r => `${r.player} (${r.team}) - shots avg ${r.shots_avg?.toFixed(2) || 'n/a'} (sample ${r.sample_size}), odds ${r.odds || 'n/a'}`).join('<br>');
+  const rows = data.results.map(r => {
+    const avg = typeof r.avg === 'number' ? r.avg.toFixed(2) : 'n/a';
+    const pct = typeof r.pct === 'number' ? (r.pct * 100).toFixed(0) + '%' : '';
+    const hits = r.hits != null ? r.hits : '';
+    const games = r.games != null ? r.games : r.sample_size;
+    return `${r.player} (${r.team}) - ${r.stat_type} avg ${avg}, hit ${r.threshold}+ in ${hits}/${games} (${pct}) of last ${r.sample_size}, odds ${r.odds || 'n/a'}`;
+  }).join('<br>');
   log.innerHTML += `<div class='msg'>Results:<br>${rows}</div>`;
 }
 </script>

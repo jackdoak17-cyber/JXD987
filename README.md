@@ -22,7 +22,7 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
    - `python -m jxd.cli sync-inplay-odds --bookmaker-id 2 --limit 200` (latest inplay odds snapshot)
    - `python -m jxd.cli sync-livescores` (live fixtures window)
    - `python -m jxd.cli sync-h2h --team-a 8 --team-b 14`
-   - `python -m jxd.cli compute-forms --samples "10,25,50" --availability-sample 5`
+   - `python -m jxd.cli compute-forms --samples "5,10,15,20,25,50" --availability-sample 5`
    - `python -m jxd.cli normalize-odds`
 5. Use Postgres for production; SQLite is fine for local prototyping. A compressed SQLite snapshot is kept in-repo at `data/jxd_dump.sql.xz` (created with `sqlite3 .dump | xz`). To restore locally:  
    ```bash
@@ -54,7 +54,7 @@ All tables store the raw API payload in JSON columns to keep future fields avail
 - Local cron (alternative):  
   - Daily history (04:00): `python -m jxd.cli sync-history --days-back 450 --days-forward 14 --with-details --league-ids 8,9,82,384,387 --limit 1800 && python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82,384,387 --limit 800 && python -m jxd.cli compute-forms --samples "10,25,50" --availability-sample 5 && python -m jxd.cli normalize-odds`  
   - Hourly odds: `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82 --limit 200`  
-  - Midday stats window: `python -m jxd.cli sync-fixtures-between $(date +\%F) $(date -v+7d +\%F) --with-details --league-ids 8,9,82 --limit 400 && python -m jxd.cli compute-forms --samples "10,25,50" --availability-sample 5`
+  - Midday stats window: `python -m jxd.cli sync-fixtures-between $(date +\%F) $(date -v+7d +\%F) --with-details --league-ids 8,9,82 --limit 400 && python -m jxd.cli compute-forms --samples "5,10,15,20,25,50" --availability-sample 5`
 Adjust season IDs per league/year. `sync-h2h` can be run ad hoc for upcoming matches.
 
 ## Environment safety

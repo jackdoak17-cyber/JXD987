@@ -4,7 +4,7 @@ set -euo pipefail
 # End-to-end refresh:
 # 1) Sync reference + deep history (with stats/lineups)
 # 2) Sync odds (Bet365 by default)
-# 3) Recompute forms (10/25/50) and availability (last 5)
+# 3) Recompute forms (5/10/15/20/25/50) and availability (last 5)
 # 4) Normalize odds snapshot
 # 5) Write compressed SQLite dump to data/jxd_dump.sql.xz
 #
@@ -48,8 +48,8 @@ python3 -m jxd.cli sync-odds \
   --league-ids "${LEAGUE_IDS}" \
   --limit "${ODDS_LIMIT}"
 
-echo "=== Compute forms (10/25/50) and availability (5) ==="
-python3 -m jxd.cli compute-forms --samples "10,25,50" --availability-sample 5
+echo "=== Compute forms (5/10/15/20/25/50) and availability (5) ==="
+python3 -m jxd.cli compute-forms --samples "5,10,15,20,25,50" --availability-sample 5
 
 echo "=== Normalize odds snapshot ==="
 python3 -m jxd.cli normalize-odds

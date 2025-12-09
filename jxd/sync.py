@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional
 
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from .api import SportMonksClient
 from .models import (
@@ -815,3 +816,27 @@ def bootstrap_schema(session: Session) -> None:
     from .db import Base
 
     Base.metadata.create_all(session.get_bind())
+    ensure_player_form_columns(session)
+
+
+def ensure_player_form_columns(session: Session) -> None:
+    """
+    Lightweight, SQLite-friendly migration to add newer player_forms columns if missing.
+    """
+    needed = {
+        "goals_avg": "FLOAT",
+        "shots_on_ge_1_pct": "FLOAT",
+        "shots_on_ge_2_pct": "FLOAT",
+        "goals_ge_1_pct": "FLOAT",
+        "goals_ge_2_pct": "FLOAT",
+        "assists_ge_1_pct": "FLOAT",
+    }
+    existing = {
+        row[1]
+        for row in session.execute(text("PRAGMA table_info(player_forms)")).fetchall()
+    }
+    for col, ddl in needed.items():
+        if col in existing:
+            continue
+        session.execute(text(f"ALTER TABLE player_forms ADD COLUMN {col} {ddl}"))
+    session.commit()

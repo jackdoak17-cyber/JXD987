@@ -102,7 +102,7 @@ jobs:
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
-          python -m jxd.cli compute-forms --samples "10,25,50" --availability-sample 2
+          python -m jxd.cli compute-forms --samples "5,10,15,20,25,50" --availability-sample 2
       - name: Normalize odds snapshot (post-stats)
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}

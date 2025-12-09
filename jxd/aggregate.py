@@ -124,8 +124,11 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
 
     shots_total = []
     shots_on = []
+    goals = []
     minutes_list = []
     ge1 = ge2 = ge3 = 0
+    sot_ge1 = sot_ge2 = 0
+    goals_ge1 = goals_ge2 = 0
     assists = []
     fixtures_raw = []
     league_id = season_id = team_id = None
@@ -136,6 +139,7 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
         team_id = team_id or stat.team_id
         shots = 0
         shots_on_target = 0
+        goals_val = 0
         assists_val = 0
         minutes_val = stat.minutes or 0
         minutes_list.append(minutes_val)
@@ -152,10 +156,13 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
                 shots = val
             elif name in ("SHOTS_ON_TARGET", "Shots On Target"):
                 shots_on_target = val
+            elif name in ("GOALS", "Goals"):
+                goals_val = val
             elif name in ("ASSISTS", "Assists"):
                 assists_val = val
         shots_total.append(shots)
         shots_on.append(shots_on_target)
+        goals.append(goals_val)
         assists.append(assists_val)
         if shots >= 1:
             ge1 += 1
@@ -163,11 +170,20 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
             ge2 += 1
         if shots >= 3:
             ge3 += 1
+        if shots_on_target >= 1:
+            sot_ge1 += 1
+        if shots_on_target >= 2:
+            sot_ge2 += 1
+        if goals_val >= 1:
+            goals_ge1 += 1
+        if goals_val >= 2:
+            goals_ge2 += 1
         fixtures_raw.append(
             {
                 "fixture_id": fx.id,
                 "shots": shots,
                 "shots_on": shots_on_target,
+                "goals": goals_val,
                 "assists": assists_val,
                 "minutes": minutes_val,
                 "date": fx.starting_at.isoformat() if fx.starting_at else None,
@@ -179,6 +195,7 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
         return None
     shots_avg = sum(shots_total) / games_played
     shots_on_avg = sum(shots_on) / games_played
+    goals_avg = sum(goals) / games_played if goals else 0
     assists_avg = sum(assists) / games_played if assists else 0
     minutes_avg = sum(minutes_list) / games_played if minutes_list else None
     obj = (
@@ -195,9 +212,15 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
         "games_played": games_played,
         "shots_total_avg": shots_avg,
         "shots_on_target_avg": shots_on_avg,
+        "goals_avg": goals_avg,
         "shots_ge_1_pct": ge1 / games_played,
         "shots_ge_2_pct": ge2 / games_played,
         "shots_ge_3_pct": ge3 / games_played,
+        "shots_on_ge_1_pct": sot_ge1 / games_played,
+        "shots_on_ge_2_pct": sot_ge2 / games_played,
+        "goals_ge_1_pct": goals_ge1 / games_played,
+        "goals_ge_2_pct": goals_ge2 / games_played,
+        "assists_ge_1_pct": sum(1 for a in assists if a >= 1) / games_played,
         "assists_avg": assists_avg,
         "minutes_avg": minutes_avg,
         "raw_fixtures": fixtures_raw,
