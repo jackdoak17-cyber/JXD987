@@ -7,6 +7,6 @@ env/
 *.pyo
 *.sqlite
 *.db
+!data/jxd.sqlite
 /.mypy_cache/
 /.pytest_cache/
-
