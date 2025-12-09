@@ -7,6 +7,7 @@ from .config import league_ids_from_settings, settings
 from .db import make_session
 from .logging_utils import configure_logging
 from .sync import SyncService, bootstrap_schema
+from .aggregate import bulk_compute_forms, normalize_odds
 
 app = typer.Typer(add_completion=False)
 
@@ -181,6 +182,28 @@ def sync_h2h(team_a: int = typer.Argument(...), team_b: int = typer.Argument(...
     """
     service = get_service()
     service.sync_h2h(team_a_id=team_a, team_b_id=team_b)
+
+
+@app.command("compute-forms")
+def compute_forms(sample_size: int = typer.Option(10, help="Number of recent games to average")) -> None:
+    """
+    Compute team/player form aggregates (shots/goals percentages) for quick querying.
+    """
+    session = make_session(settings.database_url)
+    bootstrap_schema(session)
+    t_count, p_count = bulk_compute_forms(session, sample_size=sample_size)
+    typer.echo(f"Computed forms: teams={t_count}, players={p_count}, sample={sample_size}")
+
+
+@app.command("normalize-odds")
+def normalize_odds_cmd() -> None:
+    """
+    Snapshot latest odds into a fast lookup table.
+    """
+    session = make_session(settings.database_url)
+    bootstrap_schema(session)
+    rows = normalize_odds(session)
+    typer.echo(f"Normalized odds rows: {rows}")
 
 
 if __name__ == "__main__":

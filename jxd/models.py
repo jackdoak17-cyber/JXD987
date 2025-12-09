@@ -246,8 +246,71 @@ class OddsOutcome(Base):
             "market_id",
             "label",
             "participant",
-            "handicap",
-            "total",
-            name="uq_odds_outcome_key",
+        "handicap",
+        "total",
+        name="uq_odds_outcome_key",
         ),
+    )
+
+
+class TeamForm(Base):
+    __tablename__ = "team_forms"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(Integer, ForeignKey("teams.id"), index=True, nullable=False)
+    league_id = Column(Integer, ForeignKey("leagues.id"), index=True)
+    season_id = Column(Integer, ForeignKey("seasons.id"), index=True)
+    sample_size = Column(Integer, default=10)
+    games_played = Column(Integer, default=0)
+    goals_for_avg = Column(Float)
+    goals_against_avg = Column(Float)
+    over_2_5_pct = Column(Float)
+    under_2_5_pct = Column(Float)
+    raw_fixtures = Column(JSON)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("team_id", "sample_size", name="uq_team_form_team_sample"),
+    )
+
+
+class PlayerForm(Base):
+    __tablename__ = "player_forms"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    player_id = Column(Integer, ForeignKey("players.id"), index=True, nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), index=True)
+    league_id = Column(Integer, ForeignKey("leagues.id"), index=True)
+    season_id = Column(Integer, ForeignKey("seasons.id"), index=True)
+    sample_size = Column(Integer, default=10)
+    games_played = Column(Integer, default=0)
+    shots_total_avg = Column(Float)
+    shots_on_target_avg = Column(Float)
+    shots_ge_1_pct = Column(Float)
+    shots_ge_2_pct = Column(Float)
+    shots_ge_3_pct = Column(Float)
+    minutes_avg = Column(Float)
+    raw_fixtures = Column(JSON)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint("player_id", "sample_size", name="uq_player_form_player_sample"),
+    )
+
+
+class OddsLatest(Base):
+    __tablename__ = "odds_latest"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), index=True, nullable=False)
+    bookmaker_id = Column(Integer, ForeignKey("bookmakers.id"), index=True, nullable=False)
+    market_id = Column(Integer, ForeignKey("markets.id"), index=True, nullable=False)
+    market_name = Column(String(255))
+    selection = Column(String(255))  # participant or line label
+    line = Column(String(64))  # handicap/total/line label
+    decimal_odds = Column(Float)
+    updated_at_source = Column(DateTime)
+    raw = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    __table_args__ = (
+        UniqueConstraint(
+            "fixture_id", "bookmaker_id", "market_id", "selection", "line", name="uq_odds_latest_key"
+        ),
+        Index("idx_odds_latest_fixture_market", "fixture_id", "market_id"),
     )
