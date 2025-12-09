@@ -29,7 +29,8 @@ from .utils import parse_dt, to_float, dict_hash
 log = logging.getLogger(__name__)
 FOOTBALL = "football/"
 CORE = "core/"
-ODDS = "odds/"
+# Use fully-qualified football odds prefix to avoid missing sport path.
+ODDS = "football/odds/"
 
 
 def _upsert(session: Session, model, data: Dict):
@@ -523,7 +524,7 @@ class SyncService:
         processed = 0
         for fid in ids:
             payload = self.client.get_raw(
-                f"{FOOTBALL}odds/pre-match/fixtures/{fid}",
+                f"{ODDS}pre-match/fixtures/{fid}",
                 params={"filter": f"bookmakers:{bookmaker_id}"} if bookmaker_id else {},
             )
             rows = payload.get("data") if isinstance(payload, dict) else None
