@@ -39,18 +39,11 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
 All tables store the raw API payload in JSON columns to keep future fields available.
 
 ## Scheduling
-Run the sync commands via cron/systemd/GitHub Actions. Example cron (once daily at 04:00):
-```
-0 4 * * * cd /path/to/JXD987 && . .venv/bin/activate && python -m jxd.cli sync-static && python -m jxd.cli sync-teams --season-id 19734 && python -m jxd.cli sync-players --season-id 19734 && python -m jxd.cli sync-fixtures --season-id 19734 && python -m jxd.cli sync-fixture-details --season-id 19734 --limit 400 && python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82,384,387
-```
-Hourly odds refresh (lighter, scoped to leagues):  
-```
-0 * * * * cd /path/to/JXD987 && . .venv/bin/activate && python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82 --limit 200
-```
-Midday stats refresh for upcoming 7 days (with details, capped):  
-```
-0 12 * * * cd /path/to/JXD987 && . .venv/bin/activate && python -m jxd.cli sync-fixtures-between $(date +\%F) $(date -v+7d +\%F) --with-details --league-ids 8,9,82 --limit 400
-```
+- GitHub Actions: see `.github/workflows/sync.yml` (hourly odds, twice-daily stats window). Add `SPORTMONKS_API_TOKEN` as a repo secret. Artifacts contain `data/jxd.sqlite` after each run.
+- Local cron (alternative):  
+  - Daily (04:00): `python -m jxd.cli sync-static && sync-teams --season-id <id> && sync-players --season-id <id> && sync-fixtures --season-id <id> && sync-fixture-details --season-id <id> --limit 400 && sync-odds --bookmaker-id 2 --league-ids 8,9,82,384,387`  
+  - Hourly odds: `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82 --limit 200`  
+  - Midday stats window: `python -m jxd.cli sync-fixtures-between $(date +\%F) $(date -v+7d +\%F) --with-details --league-ids 8,9,82 --limit 400`
 Adjust season IDs per league/year. `sync-h2h` can be run ad hoc for upcoming matches.
 
 ## Environment safety
