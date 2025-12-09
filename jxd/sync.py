@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional
 
 from sqlalchemy.orm import Session
@@ -179,7 +180,7 @@ def _safe_int(val) -> Optional[int]:
 def _group_team_stats(stats: Iterable[Dict]) -> Dict[int, List[Dict]]:
     grouped: Dict[int, List[Dict]] = {}
     for stat in stats or []:
-        tid = stat.get("team_id")
+        tid = stat.get("team_id") or stat.get("participant_id")
         if tid is None:
             continue
         grouped.setdefault(int(tid), []).append(stat)
@@ -351,6 +352,7 @@ class SyncService:
         end_date: str,
         league_ids: Optional[List[int]] = None,
         with_details: bool = False,
+        limit: Optional[int] = None,
     ) -> int:
         """
         Fetch fixtures between dates (inclusive). Dates are YYYY-MM-DD.
@@ -369,7 +371,7 @@ class SyncService:
             filters = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
         includes = ["participants", "scores"]
         if with_details:
-            includes.extend(["statistics.type", "lineups.player", "lineups.details"])
+            includes.extend(["statistics.type", "lineups.player", "lineups.details", "lineups.details.type"])
 
         count = 0
         for item in self.client.fetch_collection(
@@ -384,9 +386,57 @@ class SyncService:
                 self._store_team_stats(item)
                 self._store_player_stats(item)
             count += 1
+            if limit and count >= limit:
+                break
         self.session.commit()
         log.info("Fixtures between synced: %s", count)
         return count
+
+    def sync_history_window(
+        self,
+        days_back: int = 400,
+        days_forward: int = 14,
+        league_ids: Optional[List[int]] = None,
+        with_details: bool = True,
+        limit: Optional[int] = None,
+    ) -> int:
+        """
+        Convenience wrapper: fetch fixtures for a relative window (past/future) with optional details.
+        """
+        today = datetime.utcnow().date()
+        start = (today - timedelta(days=days_back)).isoformat()
+        end = (today + timedelta(days=days_forward)).isoformat()
+        log.info(
+            "Syncing history window %s to %s (back=%s forward=%s) with_details=%s limit=%s",
+            start,
+            end,
+            days_back,
+            days_forward,
+            with_details,
+            limit,
+        )
+        start_dt = datetime.fromisoformat(start)
+        end_dt = datetime.fromisoformat(end)
+        max_span = 95  # SportMonks caps date range at 100 days
+        total = 0
+        cursor = start_dt
+        while cursor <= end_dt:
+            chunk_end = min(cursor + timedelta(days=max_span - 1), end_dt)
+            remaining = None if limit is None else max(limit - total, 0)
+            if remaining == 0:
+                break
+            chunk_limit = remaining if remaining else None
+            count = self.sync_fixtures_between(
+                start_date=cursor.date().isoformat(),
+                end_date=chunk_end.date().isoformat(),
+                league_ids=league_ids,
+                with_details=with_details,
+                limit=chunk_limit,
+            )
+            total += count
+            cursor = chunk_end + timedelta(days=1)
+        log.info("History window complete: %s fixtures stored", total)
+        return total
 
     def sync_fixture_details(
         self,
@@ -415,7 +465,14 @@ class SyncService:
         for item in self.client.fetch_collection(
             path,
             params=params,
-            includes=["participants", "scores", "statistics.type", "lineups.player", "lineups.details"],
+            includes=[
+                "participants",
+                "scores",
+                "statistics.type",
+                "lineups.player",
+                "lineups.details",
+                "lineups.details.type",
+            ],
             filters=filters,
             per_page=50,
         ):
@@ -466,7 +523,7 @@ class SyncService:
         processed = 0
         for fid in ids:
             payload = self.client.get_raw(
-                f"odds/pre-match/fixtures/{fid}",
+                f"{FOOTBALL}odds/pre-match/fixtures/{fid}",
                 params={"filter": f"bookmakers:{bookmaker_id}"} if bookmaker_id else {},
             )
             rows = payload.get("data") if isinstance(payload, dict) else None
@@ -630,7 +687,7 @@ class SyncService:
             if bookmaker_id and not self.session.get(Bookmaker, bookmaker_id):
                 bm = {
                     "id": bookmaker_id,
-                    "name": row.get("bookmaker_name") or row.get("bookmaker"),
+                    "name": row.get("bookmaker_name") or row.get("bookmaker") or f"Bookmaker {bookmaker_id}",
                     "slug": None,
                     "extra": {"source": "odds_row"},
                 }

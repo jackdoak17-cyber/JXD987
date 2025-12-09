@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -211,30 +211,36 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
     return obj
 
 
-def bulk_compute_forms(session: Session, sample_size: int = 10, availability_sample: int = 2) -> Tuple[int, int, int]:
+def bulk_compute_forms(session: Session, sample_sizes: Iterable[int] | None = None, availability_sample: int = 2) -> Tuple[int, int, int]:
     """
-    Recompute team and player forms for all IDs present. Also computes availability.
+    Recompute team and player forms for all IDs present for the given sample sizes.
+    Also computes availability.
     """
+    sample_sizes = sorted({int(s) for s in (sample_sizes or [10]) if s})
     team_ids = [row[0] for row in session.query(FixtureParticipant.team_id).distinct().all()]
     player_ids = [row[0] for row in session.query(PlayerStatLine.player_id).distinct().all()]
-    t_count = p_count = 0
-    for tid in team_ids:
-        if compute_team_form(session, tid, sample_size):
-            t_count += 1
-    for pid in player_ids:
-        if compute_player_form(session, pid, sample_size):
-            p_count += 1
-    session.commit()
+    t_total = p_total = 0
+    for sample_size in sample_sizes:
+        t_count = p_count = 0
+        for tid in team_ids:
+            if compute_team_form(session, tid, sample_size):
+                t_count += 1
+        for pid in player_ids:
+            if compute_player_form(session, pid, sample_size):
+                p_count += 1
+        session.commit()
+        t_total += t_count
+        p_total += p_count
+        log.info("Computed forms sample=%s: teams=%s players=%s", sample_size, t_count, p_count)
+
     avail_count = compute_availability(session, sample_size=availability_sample)
     log.info(
-        "Computed forms: teams=%s players=%s (sample=%s), availability=%s (sample=%s)",
-        t_count,
-        p_count,
-        sample_size,
-        avail_count,
+        "Availability sample=%s entries=%s across form samples=%s",
         availability_sample,
+        avail_count,
+        sample_sizes,
     )
-    return t_count, p_count, avail_count
+    return t_total, p_total, avail_count
 
 
 # ---- Odds normalization ----

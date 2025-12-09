@@ -107,6 +107,9 @@ def sync_fixtures_between(
     with_details: bool = typer.Option(
         False, help="Include statistics + lineups (heavier, fewer per-hour)"
     ),
+    limit: int = typer.Option(
+        None, help="Optional cap on fixtures processed in the window"
+    ),
 ) -> None:
     """
     Sync fixtures between two dates (useful for upcoming/past windows).
@@ -118,6 +121,33 @@ def sync_fixtures_between(
         end_date=end_date,
         league_ids=leagues,
         with_details=with_details,
+        limit=limit,
+    )
+
+
+@app.command("sync-history")
+def sync_history(
+    days_back: int = typer.Option(400, help="How many days back to pull"),
+    days_forward: int = typer.Option(14, help="How many days forward to pull"),
+    league_ids: str = typer.Option(
+        None, help="Comma-separated league IDs to filter fixtures (optional)"
+    ),
+    with_details: bool = typer.Option(
+        True, help="Include statistics + lineups (heavier, fewer per-hour)"
+    ),
+    limit: int = typer.Option(None, help="Optional cap on fixtures processed"),
+) -> None:
+    """
+    Sync a long rolling window (history + near future) with optional details.
+    """
+    leagues = _parse_csv(league_ids) or league_ids_from_settings(settings)
+    service = get_service()
+    service.sync_history_window(
+        days_back=days_back,
+        days_forward=days_forward,
+        league_ids=leagues,
+        with_details=with_details,
+        limit=limit,
     )
 
 
@@ -186,7 +216,7 @@ def sync_h2h(team_a: int = typer.Argument(...), team_b: int = typer.Argument(...
 
 @app.command("compute-forms")
 def compute_forms(
-    sample_size: int = typer.Option(10, help="Number of recent games to average"),
+    samples: str = typer.Option("10,25,50", help="Comma-separated sample sizes (games) to average"),
     availability_sample: int = typer.Option(2, help="Number of recent games to gauge availability"),
 ) -> None:
     """
@@ -194,11 +224,12 @@ def compute_forms(
     """
     session = make_session(settings.database_url)
     bootstrap_schema(session)
+    sample_sizes = _parse_csv(samples)
     t_count, p_count, a_count = bulk_compute_forms(
-        session, sample_size=sample_size, availability_sample=availability_sample
+        session, sample_sizes=sample_sizes, availability_sample=availability_sample
     )
     typer.echo(
-        f"Computed forms: teams={t_count}, players={p_count}, availability={a_count}, sample={sample_size}, availability_sample={availability_sample}"
+        f"Computed forms: teams={t_count}, players={p_count}, availability={a_count}, samples={sample_sizes}, availability_sample={availability_sample}"
     )
 
 
