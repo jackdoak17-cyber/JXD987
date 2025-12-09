@@ -258,11 +258,15 @@ class SyncService:
         if entity:
             params["entity"] = entity
         count = 0
-        for item in self.client.fetch_collection(f"{FOOTBALL}types", params=params, per_page=500):
-            _upsert(self.session, Type, _type_mapper(item))
-            count += 1
-        self.session.commit()
-        log.info("Types synced: %s", count)
+        try:
+            for item in self.client.fetch_collection(f"{FOOTBALL}types", params=params, per_page=500):
+                _upsert(self.session, Type, _type_mapper(item))
+                count += 1
+            self.session.commit()
+            log.info("Types synced: %s", count)
+        except Exception as exc:
+            # Some plans might not expose the types endpoint; fail soft.
+            log.warning("Types sync failed (ignored): %s", exc)
         return count
 
     def sync_venues(self) -> int:
