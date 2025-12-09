@@ -19,6 +19,8 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
    - `python -m jxd.cli sync-history --days-back 450 --days-forward 14 --with-details --league-ids 8,9,82` (rolling history with stats/lineups)
    - `python -m jxd.cli sync-bookmakers`
    - `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82` (Bet365 odds)
+   - `python -m jxd.cli sync-inplay-odds --bookmaker-id 2 --limit 200` (latest inplay odds snapshot)
+   - `python -m jxd.cli sync-livescores` (live fixtures window)
    - `python -m jxd.cli sync-h2h --team-a 8 --team-b 14`
    - `python -m jxd.cli compute-forms --samples "10,25,50" --availability-sample 5`
    - `python -m jxd.cli normalize-odds`
@@ -48,7 +50,7 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
 All tables store the raw API payload in JSON columns to keep future fields available.
 
 ## Scheduling
-- GitHub Actions: see `.github/workflows/sync.yml` (hourly odds, twice-daily 7-day stats window, daily 450-day history with details and odds). Add `SPORTMONKS_API_TOKEN` as a repo secret. Artifacts contain the full `data/jxd.sqlite` and the compressed `data/jxd_dump.sql.xz` after each run. The daily history job now calls `scripts/full_refresh.sh` end-to-end.
+- GitHub Actions: see `.github/workflows/sync.yml` (hourly odds, quarter-hour inplay+livescores, twice-daily 7-day stats window, daily 450-day history with details and odds). Add `SPORTMONKS_API_TOKEN` as a repo secret. Artifacts contain the full `data/jxd.sqlite` and the compressed `data/jxd_dump.sql.xz` after each run. The daily history job now calls `scripts/full_refresh.sh` end-to-end.
 - Local cron (alternative):  
   - Daily history (04:00): `python -m jxd.cli sync-history --days-back 450 --days-forward 14 --with-details --league-ids 8,9,82,384,387 --limit 1800 && python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82,384,387 --limit 800 && python -m jxd.cli compute-forms --samples "10,25,50" --availability-sample 5 && python -m jxd.cli normalize-odds`  
   - Hourly odds: `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82 --limit 200`  

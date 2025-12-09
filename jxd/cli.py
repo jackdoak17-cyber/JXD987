@@ -151,6 +151,15 @@ def sync_history(
     )
 
 
+@app.command("sync-livescores")
+def sync_livescores(limit: int = typer.Option(None, help="Optional cap on livescores processed")) -> None:
+    """
+    Sync livescores (15min pre-kickoff to 15min post-match) to keep fixtures fresh/live.
+    """
+    service = get_service()
+    service.sync_livescores(limit=limit)
+
+
 @app.command("sync-fixture-details")
 def sync_fixture_details(
     season_id: int = typer.Option(None, help="Limit fixtures to a season ID"),
@@ -203,6 +212,18 @@ def sync_odds(
         league_ids=leagues,
         limit=limit,
     )
+
+
+@app.command("sync-inplay-odds")
+def sync_inplay_odds(
+    bookmaker_id: int = typer.Option(None, help="Bookmaker ID (default Bet365=2)"),
+    limit: int = typer.Option(200, help="Max rows from latest inplay feed"),
+) -> None:
+    """
+    Sync latest inplay odds snapshot (lightweight).
+    """
+    service = get_service()
+    service.sync_inplay_odds(bookmaker_id=bookmaker_id or settings.bookmaker_id, limit=limit)
 
 
 @app.command("sync-h2h")

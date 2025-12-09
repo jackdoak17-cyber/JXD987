@@ -44,6 +44,37 @@ jobs:
           name: jxd-sqlite-odds
           path: data/jxd.sqlite
 
+  inplay_quarter_hourly:
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/15 * * * *'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install deps
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Sync livescores (lightweight)
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+        run: |
+          python -m jxd.cli sync-livescores --limit 400
+      - name: Sync inplay odds (Bet365 scoped, latest snapshot)
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+        run: |
+          python -m jxd.cli sync-inplay-odds --bookmaker-id $BOOKMAKER_ID --limit 400
+      - name: Normalize odds snapshot
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+        run: |
+          python -m jxd.cli normalize-odds
+      - name: Upload DB artifact (inplay run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: jxd-sqlite-inplay
+          path: data/jxd.sqlite
+
   stats_twice_daily:
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 0,12 * * *'
     runs-on: ubuntu-latest

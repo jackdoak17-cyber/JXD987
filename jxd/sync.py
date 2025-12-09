@@ -488,6 +488,27 @@ class SyncService:
         log.info("Fixture details synced: %s", count)
         return count
 
+    def sync_livescores(self, limit: Optional[int] = None) -> int:
+        """
+        Fetch live scores (15-min pre-kickoff through 15-min post-game) and upsert fixtures + participants.
+        """
+        log.info("Syncing livescores%s", f" limit {limit}" if limit else "")
+        path = f"{FOOTBALL}livescores"
+        count = 0
+        for item in self.client.fetch_collection(
+            path,
+            includes=["participants", "scores"],
+            per_page=50,
+        ):
+            _upsert(self.session, Fixture, _fixture_mapper(item))
+            self._store_participants(item)
+            count += 1
+            if limit and count >= limit:
+                break
+        self.session.commit()
+        log.info("Livescores synced: %s", count)
+        return count
+
     # ---- odds ----
     def sync_bookmakers(self) -> int:
         log.info("Syncing bookmakers")
@@ -541,6 +562,39 @@ class SyncService:
         self.session.commit()
         log.info("Odds synced for %s fixtures", processed)
         return processed
+
+    def sync_inplay_odds(
+        self,
+        bookmaker_id: Optional[int] = None,
+        limit: Optional[int] = None,
+    ) -> int:
+        """
+        Fetch latest inplay odds snapshot (default Bet365).
+        """
+        bookmaker_id = bookmaker_id or 2
+        params = {"per_page": limit or 200}
+        if bookmaker_id:
+            params["filter"] = f"bookmakers:{bookmaker_id}"
+        payload = self.client.get_raw(f"{ODDS}inplay/latest", params=params)
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        if rows is None and isinstance(payload, list):
+            rows = payload
+        if not rows:
+            log.info("No inplay odds rows returned")
+            return 0
+        # Group by fixture to reuse odds storing
+        by_fixture: Dict[int, List[Dict]] = {}
+        for row in rows:
+            fid = row.get("fixture_id")
+            if fid is None:
+                continue
+            by_fixture.setdefault(int(fid), []).append(row)
+        for fid, subset in by_fixture.items():
+            self._store_odds_rows(fid, subset)
+        self.session.commit()
+        total = sum(len(v) for v in by_fixture.values())
+        log.info("Inplay odds synced: fixtures=%s rows=%s", len(by_fixture), total)
+        return len(by_fixture)
 
     # ---- H2H ----
     def sync_h2h(self, team_a_id: int, team_b_id: int) -> Dict:
