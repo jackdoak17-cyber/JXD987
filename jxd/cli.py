@@ -49,12 +49,13 @@ def main() -> None:
 @app.command("sync-static")
 def sync_static() -> None:
     """
-    Sync base reference data: countries, leagues, seasons, venues.
+    Sync base reference data: countries, leagues, seasons, types, venues.
     """
     service = get_service()
     service.sync_countries()
     service.sync_leagues()
     service.sync_seasons()
+    service.sync_types()
     service.sync_venues()
 
 
@@ -87,6 +88,15 @@ def sync_players(
     """
     service = get_service()
     service.sync_players(season_id=season_id, team_id=team_id)
+
+
+@app.command("sync-types")
+def sync_types(entity: str = typer.Option(None, help="Optional entity filter (e.g., statistics)")) -> None:
+    """
+    Sync stat/event type reference (used to decode type_id values in player/team stats).
+    """
+    service = get_service()
+    service.sync_types(entity=entity)
 
 
 @app.command("sync-fixtures")

@@ -24,6 +24,7 @@ from .models import (
     Team,
     TeamStatLine,
     Venue,
+    Type,
 )
 from .utils import parse_dt, to_float, dict_hash
 
@@ -107,6 +108,16 @@ def _team_mapper(raw: Dict) -> Dict:
         "venue_id": raw.get("venue_id") or venue.get("id"),
         "logo_path": raw.get("logo_path") or raw.get("logo"),
         "is_national": raw.get("national_team") or raw.get("is_national"),
+        **_merge_raw(raw),
+    }
+
+
+def _type_mapper(raw: Dict) -> Dict:
+    return {
+        "id": raw.get("id"),
+        "name": raw.get("name"),
+        "code": raw.get("code") or raw.get("short_code"),
+        "entity": raw.get("entity") or raw.get("model") or raw.get("resource"),
         **_merge_raw(raw),
     }
 
@@ -236,6 +247,22 @@ class SyncService:
             count += 1
         self.session.commit()
         log.info("Seasons synced: %s", count)
+        return count
+
+    def sync_types(self, entity: Optional[str] = None) -> int:
+        """
+        Sync stat/event type reference (helps decode player_stats.type_id rows).
+        """
+        log.info("Syncing types (entity=%s)", entity or "any")
+        params: Dict[str, object] = {}
+        if entity:
+            params["entity"] = entity
+        count = 0
+        for item in self.client.fetch_collection(f"{FOOTBALL}types", params=params, per_page=500):
+            _upsert(self.session, Type, _type_mapper(item))
+            count += 1
+        self.session.commit()
+        log.info("Types synced: %s", count)
         return count
 
     def sync_venues(self) -> int:

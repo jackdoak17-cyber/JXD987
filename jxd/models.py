@@ -56,6 +56,21 @@ class Season(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class Type(Base):
+    """
+    Reference mapping of SportMonks stat/event type IDs to human-readable names.
+    """
+
+    __tablename__ = "types"
+    id = Column(Integer, primary_key=True)
+    name = Column(String(255), nullable=False)
+    code = Column(String(100))
+    entity = Column(String(100))
+    extra = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Venue(Base):
     __tablename__ = "venues"
     id = Column(Integer, primary_key=True)

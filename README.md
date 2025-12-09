@@ -10,7 +10,7 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
    - `DATABASE_URL` (e.g., `postgresql+psycopg2://user:pass@host:5432/jxd` or `sqlite:///data/jxd.sqlite`)
    - Optionally tune `REQUESTS_PER_HOUR` (< 4,000 to stay under plan limits).
 4. Run a sync (examples, safe to rerun):
-   - `python -m jxd.cli sync-static` (countries/leagues/seasons/venues)
+   - `python -m jxd.cli sync-static` (countries/leagues/seasons/types/venues)
    - `python -m jxd.cli sync-teams --season-id 19734`
    - `python -m jxd.cli sync-players --season-id 19734`
    - `python -m jxd.cli sync-fixtures --season-id 19734` (lightweight fixtures + participants)
@@ -39,7 +39,7 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
 - Includes use `;` per SportMonks spec. `filters=populate` is applied automatically when safe.
 
 ## Data model (tables)
-- `countries`, `leagues`, `seasons`, `venues`
+- `countries`, `leagues`, `seasons`, `venues`, `types` (stat/event reference)
 - `teams` (venue, country, logo, founded, national flag)
 - `players` (name pieces, nationality, position, physicals, team, photo)
 - `fixtures` + `fixture_participants` (teams per fixture with locations/results)
