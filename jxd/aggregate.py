@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -111,8 +111,15 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
     Compute player shooting form over last N appearances.
     """
     query = (
-        session.query(PlayerStatLine, Fixture)
+        session.query(PlayerStatLine, Fixture, FixtureParticipant)
         .join(Fixture, PlayerStatLine.fixture_id == Fixture.id)
+        .join(
+            FixtureParticipant,
+            and_(
+                FixtureParticipant.fixture_id == Fixture.id,
+                FixtureParticipant.team_id == PlayerStatLine.team_id,
+            ),
+        )
         .filter(PlayerStatLine.player_id == player_id)
         .filter(Fixture.starting_at != None)  # noqa: E711
         .order_by(Fixture.starting_at.desc())
@@ -133,7 +140,7 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
     fixtures_raw = []
     league_id = season_id = team_id = None
 
-    for stat, fx in rows:
+    for stat, fx, part in rows:
         league_id = league_id or fx.league_id
         season_id = season_id or fx.season_id
         team_id = team_id or stat.team_id
@@ -187,6 +194,7 @@ def compute_player_form(session: Session, player_id: int, sample_size: int = 10)
                 "assists": assists_val,
                 "minutes": minutes_val,
                 "date": fx.starting_at.isoformat() if fx.starting_at else None,
+                "location": part.location,
             }
         )
 

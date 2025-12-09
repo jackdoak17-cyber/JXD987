@@ -34,6 +34,9 @@ fi
 echo "=== Sync static reference data ==="
 python3 -m jxd.cli sync-static
 
+echo "=== Sync league teams for configured leagues ==="
+python3 -m jxd.cli sync-league-teams --league-ids "${LEAGUE_IDS}"
+
 echo "=== Sync deep history (back ${DAYS_BACK}d, forward ${DAYS_FORWARD}d) with details ==="
 python3 -m jxd.cli sync-history \
   --days-back "${DAYS_BACK}" \

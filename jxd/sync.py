@@ -248,6 +248,24 @@ class SyncService:
         log.info("Venues synced: %s", count)
         return count
 
+    def sync_league_teams(self, league_ids: List[int]) -> int:
+        """
+        Convenience helper: sync teams for the given league IDs using their current seasons.
+        """
+        if not league_ids:
+            return 0
+        # Ensure seasons exist first
+        if not self.session.query(Season).count():
+            self.sync_seasons()
+        seasons = self.session.query(Season).filter(Season.league_id.in_(league_ids)).all()
+        if not seasons:
+            log.info("No seasons found for leagues %s; run sync_seasons first", league_ids)
+            return 0
+        total = 0
+        for s in seasons:
+            total += self.sync_teams(season_id=s.id)
+        return total
+
     # ---- entities ----
     def sync_teams(self, season_id: Optional[int] = None) -> int:
         log.info("Syncing teams%s", f" for season {season_id}" if season_id else "")

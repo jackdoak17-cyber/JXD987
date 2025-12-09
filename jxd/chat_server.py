@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, date
 import re
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from .config import settings
 from .db import make_session
 from .sync import ensure_player_form_columns
-from .models import PlayerForm, Player, Team, Fixture, FixtureParticipant, OddsLatest
+from .models import PlayerForm, Player, Team, Fixture, FixtureParticipant, OddsLatest, League
 
 app = FastAPI(title="JXD Chat", version="0.1")
 
@@ -101,6 +101,11 @@ def parse_query(text: str) -> Dict[str, Any]:
     exclude_fav = "not favorite" in lowered or "non favorite" in lowered or "underdog" in lowered or "exclude favorites" in lowered
     if exclude_fav:
         require_fav = False
+    location = None
+    if " at home" in lowered or " home " in lowered or "home only" in lowered or "home games" in lowered:
+        location = "home"
+    elif " away " in lowered or "away only" in lowered or "away games" in lowered or "away fixtures" in lowered:
+        location = "away"
     return {
         "stat_type": stat_type,
         "min_value": min_value,
@@ -110,6 +115,7 @@ def parse_query(text: str) -> Dict[str, Any]:
         "require_today": require_today,
         "require_favorites": require_fav,
         "exclude_favorites": exclude_fav,
+        "location": location,
     }
 
 
@@ -143,6 +149,36 @@ def favorite_teams_today(session: Session, odds_cap: Optional[float]) -> Dict[in
     return favs
 
 
+def detect_league_ids(session: Session, text: str) -> List[int]:
+    """
+    Lightweight league matching based on name fragments (e.g., 'premier league', 'la liga').
+    Falls back to empty list if no matches.
+    """
+    lowered = text.lower()
+    # quick explicit IDs if the user writes "league 8" etc.
+    ids: List[int] = []
+    for match in re.findall(r"league\s*(\d+)", lowered):
+        try:
+            ids.append(int(match))
+        except Exception:
+            continue
+    # fuzzy by name
+    leagues = session.query(League.id, League.name).all()
+    for lid, name in leagues:
+        nm = (name or "").lower()
+        if nm and nm in lowered:
+            ids.append(lid)
+    # dedupe preserving order
+    seen = set()
+    ordered = []
+    for lid in ids:
+        if lid in seen:
+            continue
+        seen.add(lid)
+        ordered.append(lid)
+    return ordered
+
+
 def teams_playing_today(session: Session) -> List[int]:
     today_date = date.today()
     rows = (
@@ -164,14 +200,18 @@ def shot_predicate(min_shots: int):
     return PlayerForm.shots_ge_1_pct >= 1
 
 
-def stat_pass(form: PlayerForm, stat_type: str, threshold: int, sample_size: int, min_pct: float) -> Dict[str, Any]:
+def stat_pass(
+    form: PlayerForm, stat_type: str, threshold: int, sample_size: int, min_pct: float, location: Optional[str] = None
+) -> Dict[str, Any]:
     """
     Evaluate whether the form meets the threshold for the chosen stat across its sample.
     Returns dict with hit_all, pct, avg.
     """
     fixtures = form.raw_fixtures or []
+    if location:
+        fixtures = [fx for fx in fixtures if fx.get("location") == location]
     if not fixtures:
-        return {"hit_all": False, "pct": 0, "avg": 0}
+        return {"hit_all": False, "pct": 0, "avg": 0, "values": []}
     # Use the most recent fixtures (raw_fixtures are newest-first)
     fixtures = fixtures[:sample_size]
     values = []
@@ -185,14 +225,22 @@ def stat_pass(form: PlayerForm, stat_type: str, threshold: int, sample_size: int
         elif stat_type == "assists":
             values.append(fx.get("assists", 0))
     if not values:
-        return {"hit_all": False, "pct": 0, "avg": 0}
+        return {"hit_all": False, "pct": 0, "avg": 0, "values": []}
     games = len(values)
     if games < sample_size:
-        return {"hit_all": False, "pct": 0, "avg": 0}
+        return {"hit_all": False, "pct": 0, "avg": 0, "values": values}
     hits = sum(1 for v in values if v >= threshold)
     avg = sum(values) / games if games else 0
     pct = hits / games if games else 0
-    return {"hit_all": hits == games, "pct": pct, "avg": avg, "hits": hits, "games": games, "meets_pct": pct >= min_pct}
+    return {
+        "hit_all": hits == games,
+        "pct": pct,
+        "avg": avg,
+        "hits": hits,
+        "games": games,
+        "meets_pct": pct >= min_pct,
+        "values": values,
+    }
 
 
 def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -204,6 +252,8 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
     require_today = parsed["require_today"]
     require_fav = parsed["require_favorites"]
     exclude_fav = parsed["exclude_favorites"]
+    league_ids: Optional[List[int]] = parsed.get("league_ids")
+    location = parsed.get("location")
 
     today_teams = set(teams_playing_today(session)) if require_today else set()
     fav_map = favorite_teams_today(session, odds_max) if require_fav or exclude_fav or odds_max is not None else {}
@@ -213,8 +263,10 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
         .join(Player, Player.id == PlayerForm.player_id)
         .outerjoin(Team, Team.id == PlayerForm.team_id)
         .filter(PlayerForm.games_played >= sample_size)
-        .order_by(PlayerForm.updated_at.desc())
+        .order_by(PlayerForm.sample_size.asc(), PlayerForm.updated_at.desc())
     )
+    if league_ids:
+        query = query.filter(PlayerForm.league_id.in_(league_ids))
     if require_today:
         if not today_teams:
             return []
@@ -227,14 +279,21 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
         query = query.filter(~PlayerForm.team_id.in_(fav_map.keys()))
 
     rows = query.all()
+    seen_players = set()
     results = []
     for form, player, team in rows:
+        if player.id in seen_players:
+            continue
+        # ensure enough fixtures in the raw list for the requested window
+        if not form.raw_fixtures or len(form.raw_fixtures) < sample_size:
+            continue
         odds_val = fav_map.get(team.id) if fav_map else None
         if odds_max is not None and odds_val is not None and odds_val > odds_max:
             continue
-        stat_eval = stat_pass(form, stat_type, min_value, sample_size, min_pct)
+        stat_eval = stat_pass(form, stat_type, min_value, sample_size, min_pct, location=location)
         if not stat_eval["meets_pct"]:
             continue
+        seen_players.add(player.id)
         results.append(
             {
                 "player": player.display_name or f"{player.first_name or ''} {player.last_name or ''}".strip(),
@@ -247,6 +306,7 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
                 "games": stat_eval.get("games"),
                 "sample_size": sample_size,
                 "games_played": form.games_played,
+                "values": stat_eval.get("values"),
                 "odds": odds_val,
             }
         )
@@ -261,6 +321,7 @@ async def chat_api(payload: Dict[str, str]):
     parsed = parse_query(text)
     session = get_session()
     try:
+        parsed["league_ids"] = detect_league_ids(session, text)
         results = search_players(session, parsed)
     finally:
         session.close()
@@ -273,6 +334,8 @@ async def chat_api(payload: Dict[str, str]):
         "favorites_only": parsed["require_favorites"],
         "exclude_favorites": parsed["exclude_favorites"],
         "odds_cap": parsed["odds_max"],
+        "location": parsed.get("location"),
+        "league_ids": parsed.get("league_ids"),
         "note": "Uses most recent games; requires hit rate >= min_pct",
     }
     return {"query": parsed, "interpretation": interpretation, "results": results}
@@ -326,11 +389,11 @@ async function send() {
     return;
   }
   const rows = data.results.map(r => {
-    const avg = typeof r.avg === 'number' ? r.avg.toFixed(2) : 'n/a';
-    const pct = typeof r.pct === 'number' ? (r.pct * 100).toFixed(0) + '%' : '';
     const hits = r.hits != null ? r.hits : '';
     const games = r.games != null ? r.games : r.sample_size;
-    return `${r.player} (${r.team}) - ${r.stat_type} avg ${avg}, hit ${r.threshold}+ in ${hits}/${games} (${pct}) of last ${r.sample_size}, odds ${r.odds || 'n/a'}`;
+    const values = Array.isArray(r.values) ? r.values.join(',') : '';
+    const pct = typeof r.pct === 'number' ? (r.pct * 100).toFixed(0) + '%' : '';
+    return `${r.player} (${r.team}) - ${r.stat_type} ${r.threshold}+ in ${hits}/${games} (${pct}) | values: ${values}`;
   }).join('<br>');
   log.innerHTML += `<div class='msg'>Results:<br>${rows}</div>`;
 }

@@ -90,6 +90,12 @@ jobs:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
           python -m jxd.cli sync-static
+      - name: Sync teams for configured leagues
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          LEAGUE_IDS: ${{ env.LEAGUE_IDS }}
+        run: |
+          python -m jxd.cli sync-league-teams --league-ids "$LEAGUE_IDS"
       - name: Sync upcoming 7 days with details (capped)
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}

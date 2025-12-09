@@ -58,6 +58,16 @@ def sync_static() -> None:
     service.sync_venues()
 
 
+@app.command("sync-league-teams")
+def sync_league_teams(league_ids: str = typer.Option(None, help="Comma-separated league IDs")) -> None:
+    """
+    Sync teams for the given leagues (uses current seasons).
+    """
+    leagues = _parse_csv(league_ids) or league_ids_from_settings(settings)
+    service = get_service()
+    service.sync_league_teams(leagues)
+
+
 @app.command("sync-teams")
 def sync_teams(season_id: int = typer.Option(None, help="Limit teams to a season ID")) -> None:
     """
