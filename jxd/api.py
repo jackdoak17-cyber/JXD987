@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import Dict, Iterable, List, Optional
+from urllib.parse import urlparse, parse_qs
 
 import requests
 
@@ -49,6 +50,7 @@ class SportMonksClient:
             {
                 "Accept": "application/json",
                 "Authorization": f"Bearer {api_token}",
+                "X-Api-Token": api_token,
             }
         )
         self.rate_limiter = RateLimiter(requests_per_hour=requests_per_hour)
@@ -56,7 +58,10 @@ class SportMonksClient:
     def _request(self, path: str, params: Optional[Dict[str, object]] = None) -> Dict:
         url = f"{self.base_url}/{path.lstrip('/')}"
         self.rate_limiter.wait()
-        response = self.session.get(url, params=params or {}, timeout=self.timeout)
+        merged_params = {"api_token": self.session.headers.get("X-Api-Token")}
+        if params:
+            merged_params.update(params)
+        response = self.session.get(url, params=merged_params, timeout=self.timeout)
         if not response.ok:
             raise SportMonksError(
                 f"SportMonks request failed ({response.status_code}): {response.text}"
@@ -80,7 +85,7 @@ class SportMonksClient:
             if isinstance(includes, str):
                 params["include"] = includes
             else:
-                params["include"] = ",".join(includes)
+                params["include"] = ";".join(includes)
         if filters:
             params["filters"] = filters
         elif self.use_filters_populate and not includes:
@@ -107,8 +112,19 @@ class SportMonksClient:
             total_pages = pagination.get("total_pages")
 
             if next_page:
-                page = next_page
-                continue
+                if isinstance(next_page, int):
+                    page = next_page
+                    continue
+                if isinstance(next_page, str):
+                    # SportMonks sometimes returns full URLs; extract `page` query param
+                    parsed = urlparse(next_page)
+                    qs_page = parse_qs(parsed.query).get("page")
+                    if qs_page and qs_page[0].isdigit():
+                        page = int(qs_page[0])
+                        continue
+                    if next_page.isdigit():
+                        page = int(next_page)
+                        continue
             if has_more is True:
                 page = (current or page) + 1
                 continue

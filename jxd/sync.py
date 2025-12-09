@@ -22,9 +22,12 @@ from .models import (
     TeamStatLine,
     Venue,
 )
-from .utils import parse_dt
+from .utils import parse_dt, to_float
 
 log = logging.getLogger(__name__)
+FOOTBALL = "football/"
+CORE = "core/"
+ODDS = "odds/"
 
 
 def _upsert(session: Session, model, data: Dict):
@@ -82,8 +85,8 @@ def _venue_mapper(raw: Dict) -> Dict:
         "city": raw.get("city"),
         "country_id": raw.get("country_id"),
         "capacity": raw.get("capacity"),
-        "latitude": coordinates.get("latitude") or raw.get("latitude"),
-        "longitude": coordinates.get("longitude") or raw.get("longitude"),
+        "latitude": to_float(coordinates.get("latitude") or raw.get("latitude")),
+        "longitude": to_float(coordinates.get("longitude") or raw.get("longitude")),
         "image_path": raw.get("image_path"),
         **_merge_raw(raw),
     }
@@ -123,7 +126,22 @@ def _player_mapper(raw: Dict) -> Dict:
 
 
 def _fixture_mapper(raw: Dict) -> Dict:
-    scores = raw.get("scores") or raw.get("score") or {}
+    scores_raw = raw.get("scores") or raw.get("score") or {}
+    home_score = None
+    away_score = None
+    if isinstance(scores_raw, list):
+        for s in scores_raw:
+            score_obj = s.get("score") or {}
+            participant = score_obj.get("participant")
+            goals = score_obj.get("goals")
+            if participant == "home" and home_score is None:
+                home_score = goals
+            if participant == "away" and away_score is None:
+                away_score = goals
+    elif isinstance(scores_raw, dict):
+        home_score = scores_raw.get("localteam_score") or scores_raw.get("home")
+        away_score = scores_raw.get("visitorteam_score") or scores_raw.get("away")
+    scores = scores_raw if isinstance(scores_raw, dict) else {"list": scores_raw}
     weather = raw.get("weather_report") or raw.get("weather")
     return {
         "id": raw.get("id"),
@@ -139,8 +157,8 @@ def _fixture_mapper(raw: Dict) -> Dict:
         "status_code": raw.get("status_code") or raw.get("time") or raw.get("state"),
         "home_team_id": raw.get("home_team_id"),
         "away_team_id": raw.get("away_team_id"),
-        "home_score": scores.get("localteam_score") or scores.get("home"),
-        "away_score": scores.get("visitorteam_score") or scores.get("away"),
+        "home_score": home_score,
+        "away_score": away_score,
         "scores": scores,
         "weather_report": weather,
         **_merge_raw(raw),
@@ -176,7 +194,7 @@ class SyncService:
     def sync_countries(self) -> int:
         log.info("Syncing countries")
         count = 0
-        for item in self.client.fetch_collection("countries"):
+        for item in self.client.fetch_collection(f"{CORE}countries"):
             _upsert(self.session, Country, _country_mapper(item))
             count += 1
         self.session.commit()
@@ -186,7 +204,7 @@ class SyncService:
     def sync_leagues(self) -> int:
         log.info("Syncing leagues")
         count = 0
-        for item in self.client.fetch_collection("leagues", includes=["country"]):
+        for item in self.client.fetch_collection(f"{FOOTBALL}leagues", includes=["country"]):
             _upsert(self.session, League, _league_mapper(item))
             count += 1
         self.session.commit()
@@ -196,7 +214,7 @@ class SyncService:
     def sync_seasons(self) -> int:
         log.info("Syncing seasons")
         count = 0
-        for item in self.client.fetch_collection("seasons", includes=["league"]):
+        for item in self.client.fetch_collection(f"{FOOTBALL}seasons", includes=["league"]):
             _upsert(self.session, Season, _season_mapper(item))
             count += 1
         self.session.commit()
@@ -206,7 +224,7 @@ class SyncService:
     def sync_venues(self) -> int:
         log.info("Syncing venues")
         count = 0
-        for item in self.client.fetch_collection("venues"):
+        for item in self.client.fetch_collection(f"{FOOTBALL}venues"):
             _upsert(self.session, Venue, _venue_mapper(item))
             count += 1
         self.session.commit()
@@ -216,9 +234,9 @@ class SyncService:
     # ---- entities ----
     def sync_teams(self, season_id: Optional[int] = None) -> int:
         log.info("Syncing teams%s", f" for season {season_id}" if season_id else "")
-        path = "teams"
+        path = f"{FOOTBALL}teams"
         if season_id:
-            path = f"teams/seasons/{season_id}"
+            path = f"{FOOTBALL}teams/seasons/{season_id}"
         count = 0
         for item in self.client.fetch_collection(path, includes=["venue"]):
             _upsert(self.session, Team, _team_mapper(item))
@@ -233,9 +251,9 @@ class SyncService:
             f" for season {season_id}" if season_id else "",
             f" and team {team_id}" if team_id else "",
         )
-        path = "players"
+        path = f"{FOOTBALL}players"
         if season_id:
-            path = f"players/seasons/{season_id}"
+            path = f"{FOOTBALL}players/seasons/{season_id}"
         params: Dict[str, object] = {}
         if team_id:
             params["team_id"] = team_id
@@ -258,11 +276,11 @@ class SyncService:
             f" filtered by teams {team_ids}" if team_ids else "",
             f" filtered by leagues {league_ids}" if league_ids else "",
         )
-        path = "fixtures"
+        path = f"{FOOTBALL}fixtures"
         params: Dict[str, object] = {}
         filters = None
         if season_id:
-            path = f"fixtures/seasons/{season_id}"
+            path = f"{FOOTBALL}fixtures/seasons/{season_id}"
         if team_ids:
             params["team_ids"] = ",".join(str(t) for t in team_ids)
         if league_ids:
@@ -298,11 +316,11 @@ class SyncService:
             f" filtered by leagues {league_ids}" if league_ids else "",
             f" limit {limit}" if limit else "",
         )
-        path = "fixtures"
+        path = f"{FOOTBALL}fixtures"
         filters = None
         params: Dict[str, object] = {}
         if season_id:
-            path = f"fixtures/seasons/{season_id}"
+            path = f"{FOOTBALL}fixtures/seasons/{season_id}"
         if league_ids:
             filters = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
 
@@ -329,7 +347,7 @@ class SyncService:
     def sync_bookmakers(self) -> int:
         log.info("Syncing bookmakers")
         count = 0
-        for row in self.client.fetch_collection("odds/bookmakers", per_page=1000):
+        for row in self.client.fetch_collection(f"{ODDS}bookmakers", per_page=1000):
             if not row:
                 continue
             data = {

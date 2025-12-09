@@ -1,10 +1,11 @@
-from pydantic import BaseSettings, Field
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
     sportmonks_api_token: str = Field("", env="SPORTMONKS_API_TOKEN")
     sportmonks_base_url: str = Field(
-        "https://api.sportmonks.com/v3/football", env="SPORTMONKS_BASE_URL"
+        "https://api.sportmonks.com/v3", env="SPORTMONKS_BASE_URL"
     )
     database_url: str = Field("sqlite:///data/jxd.sqlite", env="DATABASE_URL")
     requests_per_hour: int = Field(3500, env="REQUESTS_PER_HOUR")

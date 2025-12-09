@@ -22,3 +22,15 @@ def parse_dt(value: Any) -> Optional[datetime]:
             return None
     return None
 
+
+def to_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except Exception:
+        try:
+            if isinstance(value, str):
+                cleaned = value.replace("\\t", "").replace("\t", "").strip()
+                return float(cleaned)
+        except Exception:
+            return None
+    return None
