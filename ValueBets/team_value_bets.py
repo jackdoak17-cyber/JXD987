@@ -35,6 +35,7 @@ MIN_SAMPLES = int(os.environ.get("TEAM_VALUE_MIN_SAMPLES", str(8)))
 MAX_ROWS = 80
 LOOKAHEAD_DAYS = int(os.environ.get("TEAM_VALUE_LOOKAHEAD_DAYS", "14"))
 LOOKBACK_DAYS = int(os.environ.get("TEAM_VALUE_LOOKBACK_DAYS", "2"))
+REQUIRE_ODDS = os.environ.get("TEAM_VALUE_REQUIRE_ODDS", "1") not in ("0", "false", "False")
 
 
 def connect() -> sqlite3.Connection:
@@ -249,15 +250,25 @@ def select_best_rate(team_fixtures: Dict[int, List[Dict[str, Any]]], team_id: in
     return best
 
 
-def load_fixture_info(cur: sqlite3.Cursor) -> Dict[int, Dict[str, Any]]:
+def load_fixture_info(cur: sqlite3.Cursor, require_odds: bool) -> Dict[int, Dict[str, Any]]:
+    """
+    Pull fixtures in the date window; optionally require odds_latest entries for shot markets.
+    """
     cur.execute("SELECT datetime('now')")  # ensure sqlite now() available
+    odds_join = ""
+    odds_where = ""
+    if require_odds:
+        odds_join = "JOIN odds_latest o ON o.fixture_id = f.id AND o.market_id IN (285,292) AND o.bookmaker_id = 2"
+        odds_where = "AND o.fixture_id IS NOT NULL"
     cur.execute(
-        """
+        f"""
         SELECT f.id, f.starting_at, fp_home.team_id AS home_id, fp_away.team_id AS away_id
         FROM fixtures f
         JOIN fixture_participants fp_home ON fp_home.fixture_id = f.id AND fp_home.location = 'home'
         JOIN fixture_participants fp_away ON fp_away.fixture_id = f.id AND fp_away.location = 'away'
+        {odds_join}
         WHERE f.starting_at BETWEEN datetime('now', ?) AND datetime('now', ?)
+        {odds_where}
         """,
         (f"-{LOOKBACK_DAYS} days", f"+{LOOKAHEAD_DAYS} days"),
     )
@@ -265,31 +276,6 @@ def load_fixture_info(cur: sqlite3.Cursor) -> Dict[int, Dict[str, Any]]:
     for fid, start, home_id, away_id in cur.fetchall():
         out[fid] = {"start": start, "home": home_id, "away": away_id}
     return out
-
-
-def load_fixture_info_with_fallback(
-    cur: sqlite3.Cursor, extra_fixture_ids: Optional[List[int]]
-) -> Dict[int, Dict[str, Any]]:
-    """
-    Prefer fixtures in lookback/lookahead window; if extras are provided (e.g., fixtures with odds),
-    include them as well to surface odds-bearing games even if dates are outside the window.
-    """
-    window = load_fixture_info(cur)
-    if extra_fixture_ids:
-        placeholders = ",".join("?" for _ in extra_fixture_ids)
-        cur.execute(
-            f"""
-            SELECT f.id, f.starting_at, fp_home.team_id AS home_id, fp_away.team_id AS away_id
-            FROM fixtures f
-            JOIN fixture_participants fp_home ON fp_home.fixture_id = f.id AND fp_home.location = 'home'
-            JOIN fixture_participants fp_away ON fp_away.fixture_id = f.id AND fp_away.location = 'away'
-            WHERE f.id IN ({placeholders})
-            """,
-            extra_fixture_ids,
-        )
-        for fid, start, home_id, away_id in cur.fetchall():
-            window.setdefault(fid, {"start": start, "home": home_id, "away": away_id})
-    return window
 
 
 def build_fixture_rows(
@@ -341,8 +327,8 @@ def build_fixture_rows(
         team_lines = team_odds.get(fixture_id, {})
         sides = ["home", "away"]
         for side in sides:
-            lines = team_lines.get(side, {})
-            line_keys = list(lines.keys()) if lines else list(TEAM_SHOT_LINES)
+            lines = team_lines.get(side, {}) if REQUIRE_ODDS else team_lines.get(side, {})
+            line_keys = list(lines.keys()) if lines else ([] if REQUIRE_ODDS else list(TEAM_SHOT_LINES))
             team_id = home_id if side == "home" else away_id
             opp_id = away_id if side == "home" else home_id
             for line in line_keys:
@@ -377,7 +363,7 @@ def build_fixture_rows(
                 )
         # Match shots overs
         match_lines = match_odds.get(fixture_id, {})
-        lines_to_check = list(match_lines.keys()) if match_lines else list(MATCH_SHOT_LINES)
+        lines_to_check = list(match_lines.keys()) if match_lines else ([] if REQUIRE_ODDS else list(MATCH_SHOT_LINES))
         for line in lines_to_check:
             odds = match_lines.get(line)
             home_rate = select_best_rate(team_fixtures, home_id, sample_sizes, "match_shots", line)
@@ -455,15 +441,10 @@ def main() -> None:
     cur = conn.cursor()
     teams = fetch_team_names(cur)
     fixture_team_map = fetch_fixture_team_map(cur)
-    # include fixtures that already have shot odds as fallback if the window is sparse
-    cur.execute(
-        "SELECT DISTINCT fixture_id FROM odds_latest WHERE market_id in (285,292) AND bookmaker_id=2"
-    )
-    odds_fixture_ids = [row[0] for row in cur.fetchall()]
-    fixtures = load_fixture_info_with_fallback(cur, odds_fixture_ids)
+    fixtures = load_fixture_info(cur, require_odds=REQUIRE_ODDS)
     team_fixtures = load_team_fixtures(cur, fixture_team_map)
     if not team_fixtures or not fixtures:
-        raise SystemExit("No team stats/fixtures found. Run sync-history with details first.")
+        raise SystemExit("No fixtures with required odds in window. Sync odds or relax window/REQUIRE_ODDS.")
     match_odds, team_odds = load_odds(cur, fixture_team_map)
     rows = build_fixture_rows(
         teams=teams,
