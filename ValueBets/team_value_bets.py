@@ -267,6 +267,31 @@ def load_fixture_info(cur: sqlite3.Cursor) -> Dict[int, Dict[str, Any]]:
     return out
 
 
+def load_fixture_info_with_fallback(
+    cur: sqlite3.Cursor, extra_fixture_ids: Optional[List[int]]
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Prefer fixtures in lookback/lookahead window; if extras are provided (e.g., fixtures with odds),
+    include them as well to surface odds-bearing games even if dates are outside the window.
+    """
+    window = load_fixture_info(cur)
+    if extra_fixture_ids:
+        placeholders = ",".join("?" for _ in extra_fixture_ids)
+        cur.execute(
+            f"""
+            SELECT f.id, f.starting_at, fp_home.team_id AS home_id, fp_away.team_id AS away_id
+            FROM fixtures f
+            JOIN fixture_participants fp_home ON fp_home.fixture_id = f.id AND fp_home.location = 'home'
+            JOIN fixture_participants fp_away ON fp_away.fixture_id = f.id AND fp_away.location = 'away'
+            WHERE f.id IN ({placeholders})
+            """,
+            extra_fixture_ids,
+        )
+        for fid, start, home_id, away_id in cur.fetchall():
+            window.setdefault(fid, {"start": start, "home": home_id, "away": away_id})
+    return window
+
+
 def build_fixture_rows(
     teams: Dict[int, str],
     team_fixtures: Dict[int, List[Dict[str, Any]]],
@@ -430,7 +455,12 @@ def main() -> None:
     cur = conn.cursor()
     teams = fetch_team_names(cur)
     fixture_team_map = fetch_fixture_team_map(cur)
-    fixtures = load_fixture_info(cur)
+    # include fixtures that already have shot odds as fallback if the window is sparse
+    cur.execute(
+        "SELECT DISTINCT fixture_id FROM odds_latest WHERE market_id in (285,292) AND bookmaker_id=2"
+    )
+    odds_fixture_ids = [row[0] for row in cur.fetchall()]
+    fixtures = load_fixture_info_with_fallback(cur, odds_fixture_ids)
     team_fixtures = load_team_fixtures(cur, fixture_team_map)
     if not team_fixtures or not fixtures:
         raise SystemExit("No team stats/fixtures found. Run sync-history with details first.")

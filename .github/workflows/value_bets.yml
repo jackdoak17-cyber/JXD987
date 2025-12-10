@@ -1,0 +1,64 @@
+name: Value Bets
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12"
+  LEAGUE_IDS: "8,9,72,82,181,208,244,271,301,384,387,444,453,462,501,564,567,573,591,600"
+  BOOKMAKER_ID: "2"
+
+jobs:
+  value_bets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install deps
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Sync static
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+        run: python -m jxd.cli sync-static
+
+      - name: Sync teams (leagues)
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          LEAGUE_IDS: ${{ env.LEAGUE_IDS }}
+        run: python -m jxd.cli sync-league-teams --league-ids "$LEAGUE_IDS"
+
+      - name: Sync recent fixtures with details
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          LEAGUE_IDS: ${{ env.LEAGUE_IDS }}
+        run: |
+          start=$(date -d "-30 days" +%F)
+          end=$(date -d "+21 days" +%F)
+          python -m jxd.cli sync-fixtures-between "$start" "$end" --with-details --league-ids "$LEAGUE_IDS" --limit 600
+
+      - name: Sync odds (shot markets)
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          LEAGUE_IDS: ${{ env.LEAGUE_IDS }}
+          BOOKMAKER_ID: ${{ env.BOOKMAKER_ID }}
+        run: |
+          python -m jxd.cli sync-odds --bookmaker-id $BOOKMAKER_ID --league-ids "$LEAGUE_IDS" --limit 400
+
+      - name: Compute forms
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+        run: |
+          python -m jxd.cli compute-forms --samples "5,10,15,20,25,50" --availability-sample 5
+
+      - name: Run value bets script
+        run: |
+          python ValueBets/team_value_bets.py > value_bets.txt
+
+      - name: Upload value bet report
+        uses: actions/upload-artifact@v4
+        with:
+          name: value-bets-report
+          path: value_bets.txt
