@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, date
 import re
 from typing import List, Dict, Any, Optional, Tuple
@@ -7,7 +8,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from .config import settings
@@ -296,6 +297,64 @@ def stat_pass_team(
     }
 
 
+def extract_team_names_from_extra(extra: Any) -> Dict[int, str]:
+    """
+    Grab participant team names from a fixture.extra payload.
+    """
+    if not extra:
+        return {}
+    payload: Any = extra
+    if isinstance(extra, str):
+        try:
+            payload = json.loads(extra)
+        except Exception:
+            return {}
+    if isinstance(payload, list):
+        participants = payload
+    elif isinstance(payload, dict):
+        participants = payload.get("participants") or payload.get("lineup") or []
+    else:
+        participants = []
+    names: Dict[int, str] = {}
+    for part in participants or []:
+        try:
+            tid = int(part.get("id"))
+        except Exception:
+            continue
+        name = part.get("name")
+        if tid and name:
+            names[tid] = name
+    return names
+
+
+def resolve_team_names(session: Session, team_ids: set[int]) -> Dict[int, str]:
+    """
+    Resolve team_id -> name, using the teams table first, then fixture.extra participants as a fallback.
+    """
+    if not team_ids:
+        return {}
+    names: Dict[int, str] = {}
+    rows = session.query(Team.id, Team.name).filter(Team.id.in_(team_ids)).all()
+    for tid, name in rows:
+        if tid is not None and name:
+            names[tid] = name
+    remaining = [tid for tid in team_ids if tid not in names]
+    if not remaining:
+        return names
+    fixtures = (
+        session.query(Fixture.home_team_id, Fixture.away_team_id, Fixture.extra)
+        .filter(or_(Fixture.home_team_id.in_(remaining), Fixture.away_team_id.in_(remaining)))
+        .order_by(Fixture.starting_at.desc())
+        .all()
+    )
+    for home_id, away_id, extra in fixtures:
+        parts = extract_team_names_from_extra(extra)
+        for tid, name in parts.items():
+            if tid in remaining and tid not in names and name:
+                names[tid] = name
+    return names
+
+
 def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
     stat_type = parsed["stat_key"]
     min_value = parsed["min_value"]
@@ -334,6 +393,7 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
     rows = query.all()
     seen_players = set()
     results = []
+    missing_team_ids: set[int] = set()
     for form, player, team in rows:
         if player.id in seen_players:
             continue
@@ -347,10 +407,14 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
         if not stat_eval["meets_pct"]:
             continue
         seen_players.add(player.id)
+        team_name = team.name if team else None
+        if not team_name and form.team_id:
+            missing_team_ids.add(form.team_id)
         results.append(
             {
                 "player": player.display_name or f"{player.first_name or ''} {player.last_name or ''}".strip(),
-                "team": team.name if team else f"Team {form.team_id}",
+                "team_id": form.team_id,
+                "team": team_name or f"Team {form.team_id}",
                 "stat_type": stat_type,
                 "threshold": min_value,
                 "avg": stat_eval["avg"],
@@ -363,6 +427,12 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
                 "odds": odds_val,
             }
         )
+    if missing_team_ids:
+        name_map = resolve_team_names(session, missing_team_ids)
+        for r in results:
+            tid = r.get("team_id")
+            if tid and tid in name_map:
+                r["team"] = name_map[tid]
     return results
 
 
@@ -392,6 +462,7 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
 
     rows = query.all()
     results = []
+    missing_team_ids: set[int] = set()
     for form, team in rows:
         fixtures = form.raw_fixtures or []
         if not fixtures or len(fixtures) < sample_size:
@@ -399,9 +470,12 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
         stat_eval = stat_pass_team(form, stat_key, min_value, sample_size, min_pct, location=location)
         if not stat_eval["meets_pct"]:
             continue
+        if (not team or not team.name) and form.team_id:
+            missing_team_ids.add(form.team_id)
         results.append(
             {
-                "team": team.name if team else f"Team {form.team_id}",
+                "team_id": form.team_id,
+                "team": (team.name if team else None) or f"Team {form.team_id}",
                 "stat_type": stat_key,
                 "threshold": min_value,
                 "avg": stat_eval["avg"],
@@ -412,6 +486,12 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
                 "values": stat_eval.get("values"),
             }
         )
+    if missing_team_ids:
+        name_map = resolve_team_names(session, missing_team_ids)
+        for r in results:
+            tid = r.get("team_id")
+            if tid and tid in name_map:
+                r["team"] = name_map[tid]
     return results
 
 
