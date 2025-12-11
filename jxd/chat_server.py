@@ -162,7 +162,12 @@ def parse_query(text: str) -> Dict[str, Any]:
             "keep favorites",
         ]
     )
-    exclude_fav = "not favorite" in lowered or "non favorite" in lowered or "underdog" in lowered or "exclude favorites" in lowered
+    exclude_fav = "not favorite" in lowered or "non favorite" in lowered or "exclude favorites" in lowered
+    if "remove underdog" in lowered or "remove underdogs" in lowered or "no underdogs" in lowered:
+        require_fav = True
+        exclude_fav = False
+    if "underdog" in lowered and not require_fav:
+        exclude_fav = True
     if exclude_fav:
         require_fav = False
     if "remove teams not favorites" in lowered or "remove non favorites" in lowered:
@@ -173,6 +178,14 @@ def parse_query(text: str) -> Dict[str, Any]:
         location = "home"
     elif " away " in lowered or "away only" in lowered or "away games" in lowered or "away fixtures" in lowered:
         location = "away"
+    # entity hints / avg filter
+    min_avg = None
+    m = re.search(r"average\s*(?:less\s*than|under|below)\s*([0-9]+\.?[0-9]*)", lowered)
+    if m:
+        try:
+            min_avg = float(m.group(1))
+        except Exception:
+            min_avg = None
     # entity hints
     if "team" in lowered and entity != "team":
         entity = "team"
@@ -193,6 +206,7 @@ def parse_query(text: str) -> Dict[str, Any]:
         "exclude_favorites": exclude_fav,
         "location": location,
         "sort_by": sort_by,
+        "min_avg": min_avg,
     }
 
 
@@ -551,6 +565,7 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
     min_pct = parsed["min_pct"]
     odds_max = parsed["odds_max"]
     odds_min = parsed.get("odds_min")
+    min_avg = parsed.get("min_avg")
     require_today = parsed["require_today"]
     require_fav = parsed["require_favorites"]
     exclude_fav = parsed["exclude_favorites"]
@@ -594,6 +609,8 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
             continue
         stat_eval = stat_pass(form, stat_type, min_value, sample_size, min_pct, location=location)
         if not stat_eval["meets_pct"]:
+            continue
+        if min_avg is not None and stat_eval.get("avg") is not None and stat_eval["avg"] < min_avg:
             continue
         seen_players.add(player.id)
         team_name = (team_current.name if team_current and team_current.name else None) or (team.name if team else None)
@@ -641,6 +658,7 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
     min_pct = parsed["min_pct"]
     odds_max = parsed.get("odds_max")
     odds_min = parsed.get("odds_min")
+    min_avg = parsed.get("min_avg")
     league_ids: Optional[List[int]] = parsed.get("league_ids")
     location = parsed.get("location")
     require_today = parsed["require_today"]
@@ -672,6 +690,8 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
             continue
         stat_eval = stat_pass_team(form, stat_key, min_value, sample_size, min_pct, location=location)
         if not stat_eval["meets_pct"]:
+            continue
+        if min_avg is not None and stat_eval.get("avg") is not None and stat_eval["avg"] < min_avg:
             continue
         if form.team_id in seen:
             continue
