@@ -327,6 +327,24 @@ def extract_team_names_from_extra(extra: Any) -> Dict[int, str]:
     return names
 
 
+def extract_team_name_from_participant(extra: Any) -> Optional[str]:
+    """
+    Extract team name from a fixture_participants.extra payload.
+    """
+    if not extra:
+        return None
+    payload: Any = extra
+    if isinstance(extra, str):
+        try:
+            payload = json.loads(extra)
+        except Exception:
+            return None
+    if isinstance(payload, dict):
+        name = payload.get("name")
+        return name or None
+    return None
+
+
 def resolve_team_names(session: Session, team_ids: set[int]) -> Dict[int, str]:
     """
     Resolve team_id -> name, using the teams table first, then fixture.extra participants as a fallback.
@@ -341,6 +359,7 @@ def resolve_team_names(session: Session, team_ids: set[int]) -> Dict[int, str]:
     remaining = [tid for tid in team_ids if tid not in names]
     if not remaining:
         return names
+    # Fixtures.extra participants
     fixtures = (
         session.query(Fixture.home_team_id, Fixture.away_team_id, Fixture.extra)
         .filter(or_(Fixture.home_team_id.in_(remaining), Fixture.away_team_id.in_(remaining)))
@@ -352,6 +371,21 @@ def resolve_team_names(session: Session, team_ids: set[int]) -> Dict[int, str]:
         for tid, name in parts.items():
             if tid in remaining and tid not in names and name:
                 names[tid] = name
+    # Fixture participants extras
+    still_missing = [tid for tid in remaining if tid not in names]
+    if still_missing:
+        participants = (
+            session.query(FixtureParticipant.team_id, FixtureParticipant.extra)
+            .filter(FixtureParticipant.team_id.in_(still_missing))
+            .order_by(FixtureParticipant.updated_at.desc())
+            .all()
+        )
+        for tid, extra in participants:
+            if tid in names:
+                continue
+            nm = extract_team_name_from_participant(extra)
+            if nm:
+                names[tid] = nm
     return names
 
 
