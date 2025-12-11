@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func, or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from .config import settings
 from .db import make_session
@@ -422,10 +422,12 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
     today_teams = set(teams_playing_today(session)) if require_today else set()
     fav_map = favorite_team_odds(session, odds_max)  # always fetch to display odds when present
 
+    TeamCurrent = aliased(Team)
     query = (
-        session.query(PlayerForm, Player, Team)
+        session.query(PlayerForm, Player, Team, TeamCurrent)
         .join(Player, Player.id == PlayerForm.player_id)
         .outerjoin(Team, Team.id == PlayerForm.team_id)
+        .outerjoin(TeamCurrent, TeamCurrent.id == Player.current_team_id)
         .filter(PlayerForm.games_played >= sample_size)
         .order_by(PlayerForm.sample_size.asc(), PlayerForm.updated_at.desc())
     )
@@ -446,7 +448,7 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
     seen_players = set()
     results = []
     missing_team_ids: set[int] = set()
-    for form, player, team in rows:
+    for form, player, team, team_current in rows:
         if player.id in seen_players:
             continue
         # ensure enough fixtures in the raw list for the requested window
@@ -461,7 +463,7 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
         if not stat_eval["meets_pct"]:
             continue
         seen_players.add(player.id)
-        team_name = team.name if team else None
+        team_name = (team_current.name if team_current and team_current.name else None) or (team.name if team else None)
         if not team_name and form.team_id:
             missing_team_ids.add(form.team_id)
         results.append(
