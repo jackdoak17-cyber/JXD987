@@ -128,18 +128,28 @@ def parse_query(text: str) -> Dict[str, Any]:
     # odds cap / min
     odds_max: Optional[float] = None
     odds_min: Optional[float] = None
-    m = re.search(r"odds[^\d]*([0-9]+\.?[0-9]*)", lowered)
+    m = re.search(r"odds\s*<=\s*([0-9]+\.?[0-9]*)", lowered)
     if m:
         try:
             odds_max = float(m.group(1))
         except Exception:
             odds_max = None
-    m = re.search(r"odds[^>]*>\s*([0-9]+\.?[0-9]*)", lowered) or re.search(r">\s*([0-9]+\.?[0-9]*)\s*odds", lowered)
+    m = re.search(r"odds\s*>=\s*([0-9]+\.?[0-9]*)", lowered) or re.search(
+        r"odds\s*>\s*([0-9]+\.?[0-9]*)", lowered
+    )
     if m:
         try:
             odds_min = float(m.group(1))
         except Exception:
             odds_min = None
+    # fallback loose pattern only if neither bound was set
+    if odds_max is None and odds_min is None:
+        m = re.search(r"odds[^\d]*([0-9]+\.?[0-9]*)", lowered)
+        if m:
+            try:
+                odds_max = float(m.group(1))
+            except Exception:
+                odds_max = None
     require_today = "today" in lowered or "tonight" in lowered
     require_fav = any(
         kw in lowered
@@ -443,6 +453,97 @@ def resolve_team_names(session: Session, team_ids: set[int]) -> Dict[int, str]:
     return names
 
 
+def _normalize_name_simple(name: str) -> str:
+    return re.sub(r"\\s+", " ", (name or "").strip().lower())
+
+
+def _extract_line_from_raw(raw_obj: Any) -> Optional[float]:
+    payload = raw_obj
+    if isinstance(raw_obj, str):
+        try:
+            payload = json.loads(raw_obj)
+        except Exception:
+            return None
+    if isinstance(payload, dict):
+        for key in ("label", "line", "handicap", "total"):
+            val = payload.get(key)
+            try:
+                if val is None or val == "":
+                    continue
+                return float(val)
+            except Exception:
+                continue
+    return None
+
+
+def attach_player_prop_odds(
+    session: Session,
+    results: List[Dict[str, Any]],
+    stat_type: str,
+    threshold: Union[int, float],
+    odds_min: Optional[float],
+    odds_max: Optional[float],
+) -> None:
+    """
+    Attach player prop odds (shots/sot/goals/assists) from odds_latest when available.
+    Falls back to team odds already present.
+    """
+    if not results:
+        return
+    market_map = {
+        "shots": [268],
+        "sot": [267],
+        "goals": [331],
+        "assists": [332],
+    }
+    market_ids = market_map.get(stat_type)
+    if not market_ids:
+        return
+    name_keys = {_normalize_name_simple(r.get("player")) for r in results if r.get("player")}
+    name_keys = {n for n in name_keys if n}
+    if not name_keys:
+        return
+    rows = (
+        session.query(OddsLatest)
+        .filter(OddsLatest.market_id.in_(market_ids))
+        .filter(func.lower(OddsLatest.selection).in_(name_keys))
+        .all()
+    )
+    best: Dict[str, float] = {}
+    for row in rows:
+        key = _normalize_name_simple(row.selection)
+        if not key:
+            continue
+        line_val = _extract_line_from_raw(row.raw) or 0.0
+        # Allow small offset: threshold 1 => line 0.5, threshold 2 => line 1.5, etc.
+        if isinstance(threshold, (int, float)):
+            if line_val < max(threshold - 0.5, 0):
+                continue
+        dec = row.decimal_odds
+        if dec is None:
+            continue
+        prev = best.get(key)
+        if prev is None or dec < prev:
+            best[key] = dec
+    # Update results
+    filtered = []
+    for r in results:
+        key = _normalize_name_simple(r.get("player"))
+        prop_odds = best.get(key)
+        if prop_odds is not None:
+            r["odds_prop"] = prop_odds
+            r["odds"] = prop_odds
+        else:
+            r["odds_prop"] = None
+            r["odds"] = r.get("odds")  # keep team odds if present
+        if odds_max is not None and r.get("odds") is not None and r["odds"] > odds_max:
+            continue
+        if odds_min is not None and r.get("odds") is not None and r["odds"] < odds_min:
+            continue
+        filtered.append(r)
+    results[:] = filtered
+
+
 def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any]]:
     stat_type = parsed["stat_key"]
     min_value = parsed["min_value"]
@@ -491,11 +592,6 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
         # ensure enough fixtures in the raw list for the requested window
         if not form.raw_fixtures or len(form.raw_fixtures) < sample_size:
             continue
-        odds_val = fav_map.get(team.id) if fav_map else None
-        if odds_max is not None and odds_val is not None and odds_val > odds_max:
-            continue
-        if odds_min is not None and odds_val is not None and odds_val < odds_min:
-            continue
         stat_eval = stat_pass(form, stat_type, min_value, sample_size, min_pct, location=location)
         if not stat_eval["meets_pct"]:
             continue
@@ -517,7 +613,8 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
                 "sample_size": sample_size,
                 "games_played": form.games_played,
                 "values": stat_eval.get("values"),
-                "odds": odds_val,
+                "odds_team": fav_map.get(team.id) if fav_map else None,
+                "odds": fav_map.get(team.id) if fav_map else None,
             }
         )
     if missing_team_ids:
@@ -526,6 +623,7 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
             tid = r.get("team_id")
             if tid and tid in name_map:
                 r["team"] = name_map[tid]
+    attach_player_prop_odds(session, results, stat_type, min_value, odds_min, odds_max)
     if parsed.get("sort_by") == "odds_desc":
         results.sort(key=lambda r: (r.get("odds") is None, -(r.get("odds") or 0)))
     elif parsed.get("sort_by") == "odds_asc":
