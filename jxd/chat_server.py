@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, date
 import re
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -75,12 +75,13 @@ def parse_query(text: str) -> Dict[str, Any]:
 
     entity, stat_key = resolve_stat()
 
-    # threshold
-    min_value = 2
-    m = re.search(r"(\d+)\+?\s*(shot|sot|on target|goal|assist|corner|card)", lowered)
+    # threshold (supports decimals like 2.5+ goals)
+    min_value: Union[int, float] = 2
+    m = re.search(r"(\d+(?:\.\d+)?)\+?\s*(shot|sot|on target|goal|assist|corner|card)", lowered)
     if m:
         try:
-            min_value = int(m.group(1))
+            val = float(m.group(1))
+            min_value = int(val) if val.is_integer() else val
         except Exception:
             pass
     # sample size
@@ -144,17 +145,20 @@ def parse_query(text: str) -> Dict[str, Any]:
     }
 
 
-def favorite_teams_today(session: Session, odds_cap: Optional[float]) -> Dict[int, float]:
+def favorite_team_odds(session: Session, odds_cap: Optional[float], days_forward: int = 7) -> Dict[int, float]:
     """
-    Return team_id -> favorite decimal odds for fixtures today (market match_result=1).
+    Return team_id -> favorite decimal odds for upcoming fixtures (market match_result=1).
+    Looks from today through days_forward.
     """
     today_date = date.today()
+    end_date = date.fromordinal(today_date.toordinal() + max(days_forward, 0))
     rows = (
         session.query(OddsLatest, Fixture)
         .join(Fixture, OddsLatest.fixture_id == Fixture.id)
         .filter(OddsLatest.market_id == 1)
         .filter(Fixture.starting_at != None)  # noqa: E711
-        .filter(func.date(Fixture.starting_at) == today_date)
+        .filter(func.date(Fixture.starting_at) >= today_date)
+        .filter(func.date(Fixture.starting_at) <= end_date)
         .all()
     )
     favs: Dict[int, float] = {}
@@ -402,7 +406,11 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
     location = parsed.get("location")
 
     today_teams = set(teams_playing_today(session)) if require_today else set()
-    fav_map = favorite_teams_today(session, odds_max) if require_fav or exclude_fav or odds_max is not None else {}
+    fav_map = (
+        favorite_team_odds(session, odds_max)
+        if (require_fav or exclude_fav or odds_max is not None)
+        else {}
+    )
 
     query = (
         session.query(PlayerForm, Player, Team)
