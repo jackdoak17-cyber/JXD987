@@ -60,6 +60,10 @@ def parse_query(text: str) -> Dict[str, Any]:
         against = any(word in lowered for word in ["concede", "allowed", "against", "allow", "conceded"])
         scored_words = any(w in lowered for w in ["scored", "score", "scoring"])
         match_total = "match" in lowered and "goal" in lowered
+        if "yellow" in lowered:
+            return "team", "yellows_against" if against else "yellows_for"
+        if "red" in lowered and "card" in lowered:
+            return "team", "reds_against" if against else "reds_for"
         if "corner" in lowered:
             return "team", "corners_against" if against else "corners_for"
         if "booking" in lowered or "card" in lowered:
@@ -277,7 +281,7 @@ def stat_pass(
     if location:
         fixtures = [fx for fx in fixtures if fx.get("location") == location]
     if not fixtures:
-        return {"hit_all": False, "pct": 0, "avg": 0, "values": []}
+        return {"hit_all": False, "pct": 0, "avg": 0, "values": [], "meets_pct": False}
     # Use the most recent fixtures (raw_fixtures are newest-first)
     fixtures = fixtures[:sample_size]
     values = []
@@ -291,10 +295,11 @@ def stat_pass(
         elif stat_type == "assists":
             values.append(fx.get("assists", 0))
     if not values:
-        return {"hit_all": False, "pct": 0, "avg": 0, "values": []}
+        return {"hit_all": False, "pct": 0, "avg": 0, "values": [], "meets_pct": False}
     games = len(values)
     if games < sample_size:
-        return {"hit_all": False, "pct": 0, "avg": 0, "values": values}
+        pct = (sum(1 for v in values if v >= threshold) / games) if games else 0
+        return {"hit_all": False, "pct": pct, "avg": 0, "values": values, "meets_pct": False, "hits": 0, "games": games}
     hits = sum(1 for v in values if v >= threshold)
     avg = sum(values) / games if games else 0
     pct = hits / games if games else 0
@@ -316,7 +321,7 @@ def stat_pass_team(
     if location:
         fixtures = [fx for fx in fixtures if fx.get("location") == location]
     if not fixtures:
-        return {"hit_all": False, "pct": 0, "avg": 0, "values": []}
+        return {"hit_all": False, "pct": 0, "avg": 0, "values": [], "meets_pct": False}
     fixtures = fixtures[:sample_size]
     values = []
     alias = {"goals_for": "gf", "goals_against": "ga"}
@@ -330,7 +335,8 @@ def stat_pass_team(
         values.append(val)
     games = len(values)
     if games < sample_size:
-        return {"hit_all": False, "pct": 0, "avg": 0, "values": values}
+        pct = (sum(1 for v in values if v >= threshold) / games) if games else 0
+        return {"hit_all": False, "pct": pct, "avg": 0, "values": values, "meets_pct": False, "hits": 0, "games": games}
     hits = sum(1 for v in values if v >= threshold)
     avg = sum(values) / games if games else 0
     pct = hits / games if games else 0
