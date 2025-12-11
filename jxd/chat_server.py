@@ -624,6 +624,9 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
             if tid and tid in name_map:
                 r["team"] = name_map[tid]
     attach_player_prop_odds(session, results, stat_type, min_value, odds_min, odds_max)
+    # If user asked for odds bounds, drop rows without any odds
+    if odds_min is not None or odds_max is not None:
+        results = [r for r in results if r.get("odds") is not None]
     if parsed.get("sort_by") == "odds_desc":
         results.sort(key=lambda r: (r.get("odds") is None, -(r.get("odds") or 0)))
     elif parsed.get("sort_by") == "odds_asc":
