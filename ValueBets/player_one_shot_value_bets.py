@@ -217,16 +217,19 @@ def main() -> None:
 
     fixture_map = load_fixture_team_map(cur, require_window=True)
     if not fixture_map:
-        raise SystemExit("No fixtures in window.")
+        print("No fixtures in window.")
+        return
 
     team_fixtures = load_team_fixtures(cur)
     if not team_fixtures:
-        raise SystemExit("No team stats found; ensure with-details fixtures are synced.")
+        print("No team stats found; ensure with-details fixtures are synced.")
+        return
 
     odds_rows = load_player_odds(cur)
     odds_rows = [r for r in odds_rows if r["fixture_id"] in fixture_map and (r.get("odds") or 0) >= ODDS_MIN]
     if not odds_rows:
-        raise SystemExit("No player shot odds in window meeting ODDS_MIN.")
+        print("No player shot odds in window meeting ODDS_MIN.")
+        return
 
     player_ids = list({r["player_id"] for r in odds_rows})
     player_forms = load_player_forms(cur, player_ids)
@@ -298,7 +301,8 @@ def main() -> None:
         )
 
     if not results:
-        raise SystemExit("No candidates found with odds and thresholds.")
+        print("No candidates found with odds and thresholds.")
+        return
 
     results.sort(key=lambda r: (min(r["player_pct"], r["opp_pct"]), r["odds"]), reverse=True)
     for r in results[:50]:

@@ -444,7 +444,8 @@ def main() -> None:
     fixtures = load_fixture_info(cur, require_odds=REQUIRE_ODDS)
     team_fixtures = load_team_fixtures(cur, fixture_team_map)
     if not team_fixtures or not fixtures:
-        raise SystemExit("No fixtures with required odds in window. Sync odds or relax window/REQUIRE_ODDS.")
+        print("No fixtures with required odds in window. Sync odds or relax window/REQUIRE_ODDS.")
+        return
     match_odds, team_odds = load_odds(cur, fixture_team_map)
     rows = build_fixture_rows(
         teams=teams,
