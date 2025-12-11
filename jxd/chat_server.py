@@ -59,6 +59,7 @@ def parse_query(text: str) -> Dict[str, Any]:
         # Returns (entity, stat_key). entity: player|team. stat_key for players: shots,sot,goals,assists. teams: shots_for/against, sot_for/against, goals_for/against, corners_for/against, yellows_for/against, reds_for/against.
         against = any(word in lowered for word in ["concede", "allowed", "against", "allow", "conceded"])
         scored_words = any(w in lowered for w in ["scored", "score", "scoring"])
+        match_total = "match" in lowered and "goal" in lowered
         if "corner" in lowered:
             return "team", "corners_against" if against else "corners_for"
         if "booking" in lowered or "card" in lowered:
@@ -66,6 +67,8 @@ def parse_query(text: str) -> Dict[str, Any]:
                 return "team", "reds_against" if against else "reds_for"
             # default to yellows for generic "cards"
             return "team", "yellows_against" if against else "yellows_for"
+        if match_total:
+            return "team", "match_goals"
         if ("goal" in lowered or scored_words) and "assist" not in lowered:
             if "team" in lowered or against:
                 return "team", "goals_against" if against else "goals_for"
@@ -318,7 +321,12 @@ def stat_pass_team(
     values = []
     alias = {"goals_for": "gf", "goals_against": "ga"}
     for fx in fixtures:
-        val = fx.get(stat_key, 0) or fx.get(alias.get(stat_key, ""), 0) or 0
+        if stat_key == "match_goals":
+            gf = fx.get("gf", 0) or 0
+            ga = fx.get("ga", 0) or 0
+            val = (gf or 0) + (ga or 0)
+        else:
+            val = fx.get(stat_key, 0) or fx.get(alias.get(stat_key, ""), 0) or 0
         values.append(val)
     games = len(values)
     if games < sample_size:
@@ -549,6 +557,7 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
 
     rows = query.all()
     results = []
+    seen = set()
     missing_team_ids: set[int] = set()
     for form, team in rows:
         fixtures = form.raw_fixtures or []
@@ -557,6 +566,9 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
         stat_eval = stat_pass_team(form, stat_key, min_value, sample_size, min_pct, location=location)
         if not stat_eval["meets_pct"]:
             continue
+        if form.team_id in seen:
+            continue
+        seen.add(form.team_id)
         if (not team or not team.name) and form.team_id:
             missing_team_ids.add(form.team_id)
         odds_val = fav_map.get(form.team_id)
