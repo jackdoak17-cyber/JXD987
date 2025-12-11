@@ -110,14 +110,21 @@ def parse_query(text: str) -> Dict[str, Any]:
             min_pct = pct / 100.0
         except Exception:
             pass
-    # odds cap
+    # odds cap / min
     odds_max: Optional[float] = None
+    odds_min: Optional[float] = None
     m = re.search(r"odds[^\d]*([0-9]+\.?[0-9]*)", lowered)
     if m:
         try:
             odds_max = float(m.group(1))
         except Exception:
             odds_max = None
+    m = re.search(r"odds[^>]*>\s*([0-9]+\.?[0-9]*)", lowered) or re.search(r">\s*([0-9]+\.?[0-9]*)\s*odds", lowered)
+    if m:
+        try:
+            odds_min = float(m.group(1))
+        except Exception:
+            odds_min = None
     require_today = "today" in lowered or "tonight" in lowered
     require_fav = "favorite" in lowered or "favourite" in lowered
     exclude_fav = "not favorite" in lowered or "non favorite" in lowered or "underdog" in lowered or "exclude favorites" in lowered
@@ -131,6 +138,10 @@ def parse_query(text: str) -> Dict[str, Any]:
     # entity hints
     if "team" in lowered and entity != "team":
         entity = "team"
+    sort_by = None
+    if "rank by odds" in lowered or "sort by odds" in lowered:
+        sort_by = "odds_desc" if "highest" in lowered or "top" in lowered else "odds_asc"
+
     return {
         "entity": entity,
         "stat_key": stat_key,
@@ -138,10 +149,12 @@ def parse_query(text: str) -> Dict[str, Any]:
         "sample_size": sample_size,
         "min_pct": min_pct,
         "odds_max": odds_max,
+        "odds_min": odds_min,
         "require_today": require_today,
         "require_favorites": require_fav,
         "exclude_favorites": exclude_fav,
         "location": location,
+        "sort_by": sort_by,
     }
 
 
@@ -399,6 +412,7 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
     sample_size = parsed["sample_size"]
     min_pct = parsed["min_pct"]
     odds_max = parsed["odds_max"]
+    odds_min = parsed.get("odds_min")
     require_today = parsed["require_today"]
     require_fav = parsed["require_favorites"]
     exclude_fav = parsed["exclude_favorites"]
@@ -406,11 +420,7 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
     location = parsed.get("location")
 
     today_teams = set(teams_playing_today(session)) if require_today else set()
-    fav_map = (
-        favorite_team_odds(session, odds_max)
-        if (require_fav or exclude_fav or odds_max is not None)
-        else {}
-    )
+    fav_map = favorite_team_odds(session, odds_max)  # always fetch to display odds when present
 
     query = (
         session.query(PlayerForm, Player, Team)
@@ -445,6 +455,8 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
         odds_val = fav_map.get(team.id) if fav_map else None
         if odds_max is not None and odds_val is not None and odds_val > odds_max:
             continue
+        if odds_min is not None and odds_val is not None and odds_val < odds_min:
+            continue
         stat_eval = stat_pass(form, stat_type, min_value, sample_size, min_pct, location=location)
         if not stat_eval["meets_pct"]:
             continue
@@ -475,6 +487,10 @@ def search_players(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, A
             tid = r.get("team_id")
             if tid and tid in name_map:
                 r["team"] = name_map[tid]
+    if parsed.get("sort_by") == "odds_desc":
+        results.sort(key=lambda r: (r.get("odds") is None, -(r.get("odds") or 0)))
+    elif parsed.get("sort_by") == "odds_asc":
+        results.sort(key=lambda r: (r.get("odds") is None, r.get("odds") or 0))
     return results
 
 
@@ -483,6 +499,8 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
     min_value = parsed["min_value"]
     sample_size = parsed["sample_size"]
     min_pct = parsed["min_pct"]
+    odds_max = parsed.get("odds_max")
+    odds_min = parsed.get("odds_min")
     league_ids: Optional[List[int]] = parsed.get("league_ids")
     location = parsed.get("location")
     require_today = parsed["require_today"]
@@ -502,6 +520,8 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
             return []
         query = query.filter(TeamForm.team_id.in_(today_teams))
 
+    fav_map = favorite_team_odds(session, odds_max)
+
     rows = query.all()
     results = []
     missing_team_ids: set[int] = set()
@@ -514,6 +534,11 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
             continue
         if (not team or not team.name) and form.team_id:
             missing_team_ids.add(form.team_id)
+        odds_val = fav_map.get(form.team_id)
+        if odds_max is not None and odds_val is not None and odds_val > odds_max:
+            continue
+        if odds_min is not None and odds_val is not None and odds_val < odds_min:
+            continue
         results.append(
             {
                 "team_id": form.team_id,
@@ -526,6 +551,7 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
                 "games": stat_eval.get("games"),
                 "sample_size": sample_size,
                 "values": stat_eval.get("values"),
+                "odds": odds_val,
             }
         )
     if missing_team_ids:
@@ -534,6 +560,10 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
             tid = r.get("team_id")
             if tid and tid in name_map:
                 r["team"] = name_map[tid]
+    if parsed.get("sort_by") == "odds_desc":
+        results.sort(key=lambda r: (r.get("odds") is None, -(r.get("odds") or 0)))
+    elif parsed.get("sort_by") == "odds_asc":
+        results.sort(key=lambda r: (r.get("odds") is None, r.get("odds") or 0))
     return results
 
 
@@ -562,8 +592,10 @@ async def chat_api(payload: Dict[str, str]):
         "favorites_only": parsed["require_favorites"],
         "exclude_favorites": parsed["exclude_favorites"],
         "odds_cap": parsed["odds_max"],
+        "odds_min": parsed.get("odds_min"),
         "location": parsed.get("location"),
         "league_ids": parsed.get("league_ids"),
+        "sort_by": parsed.get("sort_by"),
         "note": "Uses most recent games; requires hit rate >= min_pct",
     }
     return {"query": parsed, "interpretation": interpretation, "results": results}
