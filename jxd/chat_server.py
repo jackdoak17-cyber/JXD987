@@ -316,8 +316,10 @@ def stat_pass_team(
         return {"hit_all": False, "pct": 0, "avg": 0, "values": []}
     fixtures = fixtures[:sample_size]
     values = []
+    alias = {"goals_for": "gf", "goals_against": "ga"}
     for fx in fixtures:
-        values.append(fx.get(stat_key, 0) or 0)
+        val = fx.get(stat_key, 0) or fx.get(alias.get(stat_key, ""), 0) or 0
+        values.append(val)
     games = len(values)
     if games < sample_size:
         return {"hit_all": False, "pct": 0, "avg": 0, "values": values}
