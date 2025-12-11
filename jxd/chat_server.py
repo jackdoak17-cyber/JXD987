@@ -58,7 +58,7 @@ def parse_query(text: str) -> Dict[str, Any]:
     def resolve_stat() -> Tuple[str, str]:
         # Returns (entity, stat_key). entity: player|team. stat_key for players: shots,sot,goals,assists. teams: shots_for/against, sot_for/against, goals_for/against, corners_for/against, yellows_for/against, reds_for/against.
         against = any(word in lowered for word in ["concede", "allowed", "against", "allow", "conceded"])
-        scored_words = any(w in lowered for w in ["scored", "score", "scoring"])
+        scored_words = any(w in lowered for w in ["scored", "score", "scoring", "scorer", "scorers"])
         match_total = "match" in lowered and "goal" in lowered
         if "yellow" in lowered:
             return "team", "yellows_against" if against else "yellows_for"
@@ -189,6 +189,32 @@ def parse_query(text: str) -> Dict[str, Any]:
     # entity hints
     if "team" in lowered and entity != "team":
         entity = "team"
+    explicit_stat = any(
+        kw in lowered
+        for kw in [
+            "shot",
+            "sot",
+            "on target",
+            "goal",
+            "assist",
+            "corner",
+            "card",
+            "booking",
+        ]
+    )
+    if require_fav and not explicit_stat:
+        entity = "team"
+        stat_key = "shots_for"
+        min_value = 0
+        min_pct = 0.0
+        sample_size = min(sample_size, 3)
+    if "top scorer" in lowered or "top scorers" in lowered or "leading scorer" in lowered:
+        entity = "player"
+        stat_key = "goals"
+        min_pct = min(min_pct, 0.6)
+        sample_size = min(sample_size, 5)
+    if "ranked" in lowered or "ranking" in lowered or "rank by" in lowered or "sort by" in lowered:
+        min_pct = 0.0
     sort_by = None
     if "rank by odds" in lowered or "sort by odds" in lowered:
         sort_by = "odds_desc" if "highest" in lowered or "top" in lowered else "odds_asc"
@@ -662,6 +688,8 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
     league_ids: Optional[List[int]] = parsed.get("league_ids")
     location = parsed.get("location")
     require_today = parsed["require_today"]
+    require_fav = parsed["require_favorites"]
+    exclude_fav = parsed["exclude_favorites"]
 
     today_teams = set(teams_playing_today(session)) if require_today else set()
 
@@ -679,6 +707,12 @@ def search_teams(session: Session, parsed: Dict[str, Any]) -> List[Dict[str, Any
         query = query.filter(TeamForm.team_id.in_(today_teams))
 
     fav_map = favorite_team_odds(session, odds_max)
+    if require_fav and not fav_map:
+        return []
+    if require_fav:
+        query = query.filter(TeamForm.team_id.in_(fav_map.keys()))
+    if exclude_fav and fav_map:
+        query = query.filter(~TeamForm.team_id.in_(fav_map.keys()))
 
     rows = query.all()
     results = []
