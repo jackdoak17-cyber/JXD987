@@ -654,7 +654,8 @@ async function send() {
   const rows = data.results.map(r => {
     const values = Array.isArray(r.values) ? r.values.join(',') : '';
     const name = r.player ? `${r.player} (${r.team || ''})` : r.team;
-    return `${name} | values: ${values}`;
+    const odds = (typeof r.odds === 'number') ? ` | odds: ${r.odds.toFixed(2)}` : '';
+    return `${name} | values: ${values}${odds}`;
   }).join('<br>');
   log.innerHTML += `<div class='msg'>${header ? header + '<br>' : ''}${rows}</div>`;
 }
