@@ -581,10 +581,12 @@ def attach_player_prop_odds(
         else:
             r["odds_prop"] = None
             r["odds"] = r.get("odds")  # keep team odds if present
-        if odds_max is not None and r.get("odds") is not None and r["odds"] > odds_max:
-            continue
-        if odds_min is not None and r.get("odds") is not None and r["odds"] < odds_min:
-            continue
+        if odds_max is not None:
+            if r.get("odds") is None or r["odds"] > odds_max:
+                continue
+        if odds_min is not None:
+            if r.get("odds") is None or r["odds"] < odds_min:
+                continue
         filtered.append(r)
     results[:] = filtered
 
@@ -852,12 +854,13 @@ async function send() {
     return;
   }
   const interp = data.interpretation || {};
+  const oddsFiltered = interp.odds_cap != null || interp.odds_min != null;
   const statLabel = interp.stat || 'stat';
   const header = `${interp.threshold || ''}+ ${statLabel} in ${interp.sample_size || ''}/${interp.sample_size || ''}`.trim();
   const rows = data.results.map(r => {
     const values = Array.isArray(r.values) ? r.values.join(',') : '';
     const name = r.player ? `${r.player} (${r.team || ''})` : r.team;
-    const odds = (typeof r.odds === 'number') ? ` | odds: ${r.odds.toFixed(2)}` : '';
+    const odds = oddsFiltered && typeof r.odds === 'number' ? ` | odds: ${r.odds.toFixed(2)}` : '';
     return `${name} | values: ${values}${odds}`;
   }).join('<br>');
   log.innerHTML += `<div class='msg'>${header ? header + '<br>' : ''}${rows}</div>`;
