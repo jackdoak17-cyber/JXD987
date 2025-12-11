@@ -52,10 +52,10 @@ Pipeline scaffolding to pull football data from SportMonks (teams, players, fixt
 All tables store the raw API payload in JSON columns to keep future fields available.
 
 ## Scheduling
-- GitHub Actions: see `.github/workflows/sync.yml` (hourly odds, quarter-hour inplay+livescores, twice-daily 7-day stats window, daily 450-day history with details and odds). Add `SPORTMONKS_API_TOKEN` as a repo secret. Artifacts contain the full `data/jxd.sqlite` and the compressed `data/jxd_dump.sql.xz` after each run. The daily history job now calls `scripts/full_refresh.sh` end-to-end.
+- GitHub Actions: see `.github/workflows/sync.yml` (hourly odds + player props, quarter-hour inplay+livescores, twice-daily 7-day stats window, daily 450-day history with details and odds). Add `SPORTMONKS_API_TOKEN` as a repo secret. Artifacts contain the full `data/jxd.sqlite` and the compressed `data/jxd_dump.sql.xz` after each run. The daily history job now calls `scripts/full_refresh.sh` end-to-end.
 - Local cron (alternative):  
-  - Daily history (04:00): `python -m jxd.cli sync-history --days-back 450 --days-forward 14 --with-details --league-ids 8,9,82,384,387 --limit 1800 && python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82,384,387 --limit 800 && python -m jxd.cli compute-forms --samples "10,25,50" --availability-sample 5 && python -m jxd.cli normalize-odds`  
-  - Hourly odds: `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82 --limit 200`  
+  - Daily history (04:00): `python -m jxd.cli sync-history --days-back 450 --days-forward 14 --with-details --league-ids 8,9,82,384,387 --limit 1800 && python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82,384,387 --limit 800 && python -m jxd.cli sync-player-odds --days-forward 7 --bookmaker-id 2 --league-ids 8,9,82,384,387 --limit 400 && python -m jxd.cli compute-forms --samples \"10,25,50\" --availability-sample 5 && python -m jxd.cli normalize-odds`  
+  - Hourly odds: `python -m jxd.cli sync-odds --bookmaker-id 2 --league-ids 8,9,82 --limit 200 && python -m jxd.cli sync-player-odds --days-forward 7 --bookmaker-id 2 --league-ids 8,9,82 --limit 200`  
   - Midday stats window: `python -m jxd.cli sync-fixtures-between $(date +\%F) $(date -v+7d +\%F) --with-details --league-ids 8,9,82 --limit 400 && python -m jxd.cli compute-forms --samples "5,10,15,20,25,50" --availability-sample 5`
 Adjust season IDs per league/year. `sync-h2h` can be run ad hoc for upcoming matches.
 

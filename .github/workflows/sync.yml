@@ -33,6 +33,12 @@ jobs:
           LEAGUE_IDS: ${{ env.LEAGUE_IDS }}
         run: |
           python -m jxd.cli sync-odds --bookmaker-id $BOOKMAKER_ID --league-ids "$LEAGUE_IDS" --limit 200
+      - name: Sync player odds (Bet365 player props)
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          LEAGUE_IDS: ${{ env.LEAGUE_IDS }}
+        run: |
+          python -m jxd.cli sync-player-odds --bookmaker-id $BOOKMAKER_ID --league-ids "$LEAGUE_IDS" --days-forward 7 --limit 200
       - name: Normalize odds snapshot
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
