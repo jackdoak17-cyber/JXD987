@@ -48,9 +48,17 @@ def parse_query(text: str) -> Dict[str, Any]:
     """
     lowered = text.lower()
 
+    def default_threshold(stat: str) -> Union[int, float]:
+        if stat in ("goals", "goals_for", "goals_against"):
+            return 1
+        if stat in ("assists",):
+            return 1
+        return 2
+
     def resolve_stat() -> Tuple[str, str]:
         # Returns (entity, stat_key). entity: player|team. stat_key for players: shots,sot,goals,assists. teams: shots_for/against, sot_for/against, goals_for/against, corners_for/against, yellows_for/against, reds_for/against.
         against = any(word in lowered for word in ["concede", "allowed", "against", "allow", "conceded"])
+        scored_words = any(w in lowered for w in ["scored", "score", "scoring"])
         if "corner" in lowered:
             return "team", "corners_against" if against else "corners_for"
         if "booking" in lowered or "card" in lowered:
@@ -58,7 +66,7 @@ def parse_query(text: str) -> Dict[str, Any]:
                 return "team", "reds_against" if against else "reds_for"
             # default to yellows for generic "cards"
             return "team", "yellows_against" if against else "yellows_for"
-        if "goal" in lowered and not "assist" in lowered:
+        if ("goal" in lowered or scored_words) and "assist" not in lowered:
             if "team" in lowered or against:
                 return "team", "goals_against" if against else "goals_for"
             return "player", "goals"
@@ -76,7 +84,7 @@ def parse_query(text: str) -> Dict[str, Any]:
     entity, stat_key = resolve_stat()
 
     # threshold (supports decimals like 2.5+ goals)
-    min_value: Union[int, float] = 2
+    min_value: Union[int, float] = default_threshold(stat_key)
     m = re.search(r"(\d+(?:\.\d+)?)\+?\s*(shot|sot|on target|goal|assist|corner|card)", lowered)
     if m:
         try:
@@ -126,10 +134,23 @@ def parse_query(text: str) -> Dict[str, Any]:
         except Exception:
             odds_min = None
     require_today = "today" in lowered or "tonight" in lowered
-    require_fav = "favorite" in lowered or "favourite" in lowered
+    require_fav = any(
+        kw in lowered
+        for kw in [
+            "favorite",
+            "favourite",
+            "only favorites",
+            "favourites only",
+            "favs only",
+            "keep favorites",
+        ]
+    )
     exclude_fav = "not favorite" in lowered or "non favorite" in lowered or "underdog" in lowered or "exclude favorites" in lowered
     if exclude_fav:
         require_fav = False
+    if "remove teams not favorites" in lowered or "remove non favorites" in lowered:
+        require_fav = True
+        exclude_fav = False
     location = None
     if " at home" in lowered or " home " in lowered or "home only" in lowered or "home games" in lowered:
         location = "home"
