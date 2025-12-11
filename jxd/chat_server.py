@@ -128,18 +128,23 @@ def parse_query(text: str) -> Dict[str, Any]:
     # odds cap / min
     odds_max: Optional[float] = None
     odds_min: Optional[float] = None
-    m = re.search(r"odds\s*<=\s*([0-9]+\.?[0-9]*)", lowered)
-    if m:
-        try:
-            odds_max = float(m.group(1))
-        except Exception:
-            odds_max = None
-    m = re.search(r"odds\s*>=\s*([0-9]+\.?[0-9]*)", lowered) or re.search(
-        r"odds\s*>\s*([0-9]+\.?[0-9]*)", lowered
+    m = re.search(r"odds\s*<=\s*([0-9]+\.?[0-9]*)", lowered) or re.search(
+        r"(less than|under|below)\s*odds\s*([0-9]+\.?[0-9]*)", lowered
     )
     if m:
         try:
-            odds_min = float(m.group(1))
+            odds_max = float(m.group(len(m.groups())))
+        except Exception:
+            odds_max = None
+    m = (
+        re.search(r"odds\s*>=\s*([0-9]+\.?[0-9]*)", lowered)
+        or re.search(r"odds\s*>\s*([0-9]+\.?[0-9]*)", lowered)
+        or re.search(r"(greater than|over|above|more than)\s*odds\s*([0-9]+\.?[0-9]*)", lowered)
+        or re.search(r"odds\s*>\s*([0-9]+\.?[0-9]*)", lowered)
+    )
+    if m:
+        try:
+            odds_min = float(m.group(len(m.groups())))
         except Exception:
             odds_min = None
     # fallback loose pattern only if neither bound was set
@@ -215,9 +220,9 @@ def parse_query(text: str) -> Dict[str, Any]:
         sample_size = min(sample_size, 5)
     if "ranked" in lowered or "ranking" in lowered or "rank by" in lowered or "sort by" in lowered:
         min_pct = 0.0
-    sort_by = None
     if "rank by odds" in lowered or "sort by odds" in lowered:
         sort_by = "odds_desc" if "highest" in lowered or "top" in lowered else "odds_asc"
+    sort_by = None
 
     return {
         "entity": entity,
