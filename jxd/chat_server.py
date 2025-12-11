@@ -608,15 +608,15 @@ async function send() {
     log.innerHTML += `<div class='msg'>No matches.</div>`;
     return;
   }
+  const interp = data.interpretation || {};
+  const statLabel = interp.stat || 'stat';
+  const header = `${interp.threshold || ''}+ ${statLabel} in ${interp.sample_size || ''}/${interp.sample_size || ''}`.trim();
   const rows = data.results.map(r => {
-    const hits = r.hits != null ? r.hits : '';
-    const games = r.games != null ? r.games : r.sample_size;
     const values = Array.isArray(r.values) ? r.values.join(',') : '';
-    const pct = typeof r.pct === 'number' ? (r.pct * 100).toFixed(0) + '%' : '';
     const name = r.player ? `${r.player} (${r.team || ''})` : r.team;
-    return `${name} - ${r.stat_type} ${r.threshold}+ in ${hits}/${games} (${pct}) | values: ${values}`;
+    return `${name} | values: ${values}`;
   }).join('<br>');
-  log.innerHTML += `<div class='msg'>Results:<br>${rows}</div>`;
+  log.innerHTML += `<div class='msg'>${header ? header + '<br>' : ''}${rows}</div>`;
 }
 </script>
 </body>
