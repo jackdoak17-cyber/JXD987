@@ -148,12 +148,39 @@ jobs:
         run: |
           chmod +x scripts/full_refresh.sh
           ./scripts/full_refresh.sh
+
+      - name: Post-sync SQLite scored checks
+        run: |
+          set -euxo pipefail
+          echo "== max scored fixture start =="
+          sqlite3 data/jxd.sqlite "select max(starting_at) from fixtures where home_score is not null and away_score is not null;"
+          echo "== league 8 scored since 2025-08-01 =="
+          sqlite3 data/jxd.sqlite "
+            select count(*) from fixtures
+            where league_id=8
+              and starting_at >= '2025-08-01'
+              and home_score is not null
+              and away_score is not null;
+          "
       - name: Export Supabase (keep current + previous season per league)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           python3 scripts/export_to_supabase.py
+
+      - name: Supabase scored sanity (league 8 since 2025-08-01)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          set -euxo pipefail
+          curl -s -D - -o /dev/null \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Prefer: count=exact" \
+            "$SUPABASE_URL/rest/v1/fixtures?league_id=eq.8&starting_at=gte.2025-08-01&home_score=not.is.null&away_score=not.is.null&select=id&limit=1" \
+            | grep -i content-range || true
       - name: Upload DB artifact (sqlite + dump)
         uses: actions/upload-artifact@v4
         with:

@@ -377,13 +377,6 @@ class SyncService:
         if league_ids:
             filters = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
 
-        id_after = None
-        try:
-            id_after_val = self._get_state("fixtures_id_after")
-            id_after = int(id_after_val) if id_after_val else None
-        except Exception:
-            id_after = None
-
         count = 0
         for item in self.client.fetch_collection(
             path,
@@ -391,12 +384,10 @@ class SyncService:
             includes=["scores", "participants"],
             filters=filters,
             per_page=50,
-            id_after=id_after,
         ):
             _upsert(self.session, Fixture, _fixture_mapper(item))
             self._store_participants(item)
             count += 1
-            self._set_state("fixtures_id_after", str(item.get("id")))
         self.session.commit()
         log.info("Fixtures synced: %s", count)
         return count

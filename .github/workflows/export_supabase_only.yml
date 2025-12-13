@@ -27,6 +27,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run full refresh (SportMonks -> SQLite -> dump)
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+        run: |
+          set -euxo pipefail
+          chmod +x scripts/full_refresh.sh
+          ./scripts/full_refresh.sh
+
       - name: Restore sqlite from dump
         run: |
           set -euxo pipefail
