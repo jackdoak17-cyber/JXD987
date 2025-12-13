@@ -44,6 +44,58 @@ jobs:
           sqlite3 data/jxd.sqlite "select count(*) as teams_named from teams where name is not null and trim(name) != '';"
           sqlite3 data/jxd.sqlite "select id,name,short_code from teams where name is not null limit 5;"
 
+      - name: SQLite sanity (league 8 + Arsenal)
+        run: |
+          set -euxo pipefail
+
+          echo "== league 8 seasons =="
+          sqlite3 data/jxd.sqlite "
+            select id,name,start_date,end_date,is_current
+            from seasons
+            where league_id=8
+            order by end_date desc
+            limit 5;
+          "
+
+          echo "== Arsenal in SQLite teams =="
+          sqlite3 data/jxd.sqlite "
+            select id,name,short_code from teams where id=19;
+          "
+
+          echo "== Arsenal fixtures since 2025-08-01 (SQLite, ANY) =="
+          sqlite3 data/jxd.sqlite "
+            select count(*)
+            from fixtures
+            where (home_team_id=19 or away_team_id=19)
+              and starting_at >= '2025-08-01';
+          "
+
+          echo "== Arsenal fixtures since 2025-08-01 (SQLite, SCORED) =="
+          sqlite3 data/jxd.sqlite "
+            select count(*)
+            from fixtures
+            where (home_team_id=19 or away_team_id=19)
+              and starting_at >= '2025-08-01'
+              and home_score is not null
+              and away_score is not null;
+          "
+
+          echo "== Latest Arsenal fixture in SQLite (ANY) =="
+          sqlite3 data/jxd.sqlite "
+            select max(starting_at)
+            from fixtures
+            where (home_team_id=19 or away_team_id=19);
+          "
+
+          echo "== Latest Arsenal fixture in SQLite (SCORED) =="
+          sqlite3 data/jxd.sqlite "
+            select max(starting_at)
+            from fixtures
+            where (home_team_id=19 or away_team_id=19)
+              and home_score is not null
+              and away_score is not null;
+          "
+
       - name: Export to Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
