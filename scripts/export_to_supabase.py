@@ -211,12 +211,22 @@ def delete_out_of_scope_fixtures(
     }
     if dry_run:
       continue
-    resp = requests.delete(f"{rest_url}/fixtures", headers=headers, params=params)
+    delete_headers = dict(headers)
+    delete_headers["Prefer"] = "count=exact"
+    resp = requests.delete(
+      f"{rest_url}/fixtures", headers=delete_headers, params=params
+    )
     if resp.status_code >= 300:
       raise RuntimeError(
         f"Delete failed for league {league_id}: {resp.status_code} {resp.text}"
       )
-    deleted += int(resp.headers.get("Content-Range", "0").split("/")[-1] or 0)
+    content_range = resp.headers.get("Content-Range", "")
+    total = content_range.split("/")[-1] if "/" in content_range else content_range
+    if total and total != "*":
+      try:
+        deleted += int(total)
+      except ValueError:
+        pass
   return deleted
 
 
