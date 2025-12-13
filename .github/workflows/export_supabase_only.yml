@@ -51,3 +51,25 @@ jobs:
         run: |
           set -euxo pipefail
           python3 scripts/export_to_supabase.py --strict
+
+      - name: Verify Supabase counts (REST)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          set -euxo pipefail
+
+          for t in seasons teams fixtures; do
+            echo "== $t =="
+            curl -s -D - -o /dev/null \
+              -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Prefer: count=exact" \
+              "$SUPABASE_URL/rest/v1/$t?select=id&limit=1" | grep -i content-range || true
+          done
+
+          echo "== sample teams =="
+          curl -s \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            "$SUPABASE_URL/rest/v1/teams?select=id,name,short_code&limit=10"
