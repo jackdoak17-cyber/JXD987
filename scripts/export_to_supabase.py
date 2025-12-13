@@ -134,16 +134,33 @@ def fetch_fixtures(conn: sqlite3.Connection, season_ids: Sequence[int]) -> List[
   return fixtures
 
 
-def fetch_teams(conn: sqlite3.Connection, team_ids: Sequence[int]) -> List[dict]:
+def fetch_teams(
+  conn: sqlite3.Connection, team_ids: Sequence[int]
+) -> Tuple[List[dict], int]:
   if not team_ids:
-    return []
-  placeholders = ",".join("?" for _ in team_ids)
-  query = f"SELECT id, name, short_code FROM teams WHERE id IN ({placeholders})"
-  rows = conn.execute(query, list(team_ids)).fetchall()
-  teams: List[dict] = []
-  for row in rows:
-    teams.append({"id": row[0], "name": row[1], "short_code": row[2]})
-  return teams
+    return [], 0
+
+  # SQLite has a variable limit; chunk IN() queries safely.
+  ids = [int(x) for x in team_ids if x is not None]
+  found_rows: List[Tuple[int, str, Optional[str]]] = []
+
+  CHUNK = 900
+  for i in range(0, len(ids), CHUNK):
+    chunk = ids[i : i + CHUNK]
+    placeholders = ",".join("?" for _ in chunk)
+    query = f"SELECT id, name, short_code FROM teams WHERE id IN ({placeholders})"
+    found_rows.extend(conn.execute(query, chunk).fetchall())
+
+  found_ids = {row[0] for row in found_rows}
+
+  teams: List[dict] = [{"id": r[0], "name": r[1], "short_code": r[2]} for r in found_rows]
+
+  missing = [tid for tid in ids if tid not in found_ids]
+  # Insert placeholders so FK constraints won’t fail during fixtures upsert
+  for tid in missing:
+    teams.append({"id": tid, "name": f"Unknown {tid}", "short_code": None})
+
+  return teams, len(missing)
 
 
 def upsert_table(
@@ -278,7 +295,7 @@ def main() -> int:
     if fx["away_team_id"]:
       team_ids.add(fx["away_team_id"])
 
-  teams = fetch_teams(conn, list(team_ids))
+  teams, teams_placeholder_count = fetch_teams(conn, list(team_ids))
 
   # Upserts
   seasons_rows: List[dict] = []
@@ -319,6 +336,7 @@ def main() -> int:
         "fixtures_deleted": deleted,
         "leagues_processed": len(keep_by_league),
         "fixtures_repaired": repaired,
+        "teams_placeholder_count": teams_placeholder_count,
       },
       indent=2,
     )
