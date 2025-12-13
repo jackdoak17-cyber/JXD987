@@ -40,6 +40,9 @@ jobs:
 
           sqlite3 data/jxd.sqlite ".tables"
           sqlite3 data/jxd.sqlite "select count(*) as seasons_count from seasons;"
+          sqlite3 data/jxd.sqlite "select count(*) as teams_count from teams;"
+          sqlite3 data/jxd.sqlite "select count(*) as teams_named from teams where name is not null and trim(name) != '';"
+          sqlite3 data/jxd.sqlite "select id,name,short_code from teams where name is not null limit 5;"
 
       - name: Export to Supabase
         env:
@@ -47,4 +50,4 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set -euxo pipefail
-          python3 scripts/export_to_supabase.py
+          python3 scripts/export_to_supabase.py --strict

@@ -136,9 +136,9 @@ def fetch_fixtures(conn: sqlite3.Connection, season_ids: Sequence[int]) -> List[
 
 def fetch_teams(
   conn: sqlite3.Connection, team_ids: Sequence[int]
-) -> Tuple[List[dict], int]:
+) -> Tuple[List[dict], set]:
   if not team_ids:
-    return [], 0
+    return [], set()
 
   # SQLite has a variable limit; chunk IN() queries safely.
   ids = [int(x) for x in team_ids if x is not None]
@@ -153,14 +153,11 @@ def fetch_teams(
 
   found_ids = {row[0] for row in found_rows}
 
-  teams: List[dict] = [{"id": r[0], "name": r[1], "short_code": r[2]} for r in found_rows]
+  teams: List[dict] = [
+    {"id": r[0], "name": r[1], "short_code": r[2]} for r in found_rows
+  ]
 
-  missing = [tid for tid in ids if tid not in found_ids]
-  # Insert placeholders so FK constraints won’t fail during fixtures upsert
-  for tid in missing:
-    teams.append({"id": tid, "name": f"Unknown {tid}", "short_code": None})
-
-  return teams, len(missing)
+  return teams, found_ids
 
 
 def upsert_table(
@@ -268,6 +265,19 @@ def main() -> int:
     action="store_true",
     help="Print counts without writing to Supabase",
   )
+  parser.add_argument(
+    "--strict",
+    dest="strict",
+    action="store_true",
+    default=True,
+    help="Fail if referenced teams are missing (default)",
+  )
+  parser.add_argument(
+    "--no-strict",
+    dest="strict",
+    action="store_false",
+    help="Skip fixtures with missing teams instead of failing",
+  )
   args = parser.parse_args()
 
   supabase_url = os.getenv("SUPABASE_URL")
@@ -305,7 +315,26 @@ def main() -> int:
     if fx["away_team_id"]:
       team_ids.add(fx["away_team_id"])
 
-  teams, teams_placeholder_count = fetch_teams(conn, list(team_ids))
+  teams, found_team_ids = fetch_teams(conn, list(team_ids))
+  missing_team_ids = [tid for tid in team_ids if tid not in found_team_ids]
+
+  if missing_team_ids and args.strict:
+    print(
+      f"Missing teams referenced by fixtures: count={len(missing_team_ids)}, "
+      f"sample={missing_team_ids[:50]}"
+    )
+    return 1
+
+  fixtures_dropped = 0
+  if missing_team_ids and not args.strict:
+    before = len(fixtures)
+    fixtures = [
+      fx
+      for fx in fixtures
+      if fx.get("home_team_id") in found_team_ids
+      and fx.get("away_team_id") in found_team_ids
+    ]
+    fixtures_dropped = before - len(fixtures)
 
   # Upserts
   seasons_rows: List[dict] = []
@@ -346,7 +375,8 @@ def main() -> int:
         "fixtures_deleted": deleted,
         "leagues_processed": len(keep_by_league),
         "fixtures_repaired": repaired,
-        "teams_placeholder_count": teams_placeholder_count,
+        "missing_team_ids": len(missing_team_ids),
+        "fixtures_dropped": fixtures_dropped,
       },
       indent=2,
     )
