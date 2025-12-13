@@ -1,0 +1,28 @@
+name: Export Supabase Only
+
+on:
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  export_supabase:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install deps
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+      - name: Restore sqlite from dump
+        run: |
+          rm -f data/jxd.sqlite
+          xz -dc data/jxd_dump.sql.xz | sqlite3 data/jxd.sqlite
+      - name: Export Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python3 scripts/export_to_supabase.py
