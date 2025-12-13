@@ -228,7 +228,9 @@ def delete_out_of_scope_fixtures(
 
 
 def repair_fixture_home_away(
-  fixtures: List[dict], participants_by_fixture: Dict[int, List[dict]]
+  fixtures: List[dict],
+  participants_by_fixture: Dict[int, List[dict]],
+  valid_team_ids: set,
 ) -> int:
   repaired = 0
   for fx in fixtures:
@@ -251,11 +253,21 @@ def repair_fixture_home_away(
         home_id = p.get("team_id")
       if not away_id and extra_loc == "away":
         away_id = p.get("team_id")
-    if home_id and away_id:
+    if home_id in valid_team_ids and away_id in valid_team_ids:
       fx["home_team_id"] = home_id
       fx["away_team_id"] = away_id
       repaired += 1
   return repaired
+
+
+def load_team_index(conn: sqlite3.Connection) -> Tuple[Dict[int, dict], int, int]:
+  rows = conn.execute("SELECT id, name, short_code FROM teams").fetchall()
+  teams = {row[0]: {"id": row[0], "name": row[1], "short_code": row[2]} for row in rows}
+  teams_count = len(rows)
+  teams_named = sum(
+    1 for row in rows if row[1] is not None and str(row[1]).strip() != ""
+  )
+  return teams, teams_count, teams_named
 
 
 def main() -> int:
@@ -302,11 +314,32 @@ def main() -> int:
 
   conn = sqlite3.connect("data/jxd.sqlite")
   keep_by_league, keep_ids = get_keep_seasons(conn)
+  team_index, teams_count, teams_named = load_team_index(conn)
   fixtures = fetch_fixtures(conn, list(keep_ids))
   participants_by_fixture = fetch_fixture_participants(
     conn, [f["id"] for f in fixtures]
   )
-  repaired = repair_fixture_home_away(fixtures, participants_by_fixture)
+  repaired = repair_fixture_home_away(
+    fixtures, participants_by_fixture, set(team_index.keys())
+  )
+
+  fixtures_total = len(fixtures)
+  fixtures_filtered: List[dict] = []
+  fixtures_dropped_missing_teams = 0
+
+  for fx in fixtures:
+    if not fx.get("home_team_id") or not fx.get("away_team_id"):
+      fixtures_dropped_missing_teams += 1
+      continue
+    if (
+      fx["home_team_id"] not in team_index
+      or fx["away_team_id"] not in team_index
+    ):
+      fixtures_dropped_missing_teams += 1
+      continue
+    fixtures_filtered.append(fx)
+
+  fixtures = fixtures_filtered
 
   team_ids: set = set()
   for fx in fixtures:
@@ -377,6 +410,10 @@ def main() -> int:
         "fixtures_repaired": repaired,
         "missing_team_ids": len(missing_team_ids),
         "fixtures_dropped": fixtures_dropped,
+        "fixtures_total": fixtures_total,
+        "fixtures_dropped_missing_teams": fixtures_dropped_missing_teams,
+        "teams_count": teams_count,
+        "teams_named": teams_named,
       },
       indent=2,
     )
