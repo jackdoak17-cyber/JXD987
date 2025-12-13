@@ -148,6 +148,12 @@ jobs:
         run: |
           chmod +x scripts/full_refresh.sh
           ./scripts/full_refresh.sh
+      - name: Export Supabase (keep current + previous season per league)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python scripts/export_to_supabase.py
       - name: Upload DB artifact (sqlite + dump)
         uses: actions/upload-artifact@v4
         with:
