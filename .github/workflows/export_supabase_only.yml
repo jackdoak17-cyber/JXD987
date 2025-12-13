@@ -127,45 +127,45 @@ jobs:
             "$SUPABASE_URL/rest/v1/teams?select=id,name,short_code&limit=10"
 
           echo "== arsenal latest scored fixture =="
-          FIXTURE_JSON="$(curl -s \
+          export FIXTURE_JSON="$(curl -s \
             -H \"apikey: $SUPABASE_SERVICE_ROLE_KEY\" \
             -H \"Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY\" \
             \"$SUPABASE_URL/rest/v1/fixtures?select=starting_at&or=(home_team_id.eq.19,away_team_id.eq.19)&home_score=not.is.null&away_score=not.is.null&order=starting_at.desc&limit=1\")"
           echo \"${FIXTURE_JSON}\"
 
           python3 - <<'PY'
-import datetime
-import json
-import os
-import sys
+          import datetime
+          import json
+          import os
+          import sys
 
-raw = os.environ.get("FIXTURE_JSON", "")
-try:
-    data = json.loads(raw or "[]")
-except Exception as exc:  # pragma: no cover - CI guard
-    print(f"Failed to parse Arsenal fixture JSON: {exc}")
-    sys.exit(1)
+          raw = os.environ.get("FIXTURE_JSON", "")
+          try:
+              data = json.loads(raw or "[]")
+          except Exception as exc:  # pragma: no cover - CI guard
+              print(f"Failed to parse Arsenal fixture JSON: {exc}")
+              sys.exit(1)
 
-if not data:
-    print("No Arsenal fixtures with scores found; failing.")
-    sys.exit(1)
+          if not data:
+              print("No Arsenal fixtures with scores found; failing.")
+              sys.exit(1)
 
-start = data[0].get("starting_at")
-print(f"latest starting_at: {start}")
-if not start:
-    print("Missing starting_at; failing.")
-    sys.exit(1)
+          start = data[0].get("starting_at")
+          print(f"latest starting_at: {start}")
+          if not start:
+              print("Missing starting_at; failing.")
+              sys.exit(1)
 
-try:
-    dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).replace(tzinfo=None)
-except Exception as exc:  # pragma: no cover - CI guard
-    print(f"Could not parse date: {exc}")
-    sys.exit(1)
+          try:
+              dt = datetime.datetime.fromisoformat(start.replace("Z", "+00:00")).replace(tzinfo=None)
+          except Exception as exc:  # pragma: no cover - CI guard
+              print(f"Could not parse date: {exc}")
+              sys.exit(1)
 
-threshold = datetime.datetime(2025, 8, 1)
-if dt < threshold:
-    print("Latest Arsenal scored fixture before 2025-08-01; failing.")
-    sys.exit(1)
+          threshold = datetime.datetime(2025, 8, 1)
+          if dt < threshold:
+              print("Latest Arsenal scored fixture before 2025-08-01; failing.")
+              sys.exit(1)
 
-print("Arsenal scored fixture ok.")
-PY
+          print("Arsenal scored fixture ok.")
+          PY
