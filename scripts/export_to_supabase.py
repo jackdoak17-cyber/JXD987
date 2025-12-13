@@ -74,6 +74,34 @@ def get_keep_seasons(conn: sqlite3.Connection) -> Tuple[Dict[int, List[dict]], s
   return keep_by_league, keep_ids
 
 
+def fetch_fixture_participants(
+  conn: sqlite3.Connection, fixture_ids: Sequence[int]
+) -> Dict[int, List[dict]]:
+  if not fixture_ids:
+    return {}
+  placeholders = ",".join("?" for _ in fixture_ids)
+  query = f"""
+    SELECT fixture_id, team_id, location, extra
+    FROM fixture_participants
+    WHERE fixture_id IN ({placeholders})
+  """
+  rows = conn.execute(query, list(fixture_ids)).fetchall()
+  by_fixture: Dict[int, List[dict]] = {}
+  for row in rows:
+    try:
+      extra = json.loads(row[3]) if row[3] else {}
+    except json.JSONDecodeError:
+      extra = {}
+    by_fixture.setdefault(row[0], []).append(
+      {
+        "team_id": row[1],
+        "location": row[2],
+        "extra": extra,
+      }
+    )
+  return by_fixture
+
+
 def fetch_fixtures(conn: sqlite3.Connection, season_ids: Sequence[int]) -> List[dict]:
   if not season_ids:
     return []
@@ -175,6 +203,37 @@ def delete_out_of_scope_fixtures(
   return deleted
 
 
+def repair_fixture_home_away(
+  fixtures: List[dict], participants_by_fixture: Dict[int, List[dict]]
+) -> int:
+  repaired = 0
+  for fx in fixtures:
+    if fx.get("home_team_id") and fx.get("away_team_id"):
+      continue
+    participants = participants_by_fixture.get(fx["id"], [])
+    home_id: Optional[int] = None
+    away_id: Optional[int] = None
+    for p in participants:
+      loc = (p.get("location") or "").lower()
+      if not home_id and loc == "home":
+        home_id = p.get("team_id")
+      if not away_id and loc == "away":
+        away_id = p.get("team_id")
+      extra_loc = (p.get("extra", {}).get("meta", {}) or {}).get("location")
+      if not extra_loc and isinstance(p.get("extra"), dict):
+        extra_loc = p["extra"].get("location")
+      extra_loc = (extra_loc or "").lower()
+      if not home_id and extra_loc == "home":
+        home_id = p.get("team_id")
+      if not away_id and extra_loc == "away":
+        away_id = p.get("team_id")
+    if home_id and away_id:
+      fx["home_team_id"] = home_id
+      fx["away_team_id"] = away_id
+      repaired += 1
+  return repaired
+
+
 def main() -> int:
   parser = argparse.ArgumentParser(description="Export recent seasons to Supabase")
   parser.add_argument(
@@ -207,6 +266,10 @@ def main() -> int:
   conn = sqlite3.connect("data/jxd.sqlite")
   keep_by_league, keep_ids = get_keep_seasons(conn)
   fixtures = fetch_fixtures(conn, list(keep_ids))
+  participants_by_fixture = fetch_fixture_participants(
+    conn, [f["id"] for f in fixtures]
+  )
+  repaired = repair_fixture_home_away(fixtures, participants_by_fixture)
 
   team_ids: set = set()
   for fx in fixtures:
@@ -255,6 +318,7 @@ def main() -> int:
         "fixtures_exported": fixtures_exported,
         "fixtures_deleted": deleted,
         "leagues_processed": len(keep_by_league),
+        "fixtures_repaired": repaired,
       },
       indent=2,
     )
