@@ -33,7 +33,12 @@ jobs:
           ls -lah data || true
           test -f data/jxd_dump.sql.xz
           rm -f data/jxd.sqlite
-          xz -dc data/jxd_dump.sql.xz | sqlite3 data/jxd.sqlite
+
+          xz -dc data/jxd_dump.sql.xz \
+            | python3 -c "import sys,re; p=re.compile(r\"unistr\\('((?:''|[^'])*)'\\)\"); \
+for line in sys.stdin: sys.stdout.write(p.sub(lambda m: \"'\"+m.group(1)+\"'\", line))" \
+            | sqlite3 data/jxd.sqlite
+
           sqlite3 data/jxd.sqlite ".tables"
           sqlite3 data/jxd.sqlite "select count(*) as seasons_count from seasons;"
 
