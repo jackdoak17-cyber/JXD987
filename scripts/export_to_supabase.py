@@ -241,18 +241,10 @@ def repair_fixture_home_away(
     home_id: Optional[int] = None
     away_id: Optional[int] = None
     for p in participants:
-      loc = (p.get("location") or "").lower()
+      loc = participant_location(p)
       if not home_id and loc == "home":
         home_id = p.get("team_id")
       if not away_id and loc == "away":
-        away_id = p.get("team_id")
-      extra_loc = (p.get("extra", {}).get("meta", {}) or {}).get("location")
-      if not extra_loc and isinstance(p.get("extra"), dict):
-        extra_loc = p["extra"].get("location")
-      extra_loc = (extra_loc or "").lower()
-      if not home_id and extra_loc == "home":
-        home_id = p.get("team_id")
-      if not away_id and extra_loc == "away":
         away_id = p.get("team_id")
     if home_id in valid_team_ids and away_id in valid_team_ids:
       fx["home_team_id"] = home_id
@@ -278,6 +270,42 @@ def parse_iso(ts: Optional[str]) -> Optional[dt.datetime]:
     return dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
   except Exception:
     return None
+
+
+def participant_location(part: dict) -> str:
+  loc = (part.get("location") or "").lower()
+  if loc:
+    return loc
+  extra = part.get("extra")
+  if isinstance(extra, str):
+    try:
+      extra = json.loads(extra)
+    except Exception:
+      extra = {}
+  if isinstance(extra, dict):
+    meta = extra.get("meta") or {}
+    if isinstance(meta, dict) and meta.get("location"):
+      return str(meta.get("location")).lower()
+    if extra.get("location"):
+      return str(extra.get("location")).lower()
+  return ""
+
+
+def parse_score_int(val: Optional[str]) -> Optional[int]:
+  if val is None or val is False:
+    return None
+  if isinstance(val, bool):
+    return None
+  if isinstance(val, (int, float)):
+    return int(val)
+  if isinstance(val, str):
+    s = val.strip()
+    if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+      try:
+        return int(s)
+      except ValueError:
+        return None
+  return None
 
 
 def main() -> int:
@@ -363,7 +391,35 @@ def main() -> int:
     fixtures, participants_by_fixture, set(team_index.keys())
   )
 
-  fixtures_total = len(fixtures)
+  fixtures_total_before_drop = len(fixtures)
+  fixtures_total = fixtures_total_before_drop
+
+  def derive_scores_from_participants(fixtures: List[dict]) -> int:
+    updated = 0
+    valid_team_ids = set(team_index.keys())
+    for fx in fixtures:
+      if fx.get("home_score") is not None and fx.get("away_score") is not None:
+        continue
+      participants = participants_by_fixture.get(fx["id"], [])
+      home = []
+      away = []
+      for p in participants:
+        loc = participant_location(p)
+        if loc == "home" and p.get("team_id") in valid_team_ids:
+          home.append(p)
+        if loc == "away" and p.get("team_id") in valid_team_ids:
+          away.append(p)
+      if len(home) == 1 and len(away) == 1:
+        h_score = parse_score_int(home[0].get("score"))
+        a_score = parse_score_int(away[0].get("score"))
+        if h_score is not None and a_score is not None:
+          fx["home_score"] = h_score
+          fx["away_score"] = a_score
+          updated += 1
+    return updated
+
+  fixtures_scored_from_participants = derive_scores_from_participants(fixtures)
+
   fixtures_filtered: List[dict] = []
   fixtures_dropped_missing_teams = 0
 
@@ -380,6 +436,16 @@ def main() -> int:
     fixtures_filtered.append(fx)
 
   fixtures = fixtures_filtered
+
+  fixtures_with_scores: List[dict] = []
+  fixtures_dropped_no_scores = 0
+  for fx in fixtures:
+    if fx.get("home_score") is None or fx.get("away_score") is None:
+      fixtures_dropped_no_scores += 1
+      continue
+    fixtures_with_scores.append(fx)
+
+  fixtures = fixtures_with_scores
 
   team_ids: set = set()
   for fx in fixtures:
@@ -408,6 +474,32 @@ def main() -> int:
       and fx.get("away_team_id") in found_team_ids
     ]
     fixtures_dropped = before - len(fixtures)
+
+  max_scored_after = None
+  for fx in fixtures:
+    if fx.get("home_score") is None or fx.get("away_score") is None:
+      continue
+    start = fx.get("starting_at")
+    if start and (
+      max_scored_after is None or parse_iso(start) > parse_iso(max_scored_after)
+    ):
+      max_scored_after = start
+
+  threshold = (
+    dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    - dt.timedelta(days=args.require_scored_within_days)
+  )
+  stale_guard_triggered = False
+  parsed_max = parse_iso(max_scored_after) if max_scored_after else None
+  if not parsed_max or parsed_max < threshold:
+    stale_guard_triggered = True
+    print(
+      f"STALE SQLITE: max_scored_starting_at={max_scored_after}, "
+      f"required_within_days={args.require_scored_within_days}. Refusing to export."
+    )
+    if not args.allow_stale:
+      return 1
+    print("ALLOW_STALE_EXPORT=1: continuing")
 
   # Upserts
   seasons_rows: List[dict] = []
@@ -454,9 +546,14 @@ def main() -> int:
         "fixtures_dropped_missing_teams": fixtures_dropped_missing_teams,
         "teams_count": teams_count,
         "teams_named": teams_named,
-        "max_scored_starting_at": max_scored_starting_at,
+        "max_scored_starting_at": max_scored_after,
         "stale_guard_days": args.require_scored_within_days,
         "stale_guard_triggered": stale_guard_triggered,
+        "fixtures_total": fixtures_total_before_drop,
+        "fixtures_total_before_drop": fixtures_total_before_drop,
+        "fixtures_scored_from_participants": fixtures_scored_from_participants,
+        "fixtures_dropped_no_scores": fixtures_dropped_no_scores,
+        "max_scored_starting_at_after_derivation": max_scored_after,
       },
       indent=2,
     )
