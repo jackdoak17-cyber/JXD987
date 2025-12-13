@@ -1,4 +1,5 @@
 import argparse
+import datetime as dt
 import json
 import os
 import sqlite3
@@ -270,6 +271,15 @@ def load_team_index(conn: sqlite3.Connection) -> Tuple[Dict[int, dict], int, int
   return teams, teams_count, teams_named
 
 
+def parse_iso(ts: Optional[str]) -> Optional[dt.datetime]:
+  if not ts:
+    return None
+  try:
+    return dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+  except Exception:
+    return None
+
+
 def main() -> int:
   parser = argparse.ArgumentParser(description="Export recent seasons to Supabase")
   parser.add_argument(
@@ -289,6 +299,17 @@ def main() -> int:
     dest="strict",
     action="store_false",
     help="Skip fixtures with missing teams instead of failing",
+  )
+  parser.add_argument(
+    "--require-scored-within-days",
+    type=int,
+    default=30,
+    help="Require the newest scored fixture to be within N days (default: 30)",
+  )
+  parser.add_argument(
+    "--allow-stale",
+    action="store_true",
+    help="Allow export even if scored fixtures are older than required window",
   )
   args = parser.parse_args()
 
@@ -313,6 +334,25 @@ def main() -> int:
   )
 
   conn = sqlite3.connect("data/jxd.sqlite")
+  max_scored_starting_at = conn.execute(
+    "select max(starting_at) from fixtures where home_score is not null and away_score is not null"
+  ).fetchone()[0]
+  parsed_max = parse_iso(max_scored_starting_at)
+  stale_guard_triggered = False
+  threshold = (
+    dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    - dt.timedelta(days=args.require_scored_within_days)
+  )
+  if not parsed_max or parsed_max < threshold:
+    stale_guard_triggered = True
+    print(
+      f"STALE SQLITE: max_scored_starting_at={max_scored_starting_at}, "
+      f"required_within_days={args.require_scored_within_days}. Refusing to export."
+    )
+    if not args.allow_stale:
+      return 1
+    print("ALLOW_STALE_EXPORT=1: continuing")
+
   keep_by_league, keep_ids = get_keep_seasons(conn)
   team_index, teams_count, teams_named = load_team_index(conn)
   fixtures = fetch_fixtures(conn, list(keep_ids))
@@ -414,6 +454,9 @@ def main() -> int:
         "fixtures_dropped_missing_teams": fixtures_dropped_missing_teams,
         "teams_count": teams_count,
         "teams_named": teams_named,
+        "max_scored_starting_at": max_scored_starting_at,
+        "stale_guard_days": args.require_scored_within_days,
+        "stale_guard_triggered": stale_guard_triggered,
       },
       indent=2,
     )

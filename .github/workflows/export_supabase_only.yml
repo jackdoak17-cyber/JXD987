@@ -44,6 +44,11 @@ jobs:
           sqlite3 data/jxd.sqlite "select count(*) as teams_named from teams where name is not null and trim(name) != '';"
           sqlite3 data/jxd.sqlite "select id,name,short_code from teams where name is not null limit 5;"
 
+      - name: Audit SQLite freshness
+        run: |
+          set -euxo pipefail
+          python3 scripts/audit_sqlite_freshness.py
+
       - name: SQLite sanity (league 8 + Arsenal)
         run: |
           set -euxo pipefail
@@ -102,7 +107,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set -euxo pipefail
-          python3 scripts/export_to_supabase.py --strict
+          python3 scripts/export_to_supabase.py --strict --require-scored-within-days 30
 
       - name: Verify Supabase counts (REST)
         env:
