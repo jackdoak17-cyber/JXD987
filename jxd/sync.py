@@ -8,7 +8,16 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .sportmonks_client import SportMonksClient
-from .models import Base, Season, Team, Fixture, FixtureParticipant
+from .models import (
+    Base,
+    Season,
+    Team,
+    Fixture,
+    FixtureParticipant,
+    FixtureStatistic,
+    FixturePlayerStatistic,
+    FixturePlayer,
+)
 
 log = logging.getLogger(__name__)
 
@@ -31,6 +40,36 @@ def _safe_int(val) -> Optional[int]:
             return int(float(val))
         except Exception:
             return None
+
+
+def _extract_stat_value(data) -> Optional[int]:
+    """Pull a numeric value from lineup.detail or statistic payloads."""
+    if data is None:
+        return None
+    if isinstance(data, (int, float, str)):
+        return _safe_int(data)
+    if isinstance(data, dict):
+        for key in (
+            "value",
+            "total",
+            "goals",
+            "shots_on_target",
+            "shotson_target",
+            "in",
+            "out",
+            "home",
+            "away",
+            "penalties",
+        ):
+            if key in data:
+                v = _safe_int(data.get(key))
+                if v is not None:
+                    return v
+        for v in data.values():
+            parsed = _safe_int(v)
+            if parsed is not None:
+                return parsed
+    return None
 
 
 def _upsert(session: Session, model, data: Dict) -> None:
@@ -141,16 +180,39 @@ class SyncService:
         }
 
     def _extract_scores(self, scores_raw) -> Tuple[Optional[int], Optional[int]]:
+        """
+        Prefer CURRENT (type_id 1525) scores when present; otherwise first home/away entries.
+        Handles zero scores without dropping them.
+        """
         home_score = away_score = None
         if isinstance(scores_raw, list):
+            # CURRENT scores
             for s in scores_raw:
-                score_obj = s.get("score") if isinstance(s, dict) else {}
-                participant = (score_obj or {}).get("participant") or s.get("participant")
-                goals = (score_obj or {}).get("goals") or s.get("goals")
-                if participant == "home" and home_score is None:
-                    home_score = _safe_int(goals)
-                if participant == "away" and away_score is None:
-                    away_score = _safe_int(goals)
+                if s.get("type_id") != 1525:
+                    continue
+                score_obj = s.get("score") or {}
+                participant = score_obj.get("participant") or s.get("participant")
+                goals_val = score_obj.get("goals")
+                if goals_val is None:
+                    goals_val = s.get("goals")
+                goals = _safe_int(goals_val)
+                if participant == "home" and goals is not None:
+                    home_score = goals
+                if participant == "away" and goals is not None:
+                    away_score = goals
+            # Fallback to first occurrences
+            if home_score is None or away_score is None:
+                for s in scores_raw:
+                    score_obj = s.get("score") if isinstance(s, dict) else {}
+                    participant = (score_obj or {}).get("participant") or s.get("participant")
+                    goals_val = (score_obj or {}).get("goals")
+                    if goals_val is None:
+                        goals_val = s.get("goals")
+                    goals = _safe_int(goals_val)
+                    if participant == "home" and home_score is None:
+                        home_score = goals
+                    if participant == "away" and away_score is None:
+                        away_score = goals
         elif isinstance(scores_raw, dict):
             home_score = _safe_int(scores_raw.get("localteam_score") or scores_raw.get("home"))
             away_score = _safe_int(scores_raw.get("visitorteam_score") or scores_raw.get("away"))
@@ -182,6 +244,104 @@ class SyncService:
                 loc_map[location] = {"team_id": team_id, "score": score_val}
         return loc_map
 
+    def _store_statistics(self, fixture_id: int, stats: Iterable[Dict]) -> None:
+        for s in stats or []:
+            type_info = s.get("type") or {}
+            type_id = s.get("type_id") or type_info.get("id")
+            code = type_info.get("code") or (type_id and str(type_id))
+            name = type_info.get("name")
+            location = (s.get("location") or "").lower() or None
+            data = s.get("data") or {}
+            value = _extract_stat_value(data)
+            player_id = s.get("player_id")
+            team_id = s.get("participant_id") or s.get("team_id")
+
+            if player_id:
+                pk = (fixture_id, player_id, type_id, code)
+                obj = self.session.get(FixturePlayerStatistic, pk)
+                payload = {
+                    "fixture_id": fixture_id,
+                    "player_id": player_id,
+                    "team_id": team_id,
+                    "type_id": type_id,
+                    "code": code,
+                    "name": name,
+                    "value": value,
+                    "extra": s,
+                }
+                if obj:
+                    for k, v in payload.items():
+                        setattr(obj, k, v)
+                else:
+                    self.session.add(FixturePlayerStatistic(**payload))
+            elif team_id:
+                pk = (fixture_id, team_id, type_id, code, location)
+                obj = self.session.get(FixtureStatistic, pk)
+                payload = {
+                    "fixture_id": fixture_id,
+                    "team_id": team_id,
+                    "type_id": type_id,
+                    "code": code,
+                    "name": name,
+                    "location": location,
+                    "value": value,
+                    "extra": s,
+                }
+                if obj:
+                    for k, v in payload.items():
+                        setattr(obj, k, v)
+                else:
+                    self.session.add(FixtureStatistic(**payload))
+
+    def _store_lineups(self, fixture_id: int, lineups: Iterable[Dict]) -> None:
+        for l in lineups or []:
+            player_id = l.get("player_id") or (l.get("player") or {}).get("id")
+            if not player_id:
+                continue
+            team_id = l.get("team_id") or (l.get("team") or {}).get("id") or l.get("participant_id")
+            player = l.get("player") or {}
+            payload = {
+                "fixture_id": fixture_id,
+                "player_id": player_id,
+                "team_id": team_id,
+                "name": l.get("player_name") or player.get("fullname") or player.get("name"),
+                "position": l.get("position") or player.get("position") or player.get("position_name"),
+                "lineup_type": (l.get("type") or l.get("type_id") or "").__str__() if (l.get("type") or l.get("type_id")) else None,
+                "formation_position": str(l.get("formation_position") or l.get("formation_field") or "") or None,
+                "jersey_number": str(l.get("jersey_number") or l.get("number") or "") or None,
+                "extra": l,
+            }
+            obj = self.session.get(FixturePlayer, (fixture_id, player_id))
+            if obj:
+                for k, v in payload.items():
+                    setattr(obj, k, v)
+            else:
+                self.session.add(FixturePlayer(**payload))
+
+            for d in l.get("details") or []:
+                type_info = d.get("type") or {}
+                type_id = d.get("type_id") or type_info.get("id")
+                code = type_info.get("code") or (type_id and str(type_id))
+                name = type_info.get("name")
+                value = _extract_stat_value(d.get("data") or d.get("value"))
+                pk = (fixture_id, player_id, type_id, code)
+                obj_stat = self.session.get(FixturePlayerStatistic, pk)
+                payload_stat = {
+                    "fixture_id": fixture_id,
+                    "player_id": player_id,
+                    "team_id": team_id,
+                    "type_id": type_id,
+                    "code": code,
+                    "name": name,
+                    "value": value,
+                    "extra": d,
+                }
+                if obj_stat:
+                    for k, v in payload_stat.items():
+                        setattr(obj_stat, k, v)
+                else:
+                    self.session.add(FixturePlayerStatistic(**payload_stat))
+
     def _apply_participant_derivations(self, fixture: Fixture, loc_map: Dict[str, Dict]) -> None:
         if fixture.home_team_id is None and loc_map.get("home"):
             fixture.home_team_id = loc_map["home"].get("team_id")
@@ -207,6 +367,8 @@ class SyncService:
 
         loc_map = self._store_participants(fixture.id, raw.get("participants") or [])
         self._apply_participant_derivations(fixture, loc_map)
+        self._store_statistics(fixture.id, raw.get("statistics") or [])
+        self._store_lineups(fixture.id, raw.get("lineups") or [])
 
     def _chunks_newest_first(self, start: date, end: date, span_days: int = 90):
         cursor = end
@@ -219,7 +381,7 @@ class SyncService:
         params: Dict[str, object] = {}
         if league_ids:
             params["filters"] = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
-        includes = ["participants", "scores"]
+        includes = ["participants", "scores", "statistics", "lineups.details"]
         count = 0
         for chunk_start, chunk_end in self._chunks_newest_first(start, end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
@@ -237,7 +399,7 @@ class SyncService:
         if season.is_current and season_end > today:
             season_end = today + timedelta(days=1)
         params: Dict[str, object] = {"filters": f"fixtureSeasons:{season.id}"}
-        includes = ["participants", "scores"]
+        includes = ["participants", "scores", "statistics", "lineups.details"]
         count = 0
         for chunk_start, chunk_end in self._chunks_newest_first(season_start, season_end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"

@@ -54,6 +54,49 @@ class FixtureParticipant(Base):
     extra = Column(JSON, nullable=True)
 
 
+class FixtureStatistic(Base):
+    __tablename__ = "fixture_statistics"
+    __table_args__ = (PrimaryKeyConstraint("fixture_id", "team_id", "type_id", "code", "location"),)
+
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
+    type_id = Column(Integer, nullable=True)
+    code = Column(String, nullable=True)
+    name = Column(String, nullable=True)
+    location = Column(String, nullable=True)
+    value = Column(Integer, nullable=True)
+    extra = Column(JSON, nullable=True)
+
+
+class FixturePlayer(Base):
+    __tablename__ = "fixture_players"
+    __table_args__ = (PrimaryKeyConstraint("fixture_id", "player_id"),)
+
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), nullable=False)
+    player_id = Column(Integer, nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    name = Column(String, nullable=True)
+    position = Column(String, nullable=True)
+    lineup_type = Column(String, nullable=True)  # lineup/substitute
+    formation_position = Column(String, nullable=True)
+    jersey_number = Column(String, nullable=True)
+    extra = Column(JSON, nullable=True)
+
+
+class FixturePlayerStatistic(Base):
+    __tablename__ = "fixture_player_statistics"
+    __table_args__ = (PrimaryKeyConstraint("fixture_id", "player_id", "type_id", "code"),)
+
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), nullable=False)
+    player_id = Column(Integer, nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    type_id = Column(Integer, nullable=True)
+    code = Column(String, nullable=True)
+    name = Column(String, nullable=True)
+    value = Column(Integer, nullable=True)
+    extra = Column(JSON, nullable=True)
+
+
 class SyncState(Base):
     __tablename__ = "sync_state"
 
