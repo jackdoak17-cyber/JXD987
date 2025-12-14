@@ -465,22 +465,24 @@ class SyncService:
         end_dt = datetime.fromisoformat(end)
         max_span = 95  # SportMonks caps date range at 100 days
         total = 0
-        cursor = start_dt
-        while cursor <= end_dt:
-            chunk_end = min(cursor + timedelta(days=max_span - 1), end_dt)
+
+        # Process newest chunks first so limited runs keep recent fixtures fresh.
+        cursor = end_dt
+        while cursor >= start_dt:
+            chunk_start = max(cursor - timedelta(days=max_span - 1), start_dt)
             remaining = None if limit is None else max(limit - total, 0)
             if remaining == 0:
                 break
             chunk_limit = remaining if remaining else None
             count = self.sync_fixtures_between(
-                start_date=cursor.date().isoformat(),
-                end_date=chunk_end.date().isoformat(),
+                start_date=chunk_start.date().isoformat(),
+                end_date=cursor.date().isoformat(),
                 league_ids=league_ids,
                 with_details=with_details,
                 limit=chunk_limit,
             )
             total += count
-            cursor = chunk_end + timedelta(days=1)
+            cursor = chunk_start - timedelta(days=1)
         log.info("History window complete: %s fixtures stored", total)
         return total
 
