@@ -1,0 +1,37 @@
+name: Spotcheck SportMonks vs SQLite
+
+on:
+  workflow_dispatch:
+
+jobs:
+  spotcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run recent sync (refresh sqlite)
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+        run: |
+          python3 scripts/run_sync.py --mode recent --leagues "8"
+
+      - name: Spotcheck recent finished fixtures
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+        run: python3 scripts/spotcheck_recent_finished.py

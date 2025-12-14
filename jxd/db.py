@@ -1,37 +1,28 @@
-from __future__ import annotations
-
-import logging
+import os
 from pathlib import Path
-from typing import Iterator
 
 from sqlalchemy import create_engine
-from sqlalchemy.orm import Session, declarative_base, sessionmaker
-
-log = logging.getLogger(__name__)
-
-Base = declarative_base()
+from sqlalchemy.orm import sessionmaker, Session
 
 
-def make_engine(database_url: str):
-    if database_url.startswith("sqlite:///"):
-        db_path = Path(database_url.replace("sqlite:///", ""))
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-    engine = create_engine(database_url, future=True)
-    return engine
+def _db_path() -> str:
+    """
+    Resolve the SQLite path from env (JXD_DB_PATH) or default to data/jxd.sqlite.
+    Ensures parent directory exists.
+    """
+    default = Path("data") / "jxd.sqlite"
+    path = Path(os.environ.get("JXD_DB_PATH", str(default)))
+    if path.parent and not path.parent.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
 
 
-def make_session(database_url: str) -> Session:
-    engine = make_engine(database_url)
-    return sessionmaker(bind=engine, expire_on_commit=False, future=True)()
+def get_engine(echo: bool = False):
+    return create_engine(f"sqlite:///{_db_path()}", echo=echo, future=True)
 
 
-def session_scope(session: Session) -> Iterator[Session]:
-    try:
-        yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
+def get_session(engine=None) -> Session:
+    if engine is None:
+        engine = get_engine()
+    SessionLocal = sessionmaker(bind=engine, future=True)
+    return SessionLocal()

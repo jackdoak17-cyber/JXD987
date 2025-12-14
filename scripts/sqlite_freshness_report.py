@@ -1,201 +1,119 @@
-import datetime as dt
+#!/usr/bin/env python3
+"""
+Report SQLite fixture freshness using fixture scores and participant scores.
+"""
+
 import json
-import re
+import os
 import sqlite3
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta
+from pathlib import Path
+
+DB_PATH = Path(os.environ.get("JXD_DB_PATH", "data/jxd.sqlite"))
+AGE_DAYS = int(os.environ.get("FRESHNESS_MAX_AGE_DAYS", "30"))
+ARSENAL_ID = 19
+LEAGUE_ID = 8
+MIN_DATE = "2025-08-01"
 
 
-def to_int(value: Any) -> Optional[int]:
-  if value is None:
-    return None
-  if isinstance(value, bool):
-    return None
-  if isinstance(value, (int, float)):
-    return int(value)
-  if isinstance(value, str):
-    s = value.strip()
-    if re.fullmatch(r"-?\d+", s):
-      try:
-        return int(s)
-      except ValueError:
-        return None
-  return None
-
-
-def parse_ts(ts: Optional[str]) -> Optional[dt.datetime]:
-  if not ts:
-    return None
-  try:
-    return dt.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-  except Exception:
-    try:
-      # Fallback for "YYYY-MM-DD HH:MM:SS"
-      return dt.datetime.fromisoformat(ts)
-    except Exception:
-      return None
-
-
-def participant_location(location: Optional[str], extra: Optional[str]) -> str:
-  loc = (location or "").lower()
-  if loc:
-    return loc
-  if extra:
-    try:
-      data = json.loads(extra)
-    except Exception:
-      data = {}
-    meta = {}
-    if isinstance(data, dict):
-      meta = data.get("meta") or {}
-      if isinstance(meta, dict) and meta.get("location"):
-        return str(meta.get("location")).lower()
-      if data.get("location"):
-        return str(data.get("location")).lower()
-    if isinstance(meta, dict) and meta.get("location"):
-      return str(meta.get("location")).lower()
-  return ""
+def query_one(cur: sqlite3.Cursor, sql: str, params=()):
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    return row[0] if row else None
 
 
 def main() -> int:
-  conn = sqlite3.connect("data/jxd.sqlite")
-  now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-  threshold = now - dt.timedelta(days=30)
-  now_iso = now.replace(microsecond=0).isoformat() + "Z"
+    if not DB_PATH.exists():
+        print(json.dumps({"error": f"sqlite not found at {DB_PATH}"}))
+        return 1
 
-  fixtures_total = conn.execute("select count(*) from fixtures").fetchone()[0]
-  fixtures_scored_in_fixtures = conn.execute(
-    "select count(*) from fixtures where home_score is not null and away_score is not null"
-  ).fetchone()[0]
-  max_scored_starting_at_in_fixtures = conn.execute(
-    "select max(starting_at) from fixtures where home_score is not null and away_score is not null"
-  ).fetchone()[0]
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
 
-  participants_rows = conn.execute(
-    """
-    select fp.fixture_id, fp.team_id, fp.location, fp.score, fp.extra,
-           f.starting_at, f.league_id
-    from fixture_participants fp
-    join fixtures f on f.id = fp.fixture_id
-    """
-  ).fetchall()
-
-  participants_map: Dict[int, Dict[str, Any]] = {}
-  for row in participants_rows:
-    fixture_id, team_id, loc_raw, score_raw, extra, starting_at, league_id = row
-    loc = participant_location(loc_raw, extra)
-    score_int = to_int(score_raw)
-    entry = participants_map.setdefault(
-      fixture_id,
-      {
-        "starting_at": starting_at,
-        "league_id": league_id,
-        "has_arsenal": False,
-        "home_score": None,
-        "away_score": None,
-      },
+    fixtures_total = query_one(cur, "select count(*) from fixtures")
+    fixtures_scored = query_one(cur, "select count(*) from fixtures where home_score is not null and away_score is not null")
+    max_scored_fixture = query_one(
+        cur,
+        "select max(starting_at) from fixtures where home_score is not null and away_score is not null",
     )
-    if team_id == 19:
-      entry["has_arsenal"] = True
-    if loc == "home" and score_int is not None and entry["home_score"] is None:
-      entry["home_score"] = score_int
-    if loc == "away" and score_int is not None and entry["away_score"] is None:
-      entry["away_score"] = score_int
 
-  fixtures_with_participant_scores = 0
-  max_scored_starting_at_from_participants: Optional[str] = None
-  league_8_participant_scored = 0
-  league_8_max_scored = None
-  arsenal_participant_scored_since = 0
-
-  for fixture_id, entry in participants_map.items():
-    home_score = entry.get("home_score")
-    away_score = entry.get("away_score")
-    if home_score is None or away_score is None:
-      continue
-    fixtures_with_participant_scores += 1
-    start_str = entry.get("starting_at")
-    if start_str and (
-      max_scored_starting_at_from_participants is None
-      or parse_ts(start_str) > parse_ts(max_scored_starting_at_from_participants)
-    ):
-      max_scored_starting_at_from_participants = start_str
-    if entry.get("league_id") == 8:
-      league_8_participant_scored += 1
-      if start_str and (
-        league_8_max_scored is None
-        or parse_ts(start_str) > parse_ts(league_8_max_scored)
-      ):
-        league_8_max_scored = start_str
-    if entry.get("has_arsenal"):
-      start_dt = parse_ts(start_str)
-      if start_dt and start_dt >= dt.datetime(2025, 8, 1):
-        arsenal_participant_scored_since += 1
-
-  league_8_fixtures_scored_since = conn.execute(
-    """
-    select count(*) from fixtures
-    where league_id=8
-      and starting_at >= '2025-08-01'
-      and home_score is not null and away_score is not null
-    """
-  ).fetchone()[0]
-
-  arsenal_scored_since_fixtures = conn.execute(
-    """
-    select count(*) from fixtures f
-    join fixture_participants fp on fp.fixture_id = f.id
-    where fp.team_id = 19
-      and f.starting_at >= '2025-08-01'
-      and f.home_score is not null
-      and f.away_score is not null
-    """
-  ).fetchone()[0]
-
-  max_fix_ts = parse_ts(max_scored_starting_at_in_fixtures)
-  max_part_ts = parse_ts(max_scored_starting_at_from_participants)
-  stale = True
-  if (max_fix_ts and max_fix_ts >= threshold) or (
-    max_part_ts and max_part_ts >= threshold
-  ):
-    stale = False
-
-  report = {
-    "now_utc": now_iso,
-    "fixtures_total": fixtures_total,
-    "fixtures_scored_in_fixtures_table": fixtures_scored_in_fixtures,
-    "max_scored_starting_at_in_fixtures_table": max_scored_starting_at_in_fixtures,
-    "fixtures_with_participant_scores_both_sides": fixtures_with_participant_scores,
-    "max_scored_starting_at_from_participants": max_scored_starting_at_from_participants,
-    "league_8": {
-      "fixtures_scored_total_in_fixtures_table": conn.execute(
-        "select count(*) from fixtures where league_id=8 and home_score is not null and away_score is not null"
-      ).fetchone()[0],
-      "fixtures_scored_since_2025_08_01_in_fixtures_table": league_8_fixtures_scored_since,
-      "fixtures_scored_total_from_participants": league_8_participant_scored,
-      "max_scored_starting_at_from_participants": league_8_max_scored,
-    },
-    "team_19_arsenal": {
-      "fixtures_scored_total_in_fixtures_table": conn.execute(
+    participants_scored = query_one(
+        cur,
         """
-        select count(*) from fixtures f
-        join fixture_participants fp on fp.fixture_id = f.id
-        where fp.team_id = 19
-          and f.home_score is not null
-          and f.away_score is not null
+        select count(*) from (
+            select fp.fixture_id
+            from fixture_participants fp
+            join fixtures f on f.id = fp.fixture_id
+            group by fp.fixture_id
+            having sum(case when lower(coalesce(fp.location,''))='home' and fp.score is not null then 1 else 0 end) >= 1
+               and sum(case when lower(coalesce(fp.location,''))='away' and fp.score is not null then 1 else 0 end) >= 1
+        )
+        """,
+    )
+    max_participant_scored = query_one(
+        cur,
         """
-      ).fetchone()[0],
-      "arsenal_scored_since_2025_08_01_in_fixtures_table": arsenal_scored_since_fixtures,
-      "arsenal_scored_since_2025_08_01_from_participants": arsenal_participant_scored_since,
-    },
-    "stale": stale,
-  }
+        select max(f.starting_at) from fixture_participants fp
+        join fixtures f on f.id = fp.fixture_id
+        group by fp.fixture_id
+        having sum(case when lower(coalesce(fp.location,''))='home' and fp.score is not null then 1 else 0 end) >= 1
+           and sum(case when lower(coalesce(fp.location,''))='away' and fp.score is not null then 1 else 0 end) >= 1
+        order by max(f.starting_at) desc
+        limit 1
+        """,
+    )
 
-  print(json.dumps(report, indent=2))
-  if stale:
-    print("STALE=true")
-    return 1
-  return 0
+    league_scored_since = query_one(
+        cur,
+        """
+        select count(*) from fixtures
+        where league_id=? and starting_at >= ? and home_score is not null and away_score is not null
+        """,
+        (LEAGUE_ID, MIN_DATE),
+    )
+
+    arsenal_scored_since = query_one(
+        cur,
+        """
+        select count(*) from fixture_participants fp
+        join fixtures f on f.id = fp.fixture_id
+        where fp.team_id=? and f.starting_at >= ?
+          and f.home_score is not null and f.away_score is not null
+        """,
+        (ARSENAL_ID, MIN_DATE),
+    )
+
+    now = datetime.utcnow()
+    cutoff = now - timedelta(days=AGE_DAYS)
+
+    def _parse_dt(val):
+        if not val:
+            return None
+        try:
+            return datetime.fromisoformat(str(val))
+        except Exception:
+            return None
+
+    max_fixture_dt = _parse_dt(max_scored_fixture)
+    max_participant_dt = _parse_dt(max_participant_scored)
+    dates = [d for d in (max_fixture_dt, max_participant_dt) if d]
+    stale = not dates or all(d < cutoff for d in dates)
+
+    report = {
+        "fixtures_total": fixtures_total,
+        "fixtures_scored_in_fixtures_table": fixtures_scored,
+        "max_scored_starting_at_in_fixtures_table": max_scored_fixture,
+        "fixtures_with_participant_scores_both_sides": participants_scored,
+        "max_scored_starting_at_from_participants": max_participant_scored,
+        "league_8_scored_since_2025_08_01": league_scored_since,
+        "team_19_arsenal_scored_since_2025_08_01": arsenal_scored_since,
+        "stale": stale,
+        "now_utc": now.isoformat(),
+        "age_cutoff_days": AGE_DAYS,
+    }
+    print(json.dumps(report, default=str))
+    return 1 if stale else 0
 
 
 if __name__ == "__main__":
-  raise SystemExit(main())
+    raise SystemExit(main())
