@@ -27,6 +27,17 @@ class Team(Base):
     extra = Column(JSON, nullable=True)
 
 
+class Player(Base):
+    __tablename__ = "players"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=True)
+    short_name = Column(String, nullable=True)
+    common_name = Column(String, nullable=True)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    extra = Column(JSON, nullable=True)
+
+
 class Fixture(Base):
     __tablename__ = "fixtures"
 
@@ -80,6 +91,9 @@ class FixturePlayer(Base):
     lineup_type = Column(String, nullable=True)  # lineup/substitute
     formation_position = Column(String, nullable=True)
     jersey_number = Column(String, nullable=True)
+    is_starter = Column(Boolean, nullable=True)
+    minutes_played = Column(Integer, nullable=True)
+    position_name = Column(String, nullable=True)
     extra = Column(JSON, nullable=True)
 
 

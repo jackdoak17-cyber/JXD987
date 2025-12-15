@@ -36,8 +36,32 @@ jobs:
       - name: Freshness report
         run: python3 scripts/sqlite_freshness_report.py
 
+      - name: Inspect SQLite counts
+        run: |
+          sqlite3 data/jxd.sqlite ".tables"
+          sqlite3 data/jxd.sqlite "select count(*) as fixtures from fixtures;"
+          sqlite3 data/jxd.sqlite "select count(*) as teams from teams;"
+          sqlite3 data/jxd.sqlite "select count(*) as players from players;"
+          sqlite3 data/jxd.sqlite "select count(*) as fixture_statistics from fixture_statistics;"
+          sqlite3 data/jxd.sqlite "select count(*) as fixture_player_statistics from fixture_player_statistics;"
+          sqlite3 data/jxd.sqlite "select count(*) as fixture_players from fixture_players;"
+
       - name: Export to Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python3 scripts/export_to_supabase.py --strict
+
+      - name: Verify Supabase table counts
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          for table in seasons teams fixtures players fixture_statistics fixture_player_statistics fixture_players; do
+            echo "Table: $table"
+            curl -s -D - -o /dev/null \
+              -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Prefer: count=exact" \
+              "$SUPABASE_URL/rest/v1/$table?select=id&limit=1" | grep -i content-range || true
+          done

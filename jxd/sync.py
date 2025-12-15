@@ -12,6 +12,7 @@ from .models import (
     Base,
     Season,
     Team,
+    Player,
     Fixture,
     FixtureParticipant,
     FixtureStatistic,
@@ -69,6 +70,17 @@ def _extract_stat_value(data) -> Optional[int]:
             parsed = _safe_int(v)
             if parsed is not None:
                 return parsed
+    return None
+
+
+def _is_starter(lineup_type: Optional[object]) -> Optional[bool]:
+    if lineup_type is None:
+        return None
+    text = str(lineup_type).lower()
+    if text in {"11", "lineup", "starting", "starter", "1"}:
+        return True
+    if text in {"12", "substitute", "sub", "bench"}:
+        return False
     return None
 
 
@@ -300,15 +312,39 @@ class SyncService:
                 continue
             team_id = l.get("team_id") or (l.get("team") or {}).get("id") or l.get("participant_id")
             player = l.get("player") or {}
+            # Upsert player master record
+            player_payload = {
+                "id": player_id,
+                "name": player.get("fullname") or player.get("name") or l.get("player_name"),
+                "short_name": player.get("short_name") or player.get("short_code"),
+                "common_name": player.get("common_name"),
+                "team_id": team_id,
+                "extra": player or l,
+            }
+            _upsert(self.session, Player, player_payload)
+
+            minutes_played = _safe_int(
+                l.get("minutes") or l.get("played") or (l.get("statistics") or {}).get("minutes")
+            )
+            position_name = (
+                l.get("position_name")
+                or player.get("position_name")
+                or player.get("position")
+                or l.get("position")
+            )
+            starter_flag = _is_starter(l.get("type") or l.get("type_id") or l.get("lineup_type"))
             payload = {
                 "fixture_id": fixture_id,
                 "player_id": player_id,
                 "team_id": team_id,
                 "name": l.get("player_name") or player.get("fullname") or player.get("name"),
                 "position": l.get("position") or player.get("position") or player.get("position_name"),
+                "position_name": position_name,
                 "lineup_type": (l.get("type") or l.get("type_id") or "").__str__() if (l.get("type") or l.get("type_id")) else None,
                 "formation_position": str(l.get("formation_position") or l.get("formation_field") or "") or None,
                 "jersey_number": str(l.get("jersey_number") or l.get("number") or "") or None,
+                "is_starter": starter_flag,
+                "minutes_played": minutes_played,
                 "extra": l,
             }
             obj = self.session.get(FixturePlayer, (fixture_id, player_id))

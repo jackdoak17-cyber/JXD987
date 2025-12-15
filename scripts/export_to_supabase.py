@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """
-Export a pruned subset of SQLite data to Supabase via REST:
+Export a pruned subset of SQLite data to Supabase via REST.
 - seasons: current + previous per league
 - teams: only those referenced by exported fixtures
 - fixtures: only with both scores and valid home/away teams
-- prune Supabase fixtures not in kept seasons
+- players: only players referenced by exported fixture player stats/lineups
+- fixture_players: only for exported fixtures
+- fixture_statistics: only for exported fixtures
+- fixture_player_statistics: only for exported fixtures
+
+Supports --dry-run to print the payload counts without hitting Supabase.
 """
 
 import argparse
 import json
 import os
 import sqlite3
-from typing import Dict, List, Sequence, Set
+from typing import Dict, List, Sequence, Set, Tuple
 
 import requests
 
@@ -20,8 +25,20 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 REST_PATH = "/rest/v1"
 
+REQUIRED_TABLES = [
+    "seasons",
+    "teams",
+    "fixtures",
+    "players",
+    "fixture_players",
+    "fixture_statistics",
+    "fixture_player_statistics",
+]
 
-def require_env() -> None:
+
+def require_env(dry_run: bool) -> None:
+    if dry_run:
+        return
     missing = []
     if not SUPABASE_URL:
         missing.append("SUPABASE_URL")
@@ -32,7 +49,18 @@ def require_env() -> None:
 
 
 def get_conn() -> sqlite3.Connection:
+    if not os.path.exists(DB_PATH):
+        raise SystemExit(f"SQLite DB not found at {DB_PATH}")
     return sqlite3.connect(DB_PATH)
+
+
+def ensure_tables_exist(conn: sqlite3.Connection, tables: Sequence[str]) -> None:
+    cur = conn.cursor()
+    cur.execute("select name from sqlite_master where type='table'")
+    existing = {row[0] for row in cur.fetchall()}
+    missing = [t for t in tables if t not in existing]
+    if missing:
+        raise SystemExit(f"Missing required tables in SQLite: {', '.join(missing)}")
 
 
 def choose_keep_seasons(conn: sqlite3.Connection) -> Set[int]:
@@ -128,6 +156,102 @@ def fetch_teams(conn: sqlite3.Connection, team_ids: Sequence[int]) -> List[Dict]
     return [{"id": r[0], "name": r[1], "short_code": r[2]} for r in cur.fetchall()]
 
 
+def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) -> List[Dict]:
+    if not fixture_ids:
+        return []
+    cur = conn.cursor()
+    q = ",".join("?" for _ in fixture_ids)
+    cur.execute(
+        f"""
+        select fixture_id, player_id, team_id, is_starter, minutes_played, position_name
+        from fixture_players
+        where fixture_id in ({q})
+        """,
+        fixture_ids,
+    )
+    return [
+        {
+            "fixture_id": r[0],
+            "player_id": r[1],
+            "team_id": r[2],
+            "is_starter": r[3],
+            "minutes_played": r[4],
+            "position_name": r[5],
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def fetch_fixture_statistics(conn: sqlite3.Connection, fixture_ids: Sequence[int]) -> List[Dict]:
+    if not fixture_ids:
+        return []
+    cur = conn.cursor()
+    q = ",".join("?" for _ in fixture_ids)
+    cur.execute(
+        f"""
+        select fixture_id, team_id, type_id, value
+        from fixture_statistics
+        where fixture_id in ({q})
+        """,
+        fixture_ids,
+    )
+    return [
+        {
+            "fixture_id": r[0],
+            "team_id": r[1],
+            "type_id": r[2],
+            "value": r[3],
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def fetch_fixture_player_statistics(conn: sqlite3.Connection, fixture_ids: Sequence[int]) -> List[Dict]:
+    if not fixture_ids:
+        return []
+    cur = conn.cursor()
+    q = ",".join("?" for _ in fixture_ids)
+    cur.execute(
+        f"""
+        select fixture_id, player_id, team_id, type_id, value
+        from fixture_player_statistics
+        where fixture_id in ({q})
+        """,
+        fixture_ids,
+    )
+    return [
+        {
+            "fixture_id": r[0],
+            "player_id": r[1],
+            "team_id": r[2],
+            "type_id": r[3],
+            "value": r[4],
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def fetch_players(conn: sqlite3.Connection, player_ids: Sequence[int]) -> List[Dict]:
+    if not player_ids:
+        return []
+    cur = conn.cursor()
+    q = ",".join("?" for _ in player_ids)
+    cur.execute(
+        f"select id, name, short_name, common_name, team_id from players where id in ({q})",
+        player_ids,
+    )
+    return [
+        {
+            "id": r[0],
+            "name": r[1],
+            "short_name": r[2],
+            "common_name": r[3],
+            "team_id": r[4],
+        }
+        for r in cur.fetchall()
+    ]
+
+
 def rest_headers() -> Dict[str, str]:
     return {
         "apikey": SUPABASE_KEY,
@@ -137,22 +261,36 @@ def rest_headers() -> Dict[str, str]:
     }
 
 
-def upsert(table: str, rows: List[Dict]) -> int:
+def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) -> int:
     if not rows:
         return 0
+    if dry_run:
+        return len(rows)
+
     url = SUPABASE_URL.rstrip("/") + REST_PATH + f"/{table}"
     total = 0
     chunk = 500
+    headers = rest_headers()
     for i in range(0, len(rows), chunk):
         batch = rows[i : i + chunk]
-        resp = requests.post(url, headers=rest_headers(), params={"on_conflict": "id"}, data=json.dumps(batch))
+        resp = requests.post(
+            url,
+            headers=headers,
+            params={"on_conflict": on_conflict},
+            data=json.dumps(batch),
+            timeout=30,
+        )
         if not resp.ok:
-            raise SystemExit(f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}")
+            raise SystemExit(
+                f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}"
+            )
         total += len(batch)
     return total
 
 
-def prune_fixtures(keep_ids: Sequence[int]) -> int:
+def prune_fixtures(keep_ids: Sequence[int], dry_run: bool) -> int:
+    if dry_run:
+        return 0
     url = SUPABASE_URL.rstrip("/") + REST_PATH + "/fixtures"
     params = {"season_id": f"not.in.({','.join(str(x) for x in keep_ids)})"}
     resp = requests.delete(url, headers={**rest_headers(), "Prefer": "count=exact"}, params=params)
@@ -169,11 +307,14 @@ def prune_fixtures(keep_ids: Sequence[int]) -> int:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--strict", action="store_true", default=True)
+    parser.add_argument("--dry-run", action="store_true", help="Compute payload sizes without sending to Supabase")
     args = parser.parse_args()
 
-    require_env()
+    require_env(args.dry_run)
 
     conn = get_conn()
+    ensure_tables_exist(conn, REQUIRED_TABLES)
+
     keep_ids = choose_keep_seasons(conn)
     if not keep_ids:
         raise SystemExit("No seasons to export")
@@ -189,18 +330,52 @@ def main():
         raise SystemExit(f"Strict export: dropping {dropped} fixtures with missing teams")
     fixtures = filtered_fixtures
 
+    fixture_ids: Set[int] = {f["id"] for f in fixtures}
+
+    fixture_players = fetch_fixture_players(conn, list(fixture_ids))
+    fixture_stats = fetch_fixture_statistics(conn, list(fixture_ids))
+    fixture_player_stats = fetch_fixture_player_statistics(conn, list(fixture_ids))
+
+    player_ids: Set[int] = set()
+    for fp in fixture_players:
+        if fp.get("player_id"):
+            player_ids.add(fp["player_id"])
+    for fps in fixture_player_stats:
+        if fps.get("player_id"):
+            player_ids.add(fps["player_id"])
+
+    players = fetch_players(conn, list(player_ids))
+
     exported = {
-        "seasons": upsert("seasons", seasons),
-        "teams": upsert("teams", teams),
-        "fixtures": upsert("fixtures", fixtures),
+        "seasons": upsert_table("seasons", seasons, "id", args.dry_run),
+        "teams": upsert_table("teams", teams, "id", args.dry_run),
+        "fixtures": upsert_table("fixtures", fixtures, "id", args.dry_run),
+        "players": upsert_table("players", players, "id", args.dry_run),
+        "fixture_players": upsert_table(
+            "fixture_players", fixture_players, "fixture_id,player_id", args.dry_run
+        ),
+        "fixture_statistics": upsert_table(
+            "fixture_statistics", fixture_stats, "fixture_id,team_id,type_id", args.dry_run
+        ),
+        "fixture_player_statistics": upsert_table(
+            "fixture_player_statistics",
+            fixture_player_stats,
+            "fixture_id,player_id,type_id",
+            args.dry_run,
+        ),
     }
-    pruned = prune_fixtures(list(keep_ids))
+    pruned = prune_fixtures(list(keep_ids), args.dry_run)
 
     summary = {
+        "dry_run": args.dry_run,
         "keep_season_ids": list(keep_ids),
         "fixtures_exported": exported["fixtures"],
         "teams_exported": exported["teams"],
         "seasons_exported": exported["seasons"],
+        "players_exported": exported["players"],
+        "fixture_players_exported": exported["fixture_players"],
+        "fixture_statistics_exported": exported["fixture_statistics"],
+        "fixture_player_statistics_exported": exported["fixture_player_statistics"],
         "fixtures_dropped_missing_teams": dropped,
         "fixtures_pruned_other_seasons": pruned,
     }
