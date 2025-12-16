@@ -127,7 +127,6 @@ POSITION_ABBR_MAP = {
     "goalkeeper": "GK",
     "striker": "ST",
     "centre-forward": "ST",
-    "attacker": "ST",
 }
 
 
@@ -442,7 +441,7 @@ class SyncService:
             dp_id = dp_obj.get("id")
             dp_name = dp_obj.get("name")
             dp_code = dp_obj.get("code")
-            position_abbr = map_position_code_to_abbr(dp_code, dp_name or detailed_position_name or position_name, fallback=position_name)
+            position_abbr = map_position_code_to_abbr(dp_code, dp_name or detailed_position_name or position_name, fallback=None)
             formation_field_val = l.get("formation_field")
             formation_position_val = _safe_int(l.get("formation_position"))
             payload = {
