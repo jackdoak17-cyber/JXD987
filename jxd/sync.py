@@ -111,27 +111,36 @@ MINUTES_NAME_HINTS = ("minute", "minutes")
 
 
 POSITION_ABBR_MAP = {
+    "right-wing": "RW",
+    "left-wing": "LW",
+    "right-winger": "RW",
+    "left-winger": "LW",
+    "right-midfield": "RM",
+    "left-midfield": "LM",
     "central-midfield": "CM",
     "defensive-midfield": "DM",
     "attacking-midfield": "AM",
-    "left-midfield": "LM",
-    "right-midfield": "RM",
-    "left-back": "LB",
     "right-back": "RB",
+    "left-back": "LB",
     "centre-back": "CB",
+    "central-defender": "CB",
     "goalkeeper": "GK",
+    "striker": "ST",
+    "centre-forward": "ST",
     "attacker": "ST",
-    "left-winger": "LW",
-    "right-winger": "RW",
 }
 
 
-def map_position_code_to_abbr(code: str, fallback: str | None = None) -> str | None:
-    if not code:
-        return fallback
-    abbr = POSITION_ABBR_MAP.get(str(code).lower())
-    if abbr:
-        return abbr
+def map_position_code_to_abbr(code: str, name: str | None = None, fallback: str | None = None) -> str | None:
+    if code:
+        abbr = POSITION_ABBR_MAP.get(str(code).lower())
+        if abbr:
+            return abbr
+    if name:
+        lower_name = name.lower()
+        for key, abbr in POSITION_ABBR_MAP.items():
+            if key in lower_name:
+                return abbr
     return fallback
 
 def _extract_minutes(lineup: Dict, details: Iterable[Dict]) -> Optional[int]:
@@ -433,7 +442,7 @@ class SyncService:
             dp_id = dp_obj.get("id")
             dp_name = dp_obj.get("name")
             dp_code = dp_obj.get("code")
-            position_abbr = map_position_code_to_abbr(dp_code, fallback=position_name)
+            position_abbr = map_position_code_to_abbr(dp_code, dp_name or detailed_position_name or position_name, fallback=position_name)
             formation_field_val = l.get("formation_field")
             formation_position_val = _safe_int(l.get("formation_position"))
             payload = {
