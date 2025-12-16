@@ -98,6 +98,10 @@ class FixturePlayer(Base):
     detailed_position_name = Column(String, nullable=True)
     detailed_position_code = Column(String, nullable=True)
     formation_field = Column(String, nullable=True)
+    lineup_detailed_position_id = Column(Integer, nullable=True)
+    lineup_detailed_position_name = Column(String, nullable=True)
+    lineup_detailed_position_code = Column(String, nullable=True)
+    position_abbr = Column(String, nullable=True)
     extra = Column(JSON, nullable=True)
 
 

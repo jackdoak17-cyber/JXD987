@@ -165,7 +165,9 @@ def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) 
         f"""
         select fixture_id, player_id, team_id, is_starter, minutes_played, position_name,
                detailed_position_id, detailed_position_name, detailed_position_code,
-               formation_field, formation_position
+               formation_field, formation_position,
+               lineup_detailed_position_id, lineup_detailed_position_name, lineup_detailed_position_code,
+               position_abbr
         from fixture_players
         where fixture_id in ({q})
         """,
@@ -184,6 +186,10 @@ def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) 
             "detailed_position_code": r[8],
             "formation_field": r[9],
             "formation_position": r[10],
+            "lineup_detailed_position_id": r[11],
+            "lineup_detailed_position_name": r[12],
+            "lineup_detailed_position_code": r[13],
+            "position_abbr": r[14],
         }
         for r in cur.fetchall()
     ]

@@ -54,6 +54,10 @@ def _ensure_fixture_player_columns(engine) -> None:
             "detailed_position_code": "TEXT",
             "formation_field": "TEXT",
             "formation_position": "INTEGER",
+            "lineup_detailed_position_id": "INTEGER",
+            "lineup_detailed_position_name": "TEXT",
+            "lineup_detailed_position_code": "TEXT",
+            "position_abbr": "TEXT",
         }
         for name, ddl_type in desired.items():
             if name not in cols:
@@ -104,6 +108,31 @@ def _is_starter(lineup_type: Optional[object]) -> Optional[bool]:
 MINUTES_TYPE_IDS = {119, 1584}
 MINUTES_NAME_HINTS = ("minute", "minutes")
 
+
+
+POSITION_ABBR_MAP = {
+    "central-midfield": "CM",
+    "defensive-midfield": "DM",
+    "attacking-midfield": "AM",
+    "left-midfield": "LM",
+    "right-midfield": "RM",
+    "left-back": "LB",
+    "right-back": "RB",
+    "centre-back": "CB",
+    "goalkeeper": "GK",
+    "attacker": "ST",
+    "left-winger": "LW",
+    "right-winger": "RW",
+}
+
+
+def map_position_code_to_abbr(code: str, fallback: str | None = None) -> str | None:
+    if not code:
+        return fallback
+    abbr = POSITION_ABBR_MAP.get(str(code).lower())
+    if abbr:
+        return abbr
+    return fallback
 
 def _extract_minutes(lineup: Dict, details: Iterable[Dict]) -> Optional[int]:
     # Direct fields on the lineup
@@ -400,6 +429,11 @@ class SyncService:
                 or position_obj.get("detailed_position_code")
                 or position_obj.get("code")
             )
+            dp_obj = l.get("detailedposition") or l.get("detailed_position") or {}
+            dp_id = dp_obj.get("id")
+            dp_name = dp_obj.get("name")
+            dp_code = dp_obj.get("code")
+            position_abbr = map_position_code_to_abbr(dp_code, fallback=position_name)
             formation_field_val = l.get("formation_field")
             formation_position_val = _safe_int(l.get("formation_position"))
             payload = {
@@ -418,6 +452,10 @@ class SyncService:
                 "detailed_position_id": _safe_int(detailed_position_id),
                 "detailed_position_name": str(detailed_position_name) if detailed_position_name is not None else None,
                 "detailed_position_code": str(detailed_position_code) if detailed_position_code is not None else None,
+                "lineup_detailed_position_id": _safe_int(dp_id),
+                "lineup_detailed_position_name": str(dp_name) if dp_name is not None else None,
+                "lineup_detailed_position_code": str(dp_code) if dp_code is not None else None,
+                "position_abbr": position_abbr,
                 "extra": l,
             }
             obj = self.session.get(FixturePlayer, (fixture_id, player_id))
@@ -490,7 +528,7 @@ class SyncService:
         params: Dict[str, object] = {}
         if league_ids:
             params["filters"] = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
-        includes = ["participants", "scores", "statistics", "lineups.details", "lineups.position"]
+        includes = ["participants", "scores", "statistics", "lineups.details", "lineups.position", "lineups.detailedposition"]
         count = 0
         for chunk_start, chunk_end in self._chunks_newest_first(start, end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
@@ -508,7 +546,7 @@ class SyncService:
         if season.is_current and season_end > today:
             season_end = today + timedelta(days=1)
         params: Dict[str, object] = {"filters": f"fixtureSeasons:{season.id}"}
-        includes = ["participants", "scores", "statistics", "lineups.details", "lineups.position"]
+        includes = ["participants", "scores", "statistics", "lineups.details", "lineups.position", "lineups.detailedposition"]
         count = 0
         for chunk_start, chunk_end in self._chunks_newest_first(season_start, season_end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
