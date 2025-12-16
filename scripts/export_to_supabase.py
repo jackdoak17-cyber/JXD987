@@ -163,7 +163,9 @@ def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) 
     q = ",".join("?" for _ in fixture_ids)
     cur.execute(
         f"""
-        select fixture_id, player_id, team_id, is_starter, minutes_played, position_name
+        select fixture_id, player_id, team_id, is_starter, minutes_played, position_name,
+               detailed_position_id, detailed_position_name, detailed_position_code,
+               formation_field, formation_position
         from fixture_players
         where fixture_id in ({q})
         """,
@@ -177,6 +179,11 @@ def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) 
             "is_starter": r[3],
             "minutes_played": r[4],
             "position_name": r[5],
+            "detailed_position_id": r[6],
+            "detailed_position_name": r[7],
+            "detailed_position_code": r[8],
+            "formation_field": r[9],
+            "formation_position": r[10],
         }
         for r in cur.fetchall()
     ]

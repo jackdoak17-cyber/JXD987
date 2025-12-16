@@ -89,11 +89,15 @@ class FixturePlayer(Base):
     name = Column(String, nullable=True)
     position = Column(String, nullable=True)
     lineup_type = Column(String, nullable=True)  # lineup/substitute
-    formation_position = Column(String, nullable=True)
+    formation_position = Column(Integer, nullable=True)
     jersey_number = Column(String, nullable=True)
     is_starter = Column(Boolean, nullable=True)
     minutes_played = Column(Integer, nullable=True)
     position_name = Column(String, nullable=True)
+    detailed_position_id = Column(Integer, nullable=True)
+    detailed_position_name = Column(String, nullable=True)
+    detailed_position_code = Column(String, nullable=True)
+    formation_field = Column(String, nullable=True)
     extra = Column(JSON, nullable=True)
 
 

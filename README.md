@@ -64,6 +64,17 @@ Adjust season IDs per league/year. `sync-h2h` can be run ad hoc for upcoming mat
 - If using Postgres, ensure the user has minimal privileges on the target database.
 - The client uses `Authorization: Bearer <token>` and sleeps between calls to respect rate limits.
 
+## Supabase schema note
+If you export `fixture_players` to Supabase, ensure these columns exist (add if missing):
+```
+alter table public.fixture_players
+  add column if not exists detailed_position_id int,
+  add column if not exists detailed_position_name text,
+  add column if not exists detailed_position_code text,
+  add column if not exists formation_field text,
+  add column if not exists formation_position int;
+```
+
 ## SportMonks best-practice mapping
 - Uses `filters=populate` automatically for bulk endpoints without includes (per docs: raises page size to 1000).
 - Keeps includes on heavy endpoints (`statistics`, `lineups`) only when needed.

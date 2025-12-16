@@ -43,6 +43,23 @@ def _safe_int(val) -> Optional[int]:
             return None
 
 
+def _ensure_fixture_player_columns(engine) -> None:
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(fixture_players)").fetchall()}
+        desired = {
+            "detailed_position_id": "INTEGER",
+            "detailed_position_name": "TEXT",
+            "detailed_position_code": "TEXT",
+            "formation_field": "TEXT",
+            "formation_position": "INTEGER",
+        }
+        for name, ddl_type in desired.items():
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE fixture_players ADD COLUMN {name} {ddl_type}")
+
+
 def _extract_stat_value(data) -> Optional[int]:
     """Pull a numeric value from lineup.detail or statistic payloads."""
     if data is None:
@@ -152,6 +169,7 @@ class SyncService:
 
     def ensure_schema(self) -> None:
         Base.metadata.create_all(self.session.get_bind())
+        _ensure_fixture_player_columns(self.session.get_bind())
 
     # --- seasons & teams ---
     def sync_seasons(self, league_ids: Sequence[int]) -> int:
@@ -365,6 +383,25 @@ class SyncService:
             position_name = str(position_name_raw) if position_name_raw is not None else None
             starter_flag = _is_starter(l.get("type") or l.get("type_id") or l.get("lineup_type"))
             position_raw = l.get("position") or player.get("position") or player.get("position_name")
+            detailed_position_id = (
+                l.get("detailed_position_id")
+                or player.get("detailed_position_id")
+                or position_obj.get("detailed_position_id")
+            )
+            detailed_position_name = (
+                l.get("detailed_position_name")
+                or player.get("detailed_position_name")
+                or position_obj.get("detailed_position_name")
+                or position_obj.get("name")
+            )
+            detailed_position_code = (
+                l.get("detailed_position_code")
+                or player.get("detailed_position_code")
+                or position_obj.get("detailed_position_code")
+                or position_obj.get("code")
+            )
+            formation_field_val = l.get("formation_field")
+            formation_position_val = _safe_int(l.get("formation_position"))
             payload = {
                 "fixture_id": fixture_id,
                 "player_id": player_id,
@@ -373,10 +410,14 @@ class SyncService:
                 "position": str(position_raw) if position_raw is not None else None,
                 "position_name": position_name,
                 "lineup_type": (l.get("type") or l.get("type_id") or "").__str__() if (l.get("type") or l.get("type_id")) else None,
-                "formation_position": str(l.get("formation_position") or l.get("formation_field") or "") or None,
+                "formation_field": str(formation_field_val) if formation_field_val is not None else None,
+                "formation_position": formation_position_val,
                 "jersey_number": str(l.get("jersey_number") or l.get("number") or "") or None,
                 "is_starter": starter_flag,
                 "minutes_played": minutes_played,
+                "detailed_position_id": _safe_int(detailed_position_id),
+                "detailed_position_name": str(detailed_position_name) if detailed_position_name is not None else None,
+                "detailed_position_code": str(detailed_position_code) if detailed_position_code is not None else None,
                 "extra": l,
             }
             obj = self.session.get(FixturePlayer, (fixture_id, player_id))
