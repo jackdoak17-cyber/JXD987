@@ -84,6 +84,32 @@ def _is_starter(lineup_type: Optional[object]) -> Optional[bool]:
     return None
 
 
+MINUTES_TYPE_IDS = {119, 1584}
+MINUTES_NAME_HINTS = ("minute", "minutes")
+
+
+def _extract_minutes(lineup: Dict, details: Iterable[Dict]) -> Optional[int]:
+    # Direct fields on the lineup
+    for key in ("minutes_played", "minutes", "played_minutes"):
+        val = _safe_int(lineup.get(key))
+        if val is not None:
+            return val
+
+    # Look through details for minute-related entries
+    for d in details or []:
+        type_info = d.get("type") or {}
+        name = str(type_info.get("name") or type_info.get("code") or "").lower()
+        type_id = d.get("type_id") or type_info.get("id")
+        val = _extract_stat_value(d.get("data") or d.get("value"))
+        if val is None:
+            continue
+        if type_id in MINUTES_TYPE_IDS:
+            return val
+        if any(hint in name for hint in MINUTES_NAME_HINTS):
+            return val
+    return None
+
+
 def _upsert(session: Session, model, data: Dict) -> None:
     obj = session.get(model, data.get("id"))
     if obj:
@@ -323,22 +349,28 @@ class SyncService:
             }
             _upsert(self.session, Player, player_payload)
 
-            minutes_played = _safe_int(
-                l.get("minutes") or l.get("played") or (l.get("statistics") or {}).get("minutes")
+            details = l.get("details") or []
+            minutes_played = _extract_minutes(
+                l,
+                details,
             )
-            position_name = (
-                l.get("position_name")
+            position_obj = l.get("position") or {}
+            position_name_raw = (
+                position_obj.get("name")
+                or l.get("position_name")
                 or player.get("position_name")
                 or player.get("position")
                 or l.get("position")
             )
+            position_name = str(position_name_raw) if position_name_raw is not None else None
             starter_flag = _is_starter(l.get("type") or l.get("type_id") or l.get("lineup_type"))
+            position_raw = l.get("position") or player.get("position") or player.get("position_name")
             payload = {
                 "fixture_id": fixture_id,
                 "player_id": player_id,
                 "team_id": team_id,
                 "name": l.get("player_name") or player.get("fullname") or player.get("name"),
-                "position": l.get("position") or player.get("position") or player.get("position_name"),
+                "position": str(position_raw) if position_raw is not None else None,
                 "position_name": position_name,
                 "lineup_type": (l.get("type") or l.get("type_id") or "").__str__() if (l.get("type") or l.get("type_id")) else None,
                 "formation_position": str(l.get("formation_position") or l.get("formation_field") or "") or None,
@@ -417,7 +449,7 @@ class SyncService:
         params: Dict[str, object] = {}
         if league_ids:
             params["filters"] = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
-        includes = ["participants", "scores", "statistics", "lineups.details"]
+        includes = ["participants", "scores", "statistics", "lineups.details", "lineups.position"]
         count = 0
         for chunk_start, chunk_end in self._chunks_newest_first(start, end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
@@ -435,7 +467,7 @@ class SyncService:
         if season.is_current and season_end > today:
             season_end = today + timedelta(days=1)
         params: Dict[str, object] = {"filters": f"fixtureSeasons:{season.id}"}
-        includes = ["participants", "scores", "statistics", "lineups.details"]
+        includes = ["participants", "scores", "statistics", "lineups.details", "lineups.position"]
         count = 0
         for chunk_start, chunk_end in self._chunks_newest_first(season_start, season_end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
