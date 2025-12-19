@@ -1,3 +1,10 @@
+do $$
+begin
+  if to_regprocedure('public.player_streak(integer, integer, integer, numeric, integer, numeric, boolean, integer, integer, integer)') is not null then
+    execute 'alter function public.player_streak(integer, integer, integer, numeric, integer, numeric, boolean, integer, integer, integer) rename to player_streak_base';
+  end if;
+end $$;
+
 create or replace function public.player_streak(
   p_league_id integer,
   p_type_id integer,
@@ -28,7 +35,7 @@ stable
 as $$
   with base as (
     select *
-    from public.player_streak(
+    from public.player_streak_base(
       p_league_id,
       p_type_id,
       p_n,
