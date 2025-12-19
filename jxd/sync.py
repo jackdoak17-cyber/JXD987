@@ -558,7 +558,15 @@ class SyncService:
         params: Dict[str, object] = {}
         if league_ids:
             params["filters"] = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
-        includes = ["participants", "scores", "statistics", "lineups.details", "lineups.position", "lineups.detailedposition"]
+        includes = [
+            "participants",
+            "scores",
+            "statistics",
+            "lineups.details",
+            "lineups.position",
+            "lineups.detailedposition",
+            "lineups.player",
+        ]
         count = 0
         for chunk_start, chunk_end in self._chunks_newest_first(start, end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
@@ -576,7 +584,15 @@ class SyncService:
         if season.is_current and season_end > today:
             season_end = today + timedelta(days=1)
         params: Dict[str, object] = {"filters": f"fixtureSeasons:{season.id}"}
-        includes = ["participants", "scores", "statistics", "lineups.details", "lineups.position", "lineups.detailedposition"]
+        includes = [
+            "participants",
+            "scores",
+            "statistics",
+            "lineups.details",
+            "lineups.position",
+            "lineups.detailedposition",
+            "lineups.player",
+        ]
         count = 0
         for chunk_start, chunk_end in self._chunks_newest_first(season_start, season_end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
