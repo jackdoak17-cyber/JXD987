@@ -72,6 +72,10 @@ def _ensure_team_player_columns(engine) -> None:
             cols = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()}
             if "image_path" not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN image_path TEXT")
+            if table == "players":
+                for col in ("common_name", "short_name"):
+                    if col not in cols:
+                        conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
 
 
 def _extract_stat_value(data) -> Optional[int]:
