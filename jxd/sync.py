@@ -365,6 +365,9 @@ class SyncService:
             data = s.get("data") or {}
             value = _extract_stat_value(data)
             player_id = s.get("player_id")
+            player = s.get("player") or {}
+            if not player_id and player.get("id"):
+                player_id = player.get("id")
             team_id = s.get("participant_id") or s.get("team_id")
 
             if player_id:
