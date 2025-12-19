@@ -64,6 +64,16 @@ def _ensure_fixture_player_columns(engine) -> None:
                 conn.exec_driver_sql(f"ALTER TABLE fixture_players ADD COLUMN {name} {ddl_type}")
 
 
+def _ensure_team_player_columns(engine) -> None:
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        for table in ("teams", "players"):
+            cols = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()}
+            if "image_path" not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN image_path TEXT")
+
+
 def _extract_stat_value(data) -> Optional[int]:
     """Pull a numeric value from lineup.detail or statistic payloads."""
     if data is None:
@@ -207,6 +217,7 @@ class SyncService:
     def ensure_schema(self) -> None:
         Base.metadata.create_all(self.session.get_bind())
         _ensure_fixture_player_columns(self.session.get_bind())
+        _ensure_team_player_columns(self.session.get_bind())
 
     # --- seasons & teams ---
     def sync_seasons(self, league_ids: Sequence[int]) -> int:
@@ -242,12 +253,15 @@ class SyncService:
                 team_id = item.get("id")
                 if team_id in seen_team_ids:
                     continue
+                image_path = item.get("image_path") or item.get("logo_path")
                 data = {
                     "id": team_id,
                     "name": item.get("name"),
                     "short_code": item.get("short_code"),
                     "extra": item,
                 }
+                if image_path:
+                    data["image_path"] = image_path
                 _upsert(self.session, Team, data)
                 seen_team_ids.add(team_id)
                 count += 1
@@ -393,6 +407,12 @@ class SyncService:
                 continue
             team_id = l.get("team_id") or (l.get("team") or {}).get("id") or l.get("participant_id")
             player = l.get("player") or {}
+            player_image = (
+                player.get("image_path")
+                or player.get("image")
+                or l.get("player_image")
+                or l.get("image_path")
+            )
             # Upsert player master record
             player_payload = {
                 "id": player_id,
@@ -402,6 +422,8 @@ class SyncService:
                 "team_id": team_id,
                 "extra": player or l,
             }
+            if player_image:
+                player_payload["image_path"] = player_image
             _upsert(self.session, Player, player_payload)
 
             details = l.get("details") or []

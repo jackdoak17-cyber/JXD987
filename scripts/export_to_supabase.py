@@ -152,8 +152,13 @@ def fetch_teams(conn: sqlite3.Connection, team_ids: Sequence[int]) -> List[Dict]
         return []
     cur = conn.cursor()
     q = ",".join("?" for _ in team_ids)
-    cur.execute(f"select id, name, short_code from teams where id in ({q})", team_ids)
-    return [{"id": r[0], "name": r[1], "short_code": r[2]} for r in cur.fetchall()]
+    cur.execute(
+        f"select id, name, short_code, image_path from teams where id in ({q})", team_ids
+    )
+    return [
+        {"id": r[0], "name": r[1], "short_code": r[2], "image_path": r[3]}
+        for r in cur.fetchall()
+    ]
 
 
 def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) -> List[Dict]:
@@ -250,7 +255,7 @@ def fetch_players(conn: sqlite3.Connection, player_ids: Sequence[int]) -> List[D
     cur = conn.cursor()
     q = ",".join("?" for _ in player_ids)
     cur.execute(
-        f"select id, name, short_name, common_name, team_id from players where id in ({q})",
+        f"select id, name, short_name, common_name, team_id, image_path from players where id in ({q})",
         player_ids,
     )
     return [
@@ -260,6 +265,7 @@ def fetch_players(conn: sqlite3.Connection, player_ids: Sequence[int]) -> List[D
             "short_name": r[2],
             "common_name": r[3],
             "team_id": r[4],
+            "image_path": r[5],
         }
         for r in cur.fetchall()
     ]

@@ -24,6 +24,7 @@ class Team(Base):
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=True)
     short_code = Column(String, nullable=True)
+    image_path = Column(String, nullable=True)
     extra = Column(JSON, nullable=True)
 
 
@@ -35,6 +36,7 @@ class Player(Base):
     short_name = Column(String, nullable=True)
     common_name = Column(String, nullable=True)
     team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    image_path = Column(String, nullable=True)
     extra = Column(JSON, nullable=True)
 
 
