@@ -1,3 +1,50 @@
+drop function if exists public.player_streak_base(
+  integer,
+  integer,
+  integer,
+  numeric,
+  integer,
+  numeric,
+  boolean,
+  integer,
+  integer,
+  integer,
+  integer
+);
+
+drop function if exists public.player_streak(
+  integer,
+  integer,
+  integer,
+  numeric,
+  integer,
+  numeric,
+  boolean,
+  integer,
+  integer,
+  integer,
+  integer,
+  integer,
+  integer
+);
+
+drop function if exists public.player_streak_playing_on_date(
+  date,
+  integer,
+  integer,
+  integer,
+  numeric,
+  integer,
+  numeric,
+  boolean,
+  integer,
+  integer,
+  integer,
+  integer,
+  integer,
+  integer
+);
+
 create or replace function public.player_streak_base(
   p_league_id integer,
   p_type_id integer,
