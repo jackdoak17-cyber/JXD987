@@ -207,9 +207,10 @@ def fetch_fixture_statistics(conn: sqlite3.Connection, fixture_ids: Sequence[int
     q = ",".join("?" for _ in fixture_ids)
     cur.execute(
         f"""
-        select fixture_id, team_id, type_id, value
+        select fixture_id, team_id, type_id, max(value) as value
         from fixture_statistics
         where fixture_id in ({q})
+        group by fixture_id, team_id, type_id
         """,
         fixture_ids,
     )
