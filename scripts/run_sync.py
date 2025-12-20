@@ -90,7 +90,7 @@ def _check_eze_stats(session, league_ids: List[int]) -> None:
         return
     if max_fixture_dt - max_stat_dt > timedelta(days=7):
         log.warning(
-            "Eze shots stats stale (last=%s vs fixtures=%s). Check includes for statistics.player/type.",
+            "Eze shots stats stale (last=%s vs fixtures=%s). Check lineups.details coverage.",
             max_stat_dt,
             max_fixture_dt,
         )
