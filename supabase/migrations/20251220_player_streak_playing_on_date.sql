@@ -171,3 +171,31 @@ as $$
   )
   select * from ordered limit p_limit;
 $$;
+
+create or replace function public.player_streak_playing_on_date_counts(
+  p_date date,
+  p_league_id integer,
+  p_season_id integer default null
+)
+returns table (
+  today_fixtures_count integer,
+  today_players_count integer
+)
+language sql
+stable
+as $$
+  with todays_fixtures as (
+    select f.id
+    from fixtures f
+    where f.league_id = p_league_id
+      and (p_season_id is null or f.season_id = p_season_id)
+      and (f.starting_at at time zone 'Europe/London')::date = p_date
+  )
+  select
+    (select count(*) from todays_fixtures)::integer as today_fixtures_count,
+    (
+      select count(distinct fp.player_id)
+      from fixture_players fp
+      join todays_fixtures tf on tf.id = fp.fixture_id
+    )::integer as today_players_count;
+$$;
