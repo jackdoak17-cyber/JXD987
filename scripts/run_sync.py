@@ -80,6 +80,14 @@ def _check_eze_stats(session, league_ids: List[int]) -> None:
             max_stat_row,
         )
         return
+    cutoff = datetime(2025, 12, 1)
+    if max_stat_dt < cutoff:
+        log.warning(
+            "Eze shots stats missing for recent fixtures (last=%s, expected >= %s).",
+            max_stat_dt,
+            cutoff.date(),
+        )
+        return
     if max_fixture_dt - max_stat_dt > timedelta(days=7):
         log.warning(
             "Eze shots stats stale (last=%s vs fixtures=%s). Check includes for statistics.player/type.",

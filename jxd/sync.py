@@ -364,48 +364,27 @@ class SyncService:
             location = (s.get("location") or "").lower() or None
             data = s.get("data") or {}
             value = _extract_stat_value(data)
-            player_id = s.get("player_id")
-            player = s.get("player") or {}
-            if not player_id and player.get("id"):
-                player_id = player.get("id")
             team_id = s.get("participant_id") or s.get("team_id")
 
-            if player_id:
-                pk = (fixture_id, player_id, type_id, code)
-                obj = self.session.get(FixturePlayerStatistic, pk)
-                payload = {
-                    "fixture_id": fixture_id,
-                    "player_id": player_id,
-                    "team_id": team_id,
-                    "type_id": type_id,
-                    "code": code,
-                    "name": name,
-                    "value": value,
-                    "extra": s,
-                }
-                if obj:
-                    for k, v in payload.items():
-                        setattr(obj, k, v)
-                else:
-                    self.session.add(FixturePlayerStatistic(**payload))
-            elif team_id:
-                pk = (fixture_id, team_id, type_id, code, location)
-                obj = self.session.get(FixtureStatistic, pk)
-                payload = {
-                    "fixture_id": fixture_id,
-                    "team_id": team_id,
-                    "type_id": type_id,
-                    "code": code,
-                    "name": name,
-                    "location": location,
-                    "value": value,
-                    "extra": s,
-                }
-                if obj:
-                    for k, v in payload.items():
-                        setattr(obj, k, v)
-                else:
-                    self.session.add(FixtureStatistic(**payload))
+            if not team_id:
+                continue
+            pk = (fixture_id, team_id, type_id, code, location)
+            obj = self.session.get(FixtureStatistic, pk)
+            payload = {
+                "fixture_id": fixture_id,
+                "team_id": team_id,
+                "type_id": type_id,
+                "code": code,
+                "name": name,
+                "location": location,
+                "value": value,
+                "extra": s,
+            }
+            if obj:
+                for k, v in payload.items():
+                    setattr(obj, k, v)
+            else:
+                self.session.add(FixtureStatistic(**payload))
 
     def _store_lineups(self, fixture_id: int, lineups: Iterable[Dict]) -> None:
         for l in lineups or []:
@@ -434,6 +413,7 @@ class SyncService:
             _upsert(self.session, Player, player_payload)
 
             details = l.get("details") or []
+            self._store_lineup_details_stats(fixture_id, player_id, team_id, details)
             minutes_played = _extract_minutes(
                 l,
                 details,
@@ -526,6 +506,41 @@ class SyncService:
                 else:
                     self.session.add(FixturePlayerStatistic(**payload_stat))
 
+    def _store_lineup_details_stats(
+        self,
+        fixture_id: int,
+        player_id: int,
+        team_id: Optional[int],
+        details: Iterable[Dict],
+    ) -> None:
+        for d in details or []:
+            type_info = d.get("type") or {}
+            type_id = d.get("type_id") or type_info.get("id")
+            if not type_id:
+                continue
+            code = type_info.get("code") or (type_id and str(type_id))
+            name = type_info.get("name")
+            value = _extract_stat_value(d.get("data") or d.get("value") or d.get("stat"))
+            if value is None:
+                continue
+            pk = (fixture_id, player_id, type_id, code)
+            obj = self.session.get(FixturePlayerStatistic, pk)
+            payload = {
+                "fixture_id": fixture_id,
+                "player_id": player_id,
+                "team_id": team_id,
+                "type_id": type_id,
+                "code": code,
+                "name": name,
+                "value": value,
+                "extra": d,
+            }
+            if obj:
+                for k, v in payload.items():
+                    setattr(obj, k, v)
+            else:
+                self.session.add(FixturePlayerStatistic(**payload))
+
     def _apply_participant_derivations(self, fixture: Fixture, loc_map: Dict[str, Dict]) -> None:
         if fixture.home_team_id is None and loc_map.get("home"):
             fixture.home_team_id = loc_map["home"].get("team_id")
@@ -570,7 +585,6 @@ class SyncService:
             "scores",
             "statistics",
             "statistics.type",
-            "statistics.player",
             "lineups.details",
             "lineups.position",
             "lineups.detailedposition",
@@ -598,7 +612,6 @@ class SyncService:
             "scores",
             "statistics",
             "statistics.type",
-            "statistics.player",
             "lineups.details",
             "lineups.position",
             "lineups.detailedposition",
