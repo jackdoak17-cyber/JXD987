@@ -335,6 +335,7 @@ class SyncService:
             team_id = p.get("id") or p.get("team_id")
             if team_id is None:
                 continue
+            self._upsert_team_from_participant(p)
             meta = p.get("meta") or {}
             location = (meta.get("location") or meta.get("venue") or meta.get("side") or "").lower()
             score_val = _safe_int(meta.get("score") or meta.get("outcome"))
@@ -354,6 +355,22 @@ class SyncService:
             if location in ("home", "away"):
                 loc_map[location] = {"team_id": team_id, "score": score_val}
         return loc_map
+
+    def _upsert_team_from_participant(self, participant: Dict) -> None:
+        team_id = participant.get("id") or participant.get("team_id")
+        if team_id is None:
+            return
+        data: Dict[str, object] = {"id": team_id, "extra": participant}
+        name = participant.get("name") or participant.get("team_name") or participant.get("display_name")
+        short_code = participant.get("short_code") or participant.get("code")
+        image_path = participant.get("image_path") or participant.get("logo_path") or participant.get("logo")
+        if name:
+            data["name"] = name
+        if short_code:
+            data["short_code"] = short_code
+        if image_path:
+            data["image_path"] = image_path
+        _upsert(self.session, Team, data)
 
     def _store_statistics(self, fixture_id: int, stats: Iterable[Dict]) -> None:
         for s in stats or []:
@@ -576,20 +593,27 @@ class SyncService:
             yield chunk_start, cursor
             cursor = chunk_start - timedelta(days=1)
 
-    def sync_fixtures_between(self, start: date, end: date, league_ids: Optional[Sequence[int]] = None) -> int:
+    def sync_fixtures_between(
+        self,
+        start: date,
+        end: date,
+        league_ids: Optional[Sequence[int]] = None,
+        includes: Optional[Sequence[str]] = None,
+    ) -> int:
         params: Dict[str, object] = {}
         if league_ids:
             params["filters"] = f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"
-        includes = [
-            "participants",
-            "scores",
-            "statistics",
-            "statistics.type",
-            "lineups.details",
-            "lineups.position",
-            "lineups.detailedposition",
-            "lineups.player",
-        ]
+        if includes is None:
+            includes = [
+                "participants",
+                "scores",
+                "statistics",
+                "statistics.type",
+                "lineups.details",
+                "lineups.position",
+                "lineups.detailedposition",
+                "lineups.player",
+            ]
         count = 0
         for chunk_start, chunk_end in self._chunks_newest_first(start, end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
@@ -632,6 +656,12 @@ class SyncService:
         start = today - timedelta(days=days)
         end = today + timedelta(days=1)
         return self.sync_fixtures_between(start, end, league_ids=league_ids)
+
+    def sync_upcoming_window(self, league_ids: Sequence[int], days_forward: int = 14) -> int:
+        today = datetime.utcnow().date()
+        end = today + timedelta(days=days_forward)
+        includes = ["participants", "scores"]
+        return self.sync_fixtures_between(today, end, league_ids=league_ids, includes=includes)
 
     def sync_history_window(self, league_ids: Sequence[int], keep_season_ids: Set[int]) -> int:
         seasons = (

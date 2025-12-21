@@ -52,6 +52,17 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python3 scripts/export_to_supabase.py --strict
 
+      - name: Refresh likely players
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          curl -sS -X POST "$SUPABASE_URL/rest/v1/rpc/refresh_team_likely_players" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"p_league_id":8,"p_recent_days":30,"p_last_n":1}'
+
       - name: Verify Supabase table counts
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

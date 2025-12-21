@@ -3,7 +3,7 @@
 Export a pruned subset of SQLite data to Supabase via REST.
 - seasons: current + previous per league
 - teams: only those referenced by exported fixtures
-- fixtures: only with both scores and valid home/away teams
+- fixtures: finished fixtures plus upcoming scheduled fixtures (next 14 days)
 - players: only players referenced by exported fixture player stats/lineups
 - fixture_players: only for exported fixtures
 - fixture_statistics: only for exported fixtures
@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sqlite3
+from datetime import datetime, timedelta
 from typing import Dict, List, Sequence, Set, Tuple
 
 import requests
@@ -112,21 +113,27 @@ def fetch_seasons(conn: sqlite3.Connection, keep_ids: Sequence[int]) -> List[Dic
     ]
 
 
-def fetch_fixtures(conn: sqlite3.Connection, keep_ids: Sequence[int]) -> List[Dict]:
+def fetch_fixtures(conn: sqlite3.Connection, keep_ids: Sequence[int], upcoming_days: int = 14) -> List[Dict]:
     cur = conn.cursor()
     q = ",".join("?" for _ in keep_ids)
+    now = datetime.utcnow()
+    upcoming_end = now + timedelta(days=upcoming_days)
+    now_iso = now.isoformat(sep=" ")
+    upcoming_iso = upcoming_end.isoformat(sep=" ")
     cur.execute(
         f"""
         select id, league_id, season_id, starting_at, status, status_code,
                home_team_id, away_team_id, home_score, away_score
         from fixtures
         where season_id in ({q})
-          and home_score is not null
-          and away_score is not null
           and home_team_id is not null
           and away_team_id is not null
+          and (
+            (home_score is not null and away_score is not null)
+            or (starting_at >= ? and starting_at <= ?)
+          )
         """,
-        keep_ids,
+        [*keep_ids, now_iso, upcoming_iso],
     )
     fixtures = []
     for row in cur.fetchall():

@@ -123,6 +123,9 @@ def main(
         log.info("Running history sync for kept seasons %s", keep_ids)
         svc.sync_history_window(league_ids, keep_ids)
 
+    log.info("Syncing upcoming fixtures (next 14 days)")
+    svc.sync_upcoming_window(league_ids, days_forward=14)
+
     _check_eze_stats(session, league_ids)
 
     log.info("Sync complete (mode=%s)", mode)
