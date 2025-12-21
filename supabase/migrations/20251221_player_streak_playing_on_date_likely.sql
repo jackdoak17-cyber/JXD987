@@ -68,11 +68,6 @@ as $$
     select distinct tf.away_team_id as team_id
     from todays_fixtures tf
     where tf.away_team_id is not null
-    union
-    select distinct fp.team_id as team_id
-    from fixture_participants fp
-    join todays_fixtures tf on tf.id = fp.fixture_id
-    where fp.team_id is not null
   ),
   candidate_players as (
     select
@@ -210,11 +205,6 @@ as $$
     select distinct tf.away_team_id as team_id
     from todays_fixtures tf
     where tf.away_team_id is not null
-    union
-    select distinct fp.team_id as team_id
-    from fixture_participants fp
-    join todays_fixtures tf on tf.id = fp.fixture_id
-    where fp.team_id is not null
   )
   select
     (select count(*) from todays_fixtures)::integer as today_fixtures_count,
