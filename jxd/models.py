@@ -1,6 +1,17 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, ForeignKey, Integer, String, JSON, PrimaryKeyConstraint
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    JSON,
+    PrimaryKeyConstraint,
+    Numeric,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
@@ -127,3 +138,34 @@ class SyncState(Base):
     key = Column(String, primary_key=True)
     value = Column(String, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class OddsSnapshot(Base):
+    __tablename__ = "odds_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    fixture_id = Column(Integer, nullable=False, index=True)
+    bookmaker_id = Column(Integer, nullable=False, default=2)
+    pulled_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    raw = Column(JSON, nullable=False)
+
+
+class OddsOutcome(Base):
+    __tablename__ = "odds_outcomes"
+    __table_args__ = (
+        UniqueConstraint(
+            "fixture_id", "bookmaker_id", "market_key", "selection_key", "line"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    fixture_id = Column(Integer, nullable=False, index=True)
+    bookmaker_id = Column(Integer, nullable=False, default=2)
+    market_key = Column(String, nullable=False, index=True)
+    selection_key = Column(String, nullable=False)
+    participant_type = Column(String, nullable=True)
+    participant_id = Column(Integer, nullable=True, index=True)
+    line = Column(Numeric, nullable=True)
+    price_decimal = Column(Numeric, nullable=False)
+    price_american = Column(Integer, nullable=True)
+    last_updated_at = Column(DateTime, nullable=True)

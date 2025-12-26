@@ -8,6 +8,7 @@ Export a pruned subset of SQLite data to Supabase via REST.
 - fixture_players: only for exported fixtures
 - fixture_statistics: only for exported fixtures
 - fixture_player_statistics: only for exported fixtures
+- odds_snapshots/odds_outcomes: only for exported fixtures
 
 Supports --dry-run to print the payload counts without hitting Supabase.
 """
@@ -34,6 +35,8 @@ REQUIRED_TABLES = [
     "fixture_players",
     "fixture_statistics",
     "fixture_player_statistics",
+    "odds_snapshots",
+    "odds_outcomes",
 ]
 
 
@@ -257,6 +260,73 @@ def fetch_fixture_player_statistics(conn: sqlite3.Connection, fixture_ids: Seque
     ]
 
 
+def fetch_odds_snapshots(conn: sqlite3.Connection, fixture_ids: Sequence[int]) -> List[Dict]:
+    if not fixture_ids:
+        return []
+    cur = conn.cursor()
+    q = ",".join("?" for _ in fixture_ids)
+    cur.execute(
+        f"""
+        select id, fixture_id, bookmaker_id, pulled_at, raw
+        from odds_snapshots
+        where fixture_id in ({q})
+        """,
+        fixture_ids,
+    )
+    def parse_raw(raw_value):
+        if raw_value is None:
+            return None
+        if isinstance(raw_value, (dict, list)):
+            return raw_value
+        try:
+            return json.loads(raw_value)
+        except Exception:
+            return raw_value
+
+    return [
+        {
+            "id": r[0],
+            "fixture_id": r[1],
+            "bookmaker_id": r[2],
+            "pulled_at": r[3],
+            "raw": parse_raw(r[4]),
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def fetch_odds_outcomes(conn: sqlite3.Connection, fixture_ids: Sequence[int]) -> List[Dict]:
+    if not fixture_ids:
+        return []
+    cur = conn.cursor()
+    q = ",".join("?" for _ in fixture_ids)
+    cur.execute(
+        f"""
+        select fixture_id, bookmaker_id, market_key, selection_key,
+               participant_type, participant_id, line,
+               price_decimal, price_american, last_updated_at
+        from odds_outcomes
+        where fixture_id in ({q})
+        """,
+        fixture_ids,
+    )
+    return [
+        {
+            "fixture_id": r[0],
+            "bookmaker_id": r[1],
+            "market_key": r[2],
+            "selection_key": r[3],
+            "participant_type": r[4],
+            "participant_id": r[5],
+            "line": r[6],
+            "price_decimal": r[7],
+            "price_american": r[8],
+            "last_updated_at": r[9],
+        }
+        for r in cur.fetchall()
+    ]
+
+
 def fetch_players(conn: sqlite3.Connection, player_ids: Sequence[int]) -> List[Dict]:
     if not player_ids:
         return []
@@ -362,6 +432,8 @@ def main():
     fixture_players = fetch_fixture_players(conn, list(fixture_ids))
     fixture_stats = fetch_fixture_statistics(conn, list(fixture_ids))
     fixture_player_stats = fetch_fixture_player_statistics(conn, list(fixture_ids))
+    odds_snapshots = fetch_odds_snapshots(conn, list(fixture_ids))
+    odds_outcomes = fetch_odds_outcomes(conn, list(fixture_ids))
 
     player_ids: Set[int] = set()
     for fp in fixture_players:
@@ -390,6 +462,13 @@ def main():
             "fixture_id,player_id,type_id",
             args.dry_run,
         ),
+        "odds_snapshots": upsert_table("odds_snapshots", odds_snapshots, "id", args.dry_run),
+        "odds_outcomes": upsert_table(
+            "odds_outcomes",
+            odds_outcomes,
+            "fixture_id,bookmaker_id,market_key,selection_key,line",
+            args.dry_run,
+        ),
     }
     pruned = prune_fixtures(list(keep_ids), args.dry_run)
 
@@ -403,6 +482,8 @@ def main():
         "fixture_players_exported": exported["fixture_players"],
         "fixture_statistics_exported": exported["fixture_statistics"],
         "fixture_player_statistics_exported": exported["fixture_player_statistics"],
+        "odds_snapshots_exported": exported["odds_snapshots"],
+        "odds_outcomes_exported": exported["odds_outcomes"],
         "fixtures_dropped_missing_teams": dropped,
         "fixtures_pruned_other_seasons": pruned,
     }
