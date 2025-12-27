@@ -39,19 +39,27 @@ jobs:
         run: |
           sqlite3 data/jxd.sqlite "select selection_key, participant_id, line, market_key from odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
 
-      - name: Supabase preflight check (fail fast)
+      - name: Supabase preflight check
+        id: preflight
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          set -euo pipefail
-          curl -sS --retry 3 --retry-all-errors --retry-delay 5 -m 10 \
+          set +e
+          status=$(curl -sS --retry 2 --retry-all-errors --retry-delay 3 -m 10 -o /dev/null -w "%{http_code}" \
             -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id&limit=1" \
-          > /dev/null
+            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id&limit=1" || true)
+          if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+            echo "supabase_ok=true" >> "$GITHUB_OUTPUT"
+            echo "Supabase reachable (HTTP $status)"
+          else
+            echo "supabase_ok=false" >> "$GITHUB_OUTPUT"
+            echo "Supabase unreachable (HTTP $status). Skipping export."
+          fi
 
       - name: Export odds to Supabase
+        if: steps.preflight.outputs.supabase_ok == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -59,6 +67,7 @@ jobs:
           python3 scripts/export_odds_to_supabase.py --leagues "8" --days-forward 14 --chunk-size 50 --timeout 120 --retries 5 --sleep 0.5
 
       - name: Debug mapped participant IDs (Supabase)
+        if: steps.preflight.outputs.supabase_ok == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -69,7 +78,13 @@ jobs:
             "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id,line,market_key&fixture_id=eq.19427629&or=(selection_key.eq.cole_palmer_anytime,selection_key.eq.cole_palmer_1_5,selection_key.eq.morgan_rogers_0_5,selection_key.eq.wesley_fofana_0_5)" \
           || echo "Supabase debug fetch timed out; continuing."
 
+      - name: Skip export notice
+        if: steps.preflight.outputs.supabase_ok != 'true'
+        run: |
+          echo "Supabase not reachable; odds export skipped."
+
       - name: Supabase reachability check
+        if: steps.preflight.outputs.supabase_ok == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
