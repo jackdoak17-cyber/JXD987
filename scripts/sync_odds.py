@@ -15,7 +15,7 @@ import re
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from jxd import SportMonksClient
 from jxd.db import get_engine, get_session
@@ -130,10 +130,10 @@ def load_team_map(session, team_ids: Iterable[int]) -> Dict[str, int]:
     ids = [int(x) for x in team_ids if x]
     if not ids:
         return {}
-    rows = session.execute(
-        text("select id, name, short_code from teams where id in :ids"),
-        {"ids": tuple(ids)},
-    ).fetchall()
+    stmt = text("select id, name, short_code from teams where id in :ids").bindparams(
+        bindparam("ids", expanding=True),
+    )
+    rows = session.execute(stmt, {"ids": ids}).fetchall()
     mapping: Dict[str, int] = {}
     for team_id, name, short_code in rows:
         for label in (name, short_code):
