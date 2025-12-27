@@ -258,8 +258,8 @@ def upsert_outcomes(session, rows: List[Dict]) -> None:
         )
         on conflict(fixture_id, bookmaker_id, market_key, selection_key, line)
         do update set
-          participant_type = excluded.participant_type,
-          participant_id = excluded.participant_id,
+          participant_type = coalesce(excluded.participant_type, odds_outcomes.participant_type),
+          participant_id = coalesce(excluded.participant_id, odds_outcomes.participant_id),
           price_decimal = excluded.price_decimal,
           price_american = excluded.price_american,
           last_updated_at = excluded.last_updated_at

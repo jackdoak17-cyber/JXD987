@@ -35,12 +35,26 @@ jobs:
         run: |
           python3 scripts/sync_odds.py --leagues "8" --days-forward 14
 
+      - name: Debug mapped participant IDs (sqlite)
+        run: |
+          sqlite3 data/jxd.sqlite "select selection_key, participant_id, line, market_key from odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
+
       - name: Export odds to Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           python3 scripts/export_odds_to_supabase.py --leagues "8" --days-forward 14 --chunk-size 100 --timeout 120 --retries 5 --sleep 0.3
+
+      - name: Debug mapped participant IDs (Supabase)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          curl -sS -m 20 \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id,line,market_key&fixture_id=eq.19427629&or=(selection_key.eq.cole_palmer_anytime,selection_key.eq.cole_palmer_1_5,selection_key.eq.morgan_rogers_0_5,selection_key.eq.wesley_fofana_0_5)"
 
       - name: Supabase reachability check
         env:
