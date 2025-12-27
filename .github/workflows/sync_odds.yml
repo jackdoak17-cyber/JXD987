@@ -105,6 +105,22 @@ jobs:
           SQL
           /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f /tmp/apply_odds_pid_patch.sql
 
+      - name: Verify odds coverage (psql)
+        if: steps.preflight.outputs.supabase_ok == 'true'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          ODDS_COVERAGE_MIN_DISTINCT: 20
+          ODDS_PLAYER_MAPPING_MIN_PCT: 80
+        run: |
+          scripts/verify_odds_coverage.sh
+
+      - name: Upload odds coverage report
+        if: steps.preflight.outputs.supabase_ok == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_coverage_report
+          path: /tmp/odds_coverage_report.json
+
       - name: Export odds to Supabase
         if: steps.preflight.outputs.supabase_ok == 'true' && env.MODE == 'full'
         env:
