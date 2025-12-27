@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Sequence
 
@@ -49,6 +50,7 @@ def upsert_table(
     on_conflict: str,
     chunk_size: int,
     timeout: int,
+    retries: int,
 ) -> int:
     if not rows:
         return 0
@@ -58,18 +60,29 @@ def upsert_table(
     headers = rest_headers()
     for i in range(0, len(rows), chunk):
         batch = rows[i : i + chunk]
-        resp = requests.post(
-            url,
-            headers=headers,
-            params={"on_conflict": on_conflict},
-            data=json.dumps(batch),
-            timeout=timeout,
-        )
-        if not resp.ok:
-            raise SystemExit(
-                f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}"
-            )
+        attempt = 0
+        while True:
+            try:
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    params={"on_conflict": on_conflict},
+                    data=json.dumps(batch),
+                    timeout=timeout,
+                )
+                if not resp.ok:
+                    raise SystemExit(
+                        f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}"
+                    )
+                break
+            except requests.RequestException as exc:
+                attempt += 1
+                if attempt > retries:
+                    raise SystemExit(f"Supabase upsert to {table} failed after retries: {exc}")
+                sleep_for = 2**attempt
+                time.sleep(sleep_for)
         total += len(batch)
+        time.sleep(0.1)
     return total
 
 
@@ -171,6 +184,7 @@ def main() -> None:
     parser.add_argument("--skip-snapshots", action="store_true")
     parser.add_argument("--chunk-size", type=int, default=500)
     parser.add_argument("--timeout", type=int, default=60)
+    parser.add_argument("--retries", type=int, default=3)
     args = parser.parse_args()
 
     require_env()
@@ -188,6 +202,7 @@ def main() -> None:
             "id",
             args.chunk_size,
             args.timeout,
+            args.retries,
         ),
         "odds_outcomes": upsert_table(
             "odds_outcomes",
@@ -195,6 +210,7 @@ def main() -> None:
             "fixture_id,bookmaker_id,market_key,selection_key,line",
             args.chunk_size,
             args.timeout,
+            args.retries,
         ),
     }
 
