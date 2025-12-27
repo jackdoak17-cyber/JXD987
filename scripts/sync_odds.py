@@ -164,7 +164,10 @@ def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[in
             """
             select fp.player_id,
                    fp.team_id,
-                   coalesce(p.common_name, p.short_name, p.name, fp.name) as name
+                   p.name,
+                   p.common_name,
+                   p.short_name,
+                   fp.name as fixture_name
             from fixture_players fp
             left join players p on p.id = fp.player_id
             where fp.fixture_id = :fixture_id
@@ -173,13 +176,18 @@ def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[in
         {"fixture_id": fixture_id},
     ).fetchall()
     mapping: Dict[str, List[Tuple[int, Optional[int]]]] = {}
-    for player_id, team_id, name in rows:
-        if not name or not player_id:
+    for player_id, team_id, name, common_name, short_name, fixture_name in rows:
+        if not player_id:
             continue
-        normalized = normalize_name(str(name))
-        if not normalized:
-            continue
-        mapping.setdefault(normalized, []).append((int(player_id), int(team_id) if team_id else None))
+        for candidate in (name, common_name, short_name, fixture_name):
+            if not candidate:
+                continue
+            normalized = normalize_name(str(candidate))
+            if not normalized:
+                continue
+            mapping.setdefault(normalized, []).append(
+                (int(player_id), int(team_id) if team_id else None)
+            )
     return mapping
 
 
@@ -189,20 +197,25 @@ def load_team_player_map(session, team_ids: Iterable[int]) -> Dict[str, List[Tup
         return {}
     stmt = text(
         """
-        select id, team_id, coalesce(common_name, short_name, name) as name
+        select id, team_id, name, common_name, short_name
         from players
         where team_id in :team_ids
         """
     ).bindparams(bindparam("team_ids", expanding=True))
     rows = session.execute(stmt, {"team_ids": ids}).fetchall()
     mapping: Dict[str, List[Tuple[int, Optional[int]]]] = {}
-    for player_id, team_id, name in rows:
-        if not name or not player_id:
+    for player_id, team_id, name, common_name, short_name in rows:
+        if not player_id:
             continue
-        normalized = normalize_name(str(name))
-        if not normalized:
-            continue
-        mapping.setdefault(normalized, []).append((int(player_id), int(team_id) if team_id else None))
+        for candidate in (name, common_name, short_name):
+            if not candidate:
+                continue
+            normalized = normalize_name(str(candidate))
+            if not normalized:
+                continue
+            mapping.setdefault(normalized, []).append(
+                (int(player_id), int(team_id) if team_id else None)
+            )
     return mapping
 
 
