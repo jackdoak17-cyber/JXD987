@@ -90,12 +90,12 @@ def upsert_table(
 
 def fetch_fixture_ids(conn: sqlite3.Connection, league_ids: Sequence[int], days_forward: int) -> List[int]:
     cur = conn.cursor()
-    now = datetime.utcnow()
-    end = now + timedelta(days=days_forward)
-    now_iso = now.isoformat(sep=" ")
-    end_iso = end.isoformat(sep=" ")
+    today = datetime.utcnow().date()
+    end = today + timedelta(days=days_forward)
+    today_iso = today.isoformat()
+    end_iso = end.isoformat()
     league_clause = ""
-    params: List[object] = [now_iso, end_iso]
+    params: List[object] = [today_iso, end_iso]
     if league_ids:
         placeholders = ",".join("?" for _ in league_ids)
         league_clause = f"and league_id in ({placeholders})"
@@ -104,7 +104,7 @@ def fetch_fixture_ids(conn: sqlite3.Connection, league_ids: Sequence[int], days_
         f"""
         select id
         from fixtures
-        where starting_at >= ? and starting_at <= ?
+        where date(starting_at) >= ? and date(starting_at) <= ?
         {league_clause}
         """,
         params,

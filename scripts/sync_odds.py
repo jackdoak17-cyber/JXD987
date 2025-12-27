@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import bindparam, text
@@ -122,19 +122,26 @@ def resolve_participant_type(row: Dict, market_key: str) -> Optional[str]:
     return None
 
 
-def fetch_fixture_rows(session, league_ids: List[int], start: datetime, end: datetime) -> List[Dict]:
+def fetch_fixture_rows(
+    session,
+    league_ids: List[int],
+    start_date: date,
+    end_date: date,
+) -> List[Dict]:
     league_list = ",".join(str(x) for x in league_ids)
+    start_iso = start_date.isoformat()
+    end_iso = end_date.isoformat()
     rows = session.execute(
         text(
             f"""
             select id, home_team_id, away_team_id
             from fixtures
             where league_id in ({league_list})
-              and starting_at >= :start
-              and starting_at <= :end
+              and date(starting_at) >= :start_date
+              and date(starting_at) <= :end_date
             """
         ),
-        {"start": start, "end": end},
+        {"start_date": start_iso, "end_date": end_iso},
     ).fetchall()
     return [
         {"fixture_id": r[0], "home_team_id": r[1], "away_team_id": r[2]} for r in rows
@@ -353,10 +360,10 @@ def main() -> None:
     Base.metadata.create_all(engine)
 
     client = SportMonksClient()
-    now = datetime.utcnow()
-    end = now + timedelta(days=args.days_forward)
+    today = datetime.utcnow().date()
+    end_date = today + timedelta(days=args.days_forward)
 
-    fixtures = fetch_fixture_rows(session, league_ids, now, end)
+    fixtures = fetch_fixture_rows(session, league_ids, today, end_date)
     if args.limit and args.limit > 0:
         fixtures = fixtures[: args.limit]
 
