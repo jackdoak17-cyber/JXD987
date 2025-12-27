@@ -2,14 +2,28 @@ name: Sync Odds
 
 on:
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode: patch or full"
+        required: false
+        default: "patch"
+        type: choice
+        options:
+          - patch
+          - full
+
+concurrency:
+  group: sync-odds
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
+      MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'patch' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,7 +36,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 postgresql-client
 
       - name: Install Python deps
         run: |
@@ -39,27 +53,60 @@ jobs:
         run: |
           sqlite3 data/jxd.sqlite "select selection_key, participant_id, line, market_key from odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
 
-      - name: Supabase preflight check
+      - name: Supabase preflight check (psql)
         id: preflight
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           set +e
-          status=$(curl -sS --retry 2 --retry-all-errors --retry-delay 3 -m 10 -o /dev/null -w "%{http_code}" \
-            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id&limit=1" || true)
-          if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
+          /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select 1" >/dev/null 2>&1
+          if [ "$?" -eq 0 ]; then
             echo "supabase_ok=true" >> "$GITHUB_OUTPUT"
-            echo "Supabase reachable (HTTP $status)"
+            echo "Supabase reachable via psql."
           else
             echo "supabase_ok=false" >> "$GITHUB_OUTPUT"
-            echo "Supabase unreachable (HTTP $status). Skipping export."
+            echo "Supabase unreachable via psql. Skipping export."
           fi
 
-      - name: Export odds to Supabase
+      - name: Build odds participant patch (sqlite)
         if: steps.preflight.outputs.supabase_ok == 'true'
+        run: |
+          python3 scripts/build_odds_pid_patch.py --leagues "8" --days-forward 14 --out /tmp/odds_pid_patch.csv
+
+      - name: Apply odds participant patch (psql)
+        if: steps.preflight.outputs.supabase_ok == 'true'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          cat > /tmp/apply_odds_pid_patch.sql <<'SQL'
+          create table if not exists public.odds_outcomes_pid_patch (
+            fixture_id bigint not null,
+            bookmaker_id int not null,
+            market_key text not null,
+            selection_key text not null,
+            line numeric null,
+            participant_id bigint not null,
+            participant_type text not null default 'player'
+          );
+          truncate public.odds_outcomes_pid_patch;
+          \copy public.odds_outcomes_pid_patch (fixture_id, bookmaker_id, market_key, selection_key, line, participant_id, participant_type)
+            from '/tmp/odds_pid_patch.csv' with (format csv, header true, null '');
+          update public.odds_outcomes o
+          set participant_id = p.participant_id,
+              participant_type = p.participant_type
+          from public.odds_outcomes_pid_patch p
+          where o.fixture_id = p.fixture_id
+            and o.bookmaker_id = p.bookmaker_id
+            and o.market_key = p.market_key
+            and o.selection_key = p.selection_key
+            and o.line is not distinct from p.line
+            and (o.participant_id is null or o.participant_id <> p.participant_id);
+          select count(*) as patch_rows from public.odds_outcomes_pid_patch;
+          SQL
+          /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f /tmp/apply_odds_pid_patch.sql
+
+      - name: Export odds to Supabase
+        if: steps.preflight.outputs.supabase_ok == 'true' && env.MODE == 'full'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -69,14 +116,9 @@ jobs:
       - name: Debug mapped participant IDs (Supabase)
         if: steps.preflight.outputs.supabase_ok == 'true'
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          curl -sS -m 20 \
-            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id,line,market_key&fixture_id=eq.19427629&or=(selection_key.eq.cole_palmer_anytime,selection_key.eq.cole_palmer_1_5,selection_key.eq.morgan_rogers_0_5,selection_key.eq.wesley_fofana_0_5)" \
-          || echo "Supabase debug fetch timed out; continuing."
+          /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select selection_key, participant_id, line, market_key from public.odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
 
       - name: Skip export notice
         if: steps.preflight.outputs.supabase_ok != 'true'
@@ -84,7 +126,7 @@ jobs:
           echo "Supabase not reachable; odds export skipped."
 
       - name: Supabase reachability check
-        if: steps.preflight.outputs.supabase_ok == 'true'
+        if: steps.preflight.outputs.supabase_ok == 'true' && env.MODE == 'full'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
