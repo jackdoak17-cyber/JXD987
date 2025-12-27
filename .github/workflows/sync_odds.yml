@@ -54,7 +54,8 @@ jobs:
           curl -sS -m 20 \
             -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id,line,market_key&fixture_id=eq.19427629&or=(selection_key.eq.cole_palmer_anytime,selection_key.eq.cole_palmer_1_5,selection_key.eq.morgan_rogers_0_5,selection_key.eq.wesley_fofana_0_5)"
+            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id,line,market_key&fixture_id=eq.19427629&or=(selection_key.eq.cole_palmer_anytime,selection_key.eq.cole_palmer_1_5,selection_key.eq.morgan_rogers_0_5,selection_key.eq.wesley_fofana_0_5)" \
+          || echo "Supabase debug fetch timed out; continuing."
 
       - name: Supabase reachability check
         env:
