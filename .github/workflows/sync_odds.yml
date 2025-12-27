@@ -39,12 +39,24 @@ jobs:
         run: |
           sqlite3 data/jxd.sqlite "select selection_key, participant_id, line, market_key from odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
 
+      - name: Supabase preflight check (fail fast)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          set -euo pipefail
+          curl -sS --retry 3 --retry-all-errors --retry-delay 5 -m 10 \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id&limit=1" \
+          > /dev/null
+
       - name: Export odds to Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python3 scripts/export_odds_to_supabase.py --leagues "8" --days-forward 14 --chunk-size 100 --timeout 120 --retries 5 --sleep 0.3
+          python3 scripts/export_odds_to_supabase.py --leagues "8" --days-forward 14 --chunk-size 50 --timeout 120 --retries 5 --sleep 0.5
 
       - name: Debug mapped participant IDs (Supabase)
         env:
@@ -63,7 +75,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set -euo pipefail
-          resp=$(curl -sS -m 20 -w "\nHTTP:%{http_code}\n" \
+          resp=$(curl -sS --retry 3 --retry-all-errors --retry-delay 5 -m 20 -w "\nHTTP:%{http_code}\n" \
             -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
             "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id&limit=1")
