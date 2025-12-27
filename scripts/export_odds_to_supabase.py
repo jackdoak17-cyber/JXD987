@@ -51,6 +51,7 @@ def upsert_table(
     chunk_size: int,
     timeout: int,
     retries: int,
+    sleep_seconds: float,
 ) -> int:
     if not rows:
         return 0
@@ -82,7 +83,8 @@ def upsert_table(
                 sleep_for = 2**attempt
                 time.sleep(sleep_for)
         total += len(batch)
-        time.sleep(0.1)
+        if sleep_seconds:
+            time.sleep(sleep_seconds)
     return total
 
 
@@ -185,6 +187,7 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=500)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--sleep", type=float, default=0.2)
     args = parser.parse_args()
 
     require_env()
@@ -203,6 +206,7 @@ def main() -> None:
             args.chunk_size,
             args.timeout,
             args.retries,
+            args.sleep,
         ),
         "odds_outcomes": upsert_table(
             "odds_outcomes",
@@ -211,6 +215,7 @@ def main() -> None:
             args.chunk_size,
             args.timeout,
             args.retries,
+            args.sleep,
         ),
     }
 

@@ -40,4 +40,21 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python3 scripts/export_odds_to_supabase.py --leagues "8" --days-forward 14 --chunk-size 100 --timeout 120 --retries 5
+          python3 scripts/export_odds_to_supabase.py --leagues "8" --days-forward 14 --chunk-size 100 --timeout 120 --retries 5 --sleep 0.3
+
+      - name: Supabase reachability check
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          set -euo pipefail
+          resp=$(curl -sS -m 20 -w "\nHTTP:%{http_code}\n" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id&limit=1")
+          echo "$resp"
+          status=$(echo "$resp" | tail -n1 | tr -d '\r' | sed 's/HTTP://')
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            echo "Supabase reachability check failed with HTTP $status"
+            exit 1
+          fi
