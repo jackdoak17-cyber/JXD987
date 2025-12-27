@@ -26,16 +26,16 @@ def main() -> None:
     args = parser.parse_args()
 
     league_ids = parse_league_ids(args.leagues)
-    now = datetime.utcnow()
-    end = now + timedelta(days=args.days_forward)
-    now_iso = now.isoformat(sep=" ")
-    end_iso = end.isoformat(sep=" ")
+    today = datetime.utcnow().date()
+    end = today + timedelta(days=args.days_forward)
+    today_iso = today.isoformat()
+    end_iso = end.isoformat()
 
     conn = sqlite3.connect(args.db)
     cur = conn.cursor()
 
     league_clause = ""
-    params: List[object] = [now_iso, end_iso]
+    params: List[object] = [today_iso, end_iso]
     if league_ids:
         placeholders = ",".join("?" for _ in league_ids)
         league_clause = f"and f.league_id in ({placeholders})"
@@ -54,7 +54,7 @@ def main() -> None:
         join fixtures f on f.id = o.fixture_id
         where o.participant_id is not null
           and o.participant_type = 'player'
-          and f.starting_at >= ? and f.starting_at <= ?
+          and date(f.starting_at) >= ? and date(f.starting_at) <= ?
           {league_clause}
         """,
         params,
