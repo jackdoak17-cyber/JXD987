@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import re
+import unicodedata
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -39,7 +40,9 @@ def normalize_slug(value: str) -> str:
 
 
 def normalize_name(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", value.lower())
+    text_val = unicodedata.normalize("NFKD", value)
+    text_val = "".join(ch for ch in text_val if not unicodedata.combining(ch))
+    return re.sub(r"[^a-z0-9]+", "", text_val.lower())
 
 
 def parse_float(value: Optional[object]) -> Optional[float]:
@@ -98,9 +101,21 @@ def resolve_market_key(row: Dict) -> str:
     return normalize_slug(str(desc))
 
 
+PLAYER_MARKET_KEYS = {
+    "goalscorers",
+    "1st_goal_scorer",
+    "last_goal_scorer",
+    "multi_scorers",
+    "player_to_score",
+    "player_to_score_or_assist",
+    "player_shots",
+    "player_shots_on_target",
+}
+
+
 def resolve_participant_type(row: Dict, market_key: str) -> Optional[str]:
     desc = str(row.get("market_description") or "").lower()
-    if "player" in desc or market_key.startswith("player_"):
+    if "player" in desc or market_key.startswith("player_") or market_key in PLAYER_MARKET_KEYS:
         return "player"
     if "team" in desc:
         return "team"
@@ -143,11 +158,12 @@ def load_team_map(session, team_ids: Iterable[int]) -> Dict[str, int]:
     return mapping
 
 
-def load_fixture_player_map(session, fixture_id: int) -> Dict[str, int]:
+def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[int, Optional[int]]]]:
     rows = session.execute(
         text(
             """
             select fp.player_id,
+                   fp.team_id,
                    coalesce(p.common_name, p.short_name, p.name, fp.name) as name
             from fixture_players fp
             left join players p on p.id = fp.player_id
@@ -156,14 +172,61 @@ def load_fixture_player_map(session, fixture_id: int) -> Dict[str, int]:
         ),
         {"fixture_id": fixture_id},
     ).fetchall()
-    mapping: Dict[str, int] = {}
-    for player_id, name in rows:
+    mapping: Dict[str, List[Tuple[int, Optional[int]]]] = {}
+    for player_id, team_id, name in rows:
         if not name or not player_id:
             continue
         normalized = normalize_name(str(name))
-        if normalized and normalized not in mapping:
-            mapping[normalized] = int(player_id)
+        if not normalized:
+            continue
+        mapping.setdefault(normalized, []).append((int(player_id), int(team_id) if team_id else None))
     return mapping
+
+
+def load_team_player_map(session, team_ids: Iterable[int]) -> Dict[str, List[Tuple[int, Optional[int]]]]:
+    ids = [int(x) for x in team_ids if x]
+    if not ids:
+        return {}
+    stmt = text(
+        """
+        select id, team_id, coalesce(common_name, short_name, name) as name
+        from players
+        where team_id in :team_ids
+        """
+    ).bindparams(bindparam("team_ids", expanding=True))
+    rows = session.execute(stmt, {"team_ids": ids}).fetchall()
+    mapping: Dict[str, List[Tuple[int, Optional[int]]]] = {}
+    for player_id, team_id, name in rows:
+        if not name or not player_id:
+            continue
+        normalized = normalize_name(str(name))
+        if not normalized:
+            continue
+        mapping.setdefault(normalized, []).append((int(player_id), int(team_id) if team_id else None))
+    return mapping
+
+
+def resolve_player_id(
+    raw_name: str,
+    fixture_map: Dict[str, List[Tuple[int, Optional[int]]]],
+    team_map: Dict[str, List[Tuple[int, Optional[int]]]],
+) -> Optional[int]:
+    normalized = normalize_name(raw_name)
+    if not normalized:
+        return None
+    candidates = fixture_map.get(normalized)
+    if candidates:
+        unique = {pid for pid, _ in candidates}
+        if len(unique) == 1:
+            return next(iter(unique))
+        return candidates[0][0]
+    candidates = team_map.get(normalized)
+    if candidates:
+        unique = {pid for pid, _ in candidates}
+        if len(unique) == 1:
+            return next(iter(unique))
+        return candidates[0][0]
+    return None
 
 
 def upsert_outcomes(session, rows: List[Dict]) -> None:
@@ -196,8 +259,9 @@ def parse_outcomes(
     fixture_id: int,
     bookmaker_id: int,
     data: List[Dict],
-    player_map: Dict[str, int],
+    player_map: Dict[str, List[Tuple[int, Optional[int]]]],
     team_map: Dict[str, int],
+    team_player_map: Dict[str, List[Tuple[int, Optional[int]]]],
 ) -> List[Dict]:
     outcomes: List[Dict] = []
     for row in data:
@@ -219,7 +283,15 @@ def parse_outcomes(
         if participant_type is None and normalized_name in team_map:
             participant_type = "team"
         if participant_type == "player":
-            participant_id = player_map.get(normalized_name)
+            participant_id = resolve_player_id(str(name), player_map, team_player_map)
+            if participant_id is None:
+                log.warning(
+                    "Unmatched player odds name (fixture %s, market %s, selection %s): %s",
+                    fixture_id,
+                    market_key,
+                    selection_key,
+                    name,
+                )
         elif participant_type == "team":
             participant_id = team_map.get(normalized_name)
 
@@ -283,6 +355,10 @@ def main() -> None:
         fixture_id = fixture["fixture_id"]
         team_map = load_team_map(session, [fixture.get("home_team_id"), fixture.get("away_team_id")])
         player_map = load_fixture_player_map(session, fixture_id)
+        team_player_map = load_team_player_map(
+            session,
+            [fixture.get("home_team_id"), fixture.get("away_team_id")],
+        )
 
         data = fetch_odds_for_fixture(client, fixture_id, args.bookmaker_id)
         snapshot = {
@@ -307,6 +383,7 @@ def main() -> None:
             data,
             player_map,
             team_map,
+            team_player_map,
         )
         upsert_outcomes(session, outcomes)
         session.commit()

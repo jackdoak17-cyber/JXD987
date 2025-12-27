@@ -9,3 +9,4 @@ env/
 *.db
 /.mypy_cache/
 /.pytest_cache/
+Betting/
