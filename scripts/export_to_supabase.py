@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Sequence, Set, Tuple
 
@@ -366,22 +367,39 @@ def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) 
 
     url = SUPABASE_URL.rstrip("/") + REST_PATH + f"/{table}"
     total = 0
-    chunk = 500
+    chunk = max(int(os.environ.get("SUPABASE_EXPORT_CHUNK", "100")), 1)
+    pause = max(float(os.environ.get("SUPABASE_EXPORT_SLEEP", "0.2")), 0.0)
+    max_retries = max(int(os.environ.get("SUPABASE_EXPORT_RETRIES", "3")), 0)
     headers = rest_headers()
     for i in range(0, len(rows), chunk):
         batch = rows[i : i + chunk]
-        resp = requests.post(
-            url,
-            headers=headers,
-            params={"on_conflict": on_conflict},
-            data=json.dumps(batch),
-            timeout=30,
-        )
-        if not resp.ok:
-            raise SystemExit(
-                f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}"
-            )
+        attempt = 0
+        while True:
+            try:
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    params={"on_conflict": on_conflict},
+                    data=json.dumps(batch),
+                    timeout=60,
+                )
+            except requests.RequestException as exc:
+                if attempt >= max_retries:
+                    raise SystemExit(f"Supabase upsert to {table} failed: {exc}") from exc
+                attempt += 1
+                time.sleep(pause * (2**attempt))
+                continue
+            if resp.ok:
+                break
+            if attempt >= max_retries:
+                raise SystemExit(
+                    f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}"
+                )
+            attempt += 1
+            time.sleep(pause * (2**attempt))
         total += len(batch)
+        if pause:
+            time.sleep(pause)
     return total
 
 
@@ -405,6 +423,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--strict", action="store_true", default=True)
     parser.add_argument("--dry-run", action="store_true", help="Compute payload sizes without sending to Supabase")
+    parser.add_argument(
+        "--skip-odds-snapshots",
+        action="store_true",
+        default=False,
+        help="Skip exporting odds_snapshots (reduces Supabase load)",
+    )
     args = parser.parse_args()
 
     require_env(args.dry_run)
@@ -432,7 +456,7 @@ def main():
     fixture_players = fetch_fixture_players(conn, list(fixture_ids))
     fixture_stats = fetch_fixture_statistics(conn, list(fixture_ids))
     fixture_player_stats = fetch_fixture_player_statistics(conn, list(fixture_ids))
-    odds_snapshots = fetch_odds_snapshots(conn, list(fixture_ids))
+    odds_snapshots = [] if args.skip_odds_snapshots else fetch_odds_snapshots(conn, list(fixture_ids))
     odds_outcomes = fetch_odds_outcomes(conn, list(fixture_ids))
 
     player_ids: Set[int] = set()
@@ -462,7 +486,9 @@ def main():
             "fixture_id,player_id,type_id",
             args.dry_run,
         ),
-        "odds_snapshots": upsert_table("odds_snapshots", odds_snapshots, "id", args.dry_run),
+        "odds_snapshots": 0
+        if args.skip_odds_snapshots
+        else upsert_table("odds_snapshots", odds_snapshots, "id", args.dry_run),
         "odds_outcomes": upsert_table(
             "odds_outcomes",
             odds_outcomes,
