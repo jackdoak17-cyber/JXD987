@@ -40,4 +40,4 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          python3 scripts/export_odds_to_supabase.py --leagues "8" --days-forward 14
+          python3 scripts/export_odds_to_supabase.py --leagues "8" --days-forward 14 --chunk-size 100 --timeout 120 --retries 5
