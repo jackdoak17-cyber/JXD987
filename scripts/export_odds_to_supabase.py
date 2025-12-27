@@ -43,12 +43,18 @@ def rest_headers() -> Dict[str, str]:
     }
 
 
-def upsert_table(table: str, rows: List[Dict], on_conflict: str) -> int:
+def upsert_table(
+    table: str,
+    rows: List[Dict],
+    on_conflict: str,
+    chunk_size: int,
+    timeout: int,
+) -> int:
     if not rows:
         return 0
     url = SUPABASE_URL.rstrip("/") + REST_PATH + f"/{table}"
     total = 0
-    chunk = 500
+    chunk = max(1, chunk_size)
     headers = rest_headers()
     for i in range(0, len(rows), chunk):
         batch = rows[i : i + chunk]
@@ -57,7 +63,7 @@ def upsert_table(table: str, rows: List[Dict], on_conflict: str) -> int:
             headers=headers,
             params={"on_conflict": on_conflict},
             data=json.dumps(batch),
-            timeout=30,
+            timeout=timeout,
         )
         if not resp.ok:
             raise SystemExit(
@@ -162,6 +168,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default="8", help="Comma-separated league IDs")
     parser.add_argument("--days-forward", type=int, default=14)
+    parser.add_argument("--skip-snapshots", action="store_true")
+    parser.add_argument("--chunk-size", type=int, default=500)
+    parser.add_argument("--timeout", type=int, default=60)
     args = parser.parse_args()
 
     require_env()
@@ -169,15 +178,23 @@ def main() -> None:
     conn = get_conn()
 
     fixture_ids = fetch_fixture_ids(conn, league_ids, args.days_forward)
-    snapshots = fetch_odds_snapshots(conn, fixture_ids)
+    snapshots = [] if args.skip_snapshots else fetch_odds_snapshots(conn, fixture_ids)
     outcomes = fetch_odds_outcomes(conn, fixture_ids)
 
     exported = {
-        "odds_snapshots": upsert_table("odds_snapshots", snapshots, "id"),
+        "odds_snapshots": upsert_table(
+            "odds_snapshots",
+            snapshots,
+            "id",
+            args.chunk_size,
+            args.timeout,
+        ),
         "odds_outcomes": upsert_table(
             "odds_outcomes",
             outcomes,
             "fixture_id,bookmaker_id,market_key,selection_key,line",
+            args.chunk_size,
+            args.timeout,
         ),
     }
 
