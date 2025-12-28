@@ -24,6 +24,18 @@ drop function if exists public.player_streak_playing_on_date_counts(
   integer
 );
 
+drop function if exists public.player_stat_window_last_n(
+  integer,
+  integer,
+  integer,
+  integer,
+  boolean,
+  integer,
+  integer,
+  integer,
+  integer
+);
+
 create or replace function public.player_streak_base(
   p_league_id integer,
   p_type_id integer,
