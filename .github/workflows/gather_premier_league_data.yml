@@ -1,4 +1,4 @@
-name: Gather Premier League Data
+name: Gather League Data
 
 on:
   workflow_dispatch:
@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
+      LEAGUE_IDS: "8,9,82,301,384,387,501,564,567,600"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,11 +28,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run full sync (Premier League)
+      - name: Run full sync (leagues)
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
-          python3 scripts/run_sync.py --mode full --leagues "8"
+          python3 scripts/run_sync.py --mode full --leagues "$LEAGUE_IDS"
 
       - name: Freshness report
         run: python3 scripts/sqlite_freshness_report.py
@@ -57,11 +58,13 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
-          curl -sS -X POST "$SUPABASE_URL/rest/v1/rpc/refresh_team_likely_players" \
-            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
-            -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-            -H "Content-Type: application/json" \
-            -d '{"p_league_id":8,"p_recent_days":30,"p_last_n":1}'
+          for league_id in ${LEAGUE_IDS//,/ }; do
+            curl -sS -X POST "$SUPABASE_URL/rest/v1/rpc/refresh_team_likely_players" \
+              -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+              -H "Content-Type: application/json" \
+              -d "{\"p_league_id\":${league_id},\"p_recent_days\":30,\"p_last_n\":1}"
+          done
 
       - name: Verify Supabase table counts
         env:

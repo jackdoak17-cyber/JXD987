@@ -181,7 +181,11 @@ def fetch_odds_outcomes(conn: sqlite3.Connection, fixture_ids: Sequence[int]) ->
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--leagues", default="8", help="Comma-separated league IDs")
+    parser.add_argument(
+        "--leagues",
+        default="8,9,82,301,384,387,501,564,567,600",
+        help="Comma-separated league IDs",
+    )
     parser.add_argument("--days-forward", type=int, default=14)
     parser.add_argument("--skip-snapshots", action="store_true")
     parser.add_argument("--chunk-size", type=int, default=500)

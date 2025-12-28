@@ -98,7 +98,10 @@ def _check_eze_stats(session, league_ids: List[int]) -> None:
 
 @app.command()
 def main(
-    leagues: str = typer.Option("8", help="Comma-separated league IDs"),
+    leagues: str = typer.Option(
+        "8,9,82,301,384,387,501,564,567,600",
+        help="Comma-separated league IDs",
+    ),
     mode: str = typer.Option("recent", help="recent|history|full"),
     recent_days: int = typer.Option(120, help="Days back for recent window"),
 ):
