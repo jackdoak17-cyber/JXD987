@@ -24,7 +24,7 @@ jobs:
     env:
       PYTHONPATH: .
       MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'patch' }}
-      LEAGUE_IDS: "8,9,82,301,384,387,501,564,567,600"
+      LEAGUE_IDS: "8,384"
     steps:
       - name: Checkout
         uses: actions/checkout@v4

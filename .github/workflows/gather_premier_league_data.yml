@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
-      LEAGUE_IDS: "8,9,82,301,384,387,501,564,567,600"
+      LEAGUE_IDS: "8,384"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,7 +51,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python3 scripts/export_to_supabase.py --strict
+        run: python3 scripts/export_to_supabase.py --strict --leagues "$LEAGUE_IDS"
 
       - name: Refresh likely players
         env:

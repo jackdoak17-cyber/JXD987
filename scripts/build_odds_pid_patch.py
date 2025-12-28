@@ -17,7 +17,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--leagues",
-        default="8,9,82,301,384,387,501,564,567,600",
+        default="8,384",
         help="Comma-separated league IDs",
     )
     parser.add_argument("--days-forward", type=int, default=14)

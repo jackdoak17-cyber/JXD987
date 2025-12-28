@@ -68,10 +68,14 @@ def ensure_tables_exist(conn: sqlite3.Connection, tables: Sequence[str]) -> None
         raise SystemExit(f"Missing required tables in SQLite: {', '.join(missing)}")
 
 
-def choose_keep_seasons(conn: sqlite3.Connection) -> Set[int]:
+def choose_keep_seasons(conn: sqlite3.Connection, league_ids: Sequence[int] | None = None) -> Set[int]:
     cur = conn.cursor()
     keep: Set[int] = set()
-    cur.execute("select distinct league_id from seasons")
+    if league_ids:
+        q = ",".join("?" for _ in league_ids)
+        cur.execute(f"select distinct league_id from seasons where league_id in ({q})", league_ids)
+    else:
+        cur.execute("select distinct league_id from seasons")
     leagues = [row[0] for row in cur.fetchall()]
     for league_id in leagues:
         cur.execute(
@@ -423,6 +427,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--strict", action="store_true", default=True)
     parser.add_argument("--dry-run", action="store_true", help="Compute payload sizes without sending to Supabase")
+    parser.add_argument("--leagues", default=os.environ.get("LEAGUE_IDS", ""), help="Comma-separated league IDs")
     parser.add_argument(
         "--skip-odds-snapshots",
         action="store_true",
@@ -436,7 +441,8 @@ def main():
     conn = get_conn()
     ensure_tables_exist(conn, REQUIRED_TABLES)
 
-    keep_ids = choose_keep_seasons(conn)
+    league_ids = [int(x) for x in args.leagues.split(",") if x.strip()] if args.leagues else []
+    keep_ids = choose_keep_seasons(conn, league_ids if league_ids else None)
     if not keep_ids:
         raise SystemExit("No seasons to export")
 
