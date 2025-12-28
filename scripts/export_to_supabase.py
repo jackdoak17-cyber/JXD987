@@ -15,6 +15,7 @@ Supports --dry-run to print the payload counts without hitting Supabase.
 
 import argparse
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -28,6 +29,8 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 REST_PATH = "/rest/v1"
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
 REQUIRED_TABLES = [
     "seasons",
     "teams",
@@ -371,11 +374,14 @@ def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) 
 
     url = SUPABASE_URL.rstrip("/") + REST_PATH + f"/{table}"
     total = 0
-    chunk = max(int(os.environ.get("SUPABASE_EXPORT_CHUNK", "100")), 1)
-    pause = max(float(os.environ.get("SUPABASE_EXPORT_SLEEP", "0.2")), 0.0)
+    chunk = max(int(os.environ.get("SUPABASE_EXPORT_CHUNK", "50")), 1)
+    pause = max(float(os.environ.get("SUPABASE_EXPORT_SLEEP", "0.5")), 0.0)
     max_retries = max(int(os.environ.get("SUPABASE_EXPORT_RETRIES", "3")), 0)
     headers = rest_headers()
+    total_batches = (len(rows) + chunk - 1) // chunk
     for i in range(0, len(rows), chunk):
+        batch_index = i // chunk + 1
+        log.info("Upserting %s batch %s/%s (%s rows)", table, batch_index, total_batches, len(rows[i : i + chunk]))
         batch = rows[i : i + chunk]
         attempt = 0
         while True:
@@ -475,33 +481,43 @@ def main():
 
     players = fetch_players(conn, list(player_ids))
 
-    exported = {
-        "seasons": upsert_table("seasons", seasons, "id", args.dry_run),
-        "teams": upsert_table("teams", teams, "id", args.dry_run),
-        "fixtures": upsert_table("fixtures", fixtures, "id", args.dry_run),
-        "players": upsert_table("players", players, "id", args.dry_run),
-        "fixture_players": upsert_table(
-            "fixture_players", fixture_players, "fixture_id,player_id", args.dry_run
-        ),
-        "fixture_statistics": upsert_table(
-            "fixture_statistics", fixture_stats, "fixture_id,team_id,type_id", args.dry_run
-        ),
-        "fixture_player_statistics": upsert_table(
-            "fixture_player_statistics",
-            fixture_player_stats,
-            "fixture_id,player_id,type_id",
-            args.dry_run,
-        ),
-        "odds_snapshots": 0
-        if args.skip_odds_snapshots
-        else upsert_table("odds_snapshots", odds_snapshots, "id", args.dry_run),
-        "odds_outcomes": upsert_table(
-            "odds_outcomes",
-            odds_outcomes,
-            "fixture_id,bookmaker_id,market_key,selection_key,line",
-            args.dry_run,
-        ),
-    }
+    log.info("Payload counts: seasons=%s teams=%s fixtures=%s players=%s", len(seasons), len(teams), len(fixtures), len(players))
+    log.info(
+        "Payload counts: fixture_players=%s fixture_statistics=%s fixture_player_statistics=%s",
+        len(fixture_players),
+        len(fixture_stats),
+        len(fixture_player_stats),
+    )
+    log.info("Payload counts: odds_snapshots=%s odds_outcomes=%s", len(odds_snapshots), len(odds_outcomes))
+
+    exported: Dict[str, int] = {}
+    exports = [
+        ("seasons", seasons, "id"),
+        ("teams", teams, "id"),
+        ("fixtures", fixtures, "id"),
+        ("players", players, "id"),
+        ("fixture_players", fixture_players, "fixture_id,player_id"),
+        ("fixture_statistics", fixture_stats, "fixture_id,team_id,type_id"),
+        ("fixture_player_statistics", fixture_player_stats, "fixture_id,player_id,type_id"),
+    ]
+
+    for table, rows, on_conflict in exports:
+        log.info("Exporting %s (%s rows)", table, len(rows))
+        exported[table] = upsert_table(table, rows, on_conflict, args.dry_run)
+
+    if args.skip_odds_snapshots:
+        exported["odds_snapshots"] = 0
+    else:
+        log.info("Exporting odds_snapshots (%s rows)", len(odds_snapshots))
+        exported["odds_snapshots"] = upsert_table("odds_snapshots", odds_snapshots, "id", args.dry_run)
+
+    log.info("Exporting odds_outcomes (%s rows)", len(odds_outcomes))
+    exported["odds_outcomes"] = upsert_table(
+        "odds_outcomes",
+        odds_outcomes,
+        "fixture_id,bookmaker_id,market_key,selection_key,line",
+        args.dry_run,
+    )
     pruned = prune_fixtures(list(keep_ids), args.dry_run)
 
     summary = {
