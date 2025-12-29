@@ -9,6 +9,7 @@ jobs:
     env:
       PYTHONPATH: .
       LEAGUE_IDS: "8,384"
+      EXPORT_DAYS_BACK: "180"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
