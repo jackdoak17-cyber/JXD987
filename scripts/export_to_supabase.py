@@ -129,8 +129,14 @@ def fetch_fixtures(conn: sqlite3.Connection, keep_ids: Sequence[int], upcoming_d
     q = ",".join("?" for _ in keep_ids)
     now = datetime.utcnow()
     upcoming_end = now + timedelta(days=upcoming_days)
+    days_back = int(os.environ.get("EXPORT_DAYS_BACK", "0") or "0")
+    finished_start = now - timedelta(days=days_back) if days_back > 0 else None
     now_iso = now.isoformat(sep=" ")
     upcoming_iso = upcoming_end.isoformat(sep=" ")
+    finished_iso = finished_start.isoformat(sep=" ") if finished_start else None
+    finished_clause = "home_score is not null and away_score is not null"
+    if finished_iso:
+        finished_clause += " and starting_at >= ?"
     cur.execute(
         f"""
         select id, league_id, season_id, starting_at, status, status_code,
@@ -140,11 +146,11 @@ def fetch_fixtures(conn: sqlite3.Connection, keep_ids: Sequence[int], upcoming_d
           and home_team_id is not null
           and away_team_id is not null
           and (
-            (home_score is not null and away_score is not null)
+            ({finished_clause})
             or (starting_at >= ? and starting_at <= ?)
           )
         """,
-        [*keep_ids, now_iso, upcoming_iso],
+        [*keep_ids, *( [finished_iso] if finished_iso else []), now_iso, upcoming_iso],
     )
     fixtures = []
     for row in cur.fetchall():
