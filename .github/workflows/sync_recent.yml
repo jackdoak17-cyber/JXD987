@@ -10,7 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
-      LEAGUE_IDS: "8,384"
       EXPORT_DAYS_BACK: "180"
     steps:
       - name: Checkout
@@ -30,6 +29,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Load league ids
+        run: |
+          echo "LEAGUE_IDS=$(paste -sd, config/league_ids.txt)" >> $GITHUB_ENV
 
       - name: Sync recent window
         env:
