@@ -126,7 +126,7 @@ jobs:
           path: /tmp/odds_coverage_report.json
 
       - name: Export odds to Supabase
-        if: steps.preflight.outputs.supabase_ok == 'true' && env.MODE == 'full'
+        if: steps.preflight.outputs.supabase_ok == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -146,7 +146,7 @@ jobs:
           echo "Supabase not reachable; odds export skipped."
 
       - name: Supabase reachability check
-        if: steps.preflight.outputs.supabase_ok == 'true' && env.MODE == 'full'
+        if: steps.preflight.outputs.supabase_ok == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
