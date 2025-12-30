@@ -315,8 +315,8 @@ with src as (
   returning (xmax = 0) as inserted
 )
 select 'upserted_total', count(*)::bigint from upserted;
-select 'inserted', count(*)::bigint filter (where inserted) from upserted;
-select 'updated', count(*)::bigint filter (where not inserted) from upserted;
+select 'inserted', (count(*) filter (where inserted))::bigint from upserted;
+select 'updated', (count(*) filter (where not inserted))::bigint from upserted;
 select 'src_count', cnt from src_count;
 commit;
 """,
