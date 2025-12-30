@@ -71,16 +71,26 @@ def upsert_table(
                     data=json.dumps(batch),
                     timeout=timeout,
                 )
-                if not resp.ok:
-                    raise SystemExit(
-                        f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}"
-                    )
-                break
+                if resp.ok:
+                    break
+                # Retry on transient gateway errors
+                if resp.status_code in (502, 503, 504):
+                    attempt += 1
+                    if attempt > retries:
+                        raise SystemExit(
+                            f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}"
+                        )
+                    sleep_for = min(60, 2**attempt)
+                    time.sleep(sleep_for)
+                    continue
+                raise SystemExit(
+                    f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}"
+                )
             except requests.RequestException as exc:
                 attempt += 1
                 if attempt > retries:
                     raise SystemExit(f"Supabase upsert to {table} failed after retries: {exc}")
-                sleep_for = 2**attempt
+                sleep_for = min(60, 2**attempt)
                 time.sleep(sleep_for)
         total += len(batch)
         if sleep_seconds:
