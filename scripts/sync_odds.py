@@ -19,6 +19,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from sqlalchemy import bindparam, text
 
 from jxd import SportMonksClient
+from jxd import SyncService
 from jxd.db import get_engine, get_session
 from jxd.models import Base
 
@@ -353,6 +354,11 @@ def main() -> None:
     parser.add_argument("--bookmaker-id", type=int, default=2)
     parser.add_argument("--sleep", type=float, default=0.05)
     parser.add_argument("--limit", type=int, default=0, help="Limit fixtures processed")
+    parser.add_argument(
+        "--refresh-upcoming",
+        action="store_true",
+        help="Refresh upcoming fixtures for the league ids before fetching odds",
+    )
     args = parser.parse_args()
 
     league_ids = [int(x) for x in args.leagues.split(",") if x.strip()]
@@ -364,6 +370,11 @@ def main() -> None:
     Base.metadata.create_all(engine)
 
     client = SportMonksClient()
+    if args.refresh_upcoming:
+        svc = SyncService(client, session)
+        svc.ensure_schema()
+        log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
+        svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
     today = datetime.utcnow().date()
     end_date = today + timedelta(days=args.days_forward)
 
