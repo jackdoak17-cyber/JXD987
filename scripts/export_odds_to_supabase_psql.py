@@ -69,6 +69,9 @@ def build_outcomes_csv(
     days_forward: int,
     out_path: Path,
     progress_every: int,
+    progress_fixtures: int,
+    total_rows_estimate: int,
+    total_fixtures_estimate: int,
     max_runtime_seconds: int,
 ) -> Tuple[int, bool, Optional[int]]:
     today = datetime.utcnow().date()
@@ -121,7 +124,9 @@ def build_outcomes_csv(
         )
 
         total_rows = 0
-        last_report = 0
+        total_fixtures = 0
+        last_report_rows = 0
+        last_report_fixtures = 0
         last_fixture_id: Optional[int] = None
         partial_run = False
         start = time.time()
@@ -130,18 +135,36 @@ def build_outcomes_csv(
             if not rows:
                 break
             for row in rows:
+                fixture_id = row[0]
+                if fixture_id != last_fixture_id:
+                    total_fixtures += 1
+                    last_fixture_id = fixture_id
                 writer.writerow(row)
                 total_rows += 1
-                last_fixture_id = row[0]
             elapsed = time.time() - start
-            if progress_every and (total_rows - last_report) >= progress_every:
+            should_log_rows = progress_every and (total_rows - last_report_rows) >= progress_every
+            should_log_fixtures = progress_fixtures and (total_fixtures - last_report_fixtures) >= progress_fixtures
+            if should_log_rows or should_log_fixtures:
                 rows_per_sec = total_rows / elapsed if elapsed > 0 else 0.0
+                fixtures_per_sec = total_fixtures / elapsed if elapsed > 0 else 0.0
+                eta_seconds = None
+                if total_rows_estimate > 0 and rows_per_sec > 0:
+                    eta_seconds = max(0.0, (total_rows_estimate - total_rows) / rows_per_sec)
+                elif total_fixtures_estimate > 0 and fixtures_per_sec > 0:
+                    eta_seconds = max(0.0, (total_fixtures_estimate - total_fixtures) / fixtures_per_sec)
+                eta_text = f"{eta_seconds:.0f}" if eta_seconds is not None else "n/a"
                 print(
-                    f"CSV progress rows={total_rows} rows_per_sec={rows_per_sec:.1f} "
-                    f"elapsed_sec={elapsed:.0f} last_fixture_id={last_fixture_id}",
+                    "CSV progress "
+                    f"rows={total_rows} fixtures={total_fixtures} "
+                    f"rows_per_sec={rows_per_sec:.1f} fixtures_per_sec={fixtures_per_sec:.2f} "
+                    f"elapsed_sec={elapsed:.0f} eta_sec={eta_text} "
+                    f"last_fixture_id={last_fixture_id}",
                     flush=True,
                 )
-                last_report = total_rows
+                if should_log_rows:
+                    last_report_rows = total_rows
+                if should_log_fixtures:
+                    last_report_fixtures = total_fixtures
             if max_runtime_seconds and elapsed > max_runtime_seconds:
                 partial_run = True
                 break
@@ -155,25 +178,14 @@ def stage_and_upsert(db_url: str, csv_path: Path) -> Dict[str, int]:
     sql = f"""
 \\set ON_ERROR_STOP on
 begin;
-create table if not exists public.odds_outcomes_stage (
-  fixture_id bigint,
-  bookmaker_id int,
-  market_key text,
-  selection_key text,
-  line numeric,
-  price_decimal numeric,
-  price_american int,
-  participant_type text,
-  participant_id bigint,
-  last_updated_at timestamptz
-);
-truncate public.odds_outcomes_stage;
-\\copy public.odds_outcomes_stage (
+create temp table odds_outcomes_stage
+  (like public.odds_outcomes including defaults) on commit drop;
+\\copy odds_outcomes_stage (
   fixture_id, bookmaker_id, market_key, selection_key, line,
   price_decimal, price_american, participant_type, participant_id, last_updated_at
 ) from '{csv_path.as_posix()}' with (format csv, header true);
 
-select 'stage_count', count(*)::bigint from public.odds_outcomes_stage;
+select 'stage_count', count(*)::bigint from odds_outcomes_stage;
 
 with upserted as (
   insert into public.odds_outcomes as o (
@@ -183,7 +195,7 @@ with upserted as (
   select
     fixture_id, bookmaker_id, market_key, selection_key, line,
     price_decimal, price_american, participant_type, participant_id, last_updated_at
-  from public.odds_outcomes_stage
+  from odds_outcomes_stage
   on conflict (fixture_id, bookmaker_id, market_key, selection_key, line)
   do update set
     price_decimal = excluded.price_decimal,
@@ -249,6 +261,44 @@ from scoped;
 """
 
 
+def coverage_baseline_query(days_back: int, league_ids: List[int]) -> str:
+    league_filter = ""
+    if league_ids:
+        league_filter = f"f.league_id = any({sql_array(league_ids)}) and"
+    return f"""
+with days as (
+  select generate_series(current_date - interval '{days_back} days', current_date, interval '1 day')::date as day
+), counts as (
+  select
+    d.day,
+    coalesce((
+      select count(*)
+      from public.odds_outcomes o
+      join public.fixtures f on f.id = o.fixture_id
+      where {league_filter}
+        o.participant_type = 'player'
+        and (coalesce(o.last_updated_at, now()) at time zone 'Europe/London')::date = d.day
+    ), 0) as total,
+    coalesce((
+      select count(*)
+      from public.odds_outcomes o
+      join public.fixtures f on f.id = o.fixture_id
+      where {league_filter}
+        o.participant_type = 'player'
+        and o.participant_id is not null
+        and (coalesce(o.last_updated_at, now()) at time zone 'Europe/London')::date = d.day
+    ), 0) as mapped
+  from days d
+)
+select coalesce(
+  percentile_cont(0.5) within group (
+    order by case when total = 0 then 0 else 100.0 * mapped / total end
+  ),
+  0
+) as median_mapped_pct;
+"""
+
+
 def verification_queries(days_forward: int) -> List[str]:
     queries = []
     queries.append(
@@ -287,6 +337,7 @@ def main() -> None:
     parser.add_argument("--csv-out", default="/tmp/odds_outcomes_export.csv")
     parser.add_argument("--report-out", default="/tmp/odds_ingest_report.json")
     parser.add_argument("--progress-rows", type=int, default=10000)
+    parser.add_argument("--progress-fixtures", type=int, default=100)
     parser.add_argument("--max-runtime-minutes", type=int, default=25)
     parser.add_argument(
         "--no-include-fixture-leagues",
@@ -326,6 +377,22 @@ def main() -> None:
             [today.isoformat(), end.isoformat(), *effective_leagues],
         ).fetchone()[0]
 
+    total_rows_estimate = 0
+    if effective_leagues:
+        placeholders = ",".join("?" for _ in effective_leagues)
+        today = datetime.utcnow().date()
+        end = today + timedelta(days=args.days_forward)
+        total_rows_estimate = conn.execute(
+            f"""
+            select count(*)
+            from odds_outcomes o
+            join fixtures f on f.id = o.fixture_id
+            where date(f.starting_at) >= ? and date(f.starting_at) <= ?
+              and f.league_id in ({placeholders})
+            """,
+            [today.isoformat(), end.isoformat(), *effective_leagues],
+        ).fetchone()[0]
+
     print(
         f"Exporting odds_outcomes fixtures={fixture_count} leagues={len(effective_leagues)} window_days={args.days_forward}",
         flush=True,
@@ -337,6 +404,9 @@ def main() -> None:
         args.days_forward,
         Path(args.csv_out),
         args.progress_rows,
+        args.progress_fixtures,
+        total_rows_estimate,
+        fixture_count,
         max_runtime_seconds,
     )
     conn.close()
@@ -372,7 +442,18 @@ def main() -> None:
     except ValueError:
         coverage_pct = 0.0
 
-    print(f"Coverage total={coverage_total} mapped={coverage_mapped} pct={coverage_pct}", flush=True)
+    baseline_sql = coverage_baseline_query(6, effective_leagues)
+    baseline_out = run_psql(DB_URL, baseline_sql)
+    try:
+        coverage_baseline_pct = float(baseline_out.strip()) if baseline_out else 0.0
+    except ValueError:
+        coverage_baseline_pct = 0.0
+
+    print(
+        f"Coverage total={coverage_total} mapped={coverage_mapped} "
+        f"pct={coverage_pct} baseline_pct={coverage_baseline_pct}",
+        flush=True,
+    )
 
     verification_outputs: List[str] = []
     for idx, query in enumerate(verification_queries(args.days_forward), start=1):
@@ -391,11 +472,17 @@ def main() -> None:
         "window_days": args.days_forward,
         "fixture_count": fixture_count,
         "league_ids": effective_leagues,
+        "league_id": effective_leagues[0] if len(effective_leagues) == 1 else None,
         "sqlite_rows_exported": total_rows,
+        "rows_exported_csv": total_rows,
         "copy_rows": counts.get("stage_count", 0),
+        "rows_copied": counts.get("stage_count", 0),
         "inserted_rows": counts.get("inserted", 0),
+        "rows_inserted": counts.get("inserted", 0),
         "updated_rows": counts.get("updated", 0),
+        "rows_updated": counts.get("updated", 0),
         "unchanged_rows": counts.get("unchanged", 0),
+        "rows_unchanged_skipped": counts.get("unchanged", 0),
         "partial_run": partial_run,
         "last_fixture_id": last_fixture_id,
         "psql_ok": os.environ.get("PSQL_OK"),
@@ -403,6 +490,7 @@ def main() -> None:
             "total": coverage_total,
             "mapped": coverage_mapped,
             "mapped_pct": coverage_pct,
+            "baseline_pct": coverage_baseline_pct,
         },
         "rest_ok": os.environ.get("REST_OK"),
         "rest_http": os.environ.get("REST_HTTP"),
