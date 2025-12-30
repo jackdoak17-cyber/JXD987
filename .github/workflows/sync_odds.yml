@@ -27,7 +27,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        league: [8, 9, 384, 387, 564, 567, 82, 301, 600, 501, 444, 72]
+        league_id: [8, 9, 384, 387, 564, 567, 82, 301, 600, 501, 444, 72]
     env:
       PYTHONPATH: .
       PYTHONUNBUFFERED: "1"
@@ -57,8 +57,8 @@ jobs:
         continue-on-error: true
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
-          LEAGUE_ID: ${{ matrix.league }}
-          REPORT_PATH: /tmp/odds_preflight_${{ matrix.league }}.json
+          LEAGUE_ID: ${{ matrix.league_id }}
+          REPORT_PATH: /tmp/odds_preflight_${{ matrix.league_id }}.json
         run: |
           set -euo pipefail
           if [ -z "${SUPABASE_DB_URL:-}" ]; then
@@ -153,7 +153,8 @@ jobs:
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
-          cmd="python3 scripts/sync_odds.py --leagues \"${{ matrix.league }}\" --days-forward 14 --refresh-upcoming"
+          echo "LEAGUES_ARG=[${{ matrix.league_id }}]"
+          cmd="python3 scripts/sync_odds.py --leagues \"${{ matrix.league_id }}\" --days-forward 14 --refresh-upcoming"
           if [ "$MODE" = "full" ]; then
             cmd="$cmd --refresh-squads"
           fi
@@ -165,26 +166,26 @@ jobs:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
         run: |
           python3 scripts/export_odds_to_supabase_psql.py \
-            --leagues "${{ matrix.league }}" \
+            --leagues "${{ matrix.league_id }}" \
             --days-forward 14 \
             --progress-rows 10000 \
             --progress-fixtures 100 \
             --max-runtime-minutes 25 \
-            --report-out /tmp/odds_ingest_report_${{ matrix.league }}.json
+            --report-out /tmp/odds_ingest_report_${{ matrix.league_id }}.json
 
       - name: Upload preflight report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: odds_preflight_${{ matrix.league }}
-          path: /tmp/odds_preflight_${{ matrix.league }}.json
+          name: odds_preflight_${{ matrix.league_id }}
+          path: /tmp/odds_preflight_${{ matrix.league_id }}.json
 
       - name: Upload odds ingest report
         if: env.PSQL_PREFLIGHT_OK == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: odds_ingest_report_${{ matrix.league }}
-          path: /tmp/odds_ingest_report_${{ matrix.league }}.json
+          name: odds_ingest_report_${{ matrix.league_id }}
+          path: /tmp/odds_ingest_report_${{ matrix.league_id }}.json
 
       - name: Fail if preflight failed
         if: env.PSQL_PREFLIGHT_OK != 'true'

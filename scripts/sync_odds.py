@@ -374,7 +374,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    league_ids = [int(x) for x in args.leagues.split(",") if x.strip()]
+    raw_leagues = args.leagues.replace('"', "").replace("'", "")
+    league_ids = [int(x) for x in raw_leagues.split(",") if x.strip()]
     if not league_ids:
         raise SystemExit("No league IDs provided")
 
