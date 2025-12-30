@@ -89,11 +89,26 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
+          import re
           import socket
           import urllib.parse
 
           url = os.environ.get("SUPABASE_DB_URL", "")
-          host = urllib.parse.urlparse(url).hostname
+          host = None
+          try:
+              host = urllib.parse.urlparse(url).hostname
+          except ValueError:
+              host = None
+          if not host:
+              match = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:(?P<userinfo>[^@/]+)@)?(?P<hostport>[^/]+)", url)
+              if match:
+                  hostport = match.group("hostport")
+                  if hostport.startswith("[") and "]" in hostport:
+                      host = hostport[1:hostport.index("]")]
+                  else:
+                      host = hostport.split(":")[0]
+          if host:
+              host = host.strip("[]")
           if not host:
               print("Could not parse host from SUPABASE_DB_URL")
               raise SystemExit(0)
