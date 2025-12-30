@@ -289,8 +289,6 @@ with src as (
   from odds_outcomes_stage
   order by fixture_id, bookmaker_id, market_key, selection_key, line,
            last_updated_at desc nulls last
-), src_count as (
-  select count(*)::bigint as cnt from src
 ), upserted as (
   insert into public.odds_outcomes as o (
     fixture_id, bookmaker_id, market_key, selection_key, line,
@@ -315,10 +313,10 @@ with src as (
     or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at)
   returning (xmax = 0) as inserted
 )
-select 'upserted_total', count(*)::bigint from upserted;
-select 'inserted', (select count(*)::bigint from upserted where inserted);
-select 'updated', (select count(*)::bigint from upserted where not inserted);
-select 'src_count', cnt from src_count;
+select 'upserted_total', count(*)::bigint from upserted
+union all select 'inserted', count(*)::bigint from upserted where inserted
+union all select 'updated', count(*)::bigint from upserted where not inserted
+union all select 'src_count', (select count(*)::bigint from src);
 commit;
 """,
         ]
