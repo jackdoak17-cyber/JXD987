@@ -91,29 +91,58 @@ jobs:
           import os
           import re
           import socket
-          import urllib.parse
 
-          url = os.environ.get("SUPABASE_DB_URL", "")
+          url = os.environ.get("SUPABASE_DB_URL", "").strip()
+          if not url:
+              print("SUPABASE_DB_URL is empty")
+              raise SystemExit(0)
+
+          match = re.match(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<rest>.+)$", url)
+          if not match:
+              print("SUPABASE_DB_URL is not a valid URI")
+              raise SystemExit(0)
+          scheme = match.group("scheme")
+          rest = match.group("rest")
+
+          rest, _, path_query = rest.partition("/")
+          authority = rest
+          rest_path = "/" + path_query if path_query else ""
+
+          userinfo = ""
+          hostport = authority
+          if "@" in authority:
+              userinfo, hostport = authority.rsplit("@", 1)
+              userinfo = userinfo + "@"
+
           host = None
-          try:
-              host = urllib.parse.urlparse(url).hostname
-          except ValueError:
-              host = None
-          if not host:
-              match = re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://(?:(?P<userinfo>[^@/]+)@)?(?P<hostport>[^/]+)", url)
-              if match:
-                  hostport = match.group("hostport")
-                  if hostport.startswith("[") and "]" in hostport:
-                      host = hostport[1:hostport.index("]")]
-                  else:
-                      host = hostport.split(":")[0]
+          port = None
+          if hostport.startswith("[") and "]" in hostport:
+              host = hostport[1:hostport.index("]")]
+              tail = hostport[hostport.index("]") + 1 :]
+              if tail.startswith(":"):
+                  try:
+                      port = int(tail[1:])
+                  except ValueError:
+                      port = None
+          else:
+              if ":" in hostport:
+                  host, port_str = hostport.rsplit(":", 1)
+                  try:
+                      port = int(port_str)
+                  except ValueError:
+                      port = None
+              else:
+                  host = hostport
+
           if host:
               host = host.strip("[]")
           if not host:
               print("Could not parse host from SUPABASE_DB_URL")
               raise SystemExit(0)
+          if port is None:
+              port = 5432
           try:
-              infos = socket.getaddrinfo(host, 5432, socket.AF_INET)
+              infos = socket.getaddrinfo(host, port, socket.AF_INET)
           except Exception as exc:
               print(f"IPv4 lookup failed for {host}: {exc}")
               raise SystemExit(0)
@@ -121,9 +150,14 @@ jobs:
           if not ip:
               print(f"No IPv4 address found for {host}")
               raise SystemExit(0)
+          hostport_ipv4 = f"{ip}:{port}" if port else ip
+          url_ipv4 = f"{scheme}{userinfo}{hostport_ipv4}{rest_path}"
           print(f"Resolved {host} -> {ip}")
           with open(os.environ["GITHUB_ENV"], "a") as f:
               f.write(f"PGHOSTADDR={ip}\n")
+              f.write(f"PGHOST={host}\n")
+              f.write(f"SUPABASE_DB_URL_IPV4={url_ipv4}\n")
+              f.write(f"SUPABASE_DB_URL={url_ipv4}\n")
           PY
 
       - name: Build odds participant patch (sqlite)
@@ -133,8 +167,6 @@ jobs:
 
       - name: Apply odds participant patch (psql)
         if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
-        env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           cat > /tmp/apply_odds_pid_patch.sql <<'SQL'
           create table if not exists public.odds_outcomes_pid_patch (
@@ -166,7 +198,6 @@ jobs:
       - name: Verify odds coverage (psql)
         if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           ODDS_COVERAGE_MIN_DISTINCT: 20
           ODDS_PLAYER_MAPPING_MIN_PCT: 80
         run: |
@@ -189,8 +220,6 @@ jobs:
 
       - name: Debug mapped participant IDs (Supabase)
         if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
-        env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select selection_key, participant_id, line, market_key from public.odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
 
