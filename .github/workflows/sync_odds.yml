@@ -32,7 +32,9 @@ jobs:
       PYTHONPATH: .
       PYTHONUNBUFFERED: "1"
       MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'prices' }}
-      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+      SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+      PGSSLMODE: require
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -56,89 +58,26 @@ jobs:
         id: preflight
         continue-on-error: true
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          PGSSLMODE: require
           LEAGUE_ID: ${{ matrix.league_id }}
           REPORT_PATH: /tmp/odds_preflight_${{ matrix.league_id }}.json
         run: |
-          set -euo pipefail
-          if [ -z "${SUPABASE_DB_URL:-}" ]; then
-            msg="Missing SUPABASE_DB_URL. Set SUPABASE_DB_URL_POOLER to the Supavisor SESSION pooler URL."
-            echo "$msg"
-            ERR_MSG="$msg" python3 - <<'PY'
-          import json, os, time
-          report_path = os.environ["REPORT_PATH"]
-          data = {
-              "league_id": int(os.environ["LEAGUE_ID"]),
-              "host": None,
-              "port": None,
-              "ok": False,
-              "error": os.environ["ERR_MSG"],
-              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-          }
-          with open(report_path, "w", encoding="utf-8") as f:
-              f.write(json.dumps(data, indent=2))
-          PY
-            echo "PSQL_PREFLIGHT_OK=false" >> $GITHUB_ENV
-            exit 1
-          fi
-
-          eval $(python3 - <<'PY'
-          import os, urllib.parse
-          url = os.environ.get("SUPABASE_DB_URL", "")
-          p = urllib.parse.urlparse(url)
-          host = p.hostname or ""
-          port = p.port or 5432
-          print(f"DB_HOST={host}")
-          print(f"DB_PORT={port}")
-          PY
-          )
-          echo "Supabase DB host=${DB_HOST} port=${DB_PORT}"
-
           set +e
-          output=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select now();" 2>&1)
+          : > /tmp/odds_preflight_err_${{ matrix.league_id }}.txt
+          python3 scripts/preflight_supabase_psql.py \
+            --league-id "${{ matrix.league_id }}" \
+            --report-out /tmp/odds_preflight_${{ matrix.league_id }}.json \
+            --stderr-out /tmp/odds_preflight_err_${{ matrix.league_id }}.txt
           status=$?
-          set -e
-
-          if [ $status -ne 0 ]; then
-            echo "$output"
-            if echo "$output" | grep -qi "Network is unreachable" && echo "$DB_HOST" | grep -q "^db\\."; then
-              echo "Direct DB endpoint is IPv6; GitHub runners are IPv4-only. Use Supavisor Session pooler URL (aws-*.pooler.supabase.com:5432) or buy IPv4 add-on."
-            fi
-            err_msg=$(echo "$output" | head -n 5 | tr -d '\r' | tr '\n' ' ')
-            DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" ERR_MSG="$err_msg" python3 - <<'PY'
-          import json, os, time
-          report_path = os.environ["REPORT_PATH"]
-          data = {
-              "league_id": int(os.environ["LEAGUE_ID"]),
-              "host": os.environ.get("DB_HOST"),
-              "port": int(os.environ.get("DB_PORT") or 0),
-              "ok": False,
-              "error": os.environ.get("ERR_MSG"),
-              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-          }
-          with open(report_path, "w", encoding="utf-8") as f:
-              f.write(json.dumps(data, indent=2))
-          PY
+          if [ $status -eq 0 ]; then
+            echo "PSQL_PREFLIGHT_OK=true" >> $GITHUB_ENV
+            echo "PSQL_OK=true" >> $GITHUB_ENV
+          else
             echo "PSQL_PREFLIGHT_OK=false" >> $GITHUB_ENV
-            exit 1
           fi
-
-          DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" ERR_MSG="" python3 - <<'PY'
-          import json, os, time
-          report_path = os.environ["REPORT_PATH"]
-          data = {
-              "league_id": int(os.environ["LEAGUE_ID"]),
-              "host": os.environ.get("DB_HOST"),
-              "port": int(os.environ.get("DB_PORT") or 0),
-              "ok": True,
-              "error": None,
-              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-          }
-          with open(report_path, "w", encoding="utf-8") as f:
-              f.write(json.dumps(data, indent=2))
-          PY
-          echo "PSQL_PREFLIGHT_OK=true" >> $GITHUB_ENV
-          echo "PSQL_OK=true" >> $GITHUB_ENV
+          exit 0
 
       - name: Supabase REST preflight
         env:
@@ -150,6 +89,7 @@ jobs:
             --env-out "$GITHUB_ENV"
 
       - name: Sync pre-match odds (next 14 days)
+        if: env.PSQL_PREFLIGHT_OK == 'true'
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
@@ -163,7 +103,9 @@ jobs:
       - name: DB-direct odds ingest (psql)
         if: env.PSQL_PREFLIGHT_OK == 'true'
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          PGSSLMODE: require
         run: |
           python3 scripts/export_odds_to_supabase_psql.py \
             --leagues "${{ matrix.league_id }}" \
@@ -179,6 +121,13 @@ jobs:
         with:
           name: odds_preflight_${{ matrix.league_id }}
           path: /tmp/odds_preflight_${{ matrix.league_id }}.json
+
+      - name: Upload preflight stderr
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_preflight_err_${{ matrix.league_id }}
+          path: /tmp/odds_preflight_err_${{ matrix.league_id }}.txt
 
       - name: Upload odds ingest report
         if: env.PSQL_PREFLIGHT_OK == 'true'
@@ -200,7 +149,9 @@ jobs:
       PYTHONPATH: .
       PYTHONUNBUFFERED: "1"
       MODE: patch
-      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+      SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+      PGSSLMODE: require
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -227,93 +178,31 @@ jobs:
       - name: Supabase DB preflight (psql)
         continue-on-error: true
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          PGSSLMODE: require
           REPORT_PATH: /tmp/odds_preflight_patch.json
         run: |
-          set -euo pipefail
-          if [ -z "${SUPABASE_DB_URL:-}" ]; then
-            msg="Missing SUPABASE_DB_URL. Set SUPABASE_DB_URL_POOLER to the Supavisor SESSION pooler URL."
-            echo "$msg"
-            ERR_MSG="$msg" python3 - <<'PY'
-          import json, os, time
-          report_path = os.environ["REPORT_PATH"]
-          data = {
-              "league_id": None,
-              "host": None,
-              "port": None,
-              "ok": False,
-              "error": os.environ["ERR_MSG"],
-              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-          }
-          with open(report_path, "w", encoding="utf-8") as f:
-              f.write(json.dumps(data, indent=2))
-          PY
-            echo "PSQL_PREFLIGHT_OK=false" >> $GITHUB_ENV
-            exit 1
-          fi
-
-          eval $(python3 - <<'PY'
-          import os, urllib.parse
-          url = os.environ.get("SUPABASE_DB_URL", "")
-          p = urllib.parse.urlparse(url)
-          host = p.hostname or ""
-          port = p.port or 5432
-          print(f"DB_HOST={host}")
-          print(f"DB_PORT={port}")
-          PY
-          )
-          echo "Supabase DB host=${DB_HOST} port=${DB_PORT}"
-
           set +e
-          output=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select now();" 2>&1)
+          : > /tmp/odds_preflight_err_patch.txt
+          python3 scripts/preflight_supabase_psql.py \
+            --report-out /tmp/odds_preflight_patch.json \
+            --stderr-out /tmp/odds_preflight_err_patch.txt
           status=$?
-          set -e
-
-          if [ $status -ne 0 ]; then
-            echo "$output"
-            if echo "$output" | grep -qi "Network is unreachable" && echo "$DB_HOST" | grep -q "^db\\."; then
-              echo "Direct DB endpoint is IPv6; GitHub runners are IPv4-only. Use Supavisor Session pooler URL (aws-*.pooler.supabase.com:5432) or buy IPv4 add-on."
-            fi
-            err_msg=$(echo "$output" | head -n 5 | tr -d '\r' | tr '\n' ' ')
-            DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" ERR_MSG="$err_msg" python3 - <<'PY'
-          import json, os, time
-          report_path = os.environ["REPORT_PATH"]
-          data = {
-              "league_id": None,
-              "host": os.environ.get("DB_HOST"),
-              "port": int(os.environ.get("DB_PORT") or 0),
-              "ok": False,
-              "error": os.environ.get("ERR_MSG"),
-              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-          }
-          with open(report_path, "w", encoding="utf-8") as f:
-              f.write(json.dumps(data, indent=2))
-          PY
+          if [ $status -eq 0 ]; then
+            echo "PSQL_PREFLIGHT_OK=true" >> $GITHUB_ENV
+            echo "PSQL_OK=true" >> $GITHUB_ENV
+          else
             echo "PSQL_PREFLIGHT_OK=false" >> $GITHUB_ENV
-            exit 1
           fi
-
-          DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" ERR_MSG="" python3 - <<'PY'
-          import json, os, time
-          report_path = os.environ["REPORT_PATH"]
-          data = {
-              "league_id": None,
-              "host": os.environ.get("DB_HOST"),
-              "port": int(os.environ.get("DB_PORT") or 0),
-              "ok": True,
-              "error": None,
-              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-          }
-          with open(report_path, "w", encoding="utf-8") as f:
-              f.write(json.dumps(data, indent=2))
-          PY
-          echo "PSQL_PREFLIGHT_OK=true" >> $GITHUB_ENV
-          echo "PSQL_OK=true" >> $GITHUB_ENV
+          exit 0
 
       - name: Patch odds participants (psql)
         if: env.PSQL_PREFLIGHT_OK == 'true'
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          PGSSLMODE: require
         run: |
           python3 scripts/patch_odds_participants_psql.py \
             --leagues "$LEAGUE_IDS" \
@@ -326,6 +215,13 @@ jobs:
         with:
           name: odds_preflight_patch
           path: /tmp/odds_preflight_patch.json
+
+      - name: Upload preflight stderr
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_preflight_err_patch
+          path: /tmp/odds_preflight_err_patch.txt
 
       - name: Upload odds patch report
         if: env.PSQL_PREFLIGHT_OK == 'true'
@@ -399,7 +295,8 @@ jobs:
                           "league_id": data.get("league_id"),
                           "host": data.get("host"),
                           "port": data.get("port"),
-                          "error": data.get("error"),
+                          "error_class": data.get("error_class"),
+                          "error_snippet": data.get("error_snippet"),
                       }
                   )
 
@@ -408,7 +305,8 @@ jobs:
               for item in preflight_errors:
                   print(
                       f"- league={item['league_id']} host={item['host']} "
-                      f"port={item['port']} error={item['error']}"
+                      f"port={item['port']} error_class={item['error_class']} "
+                      f"error_snippet={item['error_snippet']}"
                   )
 
           for path in ingest_files:

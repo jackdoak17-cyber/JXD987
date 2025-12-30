@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 DB_PATH = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
-DB_URL = os.environ.get("SUPABASE_DB_URL")
+DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL_SESSION")
 
 PLAYER_MARKET_EXTRA = (
     "goalscorers",
