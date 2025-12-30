@@ -6,12 +6,13 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Run mode: patch or full"
+        description: "Run mode: patch, prices, or full"
         required: false
-        default: "patch"
+        default: "prices"
         type: choice
         options:
           - patch
+          - prices
           - full
 
 concurrency:
@@ -23,7 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
-      MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'patch' }}
+      PYTHONUNBUFFERED: "1"
+      MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'prices' }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
     steps:
       - name: Checkout
@@ -48,6 +50,23 @@ jobs:
         run: |
           echo "LEAGUE_IDS=$(paste -sd, config/league_ids.txt)" >> $GITHUB_ENV
 
+      - name: Supabase DB preflight (psql)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select 1;"
+          echo "PSQL_OK=true" >> $GITHUB_ENV
+
+      - name: Supabase REST preflight
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python3 scripts/rest_preflight.py \
+            --path "/rest/v1/odds_outcomes?select=fixture_id&limit=1" \
+            --env-out "$GITHUB_ENV"
+
       - name: Sync pre-match odds (next 14 days)
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
@@ -62,60 +81,38 @@ jobs:
         run: |
           sqlite3 data/jxd.sqlite "select selection_key, participant_id, line, market_key from odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
 
-      - name: Supabase preflight check (rest)
-        id: preflight
+      - name: DB-direct odds ingest (psql)
+        if: env.MODE != 'patch'
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          set +e
-          resp=$(curl -sS -m 30 --retry 3 --retry-all-errors --retry-delay 5 -w "\nHTTP:%{http_code}\n" \
-            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=fixture_id&limit=1")
-          status=$(echo "$resp" | tail -n1 | tr -d '\r' | sed 's/HTTP://')
-          if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
-            echo "supabase_ok=true" >> "$GITHUB_OUTPUT"
-            echo "Supabase reachable via REST."
-          else
-            echo "supabase_ok=false" >> "$GITHUB_OUTPUT"
-            echo "Supabase unreachable via REST (HTTP $status). Continuing anyway."
-          fi
+          python3 scripts/export_odds_to_supabase_psql.py \
+            --leagues "$LEAGUE_IDS" \
+            --days-forward 14 \
+            --progress-rows 10000 \
+            --max-runtime-minutes 25 \
+            --report-out /tmp/odds_ingest_report.json
 
-      - name: Export odds to Supabase
+      - name: Patch odds participants (psql)
+        if: env.MODE == 'patch'
         env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          python3 scripts/export_odds_to_supabase.py --leagues "$LEAGUE_IDS" --days-forward 14 --skip-snapshots --chunk-size 25 --timeout 120 --retries 8 --sleep 0.5
+          python3 scripts/patch_odds_participants_psql.py \
+            --leagues "$LEAGUE_IDS" \
+            --days-forward 14 \
+            --report-out /tmp/odds_patch_report.json
 
-      - name: Patch odds participants (REST)
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: |
-          python3 scripts/patch_odds_participants_rest.py --leagues "$LEAGUE_IDS" --days-forward 14 --chunk-size 300 --timeout 120 --retries 8 --sleep 0.5
+      - name: Upload odds patch report
+        if: env.MODE == 'patch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_patch_report
+          path: /tmp/odds_patch_report.json
 
-      - name: Supabase reachability check
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: |
-          set -euo pipefail
-          resp=$(curl -sS --retry 3 --retry-all-errors --retry-delay 5 -m 20 -w "\nHTTP:%{http_code}\n" \
-            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
-            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
-            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=selection_key,participant_id&limit=1")
-          echo "$resp"
-          status=$(echo "$resp" | tail -n1 | tr -d '\r' | sed 's/HTTP://')
-          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-            echo "Supabase reachability check failed with HTTP $status"
-            exit 1
-          fi
-
-      - name: Verify odds counts (REST)
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: |
-          python3 scripts/verify_odds_rest.py
+      - name: Upload odds ingest report
+        if: env.MODE != 'patch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_ingest_report
+          path: /tmp/odds_ingest_report.json

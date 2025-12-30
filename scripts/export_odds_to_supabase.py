@@ -44,6 +44,13 @@ def rest_headers() -> Dict[str, str]:
     }
 
 
+def is_html_error(text: str) -> bool:
+    if not text:
+        return False
+    snippet = text.lstrip()[:200].lower()
+    return snippet.startswith("<html") or snippet.startswith("<!doctype html") or "cloudflare" in snippet
+
+
 def upsert_table(
     table: str,
     rows: List[Dict],
@@ -71,10 +78,10 @@ def upsert_table(
                     data=json.dumps(batch),
                     timeout=timeout,
                 )
-                if resp.ok:
+                if resp.ok and not is_html_error(resp.text or ""):
                     break
-                # Retry on transient gateway errors
-                if resp.status_code in (502, 503, 504):
+                # Retry on transient gateway errors or HTML error pages
+                if resp.status_code in (502, 503, 504, 522, 524, 525) or is_html_error(resp.text or ""):
                     attempt += 1
                     if attempt > retries:
                         raise SystemExit(

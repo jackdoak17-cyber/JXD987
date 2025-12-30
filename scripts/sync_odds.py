@@ -401,6 +401,8 @@ def main() -> None:
         log.info("No fixtures found for odds window")
         return
 
+    log.info("Found %s fixtures for odds window", len(fixtures))
+
     if args.refresh_squads and svc is not None:
         team_ids = {
             fixture.get("home_team_id")
@@ -451,13 +453,14 @@ def main() -> None:
         )
         upsert_outcomes(session, outcomes)
         session.commit()
-        log.info(
-            "Processed fixture %s (%s/%s) outcomes=%s",
-            fixture_id,
-            idx,
-            len(fixtures),
-            len(outcomes),
-        )
+        if idx == 1 or idx % 100 == 0 or idx == len(fixtures):
+            log.info(
+                "Processed fixture %s (%s/%s) outcomes=%s",
+                fixture_id,
+                idx,
+                len(fixtures),
+                len(outcomes),
+            )
 
     log.info("Odds sync complete")
 

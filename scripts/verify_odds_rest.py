@@ -23,6 +23,13 @@ def require_env() -> None:
         raise SystemExit(f"Missing env vars: {', '.join(missing)}")
 
 
+def is_html_error(text: str) -> bool:
+    if not text:
+        return False
+    snippet = text.lstrip()[:200].lower()
+    return snippet.startswith("<html") or snippet.startswith("<!doctype html") or "cloudflare" in snippet
+
+
 def count_rows(filter_expr: Optional[str] = None, retries: int = 5) -> int:
     url = SUPABASE_URL.rstrip("/") + "/rest/v1/odds_outcomes?select=id&limit=1"
     if filter_expr:
@@ -42,7 +49,7 @@ def count_rows(filter_expr: Optional[str] = None, retries: int = 5) -> int:
                 raise SystemExit(f"REST count failed after retries: {exc}")
             time.sleep(min(30, 2**attempt))
             continue
-        if resp.status_code in (502, 503, 504):
+        if resp.status_code in (502, 503, 504, 522, 524, 525) or is_html_error(resp.text or ""):
             if attempt > retries:
                 raise SystemExit(f"REST count failed {resp.status_code}: {resp.text}")
             time.sleep(min(30, 2**attempt))
