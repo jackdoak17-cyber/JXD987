@@ -7,7 +7,7 @@ from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .sportmonks_client import SportMonksClient
+from .sportmonks_client import SportMonksClient, SportMonksError
 from .models import (
     Base,
     Season,
@@ -271,6 +271,42 @@ class SyncService:
                 count += 1
         self.session.commit()
         log.info("Synced teams: %s", count)
+        return count
+
+    def sync_squads_for_teams(self, team_ids: Sequence[int]) -> int:
+        if not team_ids:
+            return 0
+        count = 0
+        seen: Set[int] = set()
+        for team_id in team_ids:
+            if not team_id or team_id in seen:
+                continue
+            seen.add(team_id)
+            endpoint = f"squads/teams/{team_id}"
+            try:
+                for item in self.client.fetch_collection(endpoint, includes=["player"], per_page=200):
+                    player = item.get("player") or {}
+                    player_id = player.get("id") or item.get("player_id")
+                    if not player_id:
+                        continue
+                    payload = {
+                        "id": player_id,
+                        "team_id": item.get("team_id") or team_id,
+                        "name": player.get("name") or player.get("display_name"),
+                        "common_name": player.get("common_name"),
+                        "short_name": player.get("short_name"),
+                        "image_path": player.get("image_path"),
+                        "extra": player,
+                    }
+                    _upsert(self.session, Player, payload)
+                    count += 1
+            except SportMonksError as exc:
+                if exc.status_code in {404, 422}:
+                    log.info("No squad data for team %s (status %s)", team_id, exc.status_code)
+                    continue
+                raise
+        self.session.commit()
+        log.info("Synced squads for %s teams (%s players)", len(seen), count)
         return count
 
     # --- fixtures ---

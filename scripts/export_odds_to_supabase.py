@@ -88,6 +88,22 @@ def upsert_table(
     return total
 
 
+def fetch_fixture_league_ids(conn: sqlite3.Connection, days_forward: int) -> List[int]:
+    cur = conn.cursor()
+    today = datetime.utcnow().date()
+    end = today + timedelta(days=days_forward)
+    cur.execute(
+        """
+        select distinct league_id
+        from fixtures
+        where league_id is not null
+          and date(starting_at) >= ? and date(starting_at) <= ?
+        """,
+        (today.isoformat(), end.isoformat()),
+    )
+    return [row[0] for row in cur.fetchall()]
+
+
 def fetch_fixture_ids(conn: sqlite3.Connection, league_ids: Sequence[int], days_forward: int) -> List[int]:
     cur = conn.cursor()
     today = datetime.utcnow().date()
@@ -188,17 +204,26 @@ def main() -> None:
     )
     parser.add_argument("--days-forward", type=int, default=14)
     parser.add_argument("--skip-snapshots", action="store_true")
+    parser.add_argument(
+        "--no-include-fixture-leagues",
+        dest="include_fixture_leagues",
+        action="store_false",
+        help="Only use --leagues list (default includes leagues from upcoming fixtures).",
+    )
     parser.add_argument("--chunk-size", type=int, default=500)
     parser.add_argument("--timeout", type=int, default=60)
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--sleep", type=float, default=0.2)
+    parser.set_defaults(include_fixture_leagues=True)
     args = parser.parse_args()
 
     require_env()
-    league_ids = [int(x) for x in args.leagues.split(",") if x.strip()]
     conn = get_conn()
+    league_ids = [int(x) for x in args.leagues.split(",") if x.strip()]
+    fixture_league_ids = fetch_fixture_league_ids(conn, args.days_forward) if args.include_fixture_leagues else []
+    effective_leagues = sorted({*league_ids, *fixture_league_ids})
 
-    fixture_ids = fetch_fixture_ids(conn, league_ids, args.days_forward)
+    fixture_ids = fetch_fixture_ids(conn, effective_leagues, args.days_forward)
     snapshots = [] if args.skip_snapshots else fetch_odds_snapshots(conn, fixture_ids)
     outcomes = fetch_odds_outcomes(conn, fixture_ids)
 

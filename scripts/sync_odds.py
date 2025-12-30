@@ -19,6 +19,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 from sqlalchemy import bindparam, text
 
 from jxd import SportMonksClient
+from jxd.sportmonks_client import SportMonksError
 from jxd import SyncService
 from jxd.db import get_engine, get_session
 from jxd.models import Base
@@ -334,11 +335,18 @@ def parse_outcomes(
 
 
 def fetch_odds_for_fixture(client: SportMonksClient, fixture_id: int, bookmaker_id: int) -> List[Dict]:
-    payload = client.request(
-        "GET",
-        f"odds/pre-match/fixtures/{fixture_id}",
-        params={"filter": f"bookmakers:{bookmaker_id}"},
-    )
+    try:
+        payload = client.request(
+            "GET",
+            f"odds/pre-match/fixtures/{fixture_id}",
+            params={"filter": f"bookmakers:{bookmaker_id}"},
+        )
+    except SportMonksError as exc:
+        status = exc.status_code
+        if status in {404, 422}:
+            log.info("No odds available for fixture %s (status %s)", fixture_id, status)
+            return []
+        raise
     data = payload.get("data") if isinstance(payload, dict) else None
     return data if isinstance(data, list) else []
 
@@ -359,6 +367,11 @@ def main() -> None:
         action="store_true",
         help="Refresh upcoming fixtures for the league ids before fetching odds",
     )
+    parser.add_argument(
+        "--refresh-squads",
+        action="store_true",
+        help="Refresh team squads for upcoming fixtures to improve player mapping",
+    )
     args = parser.parse_args()
 
     league_ids = [int(x) for x in args.leagues.split(",") if x.strip()]
@@ -370,11 +383,13 @@ def main() -> None:
     Base.metadata.create_all(engine)
 
     client = SportMonksClient()
-    if args.refresh_upcoming:
+    svc = None
+    if args.refresh_upcoming or args.refresh_squads:
         svc = SyncService(client, session)
         svc.ensure_schema()
-        log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
-        svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
+        if args.refresh_upcoming:
+            log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
+            svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
     today = datetime.utcnow().date()
     end_date = today + timedelta(days=args.days_forward)
 
@@ -385,6 +400,20 @@ def main() -> None:
     if not fixtures:
         log.info("No fixtures found for odds window")
         return
+
+    if args.refresh_squads and svc is not None:
+        team_ids = {
+            fixture.get("home_team_id")
+            for fixture in fixtures
+            if fixture.get("home_team_id")
+        } | {
+            fixture.get("away_team_id")
+            for fixture in fixtures
+            if fixture.get("away_team_id")
+        }
+        if team_ids:
+            log.info("Refreshing squads for %s teams", len(team_ids))
+            svc.sync_squads_for_teams(sorted(team_ids))
 
     for idx, fixture in enumerate(fixtures, start=1):
         fixture_id = fixture["fixture_id"]

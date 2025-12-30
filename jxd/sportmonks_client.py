@@ -6,7 +6,10 @@ import requests
 
 
 class SportMonksError(Exception):
-    pass
+    def __init__(self, message: str, status_code: Optional[int] = None, response_text: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_text = response_text
 
 
 class SportMonksClient:
@@ -49,16 +52,28 @@ class SportMonksClient:
                 try:
                     return resp.json()
                 except Exception as exc:
-                    raise SportMonksError(f"Invalid JSON from SportMonks: {exc}") from exc
+                    raise SportMonksError(
+                        f"Invalid JSON from SportMonks: {exc}",
+                        status_code=resp.status_code,
+                        response_text=resp.text,
+                    ) from exc
 
             if resp.status_code in (429,) or 500 <= resp.status_code < 600:
                 if attempt >= self.max_retries:
-                    raise SportMonksError(f"SportMonks request failed {resp.status_code}: {resp.text}")
+                    raise SportMonksError(
+                        f"SportMonks request failed {resp.status_code}: {resp.text}",
+                        status_code=resp.status_code,
+                        response_text=resp.text,
+                    )
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 16)
                 continue
 
-            raise SportMonksError(f"SportMonks request failed {resp.status_code}: {resp.text}")
+            raise SportMonksError(
+                f"SportMonks request failed {resp.status_code}: {resp.text}",
+                status_code=resp.status_code,
+                response_text=resp.text,
+            )
 
     def fetch_collection(
         self,

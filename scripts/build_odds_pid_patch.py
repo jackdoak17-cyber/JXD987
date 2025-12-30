@@ -13,6 +13,22 @@ def parse_league_ids(raw: str) -> List[int]:
     return [int(x) for x in raw.split(",") if x.strip()]
 
 
+def fetch_fixture_league_ids(conn: sqlite3.Connection, days_forward: int) -> List[int]:
+    today = datetime.utcnow().date()
+    end = today + timedelta(days=days_forward)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        select distinct league_id
+        from fixtures
+        where league_id is not null
+          and date(starting_at) >= ? and date(starting_at) <= ?
+        """,
+        (today.isoformat(), end.isoformat()),
+    )
+    return [row[0] for row in cur.fetchall()]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -27,9 +43,15 @@ def main() -> None:
         default="/tmp/odds_pid_patch.csv",
         help="Output CSV path",
     )
+    parser.add_argument(
+        "--no-include-fixture-leagues",
+        dest="include_fixture_leagues",
+        action="store_false",
+        help="Only use --leagues list (default includes leagues from upcoming fixtures).",
+    )
+    parser.set_defaults(include_fixture_leagues=True)
     args = parser.parse_args()
 
-    league_ids = parse_league_ids(args.leagues)
     today = datetime.utcnow().date()
     end = today + timedelta(days=args.days_forward)
     today_iso = today.isoformat()
@@ -38,12 +60,16 @@ def main() -> None:
     conn = sqlite3.connect(args.db)
     cur = conn.cursor()
 
+    league_ids = parse_league_ids(args.leagues)
+    fixture_league_ids = fetch_fixture_league_ids(conn, args.days_forward) if args.include_fixture_leagues else []
+    effective_leagues = sorted({*league_ids, *fixture_league_ids})
+
     league_clause = ""
     params: List[object] = [today_iso, end_iso]
-    if league_ids:
-        placeholders = ",".join("?" for _ in league_ids)
+    if effective_leagues:
+        placeholders = ",".join("?" for _ in effective_leagues)
         league_clause = f"and f.league_id in ({placeholders})"
-        params.extend(league_ids)
+        params.extend(effective_leagues)
 
     cur.execute(
         f"""

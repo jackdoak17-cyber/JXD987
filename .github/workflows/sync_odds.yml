@@ -24,6 +24,7 @@ jobs:
     env:
       PYTHONPATH: .
       MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'patch' }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,7 +52,11 @@ jobs:
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
-          python3 scripts/sync_odds_all_leagues.py --days-forward 14
+          cmd="python3 scripts/sync_odds_all_leagues.py --days-forward 14"
+          if [ "$MODE" = "full" ]; then
+            cmd="$cmd --refresh-squads"
+          fi
+          $cmd
 
       - name: Debug mapped participant IDs (sqlite)
         run: |
@@ -77,13 +82,42 @@ jobs:
             echo "Supabase unreachable via REST (HTTP $status). Skipping export."
           fi
 
+      - name: Resolve Supabase IPv4 for psql
+        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import socket
+          import urllib.parse
+
+          url = os.environ.get("SUPABASE_DB_URL", "")
+          host = urllib.parse.urlparse(url).hostname
+          if not host:
+              print("Could not parse host from SUPABASE_DB_URL")
+              raise SystemExit(0)
+          try:
+              infos = socket.getaddrinfo(host, 5432, socket.AF_INET)
+          except Exception as exc:
+              print(f"IPv4 lookup failed for {host}: {exc}")
+              raise SystemExit(0)
+          ip = infos[0][4][0] if infos else ""
+          if not ip:
+              print(f"No IPv4 address found for {host}")
+              raise SystemExit(0)
+          print(f"Resolved {host} -> {ip}")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"PGHOSTADDR={ip}\n")
+          PY
+
       - name: Build odds participant patch (sqlite)
         if: steps.preflight.outputs.supabase_ok == 'true'
         run: |
           python3 scripts/build_odds_pid_patch.py --leagues "$LEAGUE_IDS" --days-forward 14 --out /tmp/odds_pid_patch.csv
 
       - name: Apply odds participant patch (psql)
-        if: steps.preflight.outputs.supabase_ok == 'true'
+        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
@@ -115,7 +149,7 @@ jobs:
           /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f /tmp/apply_odds_pid_patch.sql
 
       - name: Verify odds coverage (psql)
-        if: steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != ''
+        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           ODDS_COVERAGE_MIN_DISTINCT: 20
@@ -139,11 +173,16 @@ jobs:
           python3 scripts/export_odds_to_supabase.py --leagues "$LEAGUE_IDS" --days-forward 14 --chunk-size 50 --timeout 120 --retries 5 --sleep 0.5
 
       - name: Debug mapped participant IDs (Supabase)
-        if: steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != ''
+        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
           /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select selection_key, participant_id, line, market_key from public.odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
+
+      - name: Skip patch notice
+        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL == '' }}
+        run: |
+          echo "SUPABASE_DB_URL not set; skipping odds participant patch and psql checks."
 
       - name: Skip export notice
         if: steps.preflight.outputs.supabase_ok != 'true'
