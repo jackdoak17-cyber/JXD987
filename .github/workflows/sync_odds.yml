@@ -87,7 +87,8 @@ jobs:
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          python3 - <<'PY'
+          echo "PSQL_READY=false" >> "$GITHUB_ENV"
+          python3 - <<'PY' || true
           import os
           import re
           import shlex
@@ -216,6 +217,9 @@ jobs:
                   f.write(f"export SUPABASE_DB_URL_IPV4={q(url_ipv4)}\n")
                   f.write(f"export SUPABASE_DB_URL={q(url_ipv4)}\n")
           PY
+          if [ -f /tmp/pg_env.sh ]; then
+            echo "PSQL_READY=true" >> "$GITHUB_ENV"
+          fi
 
       - name: Build odds participant patch (sqlite)
         if: steps.preflight.outputs.supabase_ok == 'true'
@@ -223,7 +227,7 @@ jobs:
           python3 scripts/build_odds_pid_patch.py --leagues "$LEAGUE_IDS" --days-forward 14 --out /tmp/odds_pid_patch.csv
 
       - name: Apply odds participant patch (psql)
-        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
+        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' && env.PSQL_READY == 'true' }}
         run: |
           . /tmp/pg_env.sh
           cat > /tmp/apply_odds_pid_patch.sql <<'SQL'
@@ -254,7 +258,7 @@ jobs:
           /usr/bin/psql -v ON_ERROR_STOP=1 -f /tmp/apply_odds_pid_patch.sql
 
       - name: Verify odds coverage (psql)
-        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
+        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' && env.PSQL_READY == 'true' }}
         env:
           ODDS_COVERAGE_MIN_DISTINCT: 20
           ODDS_PLAYER_MAPPING_MIN_PCT: 80
@@ -278,7 +282,7 @@ jobs:
           python3 scripts/export_odds_to_supabase.py --leagues "$LEAGUE_IDS" --days-forward 14 --chunk-size 50 --timeout 120 --retries 5 --sleep 0.5
 
       - name: Debug mapped participant IDs (Supabase)
-        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
+        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' && env.PSQL_READY == 'true' }}
         run: |
           . /tmp/pg_env.sh
           /usr/bin/psql -v ON_ERROR_STOP=1 -c "select selection_key, participant_id, line, market_key from public.odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
@@ -287,6 +291,11 @@ jobs:
         if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL == '' }}
         run: |
           echo "SUPABASE_DB_URL not set; skipping odds participant patch and psql checks."
+
+      - name: Skip psql notice (no IPv4)
+        if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' && env.PSQL_READY != 'true' }}
+        run: |
+          echo "No IPv4 address for Supabase DB host; skipping psql patch and coverage steps."
 
       - name: Skip export notice
         if: steps.preflight.outputs.supabase_ok != 'true'
