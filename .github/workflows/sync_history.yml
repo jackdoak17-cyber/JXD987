@@ -45,7 +45,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SUPABASE_EXPORT_CHUNK: "50"
-          SUPABASE_EXPORT_SLEEP: "0.5"
+          SUPABASE_EXPORT_CHUNK: "200"
+          SUPABASE_EXPORT_SLEEP: "0.1"
           SUPABASE_EXPORT_RETRIES: "5"
         run: python3 scripts/export_to_supabase.py --strict --leagues "$LEAGUE_IDS"
