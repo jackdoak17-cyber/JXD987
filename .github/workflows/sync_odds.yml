@@ -57,19 +57,24 @@ jobs:
         run: |
           sqlite3 data/jxd.sqlite "select selection_key, participant_id, line, market_key from odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
 
-      - name: Supabase preflight check (psql)
+      - name: Supabase preflight check (rest)
         id: preflight
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set +e
-          /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select 1" >/dev/null 2>&1
-          if [ "$?" -eq 0 ]; then
+          resp=$(curl -sS -m 15 -w "\nHTTP:%{http_code}\n" \
+            -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+            "${SUPABASE_URL}/rest/v1/odds_outcomes?select=fixture_id&limit=1")
+          status=$(echo "$resp" | tail -n1 | tr -d '\r' | sed 's/HTTP://')
+          if [ "$status" -ge 200 ] && [ "$status" -lt 300 ]; then
             echo "supabase_ok=true" >> "$GITHUB_OUTPUT"
-            echo "Supabase reachable via psql."
+            echo "Supabase reachable via REST."
           else
             echo "supabase_ok=false" >> "$GITHUB_OUTPUT"
-            echo "Supabase unreachable via psql. Skipping export."
+            echo "Supabase unreachable via REST (HTTP $status). Skipping export."
           fi
 
       - name: Build odds participant patch (sqlite)
@@ -110,7 +115,7 @@ jobs:
           /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f /tmp/apply_odds_pid_patch.sql
 
       - name: Verify odds coverage (psql)
-        if: steps.preflight.outputs.supabase_ok == 'true'
+        if: steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != ''
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           ODDS_COVERAGE_MIN_DISTINCT: 20
@@ -134,7 +139,7 @@ jobs:
           python3 scripts/export_odds_to_supabase.py --leagues "$LEAGUE_IDS" --days-forward 14 --chunk-size 50 --timeout 120 --retries 5 --sleep 0.5
 
       - name: Debug mapped participant IDs (Supabase)
-        if: steps.preflight.outputs.supabase_ok == 'true'
+        if: steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != ''
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
