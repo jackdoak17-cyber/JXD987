@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import urllib.parse
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -24,6 +25,38 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 DB_PATH = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
 DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL_SESSION")
+
+
+def redact_db_url(db_url: str) -> str:
+    if not db_url:
+        return db_url
+    if "://" in db_url:
+        parsed = urllib.parse.urlparse(db_url)
+        if parsed.password:
+            netloc = f"{parsed.username}:***@{parsed.hostname}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return parsed._replace(netloc=netloc).geturl()
+        return db_url
+    if "password=" in db_url:
+        parts = []
+        for part in db_url.split():
+            if part.startswith("password="):
+                parts.append("password=***")
+            else:
+                parts.append(part)
+        return " ".join(parts)
+    return db_url
+
+
+def append_output(path: str, label: str, content: str) -> None:
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"--- {label} ---\n")
+        f.write(content or "")
+        if content and not content.endswith("\n"):
+            f.write("\n")
 
 
 def parse_league_ids(raw: str) -> List[int]:
@@ -53,14 +86,46 @@ def sql_array(values: List[int]) -> str:
     return f"array[{items}]::int[]"
 
 
-def run_psql(db_url: str, sql: str, from_file: bool = False) -> str:
-    cmd = ["psql", db_url, "-v", "ON_ERROR_STOP=1", "-At", "-F", "\t"]
+def run_psql(
+    db_url: str,
+    sql: str,
+    from_file: bool = False,
+    label: str = "psql",
+    err_path: Optional[str] = None,
+    out_path: Optional[str] = None,
+) -> str:
+    cmd = [
+        "psql",
+        db_url,
+        "-v",
+        "ON_ERROR_STOP=1",
+        "--echo-errors",
+        "-v",
+        "VERBOSITY=verbose",
+        "-At",
+        "-F",
+        "\t",
+    ]
     if from_file:
         cmd.extend(["-f", sql])
     else:
         cmd.extend(["-c", sql])
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    return proc.stdout.strip()
+    env = dict(os.environ)
+    env.setdefault("PGCONNECT_TIMEOUT", "15")
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        safe_cmd = [redact_db_url(c) if c == db_url else c for c in cmd]
+        print(f"psql failed ({label}) exit={exc.returncode}")
+        print("psql cmd:", " ".join(safe_cmd))
+        print("psql stdout:\n", exc.stdout or "")
+        print("psql stderr:\n", exc.stderr or "")
+        append_output(out_path, f"{label} stdout", exc.stdout or "")
+        append_output(err_path, f"{label} stderr", exc.stderr or "")
+        raise
+    append_output(out_path, f"{label} stdout", proc.stdout or "")
+    append_output(err_path, f"{label} stderr", proc.stderr or "")
+    return (proc.stdout or "").strip()
 
 
 def build_outcomes_csv(
@@ -174,9 +239,18 @@ def build_outcomes_csv(
     return total_rows, partial_run, last_fixture_id
 
 
-def stage_and_upsert(db_url: str, csv_path: Path) -> Dict[str, int]:
+def stage_and_upsert(
+    db_url: str,
+    csv_path: Path,
+    league_label: str,
+    keep_sql: bool,
+    err_path: Optional[str],
+    out_path: Optional[str],
+) -> Dict[str, int]:
     sql = f"""
 \\set ON_ERROR_STOP on
+set statement_timeout = '25min';
+set lock_timeout = '30s';
 begin;
 create temp table odds_outcomes_stage
   (like public.odds_outcomes including defaults) on commit drop;
@@ -216,13 +290,29 @@ select 'inserted', count(*)::bigint filter (where inserted) from upserted;
 select 'updated', count(*)::bigint filter (where not inserted) from upserted;
 commit;
 """
+    sql_path: Optional[str] = None
+    if keep_sql or os.environ.get("KEEP_SQL") == "1":
+        sql_path = f"/tmp/odds_psql_sql_{league_label}.sql"
+        Path(sql_path).write_text(sql, encoding="utf-8")
+        print(f"psql sql path: {sql_path}", flush=True)
+    else:
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sql") as f:
+            f.write(sql)
+            sql_path = f.name
 
-    with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sql") as f:
-        f.write(sql)
-        sql_path = f.name
-
-    output = run_psql(db_url, sql_path, from_file=True)
-    os.unlink(sql_path)
+    output = run_psql(
+        db_url,
+        sql_path,
+        from_file=True,
+        label="stage_upsert",
+        err_path=err_path,
+        out_path=out_path,
+    )
+    if not keep_sql and os.environ.get("KEEP_SQL") != "1":
+        try:
+            os.unlink(sql_path)
+        except OSError:
+            pass
 
     counts = {"stage_count": 0, "upserted_total": 0, "inserted": 0, "updated": 0}
     for line in output.splitlines():
@@ -339,6 +429,7 @@ def main() -> None:
     parser.add_argument("--progress-rows", type=int, default=10000)
     parser.add_argument("--progress-fixtures", type=int, default=100)
     parser.add_argument("--max-runtime-minutes", type=int, default=25)
+    parser.add_argument("--keep-sql", action="store_true", help="Keep generated SQL file for debugging")
     parser.add_argument(
         "--no-include-fixture-leagues",
         dest="include_fixture_leagues",
@@ -419,7 +510,20 @@ def main() -> None:
             flush=True,
         )
 
-    counts = stage_and_upsert(DB_URL, Path(args.csv_out))
+    league_label = str(effective_leagues[0]) if len(effective_leagues) == 1 else "multi"
+    err_path = f"/tmp/psql_err_{league_label}.txt"
+    out_path = f"/tmp/psql_out_{league_label}.txt"
+    Path(err_path).touch(exist_ok=True)
+    Path(out_path).touch(exist_ok=True)
+
+    counts = stage_and_upsert(
+        DB_URL,
+        Path(args.csv_out),
+        league_label,
+        args.keep_sql,
+        err_path,
+        out_path,
+    )
     print(
         f"Stage count={counts['stage_count']} inserted={counts['inserted']} "
         f"updated={counts['updated']} unchanged={counts['unchanged']}",
@@ -427,7 +531,13 @@ def main() -> None:
     )
 
     coverage_sql = coverage_query(args.days_forward, effective_leagues)
-    coverage_out = run_psql(DB_URL, coverage_sql)
+    coverage_out = run_psql(
+        DB_URL,
+        coverage_sql,
+        label="coverage",
+        err_path=err_path,
+        out_path=out_path,
+    )
     coverage_parts = coverage_out.split("\t") if coverage_out else ["0", "0", "0"]
     try:
         coverage_total = int(coverage_parts[0])
@@ -443,7 +553,13 @@ def main() -> None:
         coverage_pct = 0.0
 
     baseline_sql = coverage_baseline_query(6, effective_leagues)
-    baseline_out = run_psql(DB_URL, baseline_sql)
+    baseline_out = run_psql(
+        DB_URL,
+        baseline_sql,
+        label="coverage_baseline",
+        err_path=err_path,
+        out_path=out_path,
+    )
     try:
         coverage_baseline_pct = float(baseline_out.strip()) if baseline_out else 0.0
     except ValueError:
@@ -458,7 +574,13 @@ def main() -> None:
     verification_outputs: List[str] = []
     for idx, query in enumerate(verification_queries(args.days_forward), start=1):
         print(f"Verification query {idx} output:", flush=True)
-        out = run_psql(DB_URL, query)
+        out = run_psql(
+            DB_URL,
+            query,
+            label=f"verification_{idx}",
+            err_path=err_path,
+            out_path=out_path,
+        )
         verification_outputs.append(out)
         print(out, flush=True)
 
@@ -492,6 +614,8 @@ def main() -> None:
             "mapped_pct": coverage_pct,
             "baseline_pct": coverage_baseline_pct,
         },
+        "psql_err_path": err_path,
+        "psql_out_path": out_path,
         "rest_ok": os.environ.get("REST_OK"),
         "rest_http": os.environ.get("REST_HTTP"),
         "verification": verification_outputs,

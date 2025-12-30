@@ -284,6 +284,8 @@ def parse_outcomes(
     player_map: Dict[str, List[Tuple[int, Optional[int]]]],
     team_map: Dict[str, int],
     team_player_map: Dict[str, List[Tuple[int, Optional[int]]]],
+    unmatched_details: Optional[List[Dict]] = None,
+    unmatched_counts: Optional[Dict[Tuple[str, str], int]] = None,
 ) -> List[Dict]:
     outcomes: List[Dict] = []
     for row in data:
@@ -307,13 +309,18 @@ def parse_outcomes(
         if participant_type == "player":
             participant_id = resolve_player_id(str(name), player_map, team_player_map)
             if participant_id is None:
-                log.warning(
-                    "Unmatched player odds name (fixture %s, market %s, selection %s): %s",
-                    fixture_id,
-                    market_key,
-                    selection_key,
-                    name,
-                )
+                if unmatched_counts is not None:
+                    key = (market_key, str(name))
+                    unmatched_counts[key] = unmatched_counts.get(key, 0) + 1
+                if unmatched_details is not None:
+                    unmatched_details.append(
+                        {
+                            "fixture_id": fixture_id,
+                            "market_key": market_key,
+                            "selection_key": selection_key,
+                            "raw_name": str(name),
+                        }
+                    )
         elif participant_type == "team":
             participant_id = team_map.get(normalized_name)
 
@@ -372,6 +379,11 @@ def main() -> None:
         action="store_true",
         help="Refresh team squads for upcoming fixtures to improve player mapping",
     )
+    parser.add_argument(
+        "--unmatched-out",
+        default="",
+        help="Write unmatched player odds to JSON (fixture_id, market_key, selection_key, raw_name)",
+    )
     args = parser.parse_args()
 
     raw_leagues = args.leagues.replace('"', "").replace("'", "")
@@ -418,6 +430,9 @@ def main() -> None:
             log.info("Refreshing squads for %s teams", len(team_ids))
             svc.sync_squads_for_teams(sorted(team_ids))
 
+    unmatched_details: List[Dict] = []
+    unmatched_counts: Dict[Tuple[str, str], int] = {}
+
     for idx, fixture in enumerate(fixtures, start=1):
         fixture_id = fixture["fixture_id"]
         team_map = load_team_map(session, [fixture.get("home_team_id"), fixture.get("away_team_id")])
@@ -451,6 +466,8 @@ def main() -> None:
             player_map,
             team_map,
             team_player_map,
+            unmatched_details,
+            unmatched_counts,
         )
         upsert_outcomes(session, outcomes)
         session.commit()
@@ -464,6 +481,23 @@ def main() -> None:
             )
 
     log.info("Odds sync complete")
+
+    if unmatched_counts:
+        by_market: Dict[str, Dict[str, int]] = {}
+        for (market_key, raw_name), count in unmatched_counts.items():
+            by_market.setdefault(market_key, {})[raw_name] = count
+        for market_key, names in sorted(by_market.items()):
+            top = sorted(names.items(), key=lambda item: item[1], reverse=True)[:20]
+            summary = ", ".join(f"{name}({count})" for name, count in top)
+            log.info("Unmatched player names summary %s: %s", market_key, summary)
+
+    if args.unmatched_out:
+        try:
+            with open(args.unmatched_out, "w", encoding="utf-8") as f:
+                json.dump(unmatched_details, f, indent=2)
+            log.info("Wrote unmatched player odds to %s (%s rows)", args.unmatched_out, len(unmatched_details))
+        except OSError as exc:
+            log.warning("Failed to write unmatched output %s: %s", args.unmatched_out, exc)
 
 
 if __name__ == "__main__":
