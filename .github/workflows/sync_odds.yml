@@ -17,7 +17,7 @@ on:
 
 concurrency:
   group: sync-odds
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   prices:
@@ -222,6 +222,22 @@ jobs:
           path: /tmp/odds_psql_sql_${{ matrix.league_id }}.sql
           if-no-files-found: ignore
 
+      - name: Upload odds CSV head
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_outcomes_head_${{ matrix.league_id }}
+          path: /tmp/odds_outcomes_head_${{ matrix.league_id }}.csv
+          if-no-files-found: ignore
+
+      - name: Upload odds CSV summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_outcomes_summary_${{ matrix.league_id }}
+          path: /tmp/odds_outcomes_summary_${{ matrix.league_id }}.json
+          if-no-files-found: ignore
+
       - name: Upload odds upsert log
         if: always()
         uses: actions/upload-artifact@v4
@@ -420,6 +436,7 @@ jobs:
           warnings = []
           rows = []
           preflight_errors = []
+          prices_cancelled = prices_result == "cancelled"
 
           for path in preflight_files:
               data = json.loads(path.read_text())
@@ -478,9 +495,12 @@ jobs:
               seen = {str(row[0]) for row in rows}
               missing = sorted(set(expected_leagues) - seen)
               if missing:
-                  failures.append(f"missing reports for leagues: {', '.join(missing)}")
-                  if preflight_errors:
-                      failures.append("preflight failures present (see above)")
+                  if prices_cancelled:
+                      warnings.append(f"missing reports for leagues (matrix cancelled): {', '.join(missing)}")
+                  else:
+                      failures.append(f"missing reports for leagues: {', '.join(missing)}")
+                      if preflight_errors:
+                          failures.append("preflight failures present (see above)")
 
           if not ingest_files:
               if preflight_files:
@@ -497,7 +517,12 @@ jobs:
                               f"- league={league_id} host={host} port={port} "
                               f"error_class={err_class} error_snippet={err_snip}"
                           )
+                  if prices_cancelled:
+                      print("Matrix cancelled; treating missing ingest as warning.")
+                      raise SystemExit(0)
                   raise SystemExit(1)
+              if prices_cancelled:
+                  raise SystemExit(0)
               raise SystemExit("No ingest reports or preflight reports found.")
 
           print("league_id runtime_min inserted updated coverage_pct baseline_pct partial_run")

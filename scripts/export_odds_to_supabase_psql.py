@@ -248,6 +248,46 @@ def build_outcomes_csv(
     return total_rows, partial_run, last_fixture_id
 
 
+def write_csv_head(csv_path: Path, out_path: Path, max_lines: int = 200) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("r", encoding="utf-8") as src, out_path.open("w", encoding="utf-8") as dst:
+        for idx, line in enumerate(src, start=1):
+            dst.write(line)
+            if idx >= max_lines:
+                break
+
+
+def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
+    counts: Dict[str, int] = {}
+    mapped: Dict[str, int] = {}
+    unmatched_keys: Dict[str, int] = {}
+    total_rows = 0
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            total_rows += 1
+            ptype = (row.get("participant_type") or "").strip() or "null"
+            counts[ptype] = counts.get(ptype, 0) + 1
+            pid = (row.get("participant_id") or "").strip()
+            if pid:
+                mapped[ptype] = mapped.get(ptype, 0) + 1
+            if ptype == "player" and not pid:
+                selection_key = (row.get("selection_key") or "").strip()
+                if selection_key:
+                    unmatched_keys[selection_key] = unmatched_keys.get(selection_key, 0) + 1
+    top_unmatched = sorted(unmatched_keys.items(), key=lambda item: item[1], reverse=True)[:top_n]
+    payload = {
+        "total_rows": total_rows,
+        "counts_by_participant_type": counts,
+        "mapped_by_participant_type": mapped,
+        "unmatched_player_selection_keys": [
+            {"selection_key": key, "count": count} for key, count in top_unmatched
+        ],
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def stage_and_upsert(
     db_url: str,
     csv_path: Path,
@@ -585,6 +625,15 @@ def main() -> None:
     out_path = f"/tmp/psql_out_{league_label}.txt"
     Path(err_path).touch(exist_ok=True)
     Path(out_path).touch(exist_ok=True)
+    csv_head_path = Path(f"/tmp/odds_outcomes_head_{league_label}.csv")
+    csv_summary_path = Path(f"/tmp/odds_outcomes_summary_{league_label}.json")
+    try:
+        write_csv_head(Path(args.csv_out), csv_head_path, max_lines=200)
+        write_csv_summary(Path(args.csv_out), csv_summary_path, top_n=50)
+        print(f"Wrote CSV head to {csv_head_path}", flush=True)
+        print(f"Wrote CSV summary to {csv_summary_path}", flush=True)
+    except OSError as exc:
+        print(f"Failed to write CSV proof artifacts: {exc}", flush=True)
 
     counts = stage_and_upsert(
         DB_URL,
@@ -697,6 +746,8 @@ def main() -> None:
             "mapped_pct": coverage_pct,
             "baseline_pct": coverage_baseline_pct,
         },
+        "csv_head_path": str(csv_head_path),
+        "csv_summary_path": str(csv_summary_path),
         "psql_err_path": err_path,
         "psql_out_path": out_path,
         "rest_ok": os.environ.get("REST_OK"),

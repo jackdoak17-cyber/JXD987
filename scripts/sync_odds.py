@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import unicodedata
+import difflib
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -406,8 +407,8 @@ def resolve_player_id(
     return None
 
 
-HOME_ALIASES = {"home", "hometeam", "team1"}
-AWAY_ALIASES = {"away", "awayteam", "team2"}
+HOME_ALIASES = {"home", "hometeam", "team1", "team_1"}
+AWAY_ALIASES = {"away", "awayteam", "team2", "team_2"}
 
 
 def resolve_team_id(
@@ -419,6 +420,16 @@ def resolve_team_id(
     home_aliases: Iterable[str],
     away_aliases: Iterable[str],
 ) -> Optional[int]:
+    selection_key = selection_key or ""
+    if selection_key in {"1", "team_1", "team1"} and home_team_id:
+        return int(home_team_id)
+    if selection_key in {"2", "team_2", "team2"} and away_team_id:
+        return int(away_team_id)
+    tokens = [token for token in selection_key.lower().split("_") if token]
+    if "home" in tokens and "away" not in tokens and home_team_id:
+        return int(home_team_id)
+    if "away" in tokens and "home" not in tokens and away_team_id:
+        return int(away_team_id)
     normalized_name = normalize_name(raw_name)
     if normalized_name and normalized_name in team_map:
         return team_map[normalized_name]
@@ -437,6 +448,112 @@ def resolve_team_id(
     for alias in away_aliases:
         if alias and alias in normalized_selection and away_team_id:
             return int(away_team_id)
+    return None
+
+
+NON_PLAYER_MARKETS = {
+    "match_shots",
+    "match_shots_on_target",
+    "to_score_in_half",
+}
+
+
+def is_non_player_selection(selection_key: str, market_key: str) -> bool:
+    selection_key = selection_key or ""
+    if market_key in NON_PLAYER_MARKETS:
+        return True
+    if selection_key.startswith(("no_goalscorer", "no_goal", "no_goals")):
+        return True
+    if "1st_half" in selection_key or "2nd_half" in selection_key:
+        return True
+    if selection_key.startswith(
+        (
+            "home_yes",
+            "home_no",
+            "away_yes",
+            "away_no",
+            "draw_yes",
+            "draw_no",
+            "tie_yes",
+            "tie_no",
+            "yes_yes",
+            "no_no",
+        )
+    ):
+        return True
+    return False
+
+
+def build_fuzzy_candidates(session, team_ids: Iterable[int]) -> List[Dict[str, object]]:
+    ids = [int(x) for x in team_ids if x]
+    if not ids:
+        return []
+    stmt = text(
+        """
+        select id, team_id, name, common_name, short_name
+        from players
+        where team_id in :team_ids
+        """
+    ).bindparams(bindparam("team_ids", expanding=True))
+    rows = session.execute(stmt, {"team_ids": ids}).fetchall()
+    candidates: List[Dict[str, object]] = []
+    seen = set()
+    for player_id, team_id, name, common_name, short_name in rows:
+        for candidate_name in (name, common_name, short_name):
+            if not candidate_name:
+                continue
+            tokens = normalize_name_tokens(str(candidate_name))
+            if not tokens:
+                continue
+            first_initial = tokens[0][0]
+            last = tokens[-1]
+            key = (int(player_id), first_initial, last)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                {
+                    "player_id": int(player_id),
+                    "team_id": int(team_id) if team_id else None,
+                    "first_initial": first_initial,
+                    "last": last,
+                    "name": str(candidate_name),
+                }
+            )
+    return candidates
+
+
+def fuzzy_match_player(
+    raw_name: str,
+    candidates: Iterable[Dict[str, object]],
+    min_ratio: float = 0.9,
+) -> Optional[Tuple[Dict[str, object], float]]:
+    tokens = normalize_name_tokens(raw_name)
+    if len(tokens) < 2:
+        return None
+    first_initial = tokens[0][0]
+    last = tokens[-1]
+    best = None
+    best_score = 0.0
+    tie = False
+    for candidate in candidates:
+        cand_first = candidate.get("first_initial") or ""
+        if cand_first and cand_first != first_initial:
+            continue
+        cand_last = candidate.get("last") or ""
+        if not cand_last:
+            continue
+        score = difflib.SequenceMatcher(None, last, str(cand_last)).ratio()
+        if score < min_ratio:
+            continue
+        if score > best_score + 1e-6:
+            best_score = score
+            best = candidate
+            tie = False
+        elif abs(score - best_score) <= 1e-6:
+            tie = True
+    if best and not tie:
+        return best, best_score
     return None
 
 
@@ -477,6 +594,7 @@ def parse_outcomes(
     away_team_id: Optional[int],
     home_aliases: Iterable[str],
     away_aliases: Iterable[str],
+    fuzzy_candidates: Optional[List[Dict[str, object]]] = None,
     unmatched_details: Optional[List[Dict]] = None,
     unmatched_counts: Optional[Dict[Tuple[str, str], int]] = None,
     unmatched_team_counts: Optional[Dict[str, int]] = None,
@@ -484,6 +602,7 @@ def parse_outcomes(
     debug_samples: Optional[List[Dict]] = None,
     debug_team_players: Optional[Dict[int, List[str]]] = None,
     debug_limit: int = 0,
+    debug_fuzzy_matches: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     outcomes: List[Dict] = []
     for row in data:
@@ -502,6 +621,7 @@ def parse_outcomes(
 
         participant_id = None
         raw_participant_id = parse_int(row.get("participant_id") or row.get("player_id"))
+        non_player_selection = is_non_player_selection(selection_key, market_key)
         normalized_name = normalize_name(str(name))
         team_id_candidate = resolve_team_id(
             str(name),
@@ -512,6 +632,8 @@ def parse_outcomes(
             home_aliases,
             away_aliases,
         )
+        if participant_type == "player" and non_player_selection:
+            participant_type = None
         if participant_type is None and team_id_candidate is not None:
             participant_type = "team"
         if participant_type == "player":
@@ -525,6 +647,25 @@ def parse_outcomes(
                     team_player_map,
                     team_ids=[home_team_id, away_team_id],
                 )
+                if participant_id is None and fuzzy_candidates:
+                    fuzzy_match = fuzzy_match_player(mapped_name, fuzzy_candidates)
+                    if fuzzy_match:
+                        candidate, score = fuzzy_match
+                        participant_id = int(candidate["player_id"])
+                        if debug_fuzzy_matches is not None:
+                            debug_fuzzy_matches.append(
+                                {
+                                    "fixture_id": fixture_id,
+                                    "market_key": market_key,
+                                    "selection_key": selection_key,
+                                    "raw_name": str(name),
+                                    "mapped_name": mapped_name,
+                                    "matched_name": candidate.get("name"),
+                                    "matched_player_id": participant_id,
+                                    "matched_team_id": candidate.get("team_id"),
+                                    "score": round(float(score), 3),
+                                }
+                            )
             if participant_id is None:
                 if unmatched_counts is not None:
                     key = (market_key, str(name))
@@ -708,6 +849,7 @@ def main() -> None:
     unmatched_team_counts: Dict[str, int] = {}
     unmatched_selection_counts: Dict[str, int] = {}
     debug_samples: List[Dict] = []
+    debug_fuzzy_matches: List[Dict] = []
 
     for idx, fixture in enumerate(fixtures, start=1):
         fixture_id = fixture["fixture_id"]
@@ -721,6 +863,7 @@ def main() -> None:
             session,
             [home_team_id, away_team_id],
         )
+        fuzzy_candidates = build_fuzzy_candidates(session, [home_team_id, away_team_id])
         debug_team_players = None
         if args.debug_mapping_out:
             debug_team_players = load_team_player_names(session, [home_team_id, away_team_id], limit=50)
@@ -753,6 +896,7 @@ def main() -> None:
             away_team_id,
             home_aliases,
             away_aliases,
+            fuzzy_candidates,
             unmatched_details,
             unmatched_counts,
             unmatched_team_counts,
@@ -760,6 +904,7 @@ def main() -> None:
             debug_samples,
             debug_team_players,
             args.debug_mapping_limit,
+            debug_fuzzy_matches,
         )
         upsert_outcomes(session, outcomes)
         session.commit()
@@ -823,6 +968,7 @@ def main() -> None:
                     )[:200]
                 ],
                 "samples": debug_samples,
+                "fuzzy_matches": debug_fuzzy_matches,
             }
             with open(args.debug_mapping_out, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2)
