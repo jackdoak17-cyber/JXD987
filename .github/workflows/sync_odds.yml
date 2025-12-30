@@ -32,7 +32,7 @@ jobs:
       PYTHONPATH: .
       PYTHONUNBUFFERED: "1"
       MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'prices' }}
-      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -53,11 +53,91 @@ jobs:
           pip install -r requirements.txt
 
       - name: Supabase DB preflight (psql)
+        id: preflight
+        continue-on-error: true
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+          LEAGUE_ID: ${{ matrix.league }}
+          REPORT_PATH: /tmp/odds_preflight_${{ matrix.league }}.json
         run: |
           set -euo pipefail
-          psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select 1;"
+          if [ -z "${SUPABASE_DB_URL:-}" ]; then
+            msg="Missing SUPABASE_DB_URL. Set SUPABASE_DB_URL_POOLER to the Supavisor SESSION pooler URL."
+            echo "$msg"
+            ERR_MSG="$msg" python3 - <<'PY'
+          import json, os, time
+          report_path = os.environ["REPORT_PATH"]
+          data = {
+              "league_id": int(os.environ["LEAGUE_ID"]),
+              "host": None,
+              "port": None,
+              "ok": False,
+              "error": os.environ["ERR_MSG"],
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          }
+          with open(report_path, "w", encoding="utf-8") as f:
+              f.write(json.dumps(data, indent=2))
+          PY
+            echo "PSQL_PREFLIGHT_OK=false" >> $GITHUB_ENV
+            exit 1
+          fi
+
+          eval $(python3 - <<'PY'
+          import os, urllib.parse
+          url = os.environ.get("SUPABASE_DB_URL", "")
+          p = urllib.parse.urlparse(url)
+          host = p.hostname or ""
+          port = p.port or 5432
+          print(f"DB_HOST={host}")
+          print(f"DB_PORT={port}")
+          PY
+          )
+          echo "Supabase DB host=${DB_HOST} port=${DB_PORT}"
+
+          set +e
+          output=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select now();" 2>&1)
+          status=$?
+          set -e
+
+          if [ $status -ne 0 ]; then
+            echo "$output"
+            if echo "$output" | grep -qi "Network is unreachable" && echo "$DB_HOST" | grep -q "^db\\."; then
+              echo "Direct DB endpoint is IPv6; GitHub runners are IPv4-only. Use Supavisor Session pooler URL (aws-*.pooler.supabase.com:5432) or buy IPv4 add-on."
+            fi
+            err_msg=$(echo "$output" | head -n 5 | tr -d '\r' | tr '\n' ' ')
+            DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" ERR_MSG="$err_msg" python3 - <<'PY'
+          import json, os, time
+          report_path = os.environ["REPORT_PATH"]
+          data = {
+              "league_id": int(os.environ["LEAGUE_ID"]),
+              "host": os.environ.get("DB_HOST"),
+              "port": int(os.environ.get("DB_PORT") or 0),
+              "ok": False,
+              "error": os.environ.get("ERR_MSG"),
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          }
+          with open(report_path, "w", encoding="utf-8") as f:
+              f.write(json.dumps(data, indent=2))
+          PY
+            echo "PSQL_PREFLIGHT_OK=false" >> $GITHUB_ENV
+            exit 1
+          fi
+
+          DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" ERR_MSG="" python3 - <<'PY'
+          import json, os, time
+          report_path = os.environ["REPORT_PATH"]
+          data = {
+              "league_id": int(os.environ["LEAGUE_ID"]),
+              "host": os.environ.get("DB_HOST"),
+              "port": int(os.environ.get("DB_PORT") or 0),
+              "ok": True,
+              "error": None,
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          }
+          with open(report_path, "w", encoding="utf-8") as f:
+              f.write(json.dumps(data, indent=2))
+          PY
+          echo "PSQL_PREFLIGHT_OK=true" >> $GITHUB_ENV
           echo "PSQL_OK=true" >> $GITHUB_ENV
 
       - name: Supabase REST preflight
@@ -80,8 +160,9 @@ jobs:
           $cmd
 
       - name: DB-direct odds ingest (psql)
+        if: env.PSQL_PREFLIGHT_OK == 'true'
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
         run: |
           python3 scripts/export_odds_to_supabase_psql.py \
             --leagues "${{ matrix.league }}" \
@@ -91,11 +172,25 @@ jobs:
             --max-runtime-minutes 25 \
             --report-out /tmp/odds_ingest_report_${{ matrix.league }}.json
 
+      - name: Upload preflight report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_preflight_${{ matrix.league }}
+          path: /tmp/odds_preflight_${{ matrix.league }}.json
+
       - name: Upload odds ingest report
+        if: env.PSQL_PREFLIGHT_OK == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: odds_ingest_report_${{ matrix.league }}
           path: /tmp/odds_ingest_report_${{ matrix.league }}.json
+
+      - name: Fail if preflight failed
+        if: env.PSQL_PREFLIGHT_OK != 'true'
+        run: |
+          echo "Supabase DB preflight failed."
+          exit 1
 
   patch:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'patch' }}
@@ -104,7 +199,7 @@ jobs:
       PYTHONPATH: .
       PYTHONUNBUFFERED: "1"
       MODE: patch
-      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -129,27 +224,120 @@ jobs:
           echo "LEAGUE_IDS=$(paste -sd, config/league_ids.txt)" >> $GITHUB_ENV
 
       - name: Supabase DB preflight (psql)
+        continue-on-error: true
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
+          REPORT_PATH: /tmp/odds_preflight_patch.json
         run: |
           set -euo pipefail
-          psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select 1;"
+          if [ -z "${SUPABASE_DB_URL:-}" ]; then
+            msg="Missing SUPABASE_DB_URL. Set SUPABASE_DB_URL_POOLER to the Supavisor SESSION pooler URL."
+            echo "$msg"
+            ERR_MSG="$msg" python3 - <<'PY'
+          import json, os, time
+          report_path = os.environ["REPORT_PATH"]
+          data = {
+              "league_id": None,
+              "host": None,
+              "port": None,
+              "ok": False,
+              "error": os.environ["ERR_MSG"],
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          }
+          with open(report_path, "w", encoding="utf-8") as f:
+              f.write(json.dumps(data, indent=2))
+          PY
+            echo "PSQL_PREFLIGHT_OK=false" >> $GITHUB_ENV
+            exit 1
+          fi
+
+          eval $(python3 - <<'PY'
+          import os, urllib.parse
+          url = os.environ.get("SUPABASE_DB_URL", "")
+          p = urllib.parse.urlparse(url)
+          host = p.hostname or ""
+          port = p.port or 5432
+          print(f"DB_HOST={host}")
+          print(f"DB_PORT={port}")
+          PY
+          )
+          echo "Supabase DB host=${DB_HOST} port=${DB_PORT}"
+
+          set +e
+          output=$(psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select now();" 2>&1)
+          status=$?
+          set -e
+
+          if [ $status -ne 0 ]; then
+            echo "$output"
+            if echo "$output" | grep -qi "Network is unreachable" && echo "$DB_HOST" | grep -q "^db\\."; then
+              echo "Direct DB endpoint is IPv6; GitHub runners are IPv4-only. Use Supavisor Session pooler URL (aws-*.pooler.supabase.com:5432) or buy IPv4 add-on."
+            fi
+            err_msg=$(echo "$output" | head -n 5 | tr -d '\r' | tr '\n' ' ')
+            DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" ERR_MSG="$err_msg" python3 - <<'PY'
+          import json, os, time
+          report_path = os.environ["REPORT_PATH"]
+          data = {
+              "league_id": None,
+              "host": os.environ.get("DB_HOST"),
+              "port": int(os.environ.get("DB_PORT") or 0),
+              "ok": False,
+              "error": os.environ.get("ERR_MSG"),
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          }
+          with open(report_path, "w", encoding="utf-8") as f:
+              f.write(json.dumps(data, indent=2))
+          PY
+            echo "PSQL_PREFLIGHT_OK=false" >> $GITHUB_ENV
+            exit 1
+          fi
+
+          DB_HOST="$DB_HOST" DB_PORT="$DB_PORT" ERR_MSG="" python3 - <<'PY'
+          import json, os, time
+          report_path = os.environ["REPORT_PATH"]
+          data = {
+              "league_id": None,
+              "host": os.environ.get("DB_HOST"),
+              "port": int(os.environ.get("DB_PORT") or 0),
+              "ok": True,
+              "error": None,
+              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+          }
+          with open(report_path, "w", encoding="utf-8") as f:
+              f.write(json.dumps(data, indent=2))
+          PY
+          echo "PSQL_PREFLIGHT_OK=true" >> $GITHUB_ENV
           echo "PSQL_OK=true" >> $GITHUB_ENV
 
       - name: Patch odds participants (psql)
+        if: env.PSQL_PREFLIGHT_OK == 'true'
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_POOLER }}
         run: |
           python3 scripts/patch_odds_participants_psql.py \
             --leagues "$LEAGUE_IDS" \
             --days-forward 14 \
             --report-out /tmp/odds_patch_report.json
 
+      - name: Upload preflight report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_preflight_patch
+          path: /tmp/odds_preflight_patch.json
+
       - name: Upload odds patch report
+        if: env.PSQL_PREFLIGHT_OK == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: odds_patch_report
           path: /tmp/odds_patch_report.json
+
+      - name: Fail if preflight failed
+        if: env.PSQL_PREFLIGHT_OK != 'true'
+        run: |
+          echo "Supabase DB preflight failed."
+          exit 1
 
   summary:
     if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode != 'patch')) }}
@@ -165,9 +353,18 @@ jobs:
       - name: Download ingest reports
         uses: actions/download-artifact@v4
         with:
-          path: /tmp/odds_reports
+          path: /tmp/odds_reports/ingest
           pattern: odds_ingest_report_*
           merge-multiple: true
+        continue-on-error: true
+
+      - name: Download preflight reports
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/odds_reports/preflight
+          pattern: odds_preflight_*
+          merge-multiple: true
+        continue-on-error: true
 
       - name: Summarize odds ingest reports
         run: |
@@ -176,10 +373,10 @@ jobs:
           import os
           from pathlib import Path
 
-          reports_dir = Path("/tmp/odds_reports")
-          files = sorted(reports_dir.glob("*.json"))
-          if not files:
-              raise SystemExit("No ingest reports found.")
+          ingest_dir = Path("/tmp/odds_reports/ingest")
+          preflight_dir = Path("/tmp/odds_reports/preflight")
+          ingest_files = sorted(ingest_dir.glob("*.json"))
+          preflight_files = sorted(preflight_dir.glob("*.json"))
 
           max_runtime_min = float(os.environ.get("ODDS_MAX_RUNTIME_MINUTES", "25"))
           min_pct = float(os.environ.get("ODDS_COVERAGE_MIN_PCT", "0"))
@@ -191,7 +388,29 @@ jobs:
 
           failures = []
           rows = []
-          for path in files:
+          preflight_errors = []
+
+          for path in preflight_files:
+              data = json.loads(path.read_text())
+              if not data.get("ok", False):
+                  preflight_errors.append(
+                      {
+                          "league_id": data.get("league_id"),
+                          "host": data.get("host"),
+                          "port": data.get("port"),
+                          "error": data.get("error"),
+                      }
+                  )
+
+          if preflight_errors:
+              print("Preflight errors:")
+              for item in preflight_errors:
+                  print(
+                      f"- league={item['league_id']} host={item['host']} "
+                      f"port={item['port']} error={item['error']}"
+                  )
+
+          for path in ingest_files:
               data = json.loads(path.read_text())
               league_id = data.get("league_id") or "unknown"
               runtime = float(data.get("runtime_seconds", 0)) / 60.0
@@ -221,6 +440,22 @@ jobs:
               missing = sorted(set(expected_leagues) - seen)
               if missing:
                   failures.append(f"missing reports for leagues: {', '.join(missing)}")
+                  if preflight_errors:
+                      failures.append("preflight failures present (see above)")
+
+          if not ingest_files:
+              if preflight_files:
+                  print("No ingest reports found; preflight failures:")
+                  for path in preflight_files:
+                      data = json.loads(path.read_text())
+                      if not data.get("ok", False):
+                          league_id = data.get("league_id", "unknown")
+                          host = data.get("host")
+                          port = data.get("port")
+                          err = data.get("error")
+                          print(f"- league={league_id} host={host} port={port} error={err}")
+                  raise SystemExit(1)
+              raise SystemExit("No ingest reports or preflight reports found.")
 
           print("league_id runtime_min inserted updated coverage_pct baseline_pct partial_run")
           def sort_key(item):
