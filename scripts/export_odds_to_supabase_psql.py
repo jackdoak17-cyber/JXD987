@@ -19,6 +19,7 @@ import subprocess
 import urllib.parse
 import tempfile
 import time
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -315,8 +316,8 @@ with src as (
   returning (xmax = 0) as inserted
 )
 select 'upserted_total', count(*)::bigint from upserted;
-select 'inserted', (count(*) filter (where inserted))::bigint from upserted;
-select 'updated', (count(*) filter (where not inserted))::bigint from upserted;
+select 'inserted', (select count(*)::bigint from upserted where inserted);
+select 'updated', (select count(*)::bigint from upserted where not inserted);
 select 'src_count', cnt from src_count;
 commit;
 """,
@@ -331,6 +332,41 @@ commit;
         with tempfile.NamedTemporaryFile("w", delete=False, suffix=".sql") as f:
             f.write(sql)
             sql_path = f.name
+
+    guard_pattern = re.compile(r"::bigint\\s+filter", re.IGNORECASE)
+    sql_text = Path(sql_path).read_text(encoding="utf-8")
+    guard_match = guard_pattern.search(sql_text)
+    if guard_match:
+        lines = sql_text.splitlines()
+        line_no = sql_text[: guard_match.start()].count("\n") + 1
+        start = max(1, line_no - 3)
+        end = min(len(lines), line_no + 3)
+        context = "\n".join(
+            f"{idx + 1:4d}: {lines[idx]}"
+            for idx in range(start - 1, end)
+        )
+        message = (
+            "SQL guard failed: detected forbidden '::bigint filter' pattern.\n"
+            f"Context:\n{context}\n"
+        )
+        print(message, flush=True)
+        append_output(err_path, "sql_guard", message)
+        raise SystemExit("SQL guard failed; refusing to run psql.")
+
+    lines = sql_text.splitlines()
+    snippet_lines = []
+    for idx, line in enumerate(lines, start=1):
+        if "select 'inserted'" in line or "select 'updated'" in line:
+            start = max(1, idx - 2)
+            end = min(len(lines), idx + 2)
+            snippet_lines = [
+                f"{line_no:4d}: {lines[line_no - 1]}" for line_no in range(start, end + 1)
+            ]
+            break
+    if snippet_lines:
+        snippet = "\n".join(snippet_lines)
+        print("SQL snippet:\n" + snippet, flush=True)
+        append_output(out_path, "sql_snippet", snippet)
 
     output = run_psql(
         db_url,

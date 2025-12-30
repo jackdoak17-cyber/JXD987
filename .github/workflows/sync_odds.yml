@@ -138,6 +138,11 @@ jobs:
         run: |
           set +e
           set -o pipefail
+          echo "HEAD=$(git rev-parse HEAD)"
+          python3 - <<'PY'
+          import scripts.export_odds_to_supabase_psql as m
+          print(f"exporter_path={m.__file__}")
+          PY
           LOG_PATH="/tmp/odds_upsert_${{ matrix.league_id }}.log"
           CSV_PATH="/tmp/odds_outcomes_export_${{ matrix.league_id }}.csv"
           : > "$LOG_PATH"
