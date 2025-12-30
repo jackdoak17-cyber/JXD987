@@ -448,10 +448,11 @@ with days as (
 )
 select coalesce(
   percentile_cont(0.5) within group (
-    order by case when total = 0 then 0 else 100.0 * mapped / total end
+    order by case when c.total = 0 then 0 else 100.0 * c.mapped / c.total end
   ),
   0
 ) as median_mapped_pct;
+from counts c;
 """
 
 
@@ -619,15 +620,18 @@ def main() -> None:
         coverage_pct = 0.0
 
     baseline_sql = coverage_baseline_query(6, effective_leagues)
-    baseline_out = run_psql(
-        DB_URL,
-        baseline_sql,
-        label="coverage_baseline",
-        err_path=err_path,
-        out_path=out_path,
-    )
+    coverage_baseline_pct = 0.0
     try:
+        baseline_out = run_psql(
+            DB_URL,
+            baseline_sql,
+            label="coverage_baseline",
+            err_path=err_path,
+            out_path=out_path,
+        )
         coverage_baseline_pct = float(baseline_out.strip()) if baseline_out else 0.0
+    except subprocess.CalledProcessError as exc:
+        print(f"coverage_baseline failed; continuing: {exc}", flush=True)
     except ValueError:
         coverage_baseline_pct = 0.0
 
