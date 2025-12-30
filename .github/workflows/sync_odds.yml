@@ -137,18 +137,33 @@ jobs:
           PGSSLMODE: require
         run: |
           set +e
+          set -o pipefail
+          LOG_PATH="/tmp/odds_upsert_${{ matrix.league_id }}.log"
+          CSV_PATH="/tmp/odds_outcomes_export_${{ matrix.league_id }}.csv"
+          : > "$LOG_PATH"
           : > /tmp/psql_err_${{ matrix.league_id }}.txt
           : > /tmp/psql_out_${{ matrix.league_id }}.txt
           : > /tmp/odds_psql_sql_${{ matrix.league_id }}.sql
           python3 scripts/export_odds_to_supabase_psql.py \
             --leagues "${{ matrix.league_id }}" \
             --days-forward 14 \
+            --csv-out "$CSV_PATH" \
+            --no-include-fixture-leagues \
             --progress-rows 10000 \
             --progress-fixtures 100 \
             --max-runtime-minutes 25 \
             --keep-sql \
-            --report-out /tmp/odds_ingest_report_${{ matrix.league_id }}.json
-          status=$?
+            --report-out /tmp/odds_ingest_report_${{ matrix.league_id }}.json \
+            2>&1 | tee "$LOG_PATH"
+          status=${PIPESTATUS[0]}
+          if [ $status -ne 0 ]; then
+            echo "=== odds upsert log tail ==="
+            tail -n 200 "$LOG_PATH" || true
+            echo "=== csv info ==="
+            ls -la "$CSV_PATH" || true
+            echo "=== csv head ==="
+            head -n 3 "$CSV_PATH" || true
+          fi
           if [ $status -eq 0 ]; then
             echo "INGEST_OK=true" >> $GITHUB_ENV
           else
@@ -171,11 +186,12 @@ jobs:
           path: /tmp/odds_preflight_err_${{ matrix.league_id }}.txt
 
       - name: Upload odds ingest report
-        if: env.INGEST_OK == 'true'
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: odds_ingest_report_${{ matrix.league_id }}
           path: /tmp/odds_ingest_report_${{ matrix.league_id }}.json
+          if-no-files-found: ignore
 
       - name: Upload psql error outputs
         if: always()
@@ -200,6 +216,23 @@ jobs:
           name: odds_psql_sql_${{ matrix.league_id }}
           path: /tmp/odds_psql_sql_${{ matrix.league_id }}.sql
           if-no-files-found: ignore
+
+      - name: Upload odds upsert log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_upsert_log_${{ matrix.league_id }}
+          path: /tmp/odds_upsert_${{ matrix.league_id }}.log
+          if-no-files-found: ignore
+
+      - name: Dump odds diagnostics
+        if: env.PSQL_PREFLIGHT_OK == 'true' && env.INGEST_OK != 'true'
+        run: |
+          ls -la /tmp || true
+          echo "=== upsert log tail ==="
+          tail -n 200 /tmp/odds_upsert_${{ matrix.league_id }}.log || true
+          echo "=== sql file head ==="
+          sed -n '1,120p' /tmp/odds_psql_sql_${{ matrix.league_id }}.sql || true
 
       - name: Fail if preflight failed
         if: env.PSQL_PREFLIGHT_OK != 'true'
@@ -342,6 +375,14 @@ jobs:
           merge-multiple: true
         continue-on-error: true
 
+      - name: Download upsert logs
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/odds_reports/upsert_logs
+          pattern: odds_upsert_log_*
+          merge-multiple: true
+        continue-on-error: true
+
       - name: Summarize odds ingest reports
         run: |
           python3 - <<'PY'
@@ -352,9 +393,13 @@ jobs:
           ingest_dir = Path("/tmp/odds_reports/ingest")
           preflight_dir = Path("/tmp/odds_reports/preflight")
           psql_err_dir = Path("/tmp/odds_reports/psql_err")
+          upsert_log_dir = Path("/tmp/odds_reports/upsert_logs")
           ingest_files = sorted(ingest_dir.glob("*.json"))
           preflight_files = sorted(preflight_dir.glob("*.json"))
           psql_err_files = {p.stem.replace("odds_psql_err_", ""): p for p in psql_err_dir.glob("*.txt")}
+          upsert_log_files = {
+              p.stem.replace("odds_upsert_", ""): p for p in upsert_log_dir.glob("odds_upsert_*.log")
+          }
 
           max_runtime_min = float(os.environ.get("ODDS_MAX_RUNTIME_MINUTES", "25"))
           min_pct = float(os.environ.get("ODDS_COVERAGE_MIN_PCT", "0"))
@@ -457,16 +502,28 @@ jobs:
               for item in failures:
                   print(f"- {item}")
               missing_leagues = sorted(set(expected_leagues) - {str(r[0]) for r in rows})
+              def first_error_line(path):
+                  if not path or not path.exists():
+                      return ""
+                  try:
+                      lines = path.read_text(encoding="utf-8").splitlines()
+                  except Exception:
+                      return ""
+                  for line in lines:
+                      if "ERROR" in line or "FATAL" in line:
+                          return line.strip()
+                  for line in lines:
+                      if line.strip():
+                          return line.strip()
+                  return ""
               for league in missing_leagues:
                   err_path = psql_err_files.get(str(league))
-                  if err_path and err_path.exists():
-                      err_line = ""
-                      with err_path.open("r", encoding="utf-8") as f:
-                          for line in f:
-                              if line.strip():
-                                  err_line = line.strip()
-                                  break
+                  err_line = first_error_line(err_path)
+                  if not err_line:
+                      err_line = first_error_line(upsert_log_files.get(str(league)))
                       if err_line:
-                          print(f"league {league} psql_err: {err_line}")
+                          print(f"league {league} upsert_log: {err_line}")
+                  elif err_line:
+                      print(f"league {league} psql_err: {err_line}")
               raise SystemExit(1)
           PY

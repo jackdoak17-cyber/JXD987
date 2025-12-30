@@ -102,6 +102,8 @@ def run_psql(
         "--echo-errors",
         "-v",
         "VERBOSITY=verbose",
+        "-v",
+        "SHOW_CONTEXT=always",
         "-At",
         "-F",
         "\t",
@@ -116,12 +118,13 @@ def run_psql(
         proc = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
     except subprocess.CalledProcessError as exc:
         safe_cmd = [redact_db_url(c) if c == db_url else c for c in cmd]
-        print(f"psql failed ({label}) exit={exc.returncode}")
-        print("psql cmd:", " ".join(safe_cmd))
+        header = f"psql failed ({label}) exit={exc.returncode}\npsql cmd: {' '.join(safe_cmd)}\n"
+        print(header)
         print("psql stdout:\n", exc.stdout or "")
         print("psql stderr:\n", exc.stderr or "")
-        append_output(out_path, f"{label} stdout", exc.stdout or "")
-        append_output(err_path, f"{label} stderr", exc.stderr or "")
+        append_output(out_path, f"{label} stdout", (exc.stdout or ""))
+        append_output(err_path, f"{label} stderr", (exc.stderr or ""))
+        append_output(err_path, f"{label} header", header)
         raise
     append_output(out_path, f"{label} stdout", proc.stdout or "")
     append_output(err_path, f"{label} stderr", proc.stderr or "")
