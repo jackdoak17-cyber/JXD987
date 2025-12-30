@@ -82,7 +82,7 @@ jobs:
             echo "Supabase unreachable via REST (HTTP $status). Skipping export."
           fi
 
-      - name: Resolve Supabase IPv4 for psql
+      - name: Prepare psql env (IPv4)
         if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
@@ -90,29 +90,42 @@ jobs:
           python3 - <<'PY'
           import os
           import re
+          import shlex
           import socket
+          import sys
+          import urllib.parse
 
           url = os.environ.get("SUPABASE_DB_URL", "").strip()
           if not url:
-              print("SUPABASE_DB_URL is empty")
-              raise SystemExit(0)
+              print("SUPABASE_DB_URL is empty", file=sys.stderr)
+              raise SystemExit(1)
 
-          match = re.match(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<rest>.+)$", url)
+          match = re.match(r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*)://(?P<rest>.+)$", url)
           if not match:
-              print("SUPABASE_DB_URL is not a valid URI")
-              raise SystemExit(0)
+              print("SUPABASE_DB_URL is not a valid URI", file=sys.stderr)
+              raise SystemExit(1)
           scheme = match.group("scheme")
           rest = match.group("rest")
 
-          rest, _, path_query = rest.partition("/")
-          authority = rest
-          rest_path = "/" + path_query if path_query else ""
+          authority, _, path_query = rest.partition("/")
 
           userinfo = ""
           hostport = authority
           if "@" in authority:
               userinfo, hostport = authority.rsplit("@", 1)
-              userinfo = userinfo + "@"
+              userinfo = userinfo.strip()
+
+          user = None
+          password = None
+          if userinfo:
+              if ":" in userinfo:
+                  user, password = userinfo.split(":", 1)
+              else:
+                  user = userinfo
+              if user:
+                  user = urllib.parse.unquote(user)
+              if password is not None:
+                  password = urllib.parse.unquote(password)
 
           host = None
           port = None
@@ -137,27 +150,71 @@ jobs:
           if host:
               host = host.strip("[]")
           if not host:
-              print("Could not parse host from SUPABASE_DB_URL")
-              raise SystemExit(0)
+              print("Could not parse host from SUPABASE_DB_URL", file=sys.stderr)
+              raise SystemExit(1)
           if port is None:
               port = 5432
+
+          dbname = None
+          query = ""
+          if path_query:
+              if "?" in path_query:
+                  path, query = path_query.split("?", 1)
+              else:
+                  path = path_query
+              if path:
+                  dbname = urllib.parse.unquote(path)
+
+          sslmode = "require"
+          if query:
+              params = dict(urllib.parse.parse_qsl(query, keep_blank_values=True))
+              if params.get("sslmode"):
+                  sslmode = params["sslmode"]
+
           try:
               infos = socket.getaddrinfo(host, port, socket.AF_INET)
           except Exception as exc:
-              print(f"IPv4 lookup failed for {host}: {exc}")
-              raise SystemExit(0)
+              print(f"IPv4 lookup failed for {host}: {exc}", file=sys.stderr)
+              raise SystemExit(1)
           ip = infos[0][4][0] if infos else ""
           if not ip:
-              print(f"No IPv4 address found for {host}")
-              raise SystemExit(0)
+              print(f"No IPv4 address found for {host}", file=sys.stderr)
+              raise SystemExit(1)
+
+          def q(val):
+              return shlex.quote(str(val))
+
+          url_ipv4 = None
+          if user:
+              userinfo_out = urllib.parse.quote(user, safe="")
+              if password is not None:
+                  userinfo_out += ":" + urllib.parse.quote(password, safe="")
+              userinfo_out += "@"
+          else:
+              userinfo_out = ""
           hostport_ipv4 = f"{ip}:{port}" if port else ip
-          url_ipv4 = f"{scheme}{userinfo}{hostport_ipv4}{rest_path}"
+          url_ipv4 = f"{scheme}://{userinfo_out}{hostport_ipv4}"
+          if dbname:
+              url_ipv4 += f"/{urllib.parse.quote(dbname, safe='')}"
+          if sslmode:
+              sep = "?" if "?" not in url_ipv4 else "&"
+              url_ipv4 += f"{sep}sslmode={urllib.parse.quote(sslmode, safe='')}"
+
           print(f"Resolved {host} -> {ip}")
-          with open(os.environ["GITHUB_ENV"], "a") as f:
-              f.write(f"PGHOSTADDR={ip}\n")
-              f.write(f"PGHOST={host}\n")
-              f.write(f"SUPABASE_DB_URL_IPV4={url_ipv4}\n")
-              f.write(f"SUPABASE_DB_URL={url_ipv4}\n")
+          with open("/tmp/pg_env.sh", "w") as f:
+              f.write(f"export PGHOSTADDR={q(ip)}\n")
+              f.write(f"export PGHOST={q(host)}\n")
+              f.write(f"export PGPORT={q(port)}\n")
+              if user:
+                  f.write(f"export PGUSER={q(user)}\n")
+              if password is not None:
+                  f.write(f"export PGPASSWORD={q(password)}\n")
+              if dbname:
+                  f.write(f"export PGDATABASE={q(dbname)}\n")
+              f.write(f"export PGSSLMODE={q(sslmode)}\n")
+              if url_ipv4:
+                  f.write(f"export SUPABASE_DB_URL_IPV4={q(url_ipv4)}\n")
+                  f.write(f"export SUPABASE_DB_URL={q(url_ipv4)}\n")
           PY
 
       - name: Build odds participant patch (sqlite)
@@ -168,6 +225,7 @@ jobs:
       - name: Apply odds participant patch (psql)
         if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
         run: |
+          . /tmp/pg_env.sh
           cat > /tmp/apply_odds_pid_patch.sql <<'SQL'
           create table if not exists public.odds_outcomes_pid_patch (
             fixture_id bigint not null,
@@ -193,7 +251,7 @@ jobs:
             and (o.participant_id is null or o.participant_id <> p.participant_id);
           select count(*) as patch_rows from public.odds_outcomes_pid_patch;
           SQL
-          /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f /tmp/apply_odds_pid_patch.sql
+          /usr/bin/psql -v ON_ERROR_STOP=1 -f /tmp/apply_odds_pid_patch.sql
 
       - name: Verify odds coverage (psql)
         if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
@@ -201,6 +259,7 @@ jobs:
           ODDS_COVERAGE_MIN_DISTINCT: 20
           ODDS_PLAYER_MAPPING_MIN_PCT: 80
         run: |
+          . /tmp/pg_env.sh
           scripts/verify_odds_coverage.sh
 
       - name: Upload odds coverage report
@@ -221,7 +280,8 @@ jobs:
       - name: Debug mapped participant IDs (Supabase)
         if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL != '' }}
         run: |
-          /usr/bin/psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select selection_key, participant_id, line, market_key from public.odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
+          . /tmp/pg_env.sh
+          /usr/bin/psql -v ON_ERROR_STOP=1 -c "select selection_key, participant_id, line, market_key from public.odds_outcomes where fixture_id=19427629 and selection_key in ('cole_palmer_anytime','cole_palmer_1_5','morgan_rogers_0_5','wesley_fofana_0_5') order by selection_key, market_key;"
 
       - name: Skip patch notice
         if: ${{ steps.preflight.outputs.supabase_ok == 'true' && env.SUPABASE_DB_URL == '' }}
