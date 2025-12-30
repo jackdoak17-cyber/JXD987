@@ -64,18 +64,24 @@ def parse_league_ids(raw: str) -> List[int]:
     return [int(x) for x in raw.split(",") if x.strip()]
 
 
+def sqlite_window_bounds(days_forward: int) -> Tuple[str, str]:
+    start_dt = datetime.utcnow()
+    end_dt = start_dt + timedelta(days=days_forward)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return start_dt.strftime(fmt), end_dt.strftime(fmt)
+
+
 def fetch_fixture_league_ids(conn: sqlite3.Connection, days_forward: int) -> List[int]:
-    today = datetime.utcnow().date()
-    end = today + timedelta(days=days_forward)
+    start_dt, end_dt = sqlite_window_bounds(days_forward)
     cur = conn.cursor()
     cur.execute(
         """
         select distinct league_id
         from fixtures
         where league_id is not null
-          and date(starting_at) >= ? and date(starting_at) <= ?
+          and datetime(starting_at) >= ? and datetime(starting_at) < ?
         """,
-        (today.isoformat(), end.isoformat()),
+        (start_dt, end_dt),
     )
     return [row[0] for row in cur.fetchall()]
 
@@ -143,9 +149,8 @@ def build_outcomes_csv(
     total_fixtures_estimate: int,
     max_runtime_seconds: int,
 ) -> Tuple[int, bool, Optional[int]]:
-    today = datetime.utcnow().date()
-    end = today + timedelta(days=days_forward)
-    params: List[object] = [today.isoformat(), end.isoformat()]
+    start_dt, end_dt = sqlite_window_bounds(days_forward)
+    params: List[object] = [start_dt, end_dt]
     league_clause = ""
     if league_ids:
         placeholders = ",".join("?" for _ in league_ids)
@@ -167,7 +172,7 @@ def build_outcomes_csv(
                o.last_updated_at
         from odds_outcomes o
         join fixtures f on f.id = o.fixture_id
-        where date(f.starting_at) >= ? and date(f.starting_at) <= ?
+        where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
           {league_clause}
         order by o.fixture_id
         """,
@@ -401,8 +406,8 @@ with fixtures_in_range as (
   select id
   from public.fixtures
   where {league_filter}
-    (starting_at at time zone 'Europe/London')::date >= current_date
-    and (starting_at at time zone 'Europe/London')::date < (current_date + interval '{days_forward} days')
+    starting_at >= (now() at time zone 'utc')
+    and starting_at < (now() at time zone 'utc') + interval '{days_forward} days'
 ), scoped as (
   select o.participant_id
   from public.odds_outcomes o
@@ -465,8 +470,8 @@ select
   count(*) filter (where participant_type='player' and participant_id is not null) as mapped_players
 from public.odds_outcomes o
 join public.fixtures f on f.id=o.fixture_id
-where date(f.starting_at) >= current_date
-  and date(f.starting_at) < current_date + {days_forward};
+where f.starting_at >= (now() at time zone 'utc')
+  and f.starting_at < (now() at time zone 'utc') + interval '{days_forward} days';
 """
     )
     queries.append(
@@ -476,8 +481,8 @@ select market_key, line,
 from public.odds_outcomes o
 join public.fixtures f on f.id=o.fixture_id
 where market_key in ('player_shots','player_shots_on_target')
-  and date(f.starting_at) >= current_date
-  and date(f.starting_at) < current_date + {days_forward}
+  and f.starting_at >= (now() at time zone 'utc')
+  and f.starting_at < (now() at time zone 'utc') + interval '{days_forward} days'
 group by market_key, line
 order by market_key, distinct_players desc
 limit 20;
@@ -523,32 +528,30 @@ def main() -> None:
     fixture_count = 0
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
-        today = datetime.utcnow().date()
-        end = today + timedelta(days=args.days_forward)
+        start_dt, end_dt = sqlite_window_bounds(args.days_forward)
         fixture_count = conn.execute(
             f"""
             select count(*)
             from fixtures
-            where date(starting_at) >= ? and date(starting_at) <= ?
+            where datetime(starting_at) >= ? and datetime(starting_at) < ?
               and league_id in ({placeholders})
             """,
-            [today.isoformat(), end.isoformat(), *effective_leagues],
+            [start_dt, end_dt, *effective_leagues],
         ).fetchone()[0]
 
     total_rows_estimate = 0
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
-        today = datetime.utcnow().date()
-        end = today + timedelta(days=args.days_forward)
+        start_dt, end_dt = sqlite_window_bounds(args.days_forward)
         total_rows_estimate = conn.execute(
             f"""
             select count(*)
             from odds_outcomes o
             join fixtures f on f.id = o.fixture_id
-            where date(f.starting_at) >= ? and date(f.starting_at) <= ?
+            where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
               and f.league_id in ({placeholders})
             """,
-            [today.isoformat(), end.isoformat(), *effective_leagues],
+            [start_dt, end_dt, *effective_leagues],
         ).fetchone()[0]
 
     print(
