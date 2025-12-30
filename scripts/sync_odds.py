@@ -41,10 +41,45 @@ def normalize_slug(value: str) -> str:
     return text_val or "unknown"
 
 
-def normalize_name(value: str) -> str:
+def normalize_name_tokens(value: str) -> List[str]:
+    if not value:
+        return []
     text_val = unicodedata.normalize("NFKD", value)
     text_val = "".join(ch for ch in text_val if not unicodedata.combining(ch))
-    return re.sub(r"[^a-z0-9]+", "", text_val.lower())
+    text_val = re.sub(r"[^a-z0-9]+", " ", text_val.lower()).strip()
+    if not text_val:
+        return []
+    return [token for token in text_val.split() if token]
+
+
+def normalize_name(value: str) -> str:
+    tokens = normalize_name_tokens(value)
+    return "".join(tokens)
+
+
+def name_variants(value: str) -> List[str]:
+    tokens = normalize_name_tokens(value)
+    if not tokens:
+        return []
+    variants = {normalize_name(value)}
+    if len(tokens) == 2:
+        first, last = tokens
+        variants.add(last + first)
+        variants.add(first[0] + last)
+        variants.add(last + first[0])
+    elif len(tokens) >= 3:
+        first = tokens[0]
+        last = tokens[-1]
+        middle = tokens[1:-1]
+        variants.add(last + "".join([first, *middle]))
+        variants.add(first + last)
+        variants.add(last + first)
+        variants.add(first[0] + last)
+        variants.add(last + first[0])
+        if len(tokens[1]) == 1:
+            variants.add(first + last)
+            variants.add(last + first)
+    return [variant for variant in variants if variant]
 
 
 def parse_float(value: Optional[object]) -> Optional[float]:
@@ -95,6 +130,29 @@ def parse_timestamp(value: Optional[object]) -> Optional[datetime]:
         return None
 
 
+def extract_player_name(raw_name: str) -> str:
+    name = (raw_name or "").strip()
+    if not name:
+        return name
+    if "(" in name and ")" in name:
+        prefix = name.split("(")[0].strip()
+        if prefix:
+            name = prefix
+    if " - " in name:
+        name = name.split(" - ")[0].strip()
+    if " @ " in name:
+        name = name.split(" @ ")[0].strip()
+    if " vs " in name:
+        name = name.split(" vs ")[0].strip()
+    if " v " in name:
+        name = name.split(" v ")[0].strip()
+    if "," in name:
+        parts = [part.strip() for part in name.split(",") if part.strip()]
+        if len(parts) >= 2:
+            name = " ".join([parts[1], parts[0]])
+    return name
+
+
 def resolve_market_key(row: Dict) -> str:
     market_id = parse_int(row.get("market_id"))
     if market_id in MARKET_ID_MAP:
@@ -116,11 +174,26 @@ PLAYER_MARKET_KEYS = {
 
 
 def resolve_participant_type(row: Dict, market_key: str) -> Optional[str]:
-    desc = str(row.get("market_description") or "").lower()
+    desc = str(row.get("market_description") or row.get("market") or "").lower()
+    if "team" in desc or market_key.startswith("team_"):
+        return "team"
     if "player" in desc or market_key.startswith("player_") or market_key in PLAYER_MARKET_KEYS:
         return "player"
-    if "team" in desc:
-        return "team"
+    if any(
+        token in market_key
+        for token in (
+            "goalscorer",
+            "goal_scorer",
+            "scorer",
+            "to_score",
+            "to_assist",
+            "assist",
+            "shots",
+            "shot",
+            "sot",
+        )
+    ):
+        return "player"
     return None
 
 
@@ -198,6 +271,39 @@ def fetch_team_player_counts(session, team_ids: Iterable[int]) -> Dict[int, int]
     return {int(team_id): int(count) for team_id, count in rows}
 
 
+def load_team_player_names(
+    session,
+    team_ids: Iterable[int],
+    limit: int = 50,
+) -> Dict[int, List[str]]:
+    ids = [int(x) for x in team_ids if x]
+    if not ids:
+        return {}
+    stmt = text(
+        """
+        select team_id, name, common_name, short_name
+        from players
+        where team_id in :team_ids
+        order by name
+        """
+    ).bindparams(bindparam("team_ids", expanding=True))
+    rows = session.execute(stmt, {"team_ids": ids}).fetchall()
+    names: Dict[int, List[str]] = {}
+    for team_id, name, common_name, short_name in rows:
+        tid = int(team_id) if team_id else None
+        if tid is None:
+            continue
+        for candidate in (name, common_name, short_name):
+            if not candidate:
+                continue
+            names.setdefault(tid, [])
+            if candidate not in names[tid]:
+                names[tid].append(candidate)
+                if limit and len(names[tid]) >= limit:
+                    break
+    return names
+
+
 def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[int, Optional[int]]]]:
     rows = session.execute(
         text(
@@ -222,12 +328,12 @@ def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[in
         for candidate in (name, common_name, short_name, fixture_name):
             if not candidate:
                 continue
-            normalized = normalize_name(str(candidate))
-            if not normalized:
-                continue
-            mapping.setdefault(normalized, []).append(
-                (int(player_id), int(team_id) if team_id else None)
-            )
+            for normalized in name_variants(str(candidate)):
+                if not normalized:
+                    continue
+                mapping.setdefault(normalized, []).append(
+                    (int(player_id), int(team_id) if team_id else None)
+                )
     return mapping
 
 
@@ -250,12 +356,12 @@ def load_team_player_map(session, team_ids: Iterable[int]) -> Dict[str, List[Tup
         for candidate in (name, common_name, short_name):
             if not candidate:
                 continue
-            normalized = normalize_name(str(candidate))
-            if not normalized:
-                continue
-            mapping.setdefault(normalized, []).append(
-                (int(player_id), int(team_id) if team_id else None)
-            )
+            for normalized in name_variants(str(candidate)):
+                if not normalized:
+                    continue
+                mapping.setdefault(normalized, []).append(
+                    (int(player_id), int(team_id) if team_id else None)
+                )
     return mapping
 
 
@@ -263,22 +369,40 @@ def resolve_player_id(
     raw_name: str,
     fixture_map: Dict[str, List[Tuple[int, Optional[int]]]],
     team_map: Dict[str, List[Tuple[int, Optional[int]]]],
+    team_ids: Optional[Iterable[int]] = None,
 ) -> Optional[int]:
-    normalized = normalize_name(raw_name)
-    if not normalized:
+    team_id_set = {int(x) for x in team_ids or [] if x}
+    variants = name_variants(raw_name)
+    if not variants:
         return None
-    candidates = fixture_map.get(normalized)
-    if candidates:
-        unique = {pid for pid, _ in candidates}
-        if len(unique) == 1:
-            return next(iter(unique))
-        return candidates[0][0]
-    candidates = team_map.get(normalized)
-    if candidates:
-        unique = {pid for pid, _ in candidates}
-        if len(unique) == 1:
-            return next(iter(unique))
-        return candidates[0][0]
+    for variant in variants:
+        candidates = fixture_map.get(variant)
+        if candidates:
+            filtered = [
+                (pid, tid)
+                for pid, tid in candidates
+                if not team_id_set or (tid and tid in team_id_set)
+            ]
+            if filtered:
+                candidates = filtered
+            unique = {pid for pid, _ in candidates}
+            if len(unique) == 1:
+                return next(iter(unique))
+            return candidates[0][0]
+    for variant in variants:
+        candidates = team_map.get(variant)
+        if candidates:
+            filtered = [
+                (pid, tid)
+                for pid, tid in candidates
+                if not team_id_set or (tid and tid in team_id_set)
+            ]
+            if filtered:
+                candidates = filtered
+            unique = {pid for pid, _ in candidates}
+            if len(unique) == 1:
+                return next(iter(unique))
+            return candidates[0][0]
     return None
 
 
@@ -356,6 +480,10 @@ def parse_outcomes(
     unmatched_details: Optional[List[Dict]] = None,
     unmatched_counts: Optional[Dict[Tuple[str, str], int]] = None,
     unmatched_team_counts: Optional[Dict[str, int]] = None,
+    unmatched_selection_counts: Optional[Dict[str, int]] = None,
+    debug_samples: Optional[List[Dict]] = None,
+    debug_team_players: Optional[Dict[int, List[str]]] = None,
+    debug_limit: int = 0,
 ) -> List[Dict]:
     outcomes: List[Dict] = []
     for row in data:
@@ -373,6 +501,7 @@ def parse_outcomes(
         last_updated_at = parse_timestamp(row.get("latest_bookmaker_update") or row.get("updated_at"))
 
         participant_id = None
+        raw_participant_id = parse_int(row.get("participant_id") or row.get("player_id"))
         normalized_name = normalize_name(str(name))
         team_id_candidate = resolve_team_id(
             str(name),
@@ -386,11 +515,22 @@ def parse_outcomes(
         if participant_type is None and team_id_candidate is not None:
             participant_type = "team"
         if participant_type == "player":
-            participant_id = resolve_player_id(str(name), player_map, team_player_map)
+            mapped_name = extract_player_name(str(name))
+            if raw_participant_id is not None:
+                participant_id = raw_participant_id
+            else:
+                participant_id = resolve_player_id(
+                    mapped_name,
+                    player_map,
+                    team_player_map,
+                    team_ids=[home_team_id, away_team_id],
+                )
             if participant_id is None:
                 if unmatched_counts is not None:
                     key = (market_key, str(name))
                     unmatched_counts[key] = unmatched_counts.get(key, 0) + 1
+                if unmatched_selection_counts is not None:
+                    unmatched_selection_counts[selection_key] = unmatched_selection_counts.get(selection_key, 0) + 1
                 if unmatched_details is not None:
                     unmatched_details.append(
                         {
@@ -398,6 +538,25 @@ def parse_outcomes(
                             "market_key": market_key,
                             "selection_key": selection_key,
                             "raw_name": str(name),
+                        }
+                    )
+                if (
+                    debug_samples is not None
+                    and debug_team_players is not None
+                    and debug_limit > 0
+                    and len(debug_samples) < debug_limit
+                ):
+                    debug_samples.append(
+                        {
+                            "fixture_id": fixture_id,
+                            "market_key": market_key,
+                            "selection_key": selection_key,
+                            "raw_name": str(name),
+                            "mapped_name": mapped_name,
+                            "home_team_id": home_team_id,
+                            "away_team_id": away_team_id,
+                            "home_team_players": debug_team_players.get(home_team_id, [])[:20],
+                            "away_team_players": debug_team_players.get(away_team_id, [])[:20],
                         }
                     )
         elif participant_type == "team":
@@ -477,6 +636,17 @@ def main() -> None:
         default="",
         help="Write unmatched player odds to JSON (fixture_id, market_key, selection_key, raw_name)",
     )
+    parser.add_argument(
+        "--debug-mapping-out",
+        default="",
+        help="Write mapping debug samples to JSON.",
+    )
+    parser.add_argument(
+        "--debug-mapping-limit",
+        type=int,
+        default=100,
+        help="Max debug samples to capture.",
+    )
     parser.set_defaults(refresh_squads_missing=True)
     args = parser.parse_args()
 
@@ -536,6 +706,8 @@ def main() -> None:
     unmatched_details: List[Dict] = []
     unmatched_counts: Dict[Tuple[str, str], int] = {}
     unmatched_team_counts: Dict[str, int] = {}
+    unmatched_selection_counts: Dict[str, int] = {}
+    debug_samples: List[Dict] = []
 
     for idx, fixture in enumerate(fixtures, start=1):
         fixture_id = fixture["fixture_id"]
@@ -549,6 +721,9 @@ def main() -> None:
             session,
             [home_team_id, away_team_id],
         )
+        debug_team_players = None
+        if args.debug_mapping_out:
+            debug_team_players = load_team_player_names(session, [home_team_id, away_team_id], limit=50)
 
         data = fetch_odds_for_fixture(client, fixture_id, args.bookmaker_id)
         snapshot = {
@@ -581,6 +756,10 @@ def main() -> None:
             unmatched_details,
             unmatched_counts,
             unmatched_team_counts,
+            unmatched_selection_counts,
+            debug_samples,
+            debug_team_players,
+            args.debug_mapping_limit,
         )
         upsert_outcomes(session, outcomes)
         session.commit()
@@ -609,6 +788,11 @@ def main() -> None:
         summary = ", ".join(f"{key}({count})" for key, count in top)
         log.info("Unmatched team selection_key summary: %s", summary)
 
+    if unmatched_selection_counts:
+        top = sorted(unmatched_selection_counts.items(), key=lambda item: item[1], reverse=True)[:20]
+        summary = ", ".join(f"{key}({count})" for key, count in top)
+        log.info("Unmatched player selection_key summary: %s", summary)
+
     if args.unmatched_out:
         try:
             with open(args.unmatched_out, "w", encoding="utf-8") as f:
@@ -616,6 +800,35 @@ def main() -> None:
             log.info("Wrote unmatched player odds to %s (%s rows)", args.unmatched_out, len(unmatched_details))
         except OSError as exc:
             log.warning("Failed to write unmatched output %s: %s", args.unmatched_out, exc)
+
+    if args.debug_mapping_out:
+        try:
+            payload = {
+                "unmatched_player_names": [
+                    {"market_key": market_key, "raw_name": raw_name, "count": count}
+                    for (market_key, raw_name), count in sorted(
+                        unmatched_counts.items(), key=lambda item: item[1], reverse=True
+                    )[:200]
+                ],
+                "unmatched_player_selection_keys": [
+                    {"selection_key": key, "count": count}
+                    for key, count in sorted(
+                        unmatched_selection_counts.items(), key=lambda item: item[1], reverse=True
+                    )[:200]
+                ],
+                "unmatched_team_selection_keys": [
+                    {"selection_key": key, "count": count}
+                    for key, count in sorted(
+                        unmatched_team_counts.items(), key=lambda item: item[1], reverse=True
+                    )[:200]
+                ],
+                "samples": debug_samples,
+            }
+            with open(args.debug_mapping_out, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            log.info("Wrote debug mapping output to %s", args.debug_mapping_out)
+        except OSError as exc:
+            log.warning("Failed to write debug mapping output %s: %s", args.debug_mapping_out, exc)
 
 
 if __name__ == "__main__":
