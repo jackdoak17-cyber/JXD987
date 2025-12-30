@@ -38,7 +38,7 @@ jobs:
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
-          python3 scripts/run_sync.py --mode recent --leagues "$LEAGUE_IDS"
+          python3 scripts/run_sync.py --mode recent --recent-days 180 --leagues "$LEAGUE_IDS"
 
       - name: Freshness report
         run: python3 scripts/sqlite_freshness_report.py
