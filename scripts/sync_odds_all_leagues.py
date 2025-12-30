@@ -14,7 +14,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from datetime import date, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 
@@ -33,7 +33,14 @@ def load_league_ids(path: Path) -> list[int]:
     return ids
 
 
-def load_fixture_league_ids(db_path: Path, start_date: date, end_date: date) -> list[int]:
+def window_bounds(days_forward: int) -> tuple[str, str]:
+    start_dt = datetime.utcnow()
+    end_dt = start_dt + timedelta(days=days_forward)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return start_dt.strftime(fmt), end_dt.strftime(fmt)
+
+
+def load_fixture_league_ids(db_path: Path, start_dt: str, end_dt: str) -> list[int]:
     if not db_path.exists():
         return []
     try:
@@ -43,10 +50,10 @@ def load_fixture_league_ids(db_path: Path, start_date: date, end_date: date) -> 
             select distinct league_id
             from fixtures
             where league_id is not null
-              and date(starting_at) >= ?
-              and date(starting_at) <= ?
+              and datetime(starting_at) >= ?
+              and datetime(starting_at) < ?
             """,
-            (start_date.isoformat(), end_date.isoformat()),
+            (start_dt, end_dt),
         ).fetchall()
     except sqlite3.Error as exc:
         print(f"Warning: could not read fixture leagues from {db_path}: {exc}", file=sys.stderr)
@@ -75,11 +82,10 @@ def main() -> None:
     repo_root = Path(__file__).resolve().parent.parent
     leagues_file = repo_root / "config" / "league_ids.txt"
     db_path = Path(os.environ.get("JXD_DB_PATH", str(repo_root / "data" / "jxd.sqlite")))
-    today = date.today()
-    end_date = today + timedelta(days=args.days_forward)
+    start_dt, end_dt = window_bounds(args.days_forward)
 
     config_ids = load_league_ids(leagues_file)
-    fixture_ids = load_fixture_league_ids(db_path, today, end_date)
+    fixture_ids = load_fixture_league_ids(db_path, start_dt, end_dt)
     league_ids = sorted({*config_ids, *fixture_ids})
     if not league_ids:
         raise SystemExit(f"No league ids found (config={leagues_file}, db={db_path})")

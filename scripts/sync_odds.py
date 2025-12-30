@@ -13,7 +13,7 @@ import json
 import logging
 import re
 import unicodedata
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import bindparam, text
@@ -124,47 +124,78 @@ def resolve_participant_type(row: Dict, market_key: str) -> Optional[str]:
     return None
 
 
+def fixture_window_bounds(days_forward: int) -> Tuple[str, str]:
+    start_dt = datetime.utcnow()
+    end_dt = start_dt + timedelta(days=days_forward)
+    fmt = "%Y-%m-%d %H:%M:%S"
+    return start_dt.strftime(fmt), end_dt.strftime(fmt)
+
+
 def fetch_fixture_rows(
     session,
     league_ids: List[int],
-    start_date: date,
-    end_date: date,
+    start_dt: str,
+    end_dt: str,
 ) -> List[Dict]:
     league_list = ",".join(str(x) for x in league_ids)
-    start_iso = start_date.isoformat()
-    end_iso = end_date.isoformat()
     rows = session.execute(
         text(
             f"""
             select id, home_team_id, away_team_id
             from fixtures
             where league_id in ({league_list})
-              and date(starting_at) >= :start_date
-              and date(starting_at) <= :end_date
+              and datetime(starting_at) >= :start_dt
+              and datetime(starting_at) < :end_dt
             """
         ),
-        {"start_date": start_iso, "end_date": end_iso},
+        {"start_dt": start_dt, "end_dt": end_dt},
     ).fetchall()
     return [
         {"fixture_id": r[0], "home_team_id": r[1], "away_team_id": r[2]} for r in rows
     ]
 
 
-def load_team_map(session, team_ids: Iterable[int]) -> Dict[str, int]:
+def load_team_context(
+    session,
+    team_ids: Iterable[int],
+) -> Tuple[Dict[str, int], Dict[int, List[str]]]:
     ids = [int(x) for x in team_ids if x]
     if not ids:
-        return {}
+        return {}, {}
     stmt = text("select id, name, short_code from teams where id in :ids").bindparams(
         bindparam("ids", expanding=True),
     )
     rows = session.execute(stmt, {"ids": ids}).fetchall()
     mapping: Dict[str, int] = {}
+    aliases: Dict[int, List[str]] = {}
     for team_id, name, short_code in rows:
+        alias_list: List[str] = []
         for label in (name, short_code):
             if not label:
                 continue
-            mapping[normalize_name(str(label))] = int(team_id)
-    return mapping
+            normalized = normalize_name(str(label))
+            if not normalized:
+                continue
+            mapping[normalized] = int(team_id)
+            alias_list.append(normalized)
+        aliases[int(team_id)] = alias_list
+    return mapping, aliases
+
+
+def fetch_team_player_counts(session, team_ids: Iterable[int]) -> Dict[int, int]:
+    ids = [int(x) for x in team_ids if x]
+    if not ids:
+        return {}
+    stmt = text(
+        """
+        select team_id, count(*) as cnt
+        from players
+        where team_id in :team_ids
+        group by team_id
+        """
+    ).bindparams(bindparam("team_ids", expanding=True))
+    rows = session.execute(stmt, {"team_ids": ids}).fetchall()
+    return {int(team_id): int(count) for team_id, count in rows}
 
 
 def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[int, Optional[int]]]]:
@@ -251,6 +282,40 @@ def resolve_player_id(
     return None
 
 
+HOME_ALIASES = {"home", "hometeam", "team1"}
+AWAY_ALIASES = {"away", "awayteam", "team2"}
+
+
+def resolve_team_id(
+    raw_name: str,
+    selection_key: str,
+    team_map: Dict[str, int],
+    home_team_id: Optional[int],
+    away_team_id: Optional[int],
+    home_aliases: Iterable[str],
+    away_aliases: Iterable[str],
+) -> Optional[int]:
+    normalized_name = normalize_name(raw_name)
+    if normalized_name and normalized_name in team_map:
+        return team_map[normalized_name]
+    if normalized_name in HOME_ALIASES and home_team_id:
+        return int(home_team_id)
+    if normalized_name in AWAY_ALIASES and away_team_id:
+        return int(away_team_id)
+    normalized_selection = normalize_name(selection_key)
+    if normalized_selection in HOME_ALIASES and home_team_id:
+        return int(home_team_id)
+    if normalized_selection in AWAY_ALIASES and away_team_id:
+        return int(away_team_id)
+    for alias in home_aliases:
+        if alias and alias in normalized_selection and home_team_id:
+            return int(home_team_id)
+    for alias in away_aliases:
+        if alias and alias in normalized_selection and away_team_id:
+            return int(away_team_id)
+    return None
+
+
 def upsert_outcomes(session, rows: List[Dict]) -> None:
     if not rows:
         return
@@ -284,8 +349,13 @@ def parse_outcomes(
     player_map: Dict[str, List[Tuple[int, Optional[int]]]],
     team_map: Dict[str, int],
     team_player_map: Dict[str, List[Tuple[int, Optional[int]]]],
+    home_team_id: Optional[int],
+    away_team_id: Optional[int],
+    home_aliases: Iterable[str],
+    away_aliases: Iterable[str],
     unmatched_details: Optional[List[Dict]] = None,
     unmatched_counts: Optional[Dict[Tuple[str, str], int]] = None,
+    unmatched_team_counts: Optional[Dict[str, int]] = None,
 ) -> List[Dict]:
     outcomes: List[Dict] = []
     for row in data:
@@ -304,7 +374,16 @@ def parse_outcomes(
 
         participant_id = None
         normalized_name = normalize_name(str(name))
-        if participant_type is None and normalized_name in team_map:
+        team_id_candidate = resolve_team_id(
+            str(name),
+            selection_key,
+            team_map,
+            home_team_id,
+            away_team_id,
+            home_aliases,
+            away_aliases,
+        )
+        if participant_type is None and team_id_candidate is not None:
             participant_type = "team"
         if participant_type == "player":
             participant_id = resolve_player_id(str(name), player_map, team_player_map)
@@ -322,7 +401,9 @@ def parse_outcomes(
                         }
                     )
         elif participant_type == "team":
-            participant_id = team_map.get(normalized_name)
+            participant_id = team_id_candidate or team_map.get(normalized_name)
+            if participant_id is None and unmatched_team_counts is not None:
+                unmatched_team_counts[selection_key] = unmatched_team_counts.get(selection_key, 0) + 1
 
         outcomes.append(
             {
@@ -380,10 +461,23 @@ def main() -> None:
         help="Refresh team squads for upcoming fixtures to improve player mapping",
     )
     parser.add_argument(
+        "--refresh-squads-missing",
+        dest="refresh_squads_missing",
+        action="store_true",
+        help="Refresh squads for teams missing players (default).",
+    )
+    parser.add_argument(
+        "--no-refresh-squads-missing",
+        dest="refresh_squads_missing",
+        action="store_false",
+        help="Disable auto refresh of squads for missing teams.",
+    )
+    parser.add_argument(
         "--unmatched-out",
         default="",
         help="Write unmatched player odds to JSON (fixture_id, market_key, selection_key, raw_name)",
     )
+    parser.set_defaults(refresh_squads_missing=True)
     args = parser.parse_args()
 
     raw_leagues = args.leagues.replace('"', "").replace("'", "")
@@ -397,16 +491,14 @@ def main() -> None:
 
     client = SportMonksClient()
     svc = None
-    if args.refresh_upcoming or args.refresh_squads:
+    if args.refresh_upcoming or args.refresh_squads or args.refresh_squads_missing:
         svc = SyncService(client, session)
         svc.ensure_schema()
         if args.refresh_upcoming:
             log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
             svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
-    today = datetime.utcnow().date()
-    end_date = today + timedelta(days=args.days_forward)
-
-    fixtures = fetch_fixture_rows(session, league_ids, today, end_date)
+    start_dt, end_dt = fixture_window_bounds(args.days_forward)
+    fixtures = fetch_fixture_rows(session, league_ids, start_dt, end_dt)
     if args.limit and args.limit > 0:
         fixtures = fixtures[: args.limit]
 
@@ -416,30 +508,46 @@ def main() -> None:
 
     log.info("Found %s fixtures for odds window", len(fixtures))
 
-    if args.refresh_squads and svc is not None:
-        team_ids = {
-            fixture.get("home_team_id")
-            for fixture in fixtures
-            if fixture.get("home_team_id")
-        } | {
-            fixture.get("away_team_id")
-            for fixture in fixtures
-            if fixture.get("away_team_id")
-        }
-        if team_ids:
-            log.info("Refreshing squads for %s teams", len(team_ids))
-            svc.sync_squads_for_teams(sorted(team_ids))
+    team_ids = {
+        fixture.get("home_team_id")
+        for fixture in fixtures
+        if fixture.get("home_team_id")
+    } | {
+        fixture.get("away_team_id")
+        for fixture in fixtures
+        if fixture.get("away_team_id")
+    }
+    if (args.refresh_squads or args.refresh_squads_missing) and svc is not None and team_ids:
+        team_ids_list = sorted(team_ids)
+        if args.refresh_squads:
+            log.info("Refreshing squads for %s teams", len(team_ids_list))
+            svc.sync_squads_for_teams(team_ids_list)
+        else:
+            counts = fetch_team_player_counts(session, team_ids_list)
+            missing = [team_id for team_id in team_ids_list if counts.get(team_id, 0) == 0]
+            if missing:
+                log.info(
+                    "Refreshing squads for %s/%s teams missing players",
+                    len(missing),
+                    len(team_ids_list),
+                )
+                svc.sync_squads_for_teams(missing)
 
     unmatched_details: List[Dict] = []
     unmatched_counts: Dict[Tuple[str, str], int] = {}
+    unmatched_team_counts: Dict[str, int] = {}
 
     for idx, fixture in enumerate(fixtures, start=1):
         fixture_id = fixture["fixture_id"]
-        team_map = load_team_map(session, [fixture.get("home_team_id"), fixture.get("away_team_id")])
+        home_team_id = fixture.get("home_team_id")
+        away_team_id = fixture.get("away_team_id")
+        team_map, team_aliases = load_team_context(session, [home_team_id, away_team_id])
+        home_aliases = team_aliases.get(home_team_id, []) if home_team_id else []
+        away_aliases = team_aliases.get(away_team_id, []) if away_team_id else []
         player_map = load_fixture_player_map(session, fixture_id)
         team_player_map = load_team_player_map(
             session,
-            [fixture.get("home_team_id"), fixture.get("away_team_id")],
+            [home_team_id, away_team_id],
         )
 
         data = fetch_odds_for_fixture(client, fixture_id, args.bookmaker_id)
@@ -466,8 +574,13 @@ def main() -> None:
             player_map,
             team_map,
             team_player_map,
+            home_team_id,
+            away_team_id,
+            home_aliases,
+            away_aliases,
             unmatched_details,
             unmatched_counts,
+            unmatched_team_counts,
         )
         upsert_outcomes(session, outcomes)
         session.commit()
@@ -490,6 +603,11 @@ def main() -> None:
             top = sorted(names.items(), key=lambda item: item[1], reverse=True)[:20]
             summary = ", ".join(f"{name}({count})" for name, count in top)
             log.info("Unmatched player names summary %s: %s", market_key, summary)
+
+    if unmatched_team_counts:
+        top = sorted(unmatched_team_counts.items(), key=lambda item: item[1], reverse=True)[:20]
+        summary = ", ".join(f"{key}({count})" for key, count in top)
+        log.info("Unmatched team selection_key summary: %s", summary)
 
     if args.unmatched_out:
         try:
