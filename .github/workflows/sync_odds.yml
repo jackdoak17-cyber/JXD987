@@ -69,7 +69,7 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           set +e
-          resp=$(curl -sS -m 15 -w "\nHTTP:%{http_code}\n" \
+          resp=$(curl -sS -m 30 --retry 3 --retry-all-errors --retry-delay 5 -w "\nHTTP:%{http_code}\n" \
             -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
             -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
             "${SUPABASE_URL}/rest/v1/odds_outcomes?select=fixture_id&limit=1")
@@ -79,11 +79,10 @@ jobs:
             echo "Supabase reachable via REST."
           else
             echo "supabase_ok=false" >> "$GITHUB_OUTPUT"
-            echo "Supabase unreachable via REST (HTTP $status). Skipping export."
+            echo "Supabase unreachable via REST (HTTP $status). Continuing anyway."
           fi
 
       - name: Export odds to Supabase
-        if: steps.preflight.outputs.supabase_ok == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -91,20 +90,13 @@ jobs:
           python3 scripts/export_odds_to_supabase.py --leagues "$LEAGUE_IDS" --days-forward 14 --skip-snapshots --chunk-size 25 --timeout 120 --retries 8 --sleep 0.5
 
       - name: Patch odds participants (REST)
-        if: steps.preflight.outputs.supabase_ok == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           python3 scripts/patch_odds_participants_rest.py --leagues "$LEAGUE_IDS" --days-forward 14 --chunk-size 300 --timeout 120 --retries 8 --sleep 0.5
 
-      - name: Skip export notice
-        if: steps.preflight.outputs.supabase_ok != 'true'
-        run: |
-          echo "Supabase not reachable; odds export skipped."
-
       - name: Supabase reachability check
-        if: steps.preflight.outputs.supabase_ok == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -120,3 +112,10 @@ jobs:
             echo "Supabase reachability check failed with HTTP $status"
             exit 1
           fi
+
+      - name: Verify odds counts (REST)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          python3 scripts/verify_odds_rest.py
