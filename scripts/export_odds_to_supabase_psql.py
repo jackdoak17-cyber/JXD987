@@ -250,20 +250,37 @@ def stage_and_upsert(
     err_path: Optional[str],
     out_path: Optional[str],
 ) -> Dict[str, int]:
-    sql = f"""
-\\set ON_ERROR_STOP on
-set statement_timeout = '25min';
-set lock_timeout = '30s';
-begin;
-create temp table odds_outcomes_stage
-  (like public.odds_outcomes including defaults) on commit drop;
-\\copy odds_outcomes_stage (
-  fixture_id, bookmaker_id, market_key, selection_key, line,
-  price_decimal, price_american, participant_type, participant_id, last_updated_at
-) from '{csv_path.as_posix()}' with (format csv, header true);
-
-select 'stage_count', count(*)::bigint from odds_outcomes_stage;
-
+    cols = [
+        "fixture_id",
+        "bookmaker_id",
+        "market_key",
+        "selection_key",
+        "line",
+        "price_decimal",
+        "price_american",
+        "participant_type",
+        "participant_id",
+        "last_updated_at",
+    ]
+    cols_sql = ", ".join(cols)
+    csv_path_sql = csv_path.as_posix().replace("'", "''")
+    copy_line = (
+        f"\\copy odds_outcomes_stage ({cols_sql}) "
+        f"from '{csv_path_sql}' with (format csv, header true);"
+    )
+    sql = "\n".join(
+        [
+            "\\set ON_ERROR_STOP on",
+            "set statement_timeout = '25min';",
+            "set lock_timeout = '30s';",
+            "begin;",
+            "create temp table odds_outcomes_stage",
+            "  (like public.odds_outcomes including defaults) on commit drop;",
+            copy_line,
+            "",
+            "select 'stage_count', count(*)::bigint from odds_outcomes_stage;",
+            "",
+            """
 with src as (
   select distinct on (fixture_id, bookmaker_id, market_key, selection_key, line)
     fixture_id, bookmaker_id, market_key, selection_key, line,
@@ -302,7 +319,9 @@ select 'inserted', count(*)::bigint filter (where inserted) from upserted;
 select 'updated', count(*)::bigint filter (where not inserted) from upserted;
 select 'src_count', cnt from src_count;
 commit;
-"""
+""",
+        ]
+    )
     sql_path: Optional[str] = None
     if keep_sql or os.environ.get("KEEP_SQL") == "1":
         sql_path = f"/tmp/odds_psql_sql_{league_label}.sql"
