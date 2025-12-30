@@ -261,7 +261,16 @@ create temp table odds_outcomes_stage
 
 select 'stage_count', count(*)::bigint from odds_outcomes_stage;
 
-with upserted as (
+with src as (
+  select distinct on (fixture_id, bookmaker_id, market_key, selection_key, line)
+    fixture_id, bookmaker_id, market_key, selection_key, line,
+    price_decimal, price_american, participant_type, participant_id, last_updated_at
+  from odds_outcomes_stage
+  order by fixture_id, bookmaker_id, market_key, selection_key, line,
+           last_updated_at desc nulls last
+), src_count as (
+  select count(*)::bigint as cnt from src
+), upserted as (
   insert into public.odds_outcomes as o (
     fixture_id, bookmaker_id, market_key, selection_key, line,
     price_decimal, price_american, participant_type, participant_id, last_updated_at
@@ -269,7 +278,7 @@ with upserted as (
   select
     fixture_id, bookmaker_id, market_key, selection_key, line,
     price_decimal, price_american, participant_type, participant_id, last_updated_at
-  from odds_outcomes_stage
+  from src
   on conflict (fixture_id, bookmaker_id, market_key, selection_key, line)
   do update set
     price_decimal = excluded.price_decimal,
@@ -288,6 +297,7 @@ with upserted as (
 select 'upserted_total', count(*)::bigint from upserted;
 select 'inserted', count(*)::bigint filter (where inserted) from upserted;
 select 'updated', count(*)::bigint filter (where not inserted) from upserted;
+select 'src_count', cnt from src_count;
 commit;
 """
     sql_path: Optional[str] = None
@@ -314,7 +324,7 @@ commit;
         except OSError:
             pass
 
-    counts = {"stage_count": 0, "upserted_total": 0, "inserted": 0, "updated": 0}
+    counts = {"stage_count": 0, "src_count": 0, "upserted_total": 0, "inserted": 0, "updated": 0}
     for line in output.splitlines():
         parts = line.split("\t")
         if len(parts) >= 2 and parts[0] in counts:
@@ -322,7 +332,7 @@ commit;
                 counts[parts[0]] = int(parts[1])
             except ValueError:
                 counts[parts[0]] = 0
-    counts["unchanged"] = max(0, counts["stage_count"] - counts["upserted_total"])
+    counts["unchanged"] = max(0, counts["src_count"] - counts["upserted_total"])
     return counts
 
 
@@ -525,7 +535,7 @@ def main() -> None:
         out_path,
     )
     print(
-        f"Stage count={counts['stage_count']} inserted={counts['inserted']} "
+        f"Stage count={counts['stage_count']} src_count={counts['src_count']} inserted={counts['inserted']} "
         f"updated={counts['updated']} unchanged={counts['unchanged']}",
         flush=True,
     )
