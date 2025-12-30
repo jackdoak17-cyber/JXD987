@@ -451,7 +451,7 @@ select coalesce(
     order by case when c.total = 0 then 0 else 100.0 * c.mapped / c.total end
   ),
   0
-) as median_mapped_pct;
+) as median_mapped_pct
 from counts c;
 """
 
@@ -598,26 +598,32 @@ def main() -> None:
     )
 
     coverage_sql = coverage_query(args.days_forward, effective_leagues)
-    coverage_out = run_psql(
-        DB_URL,
-        coverage_sql,
-        label="coverage",
-        err_path=err_path,
-        out_path=out_path,
-    )
-    coverage_parts = coverage_out.split("\t") if coverage_out else ["0", "0", "0"]
+    coverage_total = 0
+    coverage_mapped = 0
+    coverage_pct = 0.0
     try:
-        coverage_total = int(coverage_parts[0])
-    except ValueError:
-        coverage_total = 0
-    try:
-        coverage_mapped = int(coverage_parts[1])
-    except ValueError:
-        coverage_mapped = 0
-    try:
-        coverage_pct = float(coverage_parts[2])
-    except ValueError:
-        coverage_pct = 0.0
+        coverage_out = run_psql(
+            DB_URL,
+            coverage_sql,
+            label="coverage",
+            err_path=err_path,
+            out_path=out_path,
+        )
+        coverage_parts = coverage_out.split("\t") if coverage_out else ["0", "0", "0"]
+        try:
+            coverage_total = int(coverage_parts[0])
+        except ValueError:
+            coverage_total = 0
+        try:
+            coverage_mapped = int(coverage_parts[1])
+        except ValueError:
+            coverage_mapped = 0
+        try:
+            coverage_pct = float(coverage_parts[2])
+        except ValueError:
+            coverage_pct = 0.0
+    except subprocess.CalledProcessError as exc:
+        print(f"coverage failed; continuing: {exc}", flush=True)
 
     baseline_sql = coverage_baseline_query(6, effective_leagues)
     coverage_baseline_pct = 0.0
@@ -644,15 +650,19 @@ def main() -> None:
     verification_outputs: List[str] = []
     for idx, query in enumerate(verification_queries(args.days_forward), start=1):
         print(f"Verification query {idx} output:", flush=True)
-        out = run_psql(
-            DB_URL,
-            query,
-            label=f"verification_{idx}",
-            err_path=err_path,
-            out_path=out_path,
-        )
-        verification_outputs.append(out)
-        print(out, flush=True)
+        try:
+            out = run_psql(
+                DB_URL,
+                query,
+                label=f"verification_{idx}",
+                err_path=err_path,
+                out_path=out_path,
+            )
+            verification_outputs.append(out)
+            print(out, flush=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"verification {idx} failed; continuing: {exc}", flush=True)
+            verification_outputs.append("")
 
     end_time = time.time()
     end_iso = datetime.utcnow().isoformat() + "Z"

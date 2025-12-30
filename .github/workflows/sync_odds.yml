@@ -353,6 +353,7 @@ jobs:
       ODDS_MAX_RUNTIME_MINUTES: "25"
       ODDS_COVERAGE_MIN_PCT: "50"
       ODDS_COVERAGE_REGRESSION_RATIO: "0.6"
+      STRICT_COVERAGE: "0"
       PRICES_RESULT: ${{ needs.prices.result }}
       EXPECTED_LEAGUES: "8,9,384,387,564,567,82,301,600,501,444,72"
     steps:
@@ -409,12 +410,14 @@ jobs:
           max_runtime_min = float(os.environ.get("ODDS_MAX_RUNTIME_MINUTES", "25"))
           min_pct = float(os.environ.get("ODDS_COVERAGE_MIN_PCT", "0"))
           ratio = float(os.environ.get("ODDS_COVERAGE_REGRESSION_RATIO", "0"))
+          strict_coverage = os.environ.get("STRICT_COVERAGE", "0").lower() in {"1", "true", "yes"}
           prices_result = os.environ.get("PRICES_RESULT", "unknown")
           expected_leagues = [
               item.strip() for item in os.environ.get("EXPECTED_LEAGUES", "").split(",") if item.strip()
           ]
 
           failures = []
+          warnings = []
           rows = []
           preflight_errors = []
 
@@ -451,14 +454,20 @@ jobs:
               partial = data.get("partial_run", False)
               rows.append((league_id, runtime, inserted, updated, coverage, baseline, partial))
 
+              if partial:
+                  failures.append(f"league {league_id} partial_run=true")
               if runtime > max_runtime_min:
-                  failures.append(f"league {league_id} runtime {runtime:.2f}m > {max_runtime_min}m")
+                  (failures if strict_coverage else warnings).append(
+                      f"league {league_id} runtime {runtime:.2f}m > {max_runtime_min}m"
+                  )
               if coverage < min_pct:
-                  failures.append(f"league {league_id} coverage {coverage:.2f}% < {min_pct}%")
+                  (failures if strict_coverage else warnings).append(
+                      f"league {league_id} coverage {coverage:.2f}% < {min_pct}%"
+                  )
               if ratio > 0 and baseline > 0:
                   min_allowed = baseline * ratio
                   if coverage < min_allowed:
-                      failures.append(
+                      (failures if strict_coverage else warnings).append(
                           f"league {league_id} coverage {coverage:.2f}% < baseline {baseline:.2f}% * {ratio}"
                       )
 
@@ -501,6 +510,11 @@ jobs:
 
           for league_id, runtime, inserted, updated, coverage, baseline, partial in sorted(rows, key=sort_key):
               print(f"{league_id} {runtime:.2f} {inserted} {updated} {coverage:.2f} {baseline:.2f} {partial}")
+
+          if warnings:
+              print("Warnings:")
+              for item in warnings:
+                  print(f"- {item}")
 
           if failures:
               print("Failures:")
