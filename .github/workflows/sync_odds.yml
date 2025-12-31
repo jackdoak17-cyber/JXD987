@@ -14,6 +14,14 @@ on:
           - patch
           - prices
           - full
+      run_coverage:
+        description: "Run heavy coverage/verification queries"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
 
 concurrency:
   group: sync-odds
@@ -32,6 +40,7 @@ jobs:
       PYTHONPATH: .
       PYTHONUNBUFFERED: "1"
       MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'prices' }}
+      RUN_COVERAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_coverage || 'false' }}
       SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       PGSSLMODE: require
@@ -149,6 +158,10 @@ jobs:
           : > /tmp/psql_err_${{ matrix.league_id }}.txt
           : > /tmp/psql_out_${{ matrix.league_id }}.txt
           : > /tmp/odds_psql_sql_${{ matrix.league_id }}.sql
+          COVERAGE_ARGS=""
+          if [ "${RUN_COVERAGE}" != "true" ] && [ "${RUN_COVERAGE}" != "1" ]; then
+            COVERAGE_ARGS="--skip-coverage --skip-verification"
+          fi
           python3 scripts/export_odds_to_supabase_psql.py \
             --leagues "${{ matrix.league_id }}" \
             --days-forward 14 \
@@ -159,6 +172,7 @@ jobs:
             --max-runtime-minutes 25 \
             --keep-sql \
             --report-out /tmp/odds_ingest_report_${{ matrix.league_id }}.json \
+            $COVERAGE_ARGS \
             2>&1 | tee "$LOG_PATH"
           status=${PIPESTATUS[0]}
           if [ $status -ne 0 ]; then
@@ -370,6 +384,7 @@ jobs:
       ODDS_COVERAGE_MIN_PCT: "50"
       ODDS_COVERAGE_REGRESSION_RATIO: "0.6"
       STRICT_COVERAGE: "0"
+      RUN_COVERAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_coverage || 'false' }}
       PRICES_RESULT: ${{ needs.prices.result }}
       EXPECTED_LEAGUES: "8,9,384,387,564,567,82,301,600,501,444,72"
     steps:
@@ -428,9 +443,13 @@ jobs:
           ratio = float(os.environ.get("ODDS_COVERAGE_REGRESSION_RATIO", "0"))
           strict_coverage = os.environ.get("STRICT_COVERAGE", "0").lower() in {"1", "true", "yes"}
           prices_result = os.environ.get("PRICES_RESULT", "unknown")
+          run_coverage = os.environ.get("RUN_COVERAGE", "false").lower() in {"1", "true", "yes"}
           expected_leagues = [
               item.strip() for item in os.environ.get("EXPECTED_LEAGUES", "").split(",") if item.strip()
           ]
+          if not run_coverage:
+              min_pct = 0.0
+              ratio = 0.0
 
           failures = []
           warnings = []

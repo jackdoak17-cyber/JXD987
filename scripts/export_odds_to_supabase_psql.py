@@ -556,6 +556,26 @@ select count(*)::bigint from deleted;
 """
 
 
+def retention_snapshots_query(days_back: int, days_forward: int, max_age_days: int) -> str:
+    return f"""
+with deleted as (
+  delete from public.odds_snapshots s
+  where s.pulled_at < (now() at time zone 'utc') - interval '{max_age_days} days'
+     or exists (
+       select 1
+       from public.fixtures f
+       where f.id = s.fixture_id
+         and (
+           f.starting_at < (now() at time zone 'utc') - interval '{days_back} days'
+           or f.starting_at >= (now() at time zone 'utc') + interval '{days_forward} days'
+         )
+     )
+  returning 1
+)
+select count(*)::bigint from deleted;
+"""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
@@ -572,6 +592,8 @@ def main() -> None:
     parser.add_argument("--skip-retention", action="store_true", help="Skip retention cleanup after ingest")
     parser.add_argument("--retention-days-back", type=int, default=2)
     parser.add_argument("--retention-days-forward", type=int, default=14)
+    parser.add_argument("--skip-retention-snapshots", action="store_true")
+    parser.add_argument("--retention-snapshots-days", type=int, default=30)
     parser.add_argument(
         "--no-include-fixture-leagues",
         dest="include_fixture_leagues",
@@ -699,6 +721,27 @@ def main() -> None:
         except ValueError:
             retention_deleted = 0
 
+    snapshots_deleted = 0
+    if not args.skip_retention_snapshots:
+        snapshots_sql = retention_snapshots_query(
+            args.retention_days_back,
+            args.retention_days_forward,
+            args.retention_snapshots_days,
+        )
+        try:
+            snapshots_out = run_psql(
+                DB_URL,
+                snapshots_sql,
+                label="retention_snapshots",
+                err_path=err_path,
+                out_path=out_path,
+            )
+            snapshots_deleted = int(snapshots_out.strip()) if snapshots_out else 0
+        except subprocess.CalledProcessError as exc:
+            print(f"retention snapshots failed; continuing: {exc}", flush=True)
+        except ValueError:
+            snapshots_deleted = 0
+
     coverage_total = 0
     coverage_mapped = 0
     coverage_pct = 0.0
@@ -803,6 +846,10 @@ def main() -> None:
             "days_back": args.retention_days_back,
             "days_forward": args.retention_days_forward,
             "deleted_rows": retention_deleted,
+        },
+        "snapshots_retention": {
+            "max_age_days": args.retention_snapshots_days,
+            "deleted_rows": snapshots_deleted,
         },
         "csv_head_path": str(csv_head_path),
         "csv_summary_path": str(csv_summary_path),
