@@ -407,8 +407,26 @@ def resolve_player_id(
     return None
 
 
-HOME_ALIASES = {"home", "hometeam", "team1", "team_1"}
-AWAY_ALIASES = {"away", "awayteam", "team2", "team_2"}
+HOME_ALIASES = {
+    "home",
+    "hometeam",
+    "team1",
+    "team_1",
+    "host",
+    "hosts",
+    "local",
+    "homeclub",
+}
+AWAY_ALIASES = {
+    "away",
+    "awayteam",
+    "team2",
+    "team_2",
+    "visitor",
+    "visitors",
+    "guest",
+    "awayclub",
+}
 
 
 def resolve_team_id(
@@ -426,9 +444,11 @@ def resolve_team_id(
     if selection_key in {"2", "team_2", "team2"} and away_team_id:
         return int(away_team_id)
     tokens = [token for token in selection_key.lower().split("_") if token]
-    if "home" in tokens and "away" not in tokens and home_team_id:
+    home_tokens = {"home", "host", "hosts", "local"}
+    away_tokens = {"away", "visitor", "visitors", "guest"}
+    if home_tokens.intersection(tokens) and not away_tokens.intersection(tokens) and home_team_id:
         return int(home_team_id)
-    if "away" in tokens and "home" not in tokens and away_team_id:
+    if away_tokens.intersection(tokens) and not home_tokens.intersection(tokens) and away_team_id:
         return int(away_team_id)
     normalized_name = normalize_name(raw_name)
     if normalized_name and normalized_name in team_map:
@@ -489,8 +509,6 @@ def is_generic_team_prop(selection_key: str) -> bool:
     if re.fullmatch(r"\d+_\d+", selection_key):
         return True
     if selection_key in {"yes_yes", "no_no"}:
-        return True
-    if selection_key.endswith("_yes") or selection_key.endswith("_no"):
         return True
     if selection_key in {"tie_tie", "draw_draw"}:
         return True
