@@ -36,6 +36,46 @@ MARKET_ID_MAP = {
     333: "player_to_score_or_assist",
 }
 
+CANONICAL_TEAM_MARKETS = {
+    "moneyline",
+    "double_chance",
+    "draw_no_bet",
+    "handicap",
+    "card_handicap",
+    "team_shots",
+    "team_shots_on_target",
+    "team_cards",
+    "team_corners",
+    "team_most_cards",
+    "team_most_corners",
+    "team_most_shots",
+    "team_most_shots_on_target",
+    "to_score_a_penalty",
+}
+
+CANONICAL_MATCH_MARKETS = {
+    "goals_over_under",
+    "btts",
+    "corners_over_under",
+    "total_offsides",
+    "match_shots",
+    "match_shots_on_target",
+    "match_cards",
+}
+
+CANONICAL_PLAYER_MARKETS = {
+    "1st_goal_scorer",
+    "player_to_score",
+    "player_to_assist",
+    "player_to_score_or_assist",
+    "player_card",
+    "player_shots",
+    "player_shots_on_target",
+    "player_goalkeeper_saves",
+    "multi_scorers",
+    "last_goal_scorer",
+}
+
 
 def normalize_slug(value: str) -> str:
     text_val = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
@@ -158,28 +198,96 @@ def resolve_market_key(row: Dict) -> str:
     market_id = parse_int(row.get("market_id"))
     if market_id in MARKET_ID_MAP:
         return MARKET_ID_MAP[market_id]
-    desc = row.get("market_description") or row.get("market") or "market"
-    return normalize_slug(str(desc))
+
+    desc = str(row.get("market_description") or row.get("market") or "")
+    desc_lower = desc.lower()
+
+    if "draw no bet" in desc_lower or "dnb" in desc_lower:
+        return "draw_no_bet"
+    if "double chance" in desc_lower:
+        return "double_chance"
+    if "both teams to score" in desc_lower or "btts" in desc_lower:
+        return "btts"
+    if "moneyline" in desc_lower or "1x2" in desc_lower or "match winner" in desc_lower:
+        return "moneyline"
+    if "win-draw-win" in desc_lower or "1x2 (90" in desc_lower:
+        return "moneyline"
+
+    if "handicap" in desc_lower and "card" in desc_lower:
+        return "card_handicap"
+    if "handicap" in desc_lower:
+        return "handicap"
+
+    if "corner" in desc_lower and ("over" in desc_lower or "under" in desc_lower or "total" in desc_lower):
+        return "corners_over_under"
+    if "corner" in desc_lower and "most" in desc_lower:
+        return "team_most_corners"
+
+    if "player" in desc_lower and ("booked" in desc_lower or "card" in desc_lower):
+        return "player_card"
+    if "card" in desc_lower and "most" in desc_lower:
+        return "team_most_cards"
+    if "card" in desc_lower and "team" in desc_lower:
+        return "team_cards"
+    if "card" in desc_lower:
+        return "match_cards"
+
+    if "offsides" in desc_lower or "offside" in desc_lower:
+        return "total_offsides"
+
+    if "shots on target" in desc_lower:
+        if "player" in desc_lower:
+            return "player_shots_on_target"
+        if "team" in desc_lower:
+            return "team_shots_on_target"
+        return "match_shots_on_target"
+
+    if "shots" in desc_lower:
+        if "player" in desc_lower:
+            return "player_shots"
+        if "team" in desc_lower:
+            return "team_shots"
+        if "match" in desc_lower or "total" in desc_lower:
+            return "match_shots"
+
+    if "goalkeeper" in desc_lower and "save" in desc_lower:
+        return "player_goalkeeper_saves"
+
+    if "score or assist" in desc_lower:
+        return "player_to_score_or_assist"
+    if "assist" in desc_lower and "player" in desc_lower:
+        return "player_to_assist"
+    if "to score" in desc_lower and "penalty" in desc_lower:
+        return "to_score_a_penalty"
+    if "to score" in desc_lower or "anytime goalscorer" in desc_lower or "anytime goal scorer" in desc_lower:
+        return "player_to_score"
+
+    if ("first goal" in desc_lower or "1st goal" in desc_lower) and "scorer" in desc_lower:
+        return "1st_goal_scorer"
+    if "last goal" in desc_lower and "scorer" in desc_lower:
+        return "last_goal_scorer"
+    if "multi" in desc_lower and "goal" in desc_lower and "scorer" in desc_lower:
+        return "multi_scorers"
+
+    if "goals" in desc_lower and ("over" in desc_lower or "under" in desc_lower or "total" in desc_lower):
+        return "goals_over_under"
+
+    return normalize_slug(desc or "market")
 
 
-PLAYER_MARKET_KEYS = {
+PLAYER_MARKET_KEYS = set(CANONICAL_PLAYER_MARKETS) | {
     "goalscorers",
-    "1st_goal_scorer",
-    "last_goal_scorer",
-    "multi_scorers",
-    "player_to_score",
-    "player_to_score_or_assist",
-    "player_shots",
-    "player_shots_on_target",
 }
 
-TEAM_MARKET_KEYS = {
-    "to_score_a_penalty",
-}
+TEAM_MARKET_KEYS = set(CANONICAL_TEAM_MARKETS)
+
+MATCH_MARKET_KEYS = set(CANONICAL_MATCH_MARKETS)
 
 
 def resolve_participant_type(row: Dict, market_key: str) -> Optional[str]:
     desc = str(row.get("market_description") or row.get("market") or "").lower()
+    if market_key in MATCH_MARKET_KEYS:
+        return None
     if market_key in TEAM_MARKET_KEYS:
         return "team"
     if "team" in desc or market_key.startswith("team_"):
@@ -201,6 +309,117 @@ def resolve_participant_type(row: Dict, market_key: str) -> Optional[str]:
         )
     ):
         return "player"
+    return None
+
+
+def normalize_selection_tokens(value: str) -> List[str]:
+    return normalize_name_tokens(value)
+
+
+def detect_yes_no(tokens: List[str]) -> Optional[str]:
+    if "yes" in tokens:
+        return "yes"
+    if "no" in tokens:
+        return "no"
+    return None
+
+
+def detect_over_under(tokens: List[str]) -> Optional[str]:
+    if "over" in tokens:
+        return "over"
+    if "under" in tokens:
+        return "under"
+    return None
+
+
+def normalize_team_side_selection(
+    text: str,
+    home_aliases: Iterable[str],
+    away_aliases: Iterable[str],
+) -> Optional[str]:
+    tokens = normalize_selection_tokens(text)
+    if "draw" in tokens or "tie" in tokens:
+        return "draw"
+    if "home" in tokens or "host" in tokens or "hosts" in tokens or "local" in tokens:
+        return "home"
+    if "away" in tokens or "visitor" in tokens or "visitors" in tokens or "guest" in tokens:
+        return "away"
+    if "team1" in tokens or "team_1" in tokens or "1" in tokens:
+        return "home"
+    if "team2" in tokens or "team_2" in tokens or "2" in tokens:
+        return "away"
+
+    normalized = normalize_name(text)
+    for alias in home_aliases:
+        if alias and alias in normalized:
+            return "home"
+    for alias in away_aliases:
+        if alias and alias in normalized:
+            return "away"
+    return None
+
+
+def normalize_double_chance_selection(text: str) -> Optional[str]:
+    raw = (text or "").replace(" ", "").upper()
+    if "1X" in raw or "X1" in raw:
+        return "home_or_draw"
+    if "X2" in raw or "2X" in raw:
+        return "draw_or_away"
+    if "12" in raw or "1-2" in raw or "1&2" in raw:
+        return "home_or_away"
+    tokens = normalize_selection_tokens(text)
+    if "home" in tokens and "draw" in tokens:
+        return "home_or_draw"
+    if "away" in tokens and "draw" in tokens:
+        return "draw_or_away"
+    if "home" in tokens and "away" in tokens:
+        return "home_or_away"
+    return None
+
+
+def normalize_selection_key(
+    market_key: str,
+    raw_name: str,
+    raw_label: str,
+    home_aliases: Iterable[str],
+    away_aliases: Iterable[str],
+) -> Optional[str]:
+    text = f"{raw_name} {raw_label}".strip()
+    tokens = normalize_selection_tokens(text)
+
+    if market_key in {"btts"}:
+        return detect_yes_no(tokens)
+
+    if market_key in {
+        "goals_over_under",
+        "corners_over_under",
+        "match_shots",
+        "match_shots_on_target",
+        "match_cards",
+        "total_offsides",
+        "team_shots",
+        "team_shots_on_target",
+        "team_cards",
+        "team_corners",
+    }:
+        return detect_over_under(tokens)
+
+    if market_key == "double_chance":
+        return normalize_double_chance_selection(text)
+
+    if market_key in {
+        "moneyline",
+        "draw_no_bet",
+        "handicap",
+        "card_handicap",
+        "team_most_cards",
+        "team_most_corners",
+        "team_most_shots",
+        "team_most_shots_on_target",
+        "to_score_a_penalty",
+    }:
+        return normalize_team_side_selection(text, home_aliases, away_aliases)
+
     return None
 
 
@@ -648,6 +867,15 @@ def parse_outcomes(
         name = row.get("name") or row.get("total") or row.get("label") or ""
         label = row.get("label") or row.get("total") or ""
         selection_key = normalize_slug(f"{name} {label}".strip())
+        canonical_selection = normalize_selection_key(
+            market_key,
+            str(name),
+            str(label),
+            home_aliases,
+            away_aliases,
+        )
+        if canonical_selection:
+            selection_key = canonical_selection
 
         line = parse_line(row)
         price_decimal = parse_float(row.get("value") or row.get("dp3"))
@@ -672,6 +900,8 @@ def parse_outcomes(
         if participant_type == "player" and non_player_selection:
             participant_type = None
         if participant_type == "team":
+            if selection_key in {"draw", "home_or_away"}:
+                participant_type = None
             if generic_team_prop or team_id_candidate is None:
                 participant_type = None
         if participant_type is None and team_id_candidate is not None and not generic_team_prop:

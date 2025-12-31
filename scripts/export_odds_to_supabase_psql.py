@@ -551,6 +551,8 @@ def main() -> None:
     parser.add_argument("--progress-fixtures", type=int, default=100)
     parser.add_argument("--max-runtime-minutes", type=int, default=25)
     parser.add_argument("--keep-sql", action="store_true", help="Keep generated SQL file for debugging")
+    parser.add_argument("--skip-coverage", action="store_true", help="Skip coverage queries after ingest")
+    parser.add_argument("--skip-verification", action="store_true", help="Skip verification queries after ingest")
     parser.add_argument(
         "--no-include-fixture-leagues",
         dest="include_fixture_leagues",
@@ -658,49 +660,51 @@ def main() -> None:
         flush=True,
     )
 
-    coverage_sql = coverage_query(args.days_forward, effective_leagues)
     coverage_total = 0
     coverage_mapped = 0
     coverage_pct = 0.0
-    try:
-        coverage_out = run_psql(
-            DB_URL,
-            coverage_sql,
-            label="coverage",
-            err_path=err_path,
-            out_path=out_path,
-        )
-        coverage_parts = coverage_out.split("\t") if coverage_out else ["0", "0", "0"]
+    if not args.skip_coverage:
+        coverage_sql = coverage_query(args.days_forward, effective_leagues)
         try:
-            coverage_total = int(coverage_parts[0])
-        except ValueError:
-            coverage_total = 0
-        try:
-            coverage_mapped = int(coverage_parts[1])
-        except ValueError:
-            coverage_mapped = 0
-        try:
-            coverage_pct = float(coverage_parts[2])
-        except ValueError:
-            coverage_pct = 0.0
-    except subprocess.CalledProcessError as exc:
-        print(f"coverage failed; continuing: {exc}", flush=True)
+            coverage_out = run_psql(
+                DB_URL,
+                coverage_sql,
+                label="coverage",
+                err_path=err_path,
+                out_path=out_path,
+            )
+            coverage_parts = coverage_out.split("\t") if coverage_out else ["0", "0", "0"]
+            try:
+                coverage_total = int(coverage_parts[0])
+            except ValueError:
+                coverage_total = 0
+            try:
+                coverage_mapped = int(coverage_parts[1])
+            except ValueError:
+                coverage_mapped = 0
+            try:
+                coverage_pct = float(coverage_parts[2])
+            except ValueError:
+                coverage_pct = 0.0
+        except subprocess.CalledProcessError as exc:
+            print(f"coverage failed; continuing: {exc}", flush=True)
 
-    baseline_sql = coverage_baseline_query(6, effective_leagues)
     coverage_baseline_pct = 0.0
-    try:
-        baseline_out = run_psql(
-            DB_URL,
-            baseline_sql,
-            label="coverage_baseline",
-            err_path=err_path,
-            out_path=out_path,
-        )
-        coverage_baseline_pct = float(baseline_out.strip()) if baseline_out else 0.0
-    except subprocess.CalledProcessError as exc:
-        print(f"coverage_baseline failed; continuing: {exc}", flush=True)
-    except ValueError:
-        coverage_baseline_pct = 0.0
+    if not args.skip_coverage:
+        baseline_sql = coverage_baseline_query(6, effective_leagues)
+        try:
+            baseline_out = run_psql(
+                DB_URL,
+                baseline_sql,
+                label="coverage_baseline",
+                err_path=err_path,
+                out_path=out_path,
+            )
+            coverage_baseline_pct = float(baseline_out.strip()) if baseline_out else 0.0
+        except subprocess.CalledProcessError as exc:
+            print(f"coverage_baseline failed; continuing: {exc}", flush=True)
+        except ValueError:
+            coverage_baseline_pct = 0.0
 
     print(
         f"Coverage total={coverage_total} mapped={coverage_mapped} "
@@ -709,21 +713,22 @@ def main() -> None:
     )
 
     verification_outputs: List[str] = []
-    for idx, query in enumerate(verification_queries(args.days_forward), start=1):
-        print(f"Verification query {idx} output:", flush=True)
-        try:
-            out = run_psql(
-                DB_URL,
-                query,
-                label=f"verification_{idx}",
-                err_path=err_path,
-                out_path=out_path,
-            )
-            verification_outputs.append(out)
-            print(out, flush=True)
-        except subprocess.CalledProcessError as exc:
-            print(f"verification {idx} failed; continuing: {exc}", flush=True)
-            verification_outputs.append("")
+    if not args.skip_verification:
+        for idx, query in enumerate(verification_queries(args.days_forward), start=1):
+            print(f"Verification query {idx} output:", flush=True)
+            try:
+                out = run_psql(
+                    DB_URL,
+                    query,
+                    label=f"verification_{idx}",
+                    err_path=err_path,
+                    out_path=out_path,
+                )
+                verification_outputs.append(out)
+                print(out, flush=True)
+            except subprocess.CalledProcessError as exc:
+                print(f"verification {idx} failed; continuing: {exc}", flush=True)
+                verification_outputs.append("")
 
     end_time = time.time()
     end_iso = datetime.utcnow().isoformat() + "Z"
