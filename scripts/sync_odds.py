@@ -123,6 +123,18 @@ def name_variants(value: str) -> List[str]:
     return [variant for variant in variants if variant]
 
 
+def merge_selection_text(raw_name: str, raw_label: str) -> str:
+    name = (raw_name or "").strip()
+    label = (raw_label or "").strip()
+    if not name:
+        return label
+    if not label:
+        return name
+    if normalize_name(name) == normalize_name(label):
+        return name
+    return f"{name} {label}".strip()
+
+
 def parse_float(value: Optional[object]) -> Optional[float]:
     if value is None:
         return None
@@ -202,6 +214,10 @@ def resolve_market_key(row: Dict) -> str:
     desc = str(row.get("market_description") or row.get("market") or "")
     desc_lower = desc.lower()
 
+    if "full time result" in desc_lower or "full-time result" in desc_lower or "fulltime result" in desc_lower:
+        return "moneyline"
+    if "match result" in desc_lower:
+        return "moneyline"
     if "draw no bet" in desc_lower or "dnb" in desc_lower:
         return "draw_no_bet"
     if "double chance" in desc_lower:
@@ -269,6 +285,8 @@ def resolve_market_key(row: Dict) -> str:
     if "multi" in desc_lower and "goal" in desc_lower and "scorer" in desc_lower:
         return "multi_scorers"
 
+    if "goal line" in desc_lower:
+        return "goals_over_under"
     if "goals" in desc_lower and ("over" in desc_lower or "under" in desc_lower or "total" in desc_lower):
         return "goals_over_under"
 
@@ -282,6 +300,13 @@ PLAYER_MARKET_KEYS = set(CANONICAL_PLAYER_MARKETS) | {
 TEAM_MARKET_KEYS = set(CANONICAL_TEAM_MARKETS)
 
 MATCH_MARKET_KEYS = set(CANONICAL_MATCH_MARKETS)
+
+TEAM_TOTAL_MARKETS = {
+    "team_shots",
+    "team_shots_on_target",
+    "team_cards",
+    "team_corners",
+}
 
 
 def resolve_participant_type(row: Dict, market_key: str) -> Optional[str]:
@@ -359,7 +384,11 @@ def normalize_team_side_selection(
     return None
 
 
-def normalize_double_chance_selection(text: str) -> Optional[str]:
+def normalize_double_chance_selection(
+    text: str,
+    home_aliases: Iterable[str],
+    away_aliases: Iterable[str],
+) -> Optional[str]:
     raw = (text or "").replace(" ", "").upper()
     if "1X" in raw or "X1" in raw:
         return "home_or_draw"
@@ -374,6 +403,15 @@ def normalize_double_chance_selection(text: str) -> Optional[str]:
         return "draw_or_away"
     if "home" in tokens and "away" in tokens:
         return "home_or_away"
+    normalized = normalize_name(text)
+    has_home = any(alias and alias in normalized for alias in home_aliases)
+    has_away = any(alias and alias in normalized for alias in away_aliases)
+    if has_home and has_away:
+        return "home_or_away"
+    if has_home and ("draw" in tokens or "tie" in tokens):
+        return "home_or_draw"
+    if has_away and ("draw" in tokens or "tie" in tokens):
+        return "draw_or_away"
     return None
 
 
@@ -384,7 +422,7 @@ def normalize_selection_key(
     home_aliases: Iterable[str],
     away_aliases: Iterable[str],
 ) -> Optional[str]:
-    text = f"{raw_name} {raw_label}".strip()
+    text = merge_selection_text(raw_name, raw_label)
     tokens = normalize_selection_tokens(text)
 
     if market_key in {"btts"}:
@@ -405,7 +443,7 @@ def normalize_selection_key(
         return detect_over_under(tokens)
 
     if market_key == "double_chance":
-        return normalize_double_chance_selection(text)
+        return normalize_double_chance_selection(text, home_aliases, away_aliases)
 
     if market_key in {
         "moneyline",
@@ -696,6 +734,21 @@ def resolve_team_id(
     return None
 
 
+def resolve_team_id_from_label(
+    raw_label: str,
+    home_team_id: Optional[int],
+    away_team_id: Optional[int],
+    home_aliases: Iterable[str],
+    away_aliases: Iterable[str],
+) -> Optional[int]:
+    side = normalize_team_side_selection(raw_label or "", home_aliases, away_aliases)
+    if side == "home" and home_team_id:
+        return int(home_team_id)
+    if side == "away" and away_team_id:
+        return int(away_team_id)
+    return None
+
+
 NON_PLAYER_MARKETS = {
     "match_shots",
     "match_shots_on_target",
@@ -866,7 +919,8 @@ def parse_outcomes(
         participant_type = resolve_participant_type(row, market_key)
         name = row.get("name") or row.get("total") or row.get("label") or ""
         label = row.get("label") or row.get("total") or ""
-        selection_key = normalize_slug(f"{name} {label}".strip())
+        selection_text = merge_selection_text(str(name), str(label))
+        selection_key = normalize_slug(selection_text)
         canonical_selection = normalize_selection_key(
             market_key,
             str(name),
@@ -897,6 +951,17 @@ def parse_outcomes(
             home_aliases,
             away_aliases,
         )
+        if team_id_candidate is None and market_key in TEAM_TOTAL_MARKETS:
+            team_id_candidate = resolve_team_id_from_label(
+                str(label),
+                home_team_id,
+                away_team_id,
+                home_aliases,
+                away_aliases,
+            )
+        neutral_team_selection = selection_key in {"draw", "home_or_away"}
+        if neutral_team_selection:
+            team_id_candidate = None
         if participant_type == "player" and non_player_selection:
             participant_type = None
         if participant_type == "team":
