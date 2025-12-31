@@ -173,9 +173,15 @@ PLAYER_MARKET_KEYS = {
     "player_shots_on_target",
 }
 
+TEAM_MARKET_KEYS = {
+    "to_score_a_penalty",
+}
+
 
 def resolve_participant_type(row: Dict, market_key: str) -> Optional[str]:
     desc = str(row.get("market_description") or row.get("market") or "").lower()
+    if market_key in TEAM_MARKET_KEYS:
+        return "team"
     if "team" in desc or market_key.startswith("team_"):
         return "team"
     if "player" in desc or market_key.startswith("player_") or market_key in PLAYER_MARKET_KEYS:
