@@ -363,7 +363,7 @@ def normalize_team_side_selection(
     away_aliases: Iterable[str],
 ) -> Optional[str]:
     tokens = normalize_selection_tokens(text)
-    if "draw" in tokens or "tie" in tokens:
+    if "draw" in tokens or "tie" in tokens or "x" in tokens:
         return "draw"
     if "home" in tokens or "host" in tokens or "hosts" in tokens or "local" in tokens:
         return "home"
