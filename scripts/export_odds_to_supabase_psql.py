@@ -261,6 +261,7 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
     counts: Dict[str, int] = {}
     mapped: Dict[str, int] = {}
     unmatched_keys: Dict[str, int] = {}
+    unmatched_team_keys: Dict[str, int] = {}
     total_rows = 0
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -275,13 +276,21 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
                 selection_key = (row.get("selection_key") or "").strip()
                 if selection_key:
                     unmatched_keys[selection_key] = unmatched_keys.get(selection_key, 0) + 1
+            if ptype == "team" and not pid:
+                selection_key = (row.get("selection_key") or "").strip()
+                if selection_key:
+                    unmatched_team_keys[selection_key] = unmatched_team_keys.get(selection_key, 0) + 1
     top_unmatched = sorted(unmatched_keys.items(), key=lambda item: item[1], reverse=True)[:top_n]
+    top_team_unmatched = sorted(unmatched_team_keys.items(), key=lambda item: item[1], reverse=True)[:30]
     payload = {
         "total_rows": total_rows,
         "counts_by_participant_type": counts,
         "mapped_by_participant_type": mapped,
         "unmatched_player_selection_keys": [
             {"selection_key": key, "count": count} for key, count in top_unmatched
+        ],
+        "unmatched_team_selection_keys": [
+            {"selection_key": key, "count": count} for key, count in top_team_unmatched
         ],
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)

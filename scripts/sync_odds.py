@@ -484,6 +484,19 @@ def is_non_player_selection(selection_key: str, market_key: str) -> bool:
     return False
 
 
+def is_generic_team_prop(selection_key: str) -> bool:
+    selection_key = selection_key or ""
+    if re.fullmatch(r"\d+_\d+", selection_key):
+        return True
+    if selection_key in {"yes_yes", "no_no"}:
+        return True
+    if selection_key.endswith("_yes") or selection_key.endswith("_no"):
+        return True
+    if selection_key in {"tie_tie", "draw_draw"}:
+        return True
+    return False
+
+
 def build_fuzzy_candidates(session, team_ids: Iterable[int]) -> List[Dict[str, object]]:
     ids = [int(x) for x in team_ids if x]
     if not ids:
@@ -622,7 +635,7 @@ def parse_outcomes(
         participant_id = None
         raw_participant_id = parse_int(row.get("participant_id") or row.get("player_id"))
         non_player_selection = is_non_player_selection(selection_key, market_key)
-        normalized_name = normalize_name(str(name))
+        generic_team_prop = is_generic_team_prop(selection_key)
         team_id_candidate = resolve_team_id(
             str(name),
             selection_key,
@@ -634,7 +647,10 @@ def parse_outcomes(
         )
         if participant_type == "player" and non_player_selection:
             participant_type = None
-        if participant_type is None and team_id_candidate is not None:
+        if participant_type == "team":
+            if generic_team_prop or team_id_candidate is None:
+                participant_type = None
+        if participant_type is None and team_id_candidate is not None and not generic_team_prop:
             participant_type = "team"
         if participant_type == "player":
             mapped_name = extract_player_name(str(name))
@@ -701,7 +717,7 @@ def parse_outcomes(
                         }
                     )
         elif participant_type == "team":
-            participant_id = team_id_candidate or team_map.get(normalized_name)
+            participant_id = team_id_candidate
             if participant_id is None and unmatched_team_counts is not None:
                 unmatched_team_counts[selection_key] = unmatched_team_counts.get(selection_key, 0) + 1
 
