@@ -540,6 +540,22 @@ limit 20;
     return queries
 
 
+def retention_cleanup_query(days_back: int, days_forward: int) -> str:
+    return f"""
+with deleted as (
+  delete from public.odds_outcomes o
+  using public.fixtures f
+  where f.id = o.fixture_id
+    and (
+      f.starting_at < (now() at time zone 'utc') - interval '{days_back} days'
+      or f.starting_at >= (now() at time zone 'utc') + interval '{days_forward} days'
+    )
+  returning 1
+)
+select count(*)::bigint from deleted;
+"""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
@@ -553,6 +569,9 @@ def main() -> None:
     parser.add_argument("--keep-sql", action="store_true", help="Keep generated SQL file for debugging")
     parser.add_argument("--skip-coverage", action="store_true", help="Skip coverage queries after ingest")
     parser.add_argument("--skip-verification", action="store_true", help="Skip verification queries after ingest")
+    parser.add_argument("--skip-retention", action="store_true", help="Skip retention cleanup after ingest")
+    parser.add_argument("--retention-days-back", type=int, default=2)
+    parser.add_argument("--retention-days-forward", type=int, default=14)
     parser.add_argument(
         "--no-include-fixture-leagues",
         dest="include_fixture_leagues",
@@ -660,6 +679,26 @@ def main() -> None:
         flush=True,
     )
 
+    retention_deleted = 0
+    if not args.skip_retention:
+        retention_sql = retention_cleanup_query(
+            args.retention_days_back,
+            args.retention_days_forward,
+        )
+        try:
+            retention_out = run_psql(
+                DB_URL,
+                retention_sql,
+                label="retention_cleanup",
+                err_path=err_path,
+                out_path=out_path,
+            )
+            retention_deleted = int(retention_out.strip()) if retention_out else 0
+        except subprocess.CalledProcessError as exc:
+            print(f"retention cleanup failed; continuing: {exc}", flush=True)
+        except ValueError:
+            retention_deleted = 0
+
     coverage_total = 0
     coverage_mapped = 0
     coverage_pct = 0.0
@@ -759,6 +798,11 @@ def main() -> None:
             "mapped": coverage_mapped,
             "mapped_pct": coverage_pct,
             "baseline_pct": coverage_baseline_pct,
+        },
+        "retention": {
+            "days_back": args.retention_days_back,
+            "days_forward": args.retention_days_forward,
+            "deleted_rows": retention_deleted,
         },
         "csv_head_path": str(csv_head_path),
         "csv_summary_path": str(csv_summary_path),

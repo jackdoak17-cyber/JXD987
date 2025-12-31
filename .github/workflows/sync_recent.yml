@@ -10,7 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
-      EXPORT_DAYS_BACK: "180"
+      RECENT_DAYS: "30"
+      EXPORT_DAYS_BACK: "30"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -38,7 +39,7 @@ jobs:
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
-          python3 scripts/run_sync.py --mode recent --recent-days 180 --leagues "$LEAGUE_IDS"
+          python3 scripts/run_sync.py --mode recent --recent-days "$RECENT_DAYS" --leagues "$LEAGUE_IDS"
 
       - name: Freshness report
         run: python3 scripts/sqlite_freshness_report.py
@@ -47,10 +48,10 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SUPABASE_EXPORT_CHUNK: "200"
-          SUPABASE_EXPORT_SLEEP: "0.1"
+          SUPABASE_EXPORT_CHUNK: "1000"
+          SUPABASE_EXPORT_SLEEP: "0"
           SUPABASE_EXPORT_RETRIES: "5"
-          EXPORT_DAYS_BACK: "180"
+          EXPORT_DAYS_BACK: "30"
         run: python3 scripts/export_to_supabase.py --strict --leagues "$LEAGUE_IDS"
 
       - name: Refresh likely players
