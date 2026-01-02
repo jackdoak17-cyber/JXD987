@@ -11,11 +11,10 @@ returns table (
 language sql
 stable
 as $$
-  with ranked as (
+  with latest_team as (
     select
       fp.player_id,
-      fp.is_starter,
-      f.starting_at,
+      fp.team_id,
       row_number() over (
         partition by fp.player_id
         order by f.starting_at desc, f.id desc
@@ -26,13 +25,42 @@ as $$
       and fp.player_id = any(p_player_ids)
       and f.home_score is not null
       and f.away_score is not null
-      and coalesce(fp.minutes_played, 0) > 0
+  ),
+  player_team as (
+    select
+      p.id as player_id,
+      coalesce(p.team_id, lt.team_id) as team_id
+    from players p
+    left join latest_team lt
+      on lt.player_id = p.id
+     and lt.rn = 1
+    where p.id = any(p_player_ids)
+  ),
+  team_recent as (
+    select
+      pt.player_id,
+      pt.team_id,
+      f.id as fixture_id,
+      f.starting_at,
+      row_number() over (
+        partition by pt.team_id
+        order by f.starting_at desc, f.id desc
+      ) as rn
+    from player_team pt
+    join fixtures f
+      on (f.home_team_id = pt.team_id or f.away_team_id = pt.team_id)
+    where f.league_id = p_league_id
+      and f.home_score is not null
+      and f.away_score is not null
   )
   select
-    player_id,
-    sum(case when is_starter is true then 1 else 0 end)::integer as starts,
+    tr.player_id,
+    sum(case when fp.is_starter is true then 1 else 0 end)::integer as starts,
     count(*)::integer as games
-  from ranked
-  where rn <= greatest(p_recent_games, 1)
-  group by player_id;
+  from team_recent tr
+  left join fixture_players fp
+    on fp.fixture_id = tr.fixture_id
+   and fp.player_id = tr.player_id
+  where tr.rn <= greatest(p_recent_games, 1)
+  group by tr.player_id;
 $$;
