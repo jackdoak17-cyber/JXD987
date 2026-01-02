@@ -112,11 +112,15 @@ def name_variants(value: str) -> List[str]:
         first = tokens[0]
         last = tokens[-1]
         middle = tokens[1:-1]
+        tail = "".join(tokens[1:])
         variants.add(last + "".join([first, *middle]))
         variants.add(first + last)
         variants.add(last + first)
         variants.add(first[0] + last)
         variants.add(last + first[0])
+        if tail:
+            variants.add(tail)
+            variants.add(last + "".join(middle))
         if len(tokens[1]) == 1:
             variants.add(first + last)
             variants.add(last + first)
