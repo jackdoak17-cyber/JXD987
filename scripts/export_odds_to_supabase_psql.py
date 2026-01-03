@@ -437,6 +437,52 @@ where
   or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
   or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
   or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at);
+
+update public.odds_outcomes o
+set line = regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)$', '\\1.\\2')::numeric,
+    selection_key = regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)$', '\\3'),
+    participant_type = null,
+    participant_id = null
+where o.market_key in ('match_shots','match_shots_on_target')
+  and o.line is null
+  and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)$';
+
+update public.odds_outcomes o
+set line = regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)$', '\\2.\\3')::numeric,
+    selection_key = regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)$', '\\1'),
+    participant_type = null,
+    participant_id = null
+where o.market_key in ('match_shots','match_shots_on_target')
+  and o.line is null
+  and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+$';
+
+update public.odds_outcomes o
+set line = regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)_(1|2)$', '\\2.\\3')::numeric,
+    selection_key = regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)_(1|2)$', '\\1'),
+    participant_type = 'team',
+    participant_id = case
+      when regexp_replace(o.selection_key, '^.*_(1|2)$', '\\1') = '1' then f.home_team_id
+      else f.away_team_id
+    end
+from public.fixtures f
+where o.fixture_id = f.id
+  and o.market_key in ('team_shots','team_shots_on_target')
+  and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+_[12]$'
+  and (o.participant_id is null or o.line is null or o.line in (1,2));
+
+update public.odds_outcomes o
+set line = regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)_(1|2)$', '\\1.\\2')::numeric,
+    selection_key = regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)_(1|2)$', '\\3'),
+    participant_type = 'team',
+    participant_id = case
+      when regexp_replace(o.selection_key, '^.*_(1|2)$', '\\1') = '1' then f.home_team_id
+      else f.away_team_id
+    end
+from public.fixtures f
+where o.fixture_id = f.id
+  and o.market_key in ('team_shots','team_shots_on_target')
+  and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)_[12]$'
+  and (o.participant_id is null or o.line is null or o.line in (1,2));
 commit;
 """,
         ]

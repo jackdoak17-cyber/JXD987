@@ -194,8 +194,11 @@ def parse_line_from_text(text: str) -> Optional[float]:
 def parse_line_side_from_selection_key(selection_key: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
     if not selection_key:
         return None, None, None
-    key = selection_key.lower()
-    pattern_1 = re.match(r"^(over|under)_([0-9]+)(?:_([0-9]+))?(?:_(1|2))?$", key)
+    key = selection_key.lower().strip()
+    pattern_1 = re.match(
+        r"^(over|under)_([0-9]+)(?:_([0-9]+))?(?:_(?:team_)?(1|2))?$",
+        key,
+    )
     if pattern_1:
         direction = pattern_1.group(1)
         whole = pattern_1.group(2)
@@ -203,7 +206,10 @@ def parse_line_side_from_selection_key(selection_key: str) -> Tuple[Optional[flo
         side = pattern_1.group(4)
         line = float(f"{whole}.{frac}") if frac else float(whole)
         return line, direction, side
-    pattern_2 = re.match(r"^([0-9]+)(?:_([0-9]+))?_(over|under)(?:_(1|2))?$", key)
+    pattern_2 = re.match(
+        r"^([0-9]+)(?:_([0-9]+))?_(over|under)(?:_(?:team_)?(1|2))?$",
+        key,
+    )
     if pattern_2:
         whole = pattern_2.group(1)
         frac = pattern_2.group(2)
@@ -986,7 +992,7 @@ def parse_outcomes(
         if line is None:
             line = parse_line_from_text(selection_text)
         key_line, key_direction, key_side = parse_line_side_from_selection_key(raw_selection_key)
-        if key_line is not None and (line is None or market_key in line_markets):
+        if key_line is not None and market_key in line_markets:
             line = key_line
         if key_direction in {"over", "under"} and market_key in line_markets:
             selection_key = key_direction
@@ -1031,6 +1037,8 @@ def parse_outcomes(
                 participant_type = None
             if generic_team_prop or team_id_candidate is None:
                 participant_type = None
+        if market_key.startswith("match_"):
+            participant_type = None
         if participant_type is None and team_id_candidate is not None and not generic_team_prop:
             participant_type = "team"
         if participant_type == "player":
@@ -1185,8 +1193,30 @@ def main() -> None:
         default=100,
         help="Max debug samples to capture.",
     )
+    parser.add_argument(
+        "--debug-parse-examples",
+        action="store_true",
+        help="Print line/side parsing examples and exit.",
+    )
     parser.set_defaults(refresh_squads_missing=True)
     args = parser.parse_args()
+
+    if args.debug_parse_examples:
+        examples = [
+            "25_5_over",
+            "8_5_under",
+            "over_10_5_2",
+            "under_3_5_1",
+            "over_10_5_team_2",
+        ]
+        for raw in examples:
+            normalized = normalize_slug(raw)
+            line, direction, side = parse_line_side_from_selection_key(normalized)
+            print(
+                f"{raw} -> normalized={normalized} line={line} direction={direction} side={side}",
+                flush=True,
+            )
+        raise SystemExit(0)
 
     raw_leagues = args.leagues.replace('"', "").replace("'", "")
     league_ids = [int(x) for x in raw_leagues.split(",") if x.strip()]
