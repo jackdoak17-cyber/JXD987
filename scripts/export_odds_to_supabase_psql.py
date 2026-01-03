@@ -60,6 +60,17 @@ def append_output(path: str, label: str, content: str) -> None:
             f.write("\n")
 
 
+def tail_text(path: str, max_lines: int = 200) -> str:
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    lines = text.splitlines()
+    if not lines:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
 def parse_league_ids(raw: str) -> List[int]:
     return [int(x) for x in raw.split(",") if x.strip()]
 
@@ -712,30 +723,47 @@ def main() -> None:
     Path(out_path).touch(exist_ok=True)
     csv_head_path = Path(f"/tmp/odds_outcomes_head_{league_label}.csv")
     csv_summary_path = Path(f"/tmp/odds_outcomes_summary_{league_label}.json")
+    csv_summary_data: Optional[Dict[str, object]] = None
     try:
         write_csv_head(Path(args.csv_out), csv_head_path, max_lines=200)
         write_csv_summary(Path(args.csv_out), csv_summary_path, top_n=50)
         print(f"Wrote CSV head to {csv_head_path}", flush=True)
         print(f"Wrote CSV summary to {csv_summary_path}", flush=True)
-    except OSError as exc:
+        csv_summary_data = json.loads(Path(csv_summary_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
         print(f"Failed to write CSV proof artifacts: {exc}", flush=True)
 
-    counts = stage_and_upsert(
-        DB_URL,
-        Path(args.csv_out),
-        league_label,
-        args.keep_sql,
-        err_path,
-        out_path,
-    )
-    print(
-        f"Stage count={counts['stage_count']} src_count={counts['src_count']} inserted={counts['inserted']} "
-        f"updated={counts['updated']} unchanged={counts['unchanged']}",
-        flush=True,
-    )
+    counts = {"stage_count": 0, "src_count": 0, "upserted_total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
+    ingest_ok = True
+    error_stage: Optional[str] = None
+    error_message: Optional[str] = None
+    psql_err_tail = ""
+    psql_out_tail = ""
+
+    try:
+        counts = stage_and_upsert(
+            DB_URL,
+            Path(args.csv_out),
+            league_label,
+            args.keep_sql,
+            err_path,
+            out_path,
+        )
+        print(
+            f"Stage count={counts['stage_count']} src_count={counts['src_count']} inserted={counts['inserted']} "
+            f"updated={counts['updated']} unchanged={counts['unchanged']}",
+            flush=True,
+        )
+    except Exception as exc:
+        ingest_ok = False
+        error_stage = "stage_upsert"
+        error_message = str(exc)
+        psql_err_tail = tail_text(err_path)
+        psql_out_tail = tail_text(out_path)
+        print(f"Stage upsert failed: {error_message}", flush=True)
 
     retention_deleted = 0
-    if not args.skip_retention:
+    if ingest_ok and not args.skip_retention:
         retention_sql = retention_cleanup_query(
             args.retention_days_back,
             args.retention_days_forward,
@@ -755,7 +783,7 @@ def main() -> None:
             retention_deleted = 0
 
     snapshots_deleted = 0
-    if not args.skip_retention_snapshots:
+    if ingest_ok and not args.skip_retention_snapshots:
         snapshots_sql = retention_snapshots_query(
             args.retention_days_back,
             args.retention_days_forward,
@@ -778,7 +806,7 @@ def main() -> None:
     coverage_total = 0
     coverage_mapped = 0
     coverage_pct = 0.0
-    if not args.skip_coverage:
+    if ingest_ok and not args.skip_coverage:
         coverage_sql = coverage_query(args.days_forward, effective_leagues)
         try:
             coverage_out = run_psql(
@@ -805,7 +833,7 @@ def main() -> None:
             print(f"coverage failed; continuing: {exc}", flush=True)
 
     coverage_baseline_pct = 0.0
-    if not args.skip_coverage:
+    if ingest_ok and not args.skip_coverage:
         baseline_sql = coverage_baseline_query(6, effective_leagues)
         try:
             baseline_out = run_psql(
@@ -828,7 +856,7 @@ def main() -> None:
     )
 
     verification_outputs: List[str] = []
-    if not args.skip_verification:
+    if ingest_ok and not args.skip_verification:
         for idx, query in enumerate(verification_queries(args.days_forward), start=1):
             print(f"Verification query {idx} output:", flush=True)
             try:
@@ -849,6 +877,12 @@ def main() -> None:
     end_iso = datetime.utcnow().isoformat() + "Z"
 
     report = {
+        "ok": ingest_ok,
+        "error_stage": error_stage,
+        "error_message": error_message,
+        "psql_err_tail": psql_err_tail,
+        "psql_out_tail": psql_out_tail,
+        "csv_summary": csv_summary_data,
         "start_time": start_iso,
         "end_time": end_iso,
         "runtime_seconds": round(end_time - start_time, 2),
@@ -902,6 +936,21 @@ def main() -> None:
         f"runtime_sec={report['runtime_seconds']}",
         flush=True,
     )
+
+    if not ingest_ok:
+        error_path = f"/tmp/odds_ingest_error_{league_label}.txt"
+        error_payload = [
+            f"stage={error_stage or 'unknown'}",
+            f"error={error_message or 'unknown'}",
+        ]
+        if psql_err_tail:
+            error_payload.append("psql_err_tail:")
+            error_payload.append(psql_err_tail)
+        if psql_out_tail:
+            error_payload.append("psql_out_tail:")
+            error_payload.append(psql_out_tail)
+        Path(error_path).write_text("\n".join(error_payload), encoding="utf-8")
+        raise SystemExit("odds ingest failed")
 
 
 if __name__ == "__main__":

@@ -136,12 +136,8 @@ jobs:
           $cmd
 
       - name: Upload unmatched players
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: unmatched_players_${{ matrix.league_id }}
-          path: /tmp/unmatched_players_${{ matrix.league_id }}.json
-          if-no-files-found: ignore
+        if: false
+        run: echo "Skipping unmatched players artifact."
 
       - name: DB-direct odds ingest (psql)
         if: env.PSQL_PREFLIGHT_OK == 'true'
@@ -199,18 +195,12 @@ jobs:
           exit 0
 
       - name: Upload preflight report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds_preflight_${{ matrix.league_id }}
-          path: /tmp/odds_preflight_${{ matrix.league_id }}.json
+        if: false
+        run: echo "Skipping preflight artifact."
 
       - name: Upload preflight stderr
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds_preflight_err_${{ matrix.league_id }}
-          path: /tmp/odds_preflight_err_${{ matrix.league_id }}.txt
+        if: false
+        run: echo "Skipping preflight stderr artifact."
 
       - name: Upload odds ingest report
         if: always()
@@ -220,52 +210,12 @@ jobs:
           path: /tmp/odds_ingest_report_${{ matrix.league_id }}.json
           if-no-files-found: ignore
 
-      - name: Upload psql error outputs
+      - name: Upload odds ingest error
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: odds_psql_err_${{ matrix.league_id }}
-          path: /tmp/psql_err_${{ matrix.league_id }}.txt
-          if-no-files-found: ignore
-
-      - name: Upload psql stdout outputs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds_psql_out_${{ matrix.league_id }}
-          path: /tmp/psql_out_${{ matrix.league_id }}.txt
-          if-no-files-found: ignore
-
-      - name: Upload psql SQL file
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds_psql_sql_${{ matrix.league_id }}
-          path: /tmp/odds_psql_sql_${{ matrix.league_id }}.sql
-          if-no-files-found: ignore
-
-      - name: Upload odds CSV head
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds_outcomes_head_${{ matrix.league_id }}
-          path: /tmp/odds_outcomes_head_${{ matrix.league_id }}.csv
-          if-no-files-found: ignore
-
-      - name: Upload odds CSV summary
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds_outcomes_summary_${{ matrix.league_id }}
-          path: /tmp/odds_outcomes_summary_${{ matrix.league_id }}.json
-          if-no-files-found: ignore
-
-      - name: Upload odds upsert log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: odds_upsert_log_${{ matrix.league_id }}
-          path: /tmp/odds_upsert_${{ matrix.league_id }}.log
+          name: odds_ingest_error_${{ matrix.league_id }}
+          path: /tmp/odds_ingest_error_${{ matrix.league_id }}.txt
           if-no-files-found: ignore
 
       - name: Dump odds diagnostics
@@ -280,8 +230,33 @@ jobs:
       - name: Fail if preflight failed
         if: env.PSQL_PREFLIGHT_OK != 'true'
         run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          league_id = os.environ.get("LEAGUE_ID", "unknown")
+          report_path = Path(f"/tmp/odds_ingest_report_{league_id}.json")
+          preflight_path = Path(f"/tmp/odds_preflight_{league_id}.json")
+          err_path = Path(f"/tmp/odds_preflight_err_{league_id}.txt")
+          report = {
+              "ok": False,
+              "error_stage": "preflight",
+              "error_message": err_path.read_text(encoding="utf-8") if err_path.exists() else "preflight_failed",
+              "league_id": int(league_id) if str(league_id).isdigit() else league_id,
+          }
+          if preflight_path.exists():
+              try:
+                  report["preflight"] = json.loads(preflight_path.read_text(encoding="utf-8"))
+              except json.JSONDecodeError:
+                  report["preflight"] = {"raw": preflight_path.read_text(encoding="utf-8")}
+          report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+          print(f"Wrote preflight report to {report_path}")
+          PY
           echo "Supabase DB preflight failed."
           exit 1
+        env:
+          LEAGUE_ID: ${{ matrix.league_id }}
 
       - name: Fail if ingest failed
         if: env.PSQL_PREFLIGHT_OK == 'true' && env.INGEST_OK != 'true'
@@ -404,30 +379,6 @@ jobs:
           merge-multiple: true
         continue-on-error: true
 
-      - name: Download preflight reports
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/odds_reports/preflight
-          pattern: odds_preflight_*
-          merge-multiple: true
-        continue-on-error: true
-
-      - name: Download psql error outputs
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/odds_reports/psql_err
-          pattern: odds_psql_err_*
-          merge-multiple: true
-        continue-on-error: true
-
-      - name: Download upsert logs
-        uses: actions/download-artifact@v4
-        with:
-          path: /tmp/odds_reports/upsert_logs
-          pattern: odds_upsert_log_*
-          merge-multiple: true
-        continue-on-error: true
-
       - name: Summarize odds ingest reports
         run: |
           python3 - <<'PY'
@@ -436,15 +387,7 @@ jobs:
           from pathlib import Path
 
           ingest_dir = Path("/tmp/odds_reports/ingest")
-          preflight_dir = Path("/tmp/odds_reports/preflight")
-          psql_err_dir = Path("/tmp/odds_reports/psql_err")
-          upsert_log_dir = Path("/tmp/odds_reports/upsert_logs")
           ingest_files = sorted(ingest_dir.glob("*.json"))
-          preflight_files = sorted(preflight_dir.glob("*.json"))
-          psql_err_files = {p.stem.replace("odds_psql_err_", ""): p for p in psql_err_dir.glob("*.txt")}
-          upsert_log_files = {
-              p.stem.replace("odds_upsert_", ""): p for p in upsert_log_dir.glob("odds_upsert_*.log")
-          }
 
           max_runtime_min = float(os.environ.get("ODDS_MAX_RUNTIME_MINUTES", "25"))
           min_pct = float(os.environ.get("ODDS_COVERAGE_MIN_PCT", "0"))
@@ -462,30 +405,7 @@ jobs:
           failures = []
           warnings = []
           rows = []
-          preflight_errors = []
           prices_cancelled = prices_result == "cancelled"
-
-          for path in preflight_files:
-              data = json.loads(path.read_text())
-              if not data.get("ok", False):
-                  preflight_errors.append(
-                      {
-                          "league_id": data.get("league_id"),
-                          "host": data.get("host"),
-                          "port": data.get("port"),
-                          "error_class": data.get("error_class"),
-                          "error_snippet": data.get("error_snippet"),
-                      }
-                  )
-
-          if preflight_errors:
-              print("Preflight errors:")
-              for item in preflight_errors:
-                  print(
-                      f"- league={item['league_id']} host={item['host']} "
-                      f"port={item['port']} error_class={item['error_class']} "
-                      f"error_snippet={item['error_snippet']}"
-                  )
 
           for path in ingest_files:
               data = json.loads(path.read_text())
@@ -496,8 +416,13 @@ jobs:
               coverage = data.get("coverage", {}).get("mapped_pct", 0) or 0
               baseline = data.get("coverage", {}).get("baseline_pct", 0) or 0
               partial = data.get("partial_run", False)
+              ok = data.get("ok", True)
+              error_stage = data.get("error_stage")
+              error_message = data.get("error_message")
               rows.append((league_id, runtime, inserted, updated, coverage, baseline, partial))
 
+              if not ok:
+                  failures.append(f"league {league_id} failed ({error_stage}): {error_message}")
               if partial:
                   failures.append(f"league {league_id} partial_run=true")
               if runtime > max_runtime_min:
@@ -530,24 +455,6 @@ jobs:
                           failures.append("preflight failures present (see above)")
 
           if not ingest_files:
-              if preflight_files:
-                  print("No ingest reports found; preflight failures:")
-                  for path in preflight_files:
-                      data = json.loads(path.read_text())
-                      if not data.get("ok", False):
-                          league_id = data.get("league_id", "unknown")
-                          host = data.get("host")
-                          port = data.get("port")
-                          err_class = data.get("error_class")
-                          err_snip = data.get("error_snippet")
-                          print(
-                              f"- league={league_id} host={host} port={port} "
-                              f"error_class={err_class} error_snippet={err_snip}"
-                          )
-                  if prices_cancelled:
-                      print("Matrix cancelled; treating missing ingest as warning.")
-                      raise SystemExit(0)
-                  raise SystemExit(1)
               if prices_cancelled:
                   raise SystemExit(0)
               raise SystemExit("No ingest reports or preflight reports found.")
@@ -572,29 +479,5 @@ jobs:
               print("Failures:")
               for item in failures:
                   print(f"- {item}")
-              missing_leagues = sorted(set(expected_leagues) - {str(r[0]) for r in rows})
-              def first_error_line(path):
-                  if not path or not path.exists():
-                      return ""
-                  try:
-                      lines = path.read_text(encoding="utf-8").splitlines()
-                  except Exception:
-                      return ""
-                  for line in lines:
-                      if "ERROR" in line or "FATAL" in line:
-                          return line.strip()
-                  for line in lines:
-                      if line.strip():
-                          return line.strip()
-                  return ""
-              for league in missing_leagues:
-                  err_path = psql_err_files.get(str(league))
-                  err_line = first_error_line(err_path)
-                  if not err_line:
-                      err_line = first_error_line(upsert_log_files.get(str(league)))
-                      if err_line:
-                          print(f"league {league} upsert_log: {err_line}")
-                  elif err_line:
-                      print(f"league {league} psql_err: {err_line}")
               raise SystemExit(1)
           PY
