@@ -563,18 +563,18 @@ jobs:
           report = json.loads(report_path.read_text(encoding="utf-8"))
           past_rows = int(report.get("odds_rows_past_24h", 0))
           if past_rows <= max_rows:
-              print(f\"Retention OK: past24h rows={past_rows} <= {max_rows}\")
+              print("Retention OK: past24h rows={} <= {}".format(past_rows, max_rows))
               raise SystemExit(0)
-          print(f\"Retention FAIL: past24h rows={past_rows} > {max_rows}\")
-          print(\"Top markets past 24h:\")
-          for item in report.get(\"past_24h_market_top\", []):
-              print(f\"- {item.get('market_key')}: {item.get('rows')}\")
-          print(\"League breakdown past 24h:\")
-          for item in report.get(\"past_24h_league_top\", []):
-              print(f\"- {item.get('league_id')}: {item.get('rows')}\")
-          range_info = report.get(\"past_24h_range\", {}) or {}
-          print(\"Starting_at range past 24h:\")
-          print(f\"- min: {range_info.get('min_starting_at')}\")
-          print(f\"- max: {range_info.get('max_starting_at')}\")
+          print("Retention FAIL: past24h rows={} > {}".format(past_rows, max_rows))
+          print("Top markets past 24h:")
+          for item in report.get("past_24h_market_top", []):
+              print("- {}: {}".format(item.get("market_key"), item.get("rows")))
+          print("League breakdown past 24h:")
+          for item in report.get("past_24h_league_top", []):
+              print("- {}: {}".format(item.get("league_id"), item.get("rows")))
+          range_info = report.get("past_24h_range", {}) or {}
+          print("Starting_at range past 24h:")
+          print("- min: {}".format(range_info.get("min_starting_at")))
+          print("- max: {}".format(range_info.get("max_starting_at")))
           raise SystemExit(1)
           PY
