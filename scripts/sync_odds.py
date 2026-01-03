@@ -1353,7 +1353,15 @@ def main() -> None:
     unmatched_selection_counts: Dict[str, int] = {}
     debug_samples: List[Dict] = []
     debug_fuzzy_matches: List[Dict] = []
+    raw_allowlist = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
     market_allowlist = load_market_allowlist()
+    allowlist_enabled = market_allowlist is not None
+    if not allowlist_enabled and os.environ.get("ALLOWLIST_BYPASS", "").lower() not in {"1", "true", "yes"}:
+        raise SystemExit("Allowlist disabled. Set ALLOWLIST_BYPASS=1 to proceed.")
+    if allowlist_enabled:
+        log.info("Market allowlist (%s): %s", len(market_allowlist), ", ".join(sorted(market_allowlist)))
+    else:
+        log.warning("Market allowlist bypassed (ODDS_MARKET_ALLOWLIST=%s)", raw_allowlist or "unset")
     allowlist_counts: Dict[str, int] = {"dropped": 0}
 
     for idx, fixture in enumerate(fixtures, start=1):

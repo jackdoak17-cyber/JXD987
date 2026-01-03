@@ -987,10 +987,20 @@ def main() -> None:
     conn = sqlite3.connect(args.db)
     raw_allowlist = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
     market_allowlist = load_market_allowlist()
+    allowlist_enabled = market_allowlist is not None
+    if not allowlist_enabled and os.environ.get("ALLOWLIST_BYPASS", "").lower() not in {"1", "true", "yes"}:
+        raise SystemExit("Allowlist disabled. Set ALLOWLIST_BYPASS=1 to proceed.")
     if raw_allowlist:
         allowlist_source = "all" if raw_allowlist.lower() in {"all", "*"} else "env"
     else:
         allowlist_source = "default"
+    if allowlist_enabled:
+        print(
+            f\"Market allowlist enabled ({allowlist_source}): {','.join(sorted(market_allowlist))}\",
+            flush=True,
+        )
+    else:
+        print(f\"Market allowlist bypassed (ODDS_MARKET_ALLOWLIST={raw_allowlist or 'unset'})\", flush=True)
     league_ids = parse_league_ids(args.leagues)
     fixture_league_ids = fetch_fixture_league_ids(conn, args.days_forward) if args.include_fixture_leagues else []
     effective_leagues = sorted({*league_ids, *fixture_league_ids})
@@ -1038,6 +1048,8 @@ def main() -> None:
         ).fetchone()[0]
 
     market_stats: List[Dict[str, object]] = []
+    stored_by_market: Dict[str, int] = {}
+    dropped_by_allowlist: Dict[str, int] = {}
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
         start_dt, end_dt = sqlite_window_bounds(args.days_forward)
@@ -1066,6 +1078,36 @@ def main() -> None:
             }
             for row in rows
         ]
+        stored_rows = conn.execute(
+            f"""
+            select o.market_key, count(*) as outcomes
+            from odds_outcomes o
+            join fixtures f on f.id = o.fixture_id
+            where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
+              and f.league_id in ({placeholders})
+              {market_clause}
+            group by o.market_key
+            order by o.market_key
+            """,
+            [start_dt, end_dt, *effective_leagues, *market_params],
+        ).fetchall()
+        stored_by_market = {row[0]: int(row[1] or 0) for row in stored_rows}
+        if allowlist_enabled:
+            allowlist_list = sorted(market_allowlist)
+            dropped_rows = conn.execute(
+                f"""
+                select o.market_key, count(*) as outcomes
+                from odds_outcomes o
+                join fixtures f on f.id = o.fixture_id
+                where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
+                  and f.league_id in ({placeholders})
+                  and o.market_key not in ({','.join('?' for _ in allowlist_list)})
+                group by o.market_key
+                order by o.market_key
+                """,
+                [start_dt, end_dt, *effective_leagues, *allowlist_list],
+            ).fetchall()
+            dropped_by_allowlist = {row[0]: int(row[1] or 0) for row in dropped_rows}
 
     print(
         f"Exporting odds_outcomes fixtures={fixture_count} leagues={len(effective_leagues)} window_days={args.days_forward}",
@@ -1273,9 +1315,12 @@ def main() -> None:
         "window_days": args.days_forward,
         "fixture_count": fixture_count,
         "market_stats": market_stats,
-        "allowlist": sorted(market_allowlist) if allowlist_enabled else None,
+        "allowlist_enabled": allowlist_enabled,
+        "allowlist_keys": sorted(market_allowlist) if allowlist_enabled else None,
         "allowlist_source": allowlist_source,
         "allowlist_dropped_rows": allowlist_dropped_rows,
+        "dropped_by_allowlist": dropped_by_allowlist,
+        "stored_by_market": stored_by_market,
         "league_ids": effective_leagues,
         "league_id": effective_leagues[0] if len(effective_leagues) == 1 else None,
         "sqlite_rows_total": total_rows_all,
