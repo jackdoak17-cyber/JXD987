@@ -25,7 +25,7 @@ on:
 
 concurrency:
   group: sync-odds
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   prices:
@@ -384,7 +384,7 @@ jobs:
   summary:
     if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode != 'patch')) }}
     runs-on: ubuntu-latest
-    needs: prices
+    needs: [prices, retention]
     env:
       ODDS_MAX_RUNTIME_MINUTES: "25"
       ODDS_COVERAGE_MIN_PCT: "50"
@@ -392,6 +392,7 @@ jobs:
       STRICT_COVERAGE: "0"
       RUN_COVERAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_coverage || 'false' }}
       PRICES_RESULT: ${{ needs.prices.result }}
+      RETENTION_RESULT: ${{ needs.retention.result }}
       EXPECTED_LEAGUES: "8,9,384,387,564,567,82,301,600,501,444,72"
     steps:
       - name: Download ingest reports
@@ -418,6 +419,7 @@ jobs:
           ratio = float(os.environ.get("ODDS_COVERAGE_REGRESSION_RATIO", "0"))
           strict_coverage = os.environ.get("STRICT_COVERAGE", "0").lower() in {"1", "true", "yes"}
           prices_result = os.environ.get("PRICES_RESULT", "unknown")
+          retention_result = os.environ.get("RETENTION_RESULT", "unknown")
           run_coverage = os.environ.get("RUN_COVERAGE", "false").lower() in {"1", "true", "yes"}
           expected_leagues = [
               item.strip() for item in os.environ.get("EXPECTED_LEAGUES", "").split(",") if item.strip()
@@ -464,8 +466,13 @@ jobs:
                           f"league {league_id} coverage {coverage:.2f}% < baseline {baseline:.2f}% * {ratio}"
                       )
 
-          if prices_result != "success":
+          if prices_result == "failure":
               failures.append(f"prices job result was {prices_result}")
+          elif prices_result == "cancelled":
+              warnings.append(f"prices job result was {prices_result}")
+
+          if retention_result != "success":
+              failures.append(f"retention job result was {retention_result}")
 
           if expected_leagues:
               seen = {str(row[0]) for row in rows}
@@ -479,9 +486,7 @@ jobs:
                           failures.append("preflight failures present (see above)")
 
           if not ingest_files:
-              if prices_cancelled:
-                  raise SystemExit(0)
-              raise SystemExit("No ingest reports or preflight reports found.")
+              raise SystemExit("No ingest reports found; treating as failure.")
 
           print("league_id runtime_min inserted updated coverage_pct baseline_pct partial_run")
           def sort_key(item):
