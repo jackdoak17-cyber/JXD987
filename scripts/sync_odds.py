@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import unicodedata
 import difflib
@@ -75,6 +76,46 @@ CANONICAL_PLAYER_MARKETS = {
     "multi_scorers",
     "last_goal_scorer",
 }
+
+DEFAULT_MARKET_ALLOWLIST = {
+    "moneyline",
+    "double_chance",
+    "draw_no_bet",
+    "handicap",
+    "card_handicap",
+    "goals_over_under",
+    "btts",
+    "corners_over_under",
+    "total_offsides",
+    "match_shots",
+    "match_shots_on_target",
+    "match_cards",
+    "team_shots",
+    "team_shots_on_target",
+    "team_cards",
+    "team_corners",
+    "team_most_cards",
+    "team_most_corners",
+    "team_most_shots",
+    "team_most_shots_on_target",
+    "player_shots",
+    "player_shots_on_target",
+    "player_to_assist",
+    "player_to_score_or_assist",
+    "player_card",
+    "player_goalkeeper_saves",
+    "full_time_result",
+}
+
+
+def load_market_allowlist() -> Optional[set]:
+    raw = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
+    if raw:
+        if raw.lower() in {"all", "*"}:
+            return None
+        items = {normalize_slug(item) for item in raw.split(",") if item.strip()}
+        return {item for item in items if item}
+    return set(DEFAULT_MARKET_ALLOWLIST)
 
 
 def normalize_slug(value: str) -> str:
@@ -974,6 +1015,8 @@ def parse_outcomes(
     debug_team_players: Optional[Dict[int, List[str]]] = None,
     debug_limit: int = 0,
     debug_fuzzy_matches: Optional[List[Dict]] = None,
+    market_allowlist: Optional[set] = None,
+    allowlist_counts: Optional[Dict[str, int]] = None,
 ) -> List[Dict]:
     outcomes: List[Dict] = []
     line_markets = {
@@ -987,6 +1030,10 @@ def parse_outcomes(
 
     for row in data:
         market_key = resolve_market_key(row)
+        if market_allowlist is not None and market_key not in market_allowlist:
+            if allowlist_counts is not None:
+                allowlist_counts["dropped"] = allowlist_counts.get("dropped", 0) + 1
+            continue
         participant_type = resolve_participant_type(row, market_key)
         name = row.get("name") or row.get("total") or row.get("label") or ""
         label = row.get("label") or row.get("total") or ""
@@ -1306,6 +1353,8 @@ def main() -> None:
     unmatched_selection_counts: Dict[str, int] = {}
     debug_samples: List[Dict] = []
     debug_fuzzy_matches: List[Dict] = []
+    market_allowlist = load_market_allowlist()
+    allowlist_counts: Dict[str, int] = {"dropped": 0}
 
     for idx, fixture in enumerate(fixtures, start=1):
         fixture_id = fixture["fixture_id"]
@@ -1361,6 +1410,8 @@ def main() -> None:
             debug_team_players,
             args.debug_mapping_limit,
             debug_fuzzy_matches,
+            market_allowlist,
+            allowlist_counts,
         )
         upsert_outcomes(session, outcomes)
         session.commit()
@@ -1374,6 +1425,12 @@ def main() -> None:
             )
 
     log.info("Odds sync complete")
+    if market_allowlist is not None:
+        log.info(
+            "Market allowlist active (size=%s). Dropped outcomes=%s",
+            len(market_allowlist),
+            allowlist_counts.get("dropped", 0),
+        )
 
     if unmatched_counts:
         by_market: Dict[str, Dict[str, int]] = {}

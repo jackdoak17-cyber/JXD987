@@ -27,6 +27,52 @@ from typing import Dict, Iterable, List, Optional, Tuple
 DB_PATH = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
 DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL_SESSION")
 
+DEFAULT_MARKET_ALLOWLIST = {
+    "moneyline",
+    "double_chance",
+    "draw_no_bet",
+    "handicap",
+    "card_handicap",
+    "goals_over_under",
+    "btts",
+    "corners_over_under",
+    "total_offsides",
+    "match_shots",
+    "match_shots_on_target",
+    "match_cards",
+    "team_shots",
+    "team_shots_on_target",
+    "team_cards",
+    "team_corners",
+    "team_most_cards",
+    "team_most_corners",
+    "team_most_shots",
+    "team_most_shots_on_target",
+    "player_shots",
+    "player_shots_on_target",
+    "player_to_assist",
+    "player_to_score_or_assist",
+    "player_card",
+    "player_goalkeeper_saves",
+    "full_time_result",
+}
+
+
+def normalize_market_key(value: str) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9_]+", "_", value.strip().lower()).strip("_")
+
+
+def load_market_allowlist() -> Optional[set]:
+    raw = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
+    if raw:
+        if raw.lower() in {"all", "*"}:
+            return None
+        items = {normalize_market_key(item) for item in raw.split(",") if item.strip()}
+        return {item for item in items if item}
+    return set(DEFAULT_MARKET_ALLOWLIST)
+
 
 def redact_db_url(db_url: str) -> str:
     if not db_url:
@@ -73,6 +119,14 @@ def tail_text(path: str, max_lines: int = 200) -> str:
 
 def parse_league_ids(raw: str) -> List[int]:
     return [int(x) for x in raw.split(",") if x.strip()]
+
+
+def market_clause_and_params(market_allowlist: Optional[Iterable[str]]) -> Tuple[str, List[str]]:
+    if not market_allowlist:
+        return "", []
+    market_list = sorted(value for value in market_allowlist if value)
+    placeholders = ",".join("?" for _ in market_list)
+    return f"and o.market_key in ({placeholders})", market_list
 
 
 def sqlite_window_bounds(days_forward: int) -> Tuple[str, str]:
@@ -183,6 +237,7 @@ def run_psql(
 def build_outcomes_csv(
     conn: sqlite3.Connection,
     league_ids: Iterable[int],
+    market_allowlist: Optional[Iterable[str]],
     days_forward: int,
     out_path: Path,
     progress_every: int,
@@ -198,6 +253,8 @@ def build_outcomes_csv(
         placeholders = ",".join("?" for _ in league_ids)
         league_clause = f"and f.league_id in ({placeholders})"
         params.extend(league_ids)
+    market_clause, market_params = market_clause_and_params(market_allowlist)
+    params.extend(market_params)
 
     cur = conn.cursor()
     cur.execute(
@@ -216,6 +273,7 @@ def build_outcomes_csv(
         join fixtures f on f.id = o.fixture_id
         where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
           {league_clause}
+          {market_clause}
         order by o.fixture_id
         """,
         params,
@@ -904,7 +962,7 @@ def main() -> None:
     parser.add_argument("--skip-coverage", action="store_true", help="Skip coverage queries after ingest")
     parser.add_argument("--skip-verification", action="store_true", help="Skip verification queries after ingest")
     parser.add_argument("--skip-retention", action="store_true", help="Skip retention cleanup after ingest")
-    parser.add_argument("--retention-days-back", type=int, default=2)
+    parser.add_argument("--retention-days-back", type=int, default=1)
     parser.add_argument("--retention-days-forward", type=int, default=14)
     parser.add_argument("--skip-retention-snapshots", action="store_true")
     parser.add_argument("--retention-snapshots-days", type=int, default=30)
@@ -927,6 +985,12 @@ def main() -> None:
     max_runtime_seconds = max(0, int(args.max_runtime_minutes) * 60)
 
     conn = sqlite3.connect(args.db)
+    raw_allowlist = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
+    market_allowlist = load_market_allowlist()
+    if raw_allowlist:
+        allowlist_source = "all" if raw_allowlist.lower() in {"all", "*"} else "env"
+    else:
+        allowlist_source = "default"
     league_ids = parse_league_ids(args.leagues)
     fixture_league_ids = fetch_fixture_league_ids(conn, args.days_forward) if args.include_fixture_leagues else []
     effective_leagues = sorted({*league_ids, *fixture_league_ids})
@@ -945,11 +1009,12 @@ def main() -> None:
             [start_dt, end_dt, *effective_leagues],
         ).fetchone()[0]
 
+    total_rows_all = 0
     total_rows_estimate = 0
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
         start_dt, end_dt = sqlite_window_bounds(args.days_forward)
-        total_rows_estimate = conn.execute(
+        total_rows_all = conn.execute(
             f"""
             select count(*)
             from odds_outcomes o
@@ -959,6 +1024,48 @@ def main() -> None:
             """,
             [start_dt, end_dt, *effective_leagues],
         ).fetchone()[0]
+        market_clause, market_params = market_clause_and_params(market_allowlist)
+        total_rows_estimate = conn.execute(
+            f"""
+            select count(*)
+            from odds_outcomes o
+            join fixtures f on f.id = o.fixture_id
+            where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
+              and f.league_id in ({placeholders})
+              {market_clause}
+            """,
+            [start_dt, end_dt, *effective_leagues, *market_params],
+        ).fetchone()[0]
+
+    market_stats: List[Dict[str, object]] = []
+    if effective_leagues:
+        placeholders = ",".join("?" for _ in effective_leagues)
+        start_dt, end_dt = sqlite_window_bounds(args.days_forward)
+        market_clause, market_params = market_clause_and_params(market_allowlist)
+        rows = conn.execute(
+            f"""
+            select o.market_key,
+                   count(*) as outcomes,
+                   count(distinct o.fixture_id) as fixtures_with_odds
+            from odds_outcomes o
+            join fixtures f on f.id = o.fixture_id
+            where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
+              and f.league_id in ({placeholders})
+              {market_clause}
+            group by o.market_key
+            order by outcomes desc
+            limit 30
+            """,
+            [start_dt, end_dt, *effective_leagues, *market_params],
+        ).fetchall()
+        market_stats = [
+            {
+                "market_key": row[0],
+                "rows": int(row[1] or 0),
+                "fixtures_with_odds": int(row[2] or 0),
+            }
+            for row in rows
+        ]
 
     print(
         f"Exporting odds_outcomes fixtures={fixture_count} leagues={len(effective_leagues)} window_days={args.days_forward}",
@@ -968,6 +1075,7 @@ def main() -> None:
     total_rows, partial_run, last_fixture_id = build_outcomes_csv(
         conn,
         effective_leagues,
+        market_allowlist,
         args.days_forward,
         Path(args.csv_out),
         args.progress_rows,
@@ -1147,6 +1255,10 @@ def main() -> None:
 
     end_time = time.time()
     end_iso = datetime.utcnow().isoformat() + "Z"
+    allowlist_dropped_rows = 0
+    allowlist_enabled = market_allowlist is not None
+    if allowlist_enabled:
+        allowlist_dropped_rows = max(0, total_rows_all - total_rows_estimate)
 
     report = {
         "ok": ingest_ok,
@@ -1160,8 +1272,14 @@ def main() -> None:
         "runtime_seconds": round(end_time - start_time, 2),
         "window_days": args.days_forward,
         "fixture_count": fixture_count,
+        "market_stats": market_stats,
+        "allowlist": sorted(market_allowlist) if allowlist_enabled else None,
+        "allowlist_source": allowlist_source,
+        "allowlist_dropped_rows": allowlist_dropped_rows,
         "league_ids": effective_leagues,
         "league_id": effective_leagues[0] if len(effective_leagues) == 1 else None,
+        "sqlite_rows_total": total_rows_all,
+        "sqlite_rows_filtered": total_rows_estimate,
         "sqlite_rows_exported": total_rows,
         "rows_exported_csv": total_rows,
         "copy_rows": counts.get("stage_count", 0),

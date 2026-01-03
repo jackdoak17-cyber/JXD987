@@ -47,6 +47,7 @@ jobs:
       ODDS_STATEMENT_TIMEOUT: "0"
       ODDS_IDLE_TX_TIMEOUT: "0"
       ODDS_ADVISORY_LOCK_KEY: "982374"
+      ODDS_MARKET_ALLOWLIST: ${{ vars.ODDS_MARKET_ALLOWLIST }}
       SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       PGSSLMODE: require
@@ -161,8 +162,12 @@ jobs:
           : > /tmp/psql_out_${{ matrix.league_id }}.txt
           : > /tmp/odds_psql_sql_${{ matrix.league_id }}.sql
           COVERAGE_ARGS=""
+          RETENTION_ARGS="--skip-retention --skip-retention-snapshots"
           if [ "${RUN_COVERAGE}" != "true" ] && [ "${RUN_COVERAGE}" != "1" ]; then
             COVERAGE_ARGS="--skip-coverage --skip-verification"
+          fi
+          if [ "${{ matrix.league_id }}" = "8" ]; then
+            RETENTION_ARGS=""
           fi
           python3 scripts/export_odds_to_supabase_psql.py \
             --leagues "${{ matrix.league_id }}" \
@@ -174,8 +179,7 @@ jobs:
             --max-runtime-minutes 25 \
             --keep-sql \
             --report-out /tmp/odds_ingest_report_${{ matrix.league_id }}.json \
-            --skip-retention \
-            --skip-retention-snapshots \
+            $RETENTION_ARGS \
             $COVERAGE_ARGS \
             2>&1 | tee "$LOG_PATH"
           status=${PIPESTATUS[0]}
@@ -186,9 +190,11 @@ jobs:
             ls -la "$CSV_PATH" || true
             echo "=== csv head ==="
             head -n 3 "$CSV_PATH" || true
+            tail -n 200 "$LOG_PATH" > /tmp/odds_ingest_error_${{ matrix.league_id }}.txt
           fi
           if [ $status -eq 0 ]; then
             echo "INGEST_OK=true" >> $GITHUB_ENV
+            rm -f /tmp/odds_ingest_error_${{ matrix.league_id }}.txt
           else
             echo "INGEST_OK=false" >> $GITHUB_ENV
           fi
@@ -237,6 +243,7 @@ jobs:
 
           league_id = os.environ.get("LEAGUE_ID", "unknown")
           report_path = Path(f"/tmp/odds_ingest_report_{league_id}.json")
+          error_path = Path(f"/tmp/odds_ingest_error_{league_id}.txt")
           preflight_path = Path(f"/tmp/odds_preflight_{league_id}.json")
           err_path = Path(f"/tmp/odds_preflight_err_{league_id}.txt")
           report = {
@@ -251,6 +258,7 @@ jobs:
               except json.JSONDecodeError:
                   report["preflight"] = {"raw": preflight_path.read_text(encoding="utf-8")}
           report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+          error_path.write_text(report.get("error_message") or "preflight_failed", encoding="utf-8")
           print(f"Wrote preflight report to {report_path}")
           PY
           echo "Supabase DB preflight failed."
