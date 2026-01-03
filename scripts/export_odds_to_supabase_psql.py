@@ -146,6 +146,8 @@ def run_psql(
                     "connection to server",
                     "timeout expired",
                     "server closed the connection",
+                    "lock timeout",
+                    "canceling statement due to lock timeout",
                     "could not connect",
                     "ssl sycall error",
                     "terminating connection",
