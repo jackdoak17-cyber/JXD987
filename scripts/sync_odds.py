@@ -164,7 +164,7 @@ def parse_int(value: Optional[object]) -> Optional[int]:
 
 
 def parse_line(row: Dict) -> Optional[float]:
-    for key in ("label", "handicap", "line"):
+    for key in ("line", "handicap", "total", "label"):
         raw = row.get(key)
         if raw is None:
             continue
@@ -218,6 +218,21 @@ def parse_line_side_from_selection_key(selection_key: str) -> Tuple[Optional[flo
         line = float(f"{whole}.{frac}") if frac else float(whole)
         return line, direction, side
     return None, None, None
+
+
+def extract_side_from_tokens(tokens: List[str]) -> Optional[str]:
+    if not tokens:
+        return None
+    token_set = set(tokens)
+    if "team1" in token_set or ("team" in token_set and "1" in token_set):
+        return "1"
+    if "team2" in token_set or ("team" in token_set and "2" in token_set):
+        return "2"
+    if "home" in token_set or "host" in token_set or "hosts" in token_set:
+        return "1"
+    if "away" in token_set or "visitor" in token_set or "visitors" in token_set or "guest" in token_set:
+        return "2"
+    return None
 
 
 def parse_timestamp(value: Optional[object]) -> Optional[datetime]:
@@ -975,7 +990,12 @@ def parse_outcomes(
         participant_type = resolve_participant_type(row, market_key)
         name = row.get("name") or row.get("total") or row.get("label") or ""
         label = row.get("label") or row.get("total") or ""
+        total = row.get("total")
         selection_text = merge_selection_text(str(name), str(label))
+        if total is not None:
+            total_text = str(total).strip()
+            if total_text and total_text not in selection_text:
+                selection_text = f"{selection_text} {total_text}".strip()
         raw_selection_key = normalize_slug(selection_text)
         selection_key = raw_selection_key
         canonical_selection = normalize_selection_key(
@@ -992,10 +1012,19 @@ def parse_outcomes(
         if line is None:
             line = parse_line_from_text(selection_text)
         key_line, key_direction, key_side = parse_line_side_from_selection_key(raw_selection_key)
+        if key_side is None:
+            key_side = extract_side_from_tokens(normalize_selection_tokens(selection_text))
         if key_line is not None and market_key in line_markets:
             line = key_line
         if key_direction in {"over", "under"} and market_key in line_markets:
             selection_key = key_direction
+        if (
+            market_key in TEAM_TOTAL_MARKETS
+            and key_side in {"1", "2"}
+            and key_line is None
+            and line in (1.0, 2.0)
+        ):
+            line = None
         price_decimal = parse_float(row.get("value") or row.get("dp3"))
         if price_decimal is None:
             continue

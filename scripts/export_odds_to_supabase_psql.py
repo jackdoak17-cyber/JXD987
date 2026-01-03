@@ -613,6 +613,24 @@ from parsed_team p
 where o.ctid = p.ctid
   and p.new_participant_id is not null;
 """
+    cleanup_match_sql = f"""
+{fixture_window_sql}
+delete from public.odds_outcomes o
+using fixture_window fw
+where o.fixture_id = fw.id
+  and o.market_key in ('match_shots','match_shots_on_target')
+  and o.line is null
+  and o.selection_key in ('over','under');
+"""
+    cleanup_team_sql = f"""
+{fixture_window_sql}
+delete from public.odds_outcomes o
+using fixture_window fw
+where o.fixture_id = fw.id
+  and o.market_key in ('team_shots','team_shots_on_target')
+  and o.line in (1,2)
+  and o.selection_key in ('over','under');
+"""
     sql_lines = [
         "\\set ON_ERROR_STOP on",
         f"set statement_timeout = '{statement_timeout}';",
@@ -664,6 +682,8 @@ where
         match_update_sql,
         team_delete_sql,
         team_update_sql,
+        cleanup_match_sql,
+        cleanup_team_sql,
         "commit;",
     ]
     sql = "\n".join(sql_lines)
