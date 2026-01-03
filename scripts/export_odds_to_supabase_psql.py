@@ -1006,6 +1006,8 @@ def main() -> None:
     effective_leagues = sorted({*league_ids, *fixture_league_ids})
 
     fixture_count = 0
+    shot_market_threshold = float(os.environ.get("SHOT_MARKET_MIN_FIXTURE_PCT", "0.5"))
+    shot_market_keys = ("team_shots", "team_shots_on_target", "match_shots", "match_shots_on_target")
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
         start_dt, end_dt = sqlite_window_bounds(args.days_forward)
@@ -1050,6 +1052,8 @@ def main() -> None:
     market_stats: List[Dict[str, object]] = []
     stored_by_market: Dict[str, int] = {}
     dropped_by_allowlist: Dict[str, int] = {}
+    shot_market_coverage: List[Dict[str, object]] = []
+    warnings: List[str] = []
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
         start_dt, end_dt = sqlite_window_bounds(args.days_forward)
@@ -1092,6 +1096,36 @@ def main() -> None:
             [start_dt, end_dt, *effective_leagues, *market_params],
         ).fetchall()
         stored_by_market = {row[0]: int(row[1] or 0) for row in stored_rows}
+        shot_rows = conn.execute(
+            f"""
+            select o.market_key, count(distinct o.fixture_id) as fixtures_with_odds
+            from odds_outcomes o
+            join fixtures f on f.id = o.fixture_id
+            where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
+              and f.league_id in ({placeholders})
+              and o.market_key in ({','.join('?' for _ in shot_market_keys)})
+            group by o.market_key
+            order by o.market_key
+            """,
+            [start_dt, end_dt, *effective_leagues, *shot_market_keys],
+        ).fetchall()
+        shot_map = {row[0]: int(row[1] or 0) for row in shot_rows}
+        for key in shot_market_keys:
+            fixtures_with_odds = shot_map.get(key, 0)
+            pct = (fixtures_with_odds / fixture_count) if fixture_count else 0.0
+            shot_market_coverage.append(
+                {
+                    "market_key": key,
+                    "fixtures_with_odds": fixtures_with_odds,
+                    "fixtures_in_window": fixture_count,
+                    "coverage_pct": round(pct * 100.0, 2),
+                }
+            )
+            if fixture_count and pct < shot_market_threshold:
+                warnings.append(
+                    f"Low {key} coverage: {fixtures_with_odds}/{fixture_count} fixtures "
+                    f"({pct:.0%} < {shot_market_threshold:.0%})"
+                )
         if allowlist_enabled:
             allowlist_list = sorted(market_allowlist)
             dropped_rows = conn.execute(
@@ -1314,7 +1348,10 @@ def main() -> None:
         "runtime_seconds": round(end_time - start_time, 2),
         "window_days": args.days_forward,
         "fixture_count": fixture_count,
+        "fixtures_in_window": fixture_count,
         "market_stats": market_stats,
+        "shot_market_coverage": shot_market_coverage,
+        "warnings": warnings,
         "allowlist_enabled": allowlist_enabled,
         "allowlist_keys": sorted(market_allowlist) if allowlist_enabled else None,
         "allowlist_source": allowlist_source,

@@ -1232,6 +1232,12 @@ def main() -> None:
     parser.add_argument("--sleep", type=float, default=0.05)
     parser.add_argument("--limit", type=int, default=0, help="Limit fixtures processed")
     parser.add_argument(
+        "--debug-fixture",
+        type=int,
+        default=0,
+        help="Debug a single fixture's odds payload (no DB writes).",
+    )
+    parser.add_argument(
         "--refresh-upcoming",
         action="store_true",
         help="Refresh upcoming fixtures for the league ids before fetching odds",
@@ -1299,11 +1305,48 @@ def main() -> None:
     if not league_ids:
         raise SystemExit("No league IDs provided")
 
+    client = SportMonksClient()
+    if args.debug_fixture:
+        fixture_id = int(args.debug_fixture)
+        data = fetch_odds_for_fixture(client, fixture_id, args.bookmaker_id)
+        log.info("Debug fixture %s markets=%s", fixture_id, len(data))
+        markets = {}
+        shot_rows = []
+        for row in data:
+            market_id = parse_int(row.get("market_id"))
+            market_desc = str(row.get("market_description") or row.get("market") or "")
+            market_key = resolve_market_key(row)
+            markets.setdefault((market_id, market_desc, market_key), 0)
+            markets[(market_id, market_desc, market_key)] += 1
+            desc_lower = market_desc.lower()
+            if "shot" in desc_lower or "on target" in desc_lower:
+                shot_rows.append(
+                    {
+                        "market_id": market_id,
+                        "market_description": market_desc,
+                        "market_key": market_key,
+                        "name": row.get("name"),
+                        "label": row.get("label"),
+                        "total": row.get("total"),
+                        "selection_key": normalize_slug(merge_selection_text(str(row.get("name") or ""), str(row.get("label") or ""))),
+                        "value": row.get("value"),
+                        "american": row.get("american"),
+                    }
+                )
+        for (market_id, market_desc, market_key), count in sorted(markets.items(), key=lambda item: item[0][1]):
+            log.info("market_id=%s market_key=%s desc=%s outcomes=%s", market_id, market_key, market_desc, count)
+        if shot_rows:
+            log.info("Shot-related markets (first 200 rows):")
+            for row in shot_rows[:200]:
+                log.info("%s", row)
+        else:
+            log.info("No shot-related markets found for fixture %s", fixture_id)
+        return
+
     engine = get_engine()
     session = get_session(engine)
     Base.metadata.create_all(engine)
 
-    client = SportMonksClient()
     svc = None
     if args.refresh_upcoming or args.refresh_squads or args.refresh_squads_missing:
         svc = SyncService(client, session)
