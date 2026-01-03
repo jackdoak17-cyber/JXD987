@@ -41,6 +41,8 @@ jobs:
       PYTHONUNBUFFERED: "1"
       MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.mode || 'prices' }}
       RUN_COVERAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_coverage || 'false' }}
+      PSQL_RETRIES: "3"
+      PSQL_RETRY_SLEEP: "2"
       SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       PGSSLMODE: require

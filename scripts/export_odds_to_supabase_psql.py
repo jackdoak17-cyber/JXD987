@@ -121,21 +121,50 @@ def run_psql(
         cmd.extend(["-c", sql])
     env = dict(os.environ)
     env.setdefault("PGCONNECT_TIMEOUT", "15")
-    try:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
-    except subprocess.CalledProcessError as exc:
-        safe_cmd = [redact_db_url(c) if c == db_url else c for c in cmd]
-        header = f"psql failed ({label}) exit={exc.returncode}\npsql cmd: {' '.join(safe_cmd)}\n"
-        print(header)
-        print("psql stdout:\n", exc.stdout or "")
-        print("psql stderr:\n", exc.stderr or "")
-        append_output(out_path, f"{label} stdout", (exc.stdout or ""))
-        append_output(err_path, f"{label} stderr", (exc.stderr or ""))
-        append_output(err_path, f"{label} header", header)
-        raise
-    append_output(out_path, f"{label} stdout", proc.stdout or "")
-    append_output(err_path, f"{label} stderr", proc.stderr or "")
-    return (proc.stdout or "").strip()
+    retry_limit = int(os.environ.get("PSQL_RETRIES", "3"))
+    retry_sleep = float(os.environ.get("PSQL_RETRY_SLEEP", "2.0"))
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            proc = subprocess.run(cmd, check=True, capture_output=True, text=True, env=env)
+            append_output(out_path, f"{label} stdout", proc.stdout or "")
+            append_output(err_path, f"{label} stderr", proc.stderr or "")
+            return (proc.stdout or "").strip()
+        except subprocess.CalledProcessError as exc:
+            safe_cmd = [redact_db_url(c) if c == db_url else c for c in cmd]
+            header = (
+                f"psql failed ({label}) exit={exc.returncode}\n"
+                f"psql cmd: {' '.join(safe_cmd)}\n"
+                f"attempt: {attempt}/{retry_limit}\n"
+            )
+            stderr = (exc.stderr or "").lower()
+            stdout = (exc.stdout or "").lower()
+            retryable = any(
+                token in stderr or token in stdout
+                for token in (
+                    "connection to server",
+                    "timeout expired",
+                    "server closed the connection",
+                    "could not connect",
+                    "ssl sycall error",
+                    "terminating connection",
+                    "too many connections",
+                    "connection not open",
+                )
+            )
+            print(header)
+            print("psql stdout:\n", exc.stdout or "")
+            print("psql stderr:\n", exc.stderr or "")
+            append_output(out_path, f"{label} stdout", (exc.stdout or ""))
+            append_output(err_path, f"{label} stderr", (exc.stderr or ""))
+            append_output(err_path, f"{label} header", header)
+            if retryable and attempt < retry_limit:
+                sleep_seconds = retry_sleep * attempt
+                print(f"Retrying psql in {sleep_seconds:.1f}s...", flush=True)
+                time.sleep(sleep_seconds)
+                continue
+            raise
 
 
 def build_outcomes_csv(
