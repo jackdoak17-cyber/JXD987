@@ -882,6 +882,34 @@ from counts c;
 """
 
 
+def _parse_starting_at(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    text_val = value.replace("T", " ").replace("Z", "")
+    try:
+        return datetime.fromisoformat(text_val)
+    except Exception:
+        return None
+
+
+def _hours_bucket(hours: float) -> str:
+    if hours < 0:
+        return "<0h"
+    if hours < 6:
+        return "0-6h"
+    if hours < 12:
+        return "6-12h"
+    if hours < 24:
+        return "12-24h"
+    if hours < 48:
+        return "24-48h"
+    if hours < 96:
+        return "48-96h"
+    if hours < 168:
+        return "96-168h"
+    return "168h+"
+
+
 def verification_queries(days_forward: int) -> List[str]:
     queries = []
     queries.append(
@@ -1059,6 +1087,8 @@ def main() -> None:
     stored_by_market: Dict[str, int] = {}
     dropped_by_allowlist: Dict[str, int] = {}
     shot_market_coverage: List[Dict[str, object]] = []
+    shot_coverage_by_day: List[Dict[str, object]] = []
+    shot_coverage_by_hours: List[Dict[str, object]] = []
     warnings: List[str] = []
     errors: List[str] = []
     if effective_leagues:
@@ -1133,6 +1163,82 @@ def main() -> None:
                     f"Low {key} coverage: {fixtures_with_odds}/{fixture_count} fixtures "
                     f"({pct:.0%} < {shot_market_threshold:.0%})"
                 )
+        if fixture_count:
+            fixtures = conn.execute(
+                f"""
+                select id, starting_at
+                from fixtures
+                where datetime(starting_at) >= ? and datetime(starting_at) < ?
+                  and league_id in ({placeholders})
+                """,
+                [start_dt, end_dt, *effective_leagues],
+            ).fetchall()
+            fixture_ids = [row[0] for row in fixtures]
+            fixture_markets: Dict[int, List[str]] = {}
+            if fixture_ids:
+                odds_rows = conn.execute(
+                    f"""
+                    select distinct fixture_id, market_key
+                    from odds_outcomes
+                    where fixture_id in ({','.join('?' for _ in fixture_ids)})
+                      and market_key in ({','.join('?' for _ in shot_market_keys)})
+                    """,
+                    [*fixture_ids, *shot_market_keys],
+                ).fetchall()
+                for fixture_id, market_key in odds_rows:
+                    fixture_markets.setdefault(int(fixture_id), []).append(str(market_key))
+
+            day_totals: Dict[str, int] = {}
+            day_market: Dict[Tuple[str, str], int] = {}
+            bucket_totals: Dict[str, int] = {}
+            bucket_market: Dict[Tuple[str, str], int] = {}
+            now = datetime.utcnow()
+            for fixture_id, starting_at in fixtures:
+                fixture_dt = _parse_starting_at(str(starting_at) if starting_at else "")
+                if not fixture_dt:
+                    continue
+                day_key = fixture_dt.date().isoformat()
+                hours_to_kickoff = (fixture_dt - now).total_seconds() / 3600.0
+                bucket_key = _hours_bucket(hours_to_kickoff)
+                day_totals[day_key] = day_totals.get(day_key, 0) + 1
+                bucket_totals[bucket_key] = bucket_totals.get(bucket_key, 0) + 1
+                market_keys = fixture_markets.get(int(fixture_id), [])
+                for key in shot_market_keys:
+                    if key in market_keys:
+                        day_market[(day_key, key)] = day_market.get((day_key, key), 0) + 1
+                        bucket_market[(bucket_key, key)] = bucket_market.get((bucket_key, key), 0) + 1
+
+            for day_key, total in sorted(day_totals.items()):
+                for key in shot_market_keys:
+                    fixtures_with_odds = day_market.get((day_key, key), 0)
+                    pct = (fixtures_with_odds / total) if total else 0.0
+                    shot_coverage_by_day.append(
+                        {
+                            "day": day_key,
+                            "market_key": key,
+                            "fixtures_in_window": total,
+                            "fixtures_with_odds": fixtures_with_odds,
+                            "coverage_pct": round(pct * 100.0, 2),
+                        }
+                    )
+
+            bucket_order = ["<0h", "0-6h", "6-12h", "12-24h", "24-48h", "48-96h", "96-168h", "168h+"]
+            for bucket_key in bucket_order:
+                total = bucket_totals.get(bucket_key, 0)
+                if total == 0:
+                    continue
+                for key in shot_market_keys:
+                    fixtures_with_odds = bucket_market.get((bucket_key, key), 0)
+                    pct = (fixtures_with_odds / total) if total else 0.0
+                    shot_coverage_by_hours.append(
+                        {
+                            "hours_bucket": bucket_key,
+                            "market_key": key,
+                            "fixtures_in_window": total,
+                            "fixtures_with_odds": fixtures_with_odds,
+                            "coverage_pct": round(pct * 100.0, 2),
+                        }
+                    )
         if (
             fixture_count
             and shot_enforce_leagues
@@ -1377,6 +1483,8 @@ def main() -> None:
         "fixtures_in_window": fixture_count,
         "market_stats": market_stats,
         "shot_market_coverage": shot_market_coverage,
+        "shot_coverage_by_day": shot_coverage_by_day,
+        "shot_coverage_by_hours": shot_coverage_by_hours,
         "warnings": warnings,
         "errors": errors,
         "allowlist_enabled": allowlist_enabled,

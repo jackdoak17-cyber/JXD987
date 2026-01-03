@@ -15,6 +15,7 @@ import os
 import re
 import unicodedata
 import difflib
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -32,6 +33,10 @@ log = logging.getLogger(__name__)
 MARKET_ID_MAP = {
     267: "player_shots_on_target",
     268: "player_shots",
+    284: "team_shots_on_target",
+    285: "team_shots",
+    291: "match_shots_on_target",
+    292: "match_shots",
     331: "player_to_score",
     332: "player_to_assist",
     333: "player_to_score_or_assist",
@@ -1203,21 +1208,69 @@ def parse_outcomes(
     return outcomes
 
 
-def fetch_odds_for_fixture(client: SportMonksClient, fixture_id: int, bookmaker_id: int) -> List[Dict]:
-    try:
-        payload = client.request(
-            "GET",
-            f"odds/pre-match/fixtures/{fixture_id}",
-            params={"filter": f"bookmakers:{bookmaker_id}"},
-        )
-    except SportMonksError as exc:
-        status = exc.status_code
-        if status in {404, 422}:
-            log.info("No odds available for fixture %s (status %s)", fixture_id, status)
-            return []
-        raise
-    data = payload.get("data") if isinstance(payload, dict) else None
-    return data if isinstance(data, list) else []
+def _extract_next_page(pagination: Optional[Dict], current_page: int) -> Optional[int]:
+    if not pagination:
+        return None
+    next_page_val = pagination.get("next_page")
+    if isinstance(next_page_val, int):
+        return next_page_val if next_page_val > current_page else None
+    if isinstance(next_page_val, str) and "page=" in next_page_val:
+        try:
+            parsed = urllib.parse.urlparse(next_page_val)
+            query = urllib.parse.parse_qs(parsed.query)
+            page_vals = query.get("page")
+            if page_vals:
+                page_num = int(page_vals[0])
+                return page_num if page_num > current_page else None
+        except Exception:
+            pass
+    total_pages = pagination.get("total_pages")
+    if isinstance(total_pages, int) and current_page < total_pages:
+        return current_page + 1
+    if pagination.get("has_more"):
+        return current_page + 1
+    return None
+
+
+def fetch_odds_for_fixture(
+    client: SportMonksClient,
+    fixture_id: int,
+    bookmaker_id: int,
+    market_ids: Optional[List[int]] = None,
+    per_page: int = 50,
+) -> List[Dict]:
+    endpoint = f"odds/pre-match/fixtures/{fixture_id}/bookmakers/{bookmaker_id}"
+    base_params: Dict[str, object] = {"per_page": per_page}
+    if market_ids:
+        base_params["filters"] = f"markets:{','.join(str(m) for m in market_ids)}"
+    rows: List[Dict] = []
+    page = 1
+    while True:
+        params = dict(base_params)
+        params["page"] = page
+        try:
+            payload = client.request("GET", endpoint, params=params)
+        except SportMonksError as exc:
+            status = exc.status_code
+            if status in {404, 422}:
+                log.info("No odds available for fixture %s (status %s)", fixture_id, status)
+                return []
+            raise
+        data = payload.get("data") if isinstance(payload, dict) else None
+        page_rows = data if isinstance(data, list) else []
+        if page_rows:
+            rows.extend(page_rows)
+        pagination = None
+        if isinstance(payload, dict):
+            pagination = payload.get("pagination") or (payload.get("meta") or {}).get("pagination")
+        next_page = _extract_next_page(pagination, page)
+        if next_page:
+            page = next_page
+            continue
+        if not page_rows or len(page_rows) < per_page:
+            break
+        page += 1
+    return rows
 
 
 def main() -> None:
@@ -1231,6 +1284,17 @@ def main() -> None:
     parser.add_argument("--bookmaker-id", type=int, default=2)
     parser.add_argument("--sleep", type=float, default=0.05)
     parser.add_argument("--limit", type=int, default=0, help="Limit fixtures processed")
+    parser.add_argument(
+        "--market-ids",
+        default="",
+        help="Comma-separated SportMonks market IDs to filter odds by.",
+    )
+    parser.add_argument(
+        "--per-page",
+        type=int,
+        default=50,
+        help="Rows per page when fetching odds.",
+    )
     parser.add_argument(
         "--debug-fixture",
         type=int,
@@ -1305,10 +1369,21 @@ def main() -> None:
     if not league_ids:
         raise SystemExit("No league IDs provided")
 
+    market_ids: List[int] = []
+    if args.market_ids:
+        raw_markets = args.market_ids.replace('"', "").replace("'", "")
+        market_ids = [int(x) for x in raw_markets.split(",") if x.strip()]
+
     client = SportMonksClient()
     if args.debug_fixture:
         fixture_id = int(args.debug_fixture)
-        data = fetch_odds_for_fixture(client, fixture_id, args.bookmaker_id)
+        data = fetch_odds_for_fixture(
+            client,
+            fixture_id,
+            args.bookmaker_id,
+            market_ids=market_ids or None,
+            per_page=args.per_page,
+        )
         log.info("Debug fixture %s markets=%s", fixture_id, len(data))
         markets = {}
         shot_rows = []
@@ -1458,7 +1533,13 @@ def main() -> None:
         if args.debug_mapping_out:
             debug_team_players = load_team_player_names(session, [home_team_id, away_team_id], limit=50)
 
-        data = fetch_odds_for_fixture(client, fixture_id, args.bookmaker_id)
+        data = fetch_odds_for_fixture(
+            client,
+            fixture_id,
+            args.bookmaker_id,
+            market_ids=market_ids or None,
+            per_page=args.per_page,
+        )
         snapshot = {
             "fixture_id": fixture_id,
             "bookmaker_id": args.bookmaker_id,
