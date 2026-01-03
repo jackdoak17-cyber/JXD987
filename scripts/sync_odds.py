@@ -1312,6 +1312,13 @@ def main() -> None:
         log.info("Debug fixture %s markets=%s", fixture_id, len(data))
         markets = {}
         shot_rows = []
+        shot_total_rows = []
+        shot_total_keys = {
+            "team_shots",
+            "team_shots_on_target",
+            "match_shots",
+            "match_shots_on_target",
+        }
         for row in data:
             market_id = parse_int(row.get("market_id"))
             market_desc = str(row.get("market_description") or row.get("market") or "")
@@ -1319,7 +1326,14 @@ def main() -> None:
             markets.setdefault((market_id, market_desc, market_key), 0)
             markets[(market_id, market_desc, market_key)] += 1
             desc_lower = market_desc.lower()
-            if "shot" in desc_lower or "on target" in desc_lower:
+            selection_text = merge_selection_text(str(row.get("name") or ""), str(row.get("label") or ""))
+            selection_lower = selection_text.lower()
+            if (
+                "shot" in desc_lower
+                or "on target" in desc_lower
+                or "shot" in selection_lower
+                or "on target" in selection_lower
+            ):
                 shot_rows.append(
                     {
                         "market_id": market_id,
@@ -1328,7 +1342,21 @@ def main() -> None:
                         "name": row.get("name"),
                         "label": row.get("label"),
                         "total": row.get("total"),
-                        "selection_key": normalize_slug(merge_selection_text(str(row.get("name") or ""), str(row.get("label") or ""))),
+                        "selection_key": normalize_slug(selection_text),
+                        "value": row.get("value"),
+                        "american": row.get("american"),
+                    }
+                )
+            if market_key in shot_total_keys:
+                shot_total_rows.append(
+                    {
+                        "market_id": market_id,
+                        "market_description": market_desc,
+                        "market_key": market_key,
+                        "name": row.get("name"),
+                        "label": row.get("label"),
+                        "total": row.get("total"),
+                        "selection_key": normalize_slug(selection_text),
                         "value": row.get("value"),
                         "american": row.get("american"),
                     }
@@ -1341,6 +1369,12 @@ def main() -> None:
                 log.info("%s", row)
         else:
             log.info("No shot-related markets found for fixture %s", fixture_id)
+        if shot_total_rows:
+            log.info("Shot totals markets (first 200 rows):")
+            for row in shot_total_rows[:200]:
+                log.info("%s", row)
+        else:
+            log.info("No shot totals markets (team/match) found for fixture %s", fixture_id)
         return
 
     engine = get_engine()

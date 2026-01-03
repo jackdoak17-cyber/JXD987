@@ -1007,6 +1007,12 @@ def main() -> None:
 
     fixture_count = 0
     shot_market_threshold = float(os.environ.get("SHOT_MARKET_MIN_FIXTURE_PCT", "0.5"))
+    shot_enforce_leagues = {
+        int(value)
+        for value in os.environ.get("SHOT_MARKET_ENFORCE_LEAGUES", "").split(",")
+        if value.strip()
+    }
+    shot_enforce_min_pct = float(os.environ.get("SHOT_MARKET_ENFORCE_MIN_PCT", "0.8"))
     shot_market_keys = ("team_shots", "team_shots_on_target", "match_shots", "match_shots_on_target")
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
@@ -1054,6 +1060,7 @@ def main() -> None:
     dropped_by_allowlist: Dict[str, int] = {}
     shot_market_coverage: List[Dict[str, object]] = []
     warnings: List[str] = []
+    errors: List[str] = []
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
         start_dt, end_dt = sqlite_window_bounds(args.days_forward)
@@ -1126,6 +1133,20 @@ def main() -> None:
                     f"Low {key} coverage: {fixtures_with_odds}/{fixture_count} fixtures "
                     f"({pct:.0%} < {shot_market_threshold:.0%})"
                 )
+        if (
+            fixture_count
+            and shot_enforce_leagues
+            and len(effective_leagues) == 1
+            and effective_leagues[0] in shot_enforce_leagues
+        ):
+            for key in ("team_shots", "match_shots"):
+                entry = next((row for row in shot_market_coverage if row["market_key"] == key), None)
+                pct_value = (entry.get("coverage_pct", 0.0) / 100.0) if entry else 0.0
+                if pct_value < shot_enforce_min_pct:
+                    errors.append(
+                        f"Shot market coverage too low for league {effective_leagues[0]}: "
+                        f"{key} {pct_value:.0%} < {shot_enforce_min_pct:.0%}"
+                    )
         if allowlist_enabled:
             allowlist_list = sorted(market_allowlist)
             dropped_rows = conn.execute(
@@ -1311,6 +1332,11 @@ def main() -> None:
         flush=True,
     )
 
+    if ingest_ok and errors:
+        ingest_ok = False
+        error_stage = "shot_coverage"
+        error_message = "; ".join(errors)
+
     verification_outputs: List[str] = []
     if ingest_ok and not args.skip_verification:
         for idx, query in enumerate(verification_queries(args.days_forward), start=1):
@@ -1352,6 +1378,7 @@ def main() -> None:
         "market_stats": market_stats,
         "shot_market_coverage": shot_market_coverage,
         "warnings": warnings,
+        "errors": errors,
         "allowlist_enabled": allowlist_enabled,
         "allowlist_keys": sorted(market_allowlist) if allowlist_enabled else None,
         "allowlist_source": allowlist_source,
