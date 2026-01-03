@@ -388,6 +388,7 @@ jobs:
 
           ingest_dir = Path("/tmp/odds_reports/ingest")
           ingest_files = sorted(ingest_dir.glob("*.json"))
+          preflight_errors = []
 
           max_runtime_min = float(os.environ.get("ODDS_MAX_RUNTIME_MINUTES", "25"))
           min_pct = float(os.environ.get("ODDS_COVERAGE_MIN_PCT", "0"))

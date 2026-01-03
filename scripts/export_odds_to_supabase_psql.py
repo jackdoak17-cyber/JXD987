@@ -367,6 +367,8 @@ def stage_and_upsert(
     db_url: str,
     csv_path: Path,
     league_label: str,
+    league_ids: List[int],
+    days_forward: int,
     keep_sql: bool,
     err_path: Optional[str],
     out_path: Optional[str],
@@ -393,21 +395,241 @@ def stage_and_upsert(
     statement_timeout = os.environ.get("ODDS_STATEMENT_TIMEOUT", "0")
     advisory_lock_key = os.environ.get("ODDS_ADVISORY_LOCK_KEY", "982374")
     idle_tx_timeout = os.environ.get("ODDS_IDLE_TX_TIMEOUT", "0")
-    sql = "\n".join(
-        [
-            "\\set ON_ERROR_STOP on",
-            f"set statement_timeout = '{statement_timeout}';",
-            f"set lock_timeout = '{lock_timeout}';",
-            f"set idle_in_transaction_session_timeout = '{idle_tx_timeout}';",
-            "begin;",
-            f"select pg_advisory_xact_lock({advisory_lock_key});",
-            "create temp table odds_outcomes_stage",
-            "  (like public.odds_outcomes including defaults) on commit drop;",
-            copy_line,
-            "",
-            "select 'stage_count', count(*)::bigint from odds_outcomes_stage;",
-            "",
-            """
+    use_advisory_lock = os.environ.get("ODDS_USE_ADVISORY_LOCK", "").lower() in {"1", "true", "yes"}
+    league_filter = ""
+    if league_ids:
+        league_filter = f"and f.league_id = any({sql_array(league_ids)})"
+    fixture_window_sql = (
+        f"with fixture_window as (\n"
+        f"  select f.id, f.home_team_id, f.away_team_id\n"
+        f"  from public.fixtures f\n"
+        f"  where f.starting_at >= (now() at time zone 'utc')\n"
+        f"    and f.starting_at < (now() at time zone 'utc') + interval '{days_forward} days'\n"
+        f"    {league_filter}\n"
+        f")"
+    )
+    match_delete_sql = f"""
+{fixture_window_sql},
+parsed_match as (
+  select
+    o.ctid as ctid,
+    o.fixture_id,
+    o.bookmaker_id,
+    o.market_key,
+    regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)$', '\\3') as new_sel,
+    regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)$', '\\1.\\2')::numeric as new_line,
+    o.price_decimal,
+    o.price_american,
+    o.last_updated_at
+  from public.odds_outcomes o
+  join fixture_window fw on fw.id = o.fixture_id
+  where o.market_key in ('match_shots','match_shots_on_target')
+    and o.line is null
+    and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)$'
+  union all
+  select
+    o.ctid as ctid,
+    o.fixture_id,
+    o.bookmaker_id,
+    o.market_key,
+    regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)$', '\\1') as new_sel,
+    regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)$', '\\2.\\3')::numeric as new_line,
+    o.price_decimal,
+    o.price_american,
+    o.last_updated_at
+  from public.odds_outcomes o
+  join fixture_window fw on fw.id = o.fixture_id
+  where o.market_key in ('match_shots','match_shots_on_target')
+    and o.line is null
+    and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+$'
+),
+match_merge as (
+  update public.odds_outcomes o
+  set price_decimal = p.price_decimal,
+      price_american = p.price_american,
+      last_updated_at = p.last_updated_at
+  from parsed_match p
+  where o.fixture_id = p.fixture_id
+    and o.bookmaker_id = p.bookmaker_id
+    and o.market_key = p.market_key
+    and o.selection_key = p.new_sel
+    and o.line = p.new_line
+    and (
+      o.last_updated_at is null
+      or (p.last_updated_at is not null and p.last_updated_at > o.last_updated_at)
+    )
+  returning 1
+)
+delete from public.odds_outcomes o
+using parsed_match p
+where o.ctid = p.ctid
+  and exists (
+    select 1
+    from public.odds_outcomes o2
+    where o2.fixture_id = p.fixture_id
+      and o2.bookmaker_id = p.bookmaker_id
+      and o2.market_key = p.market_key
+      and o2.selection_key = p.new_sel
+      and o2.line = p.new_line
+  );
+"""
+    match_update_sql = f"""
+{fixture_window_sql},
+parsed_match as (
+  select
+    o.ctid as ctid,
+    regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)$', '\\3') as new_sel,
+    regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)$', '\\1.\\2')::numeric as new_line
+  from public.odds_outcomes o
+  join fixture_window fw on fw.id = o.fixture_id
+  where o.market_key in ('match_shots','match_shots_on_target')
+    and o.line is null
+    and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)$'
+  union all
+  select
+    o.ctid as ctid,
+    regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)$', '\\1') as new_sel,
+    regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)$', '\\2.\\3')::numeric as new_line
+  from public.odds_outcomes o
+  join fixture_window fw on fw.id = o.fixture_id
+  where o.market_key in ('match_shots','match_shots_on_target')
+    and o.line is null
+    and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+$'
+)
+update public.odds_outcomes o
+set line = p.new_line,
+    selection_key = p.new_sel,
+    participant_type = null,
+    participant_id = null
+from parsed_match p
+where o.ctid = p.ctid;
+"""
+    team_delete_sql = f"""
+{fixture_window_sql},
+parsed_team as (
+  select
+    o.ctid as ctid,
+    o.fixture_id,
+    o.bookmaker_id,
+    o.market_key,
+    regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)_(?:team_)?(1|2)$', '\\1') as new_sel,
+    regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)_(?:team_)?(1|2)$', '\\2.\\3')::numeric as new_line,
+    case
+      when regexp_replace(o.selection_key, '^.*_(?:team_)?(1|2)$', '\\1') = '1' then fw.home_team_id
+      else fw.away_team_id
+    end as new_participant_id,
+    o.price_decimal,
+    o.price_american,
+    o.last_updated_at
+  from public.odds_outcomes o
+  join fixture_window fw on fw.id = o.fixture_id
+  where o.market_key in ('team_shots','team_shots_on_target')
+    and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+_(?:team_)?[12]$'
+  union all
+  select
+    o.ctid as ctid,
+    o.fixture_id,
+    o.bookmaker_id,
+    o.market_key,
+    regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)_(?:team_)?(1|2)$', '\\3') as new_sel,
+    regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)_(?:team_)?(1|2)$', '\\1.\\2')::numeric as new_line,
+    case
+      when regexp_replace(o.selection_key, '^.*_(?:team_)?(1|2)$', '\\1') = '1' then fw.home_team_id
+      else fw.away_team_id
+    end as new_participant_id,
+    o.price_decimal,
+    o.price_american,
+    o.last_updated_at
+  from public.odds_outcomes o
+  join fixture_window fw on fw.id = o.fixture_id
+  where o.market_key in ('team_shots','team_shots_on_target')
+    and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)_(?:team_)?[12]$'
+),
+team_merge as (
+  update public.odds_outcomes o
+  set price_decimal = p.price_decimal,
+      price_american = p.price_american,
+      last_updated_at = p.last_updated_at
+  from parsed_team p
+  where o.fixture_id = p.fixture_id
+    and o.bookmaker_id = p.bookmaker_id
+    and o.market_key = p.market_key
+    and o.selection_key = p.new_sel
+    and o.line = p.new_line
+    and (
+      o.last_updated_at is null
+      or (p.last_updated_at is not null and p.last_updated_at > o.last_updated_at)
+    )
+  returning 1
+)
+delete from public.odds_outcomes o
+using parsed_team p
+where o.ctid = p.ctid
+  and exists (
+    select 1
+    from public.odds_outcomes o2
+    where o2.fixture_id = p.fixture_id
+      and o2.bookmaker_id = p.bookmaker_id
+      and o2.market_key = p.market_key
+      and o2.selection_key = p.new_sel
+      and o2.line = p.new_line
+  );
+"""
+    team_update_sql = f"""
+{fixture_window_sql},
+parsed_team as (
+  select
+    o.ctid as ctid,
+    regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)_(?:team_)?(1|2)$', '\\1') as new_sel,
+    regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)_(?:team_)?(1|2)$', '\\2.\\3')::numeric as new_line,
+    case
+      when regexp_replace(o.selection_key, '^.*_(?:team_)?(1|2)$', '\\1') = '1' then fw.home_team_id
+      else fw.away_team_id
+    end as new_participant_id
+  from public.odds_outcomes o
+  join fixture_window fw on fw.id = o.fixture_id
+  where o.market_key in ('team_shots','team_shots_on_target')
+    and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+_(?:team_)?[12]$'
+  union all
+  select
+    o.ctid as ctid,
+    regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)_(?:team_)?(1|2)$', '\\3') as new_sel,
+    regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)_(?:team_)?(1|2)$', '\\1.\\2')::numeric as new_line,
+    case
+      when regexp_replace(o.selection_key, '^.*_(?:team_)?(1|2)$', '\\1') = '1' then fw.home_team_id
+      else fw.away_team_id
+    end as new_participant_id
+  from public.odds_outcomes o
+  join fixture_window fw on fw.id = o.fixture_id
+  where o.market_key in ('team_shots','team_shots_on_target')
+    and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)_(?:team_)?[12]$'
+)
+update public.odds_outcomes o
+set line = p.new_line,
+    selection_key = p.new_sel,
+    participant_type = 'team',
+    participant_id = p.new_participant_id
+from parsed_team p
+where o.ctid = p.ctid
+  and p.new_participant_id is not null;
+"""
+    sql_lines = [
+        "\\set ON_ERROR_STOP on",
+        f"set statement_timeout = '{statement_timeout}';",
+        f"set lock_timeout = '{lock_timeout}';",
+        f"set idle_in_transaction_session_timeout = '{idle_tx_timeout}';",
+        "begin;",
+    ]
+    if use_advisory_lock:
+        sql_lines.append(f"select pg_advisory_xact_lock({advisory_lock_key});")
+    sql_lines += [
+        "create temp table odds_outcomes_stage",
+        "  (like public.odds_outcomes including defaults) on commit drop;",
+        copy_line,
+        "",
+        "select 'stage_count', count(*)::bigint from odds_outcomes_stage;",
+        "",
+        """
 with src as (
   select distinct on (fixture_id, bookmaker_id, market_key, selection_key, line)
     fixture_id, bookmaker_id, market_key, selection_key, line,
@@ -437,56 +659,14 @@ where
   or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
   or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
   or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at);
-
-update public.odds_outcomes o
-set line = regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)$', '\\1.\\2')::numeric,
-    selection_key = regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)$', '\\3'),
-    participant_type = null,
-    participant_id = null
-where o.market_key in ('match_shots','match_shots_on_target')
-  and o.line is null
-  and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)$';
-
-update public.odds_outcomes o
-set line = regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)$', '\\2.\\3')::numeric,
-    selection_key = regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)$', '\\1'),
-    participant_type = null,
-    participant_id = null
-where o.market_key in ('match_shots','match_shots_on_target')
-  and o.line is null
-  and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+$';
-
-update public.odds_outcomes o
-set line = regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)_(1|2)$', '\\2.\\3')::numeric,
-    selection_key = regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)_(1|2)$', '\\1'),
-    participant_type = 'team',
-    participant_id = case
-      when regexp_replace(o.selection_key, '^.*_(1|2)$', '\\1') = '1' then f.home_team_id
-      else f.away_team_id
-    end
-from public.fixtures f
-where o.fixture_id = f.id
-  and o.market_key in ('team_shots','team_shots_on_target')
-  and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+_[12]$'
-  and (o.participant_id is null or o.line is null or o.line in (1,2));
-
-update public.odds_outcomes o
-set line = regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)_(1|2)$', '\\1.\\2')::numeric,
-    selection_key = regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)_(1|2)$', '\\3'),
-    participant_type = 'team',
-    participant_id = case
-      when regexp_replace(o.selection_key, '^.*_(1|2)$', '\\1') = '1' then f.home_team_id
-      else f.away_team_id
-    end
-from public.fixtures f
-where o.fixture_id = f.id
-  and o.market_key in ('team_shots','team_shots_on_target')
-  and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)_[12]$'
-  and (o.participant_id is null or o.line is null or o.line in (1,2));
-commit;
 """,
-        ]
-    )
+        match_delete_sql,
+        match_update_sql,
+        team_delete_sql,
+        team_update_sql,
+        "commit;",
+    ]
+    sql = "\n".join(sql_lines)
     sql_path: Optional[str] = None
     if keep_sql or os.environ.get("KEEP_SQL") == "1":
         sql_path = f"/tmp/odds_psql_sql_{league_label}.sql"
@@ -815,6 +995,8 @@ def main() -> None:
             DB_URL,
             Path(args.csv_out),
             league_label,
+            effective_leagues,
+            args.days_forward,
             args.keep_sql,
             err_path,
             out_path,
