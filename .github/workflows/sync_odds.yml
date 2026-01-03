@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         league_id: [8, 9, 384, 387, 564, 567, 82, 301, 600, 501, 444, 72]
     env:
@@ -43,7 +43,9 @@ jobs:
       RUN_COVERAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_coverage || 'false' }}
       PSQL_RETRIES: "3"
       PSQL_RETRY_SLEEP: "2"
-      ODDS_LOCK_TIMEOUT: "5min"
+      ODDS_LOCK_TIMEOUT: "0"
+      ODDS_STATEMENT_TIMEOUT: "45min"
+      ODDS_ADVISORY_LOCK_KEY: "982374"
       SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       PGSSLMODE: require
