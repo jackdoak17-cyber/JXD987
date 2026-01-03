@@ -106,6 +106,39 @@ where f.starting_at < (now() at time zone 'utc') - interval '24 hours';
 """
 
 
+def past_24h_market_breakdown_query() -> str:
+    return """
+select o.market_key, count(*)::bigint as rows
+from public.odds_outcomes o
+join public.fixtures f on f.id = o.fixture_id
+where f.starting_at < (now() at time zone 'utc') - interval '24 hours'
+group by o.market_key
+order by rows desc
+limit 10;
+"""
+
+
+def past_24h_league_breakdown_query() -> str:
+    return """
+select f.league_id, count(*)::bigint as rows
+from public.odds_outcomes o
+join public.fixtures f on f.id = o.fixture_id
+where f.starting_at < (now() at time zone 'utc') - interval '24 hours'
+group by f.league_id
+order by rows desc
+limit 10;
+"""
+
+
+def past_24h_range_query() -> str:
+    return """
+select min(f.starting_at), max(f.starting_at)
+from public.odds_outcomes o
+join public.fixtures f on f.id = o.fixture_id
+where f.starting_at < (now() at time zone 'utc') - interval '24 hours';
+"""
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days-back", type=int, default=1)
@@ -122,6 +155,9 @@ def main() -> None:
     deleted_rows = 0
     snapshots_deleted = 0
     past_24h_rows = 0
+    past_24h_market_top: list[dict[str, object]] = []
+    past_24h_league_top: list[dict[str, object]] = []
+    past_24h_range: dict[str, Optional[str]] = {"min_starting_at": None, "max_starting_at": None}
 
     try:
         deleted_out = run_psql(retention_cleanup_query(args.days_back, args.days_forward), label="retention")
@@ -144,6 +180,32 @@ def main() -> None:
     except Exception:
         past_24h_rows = 0
 
+    if past_24h_rows > 0:
+        try:
+            market_out = run_psql(past_24h_market_breakdown_query(), label="past_24h_markets")
+            for line in market_out.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    past_24h_market_top.append({"market_key": parts[0], "rows": int(parts[1])})
+        except Exception:
+            pass
+        try:
+            league_out = run_psql(past_24h_league_breakdown_query(), label="past_24h_leagues")
+            for line in league_out.splitlines():
+                parts = line.split("\t")
+                if len(parts) >= 2:
+                    past_24h_league_top.append({"league_id": parts[0], "rows": int(parts[1])})
+        except Exception:
+            pass
+        try:
+            range_out = run_psql(past_24h_range_query(), label="past_24h_range")
+            parts = range_out.split("\t")
+            if len(parts) >= 2:
+                past_24h_range["min_starting_at"] = parts[0] or None
+                past_24h_range["max_starting_at"] = parts[1] or None
+        except Exception:
+            pass
+
     report = {
         "start_time": start_iso,
         "end_time": datetime.utcnow().isoformat() + "Z",
@@ -153,6 +215,9 @@ def main() -> None:
         "deleted_rows": deleted_rows,
         "snapshots_deleted": snapshots_deleted,
         "odds_rows_past_24h": past_24h_rows,
+        "past_24h_market_top": past_24h_market_top,
+        "past_24h_league_top": past_24h_league_top,
+        "past_24h_range": past_24h_range,
     }
     Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, indent=2))

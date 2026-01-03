@@ -503,6 +503,7 @@ jobs:
       SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       PGSSLMODE: require
+      RETENTION_MAX_PAST24H_ROWS: "10000"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -531,3 +532,33 @@ jobs:
         with:
           name: odds_retention_report
           path: /tmp/odds_retention_report.json
+
+      - name: Enforce retention invariant
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          max_rows = int(os.environ.get("RETENTION_MAX_PAST24H_ROWS", "10000"))
+          report_path = Path("/tmp/odds_retention_report.json")
+          if not report_path.exists():
+              raise SystemExit("Missing odds_retention_report.json")
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          past_rows = int(report.get("odds_rows_past_24h", 0))
+          if past_rows <= max_rows:
+              print(f\"Retention OK: past24h rows={past_rows} <= {max_rows}\")
+              raise SystemExit(0)
+          print(f\"Retention FAIL: past24h rows={past_rows} > {max_rows}\")
+          print(\"Top markets past 24h:\")
+          for item in report.get(\"past_24h_market_top\", []):
+              print(f\"- {item.get('market_key')}: {item.get('rows')}\")
+          print(\"League breakdown past 24h:\")
+          for item in report.get(\"past_24h_league_top\", []):
+              print(f\"- {item.get('league_id')}: {item.get('rows')}\")
+          range_info = report.get(\"past_24h_range\", {}) or {}
+          print(\"Starting_at range past 24h:\")
+          print(f\"- min: {range_info.get('min_starting_at')}\")
+          print(f\"- max: {range_info.get('max_starting_at')}\")
+          raise SystemExit(1)
+          PY
