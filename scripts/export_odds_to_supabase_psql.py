@@ -352,11 +352,12 @@ def stage_and_upsert(
         f"\\copy odds_outcomes_stage ({cols_sql}) "
         f"from '{csv_path_sql}' with (format csv, header true);"
     )
+    lock_timeout = os.environ.get("ODDS_LOCK_TIMEOUT", "5min")
     sql = "\n".join(
         [
             "\\set ON_ERROR_STOP on",
             "set statement_timeout = '25min';",
-            "set lock_timeout = '30s';",
+            f"set lock_timeout = '{lock_timeout}';",
             "begin;",
             "create temp table odds_outcomes_stage",
             "  (like public.odds_outcomes including defaults) on commit drop;",

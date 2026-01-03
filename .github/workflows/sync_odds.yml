@@ -43,6 +43,7 @@ jobs:
       RUN_COVERAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_coverage || 'false' }}
       PSQL_RETRIES: "3"
       PSQL_RETRY_SLEEP: "2"
+      ODDS_LOCK_TIMEOUT: "5min"
       SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       PGSSLMODE: require
@@ -174,6 +175,8 @@ jobs:
             --max-runtime-minutes 25 \
             --keep-sql \
             --report-out /tmp/odds_ingest_report_${{ matrix.league_id }}.json \
+            --skip-retention \
+            --skip-retention-snapshots \
             $COVERAGE_ARGS \
             2>&1 | tee "$LOG_PATH"
           status=${PIPESTATUS[0]}
