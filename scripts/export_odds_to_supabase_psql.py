@@ -304,7 +304,15 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
     mapped: Dict[str, int] = {}
     unmatched_keys: Dict[str, int] = {}
     unmatched_team_keys: Dict[str, int] = {}
+    line_missing_keys: Dict[str, int] = {}
+    team_unmapped_keys: Dict[str, int] = {}
     total_rows = 0
+    line_markets = {
+        "team_shots",
+        "team_shots_on_target",
+        "match_shots",
+        "match_shots_on_target",
+    }
     with csv_path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -322,8 +330,18 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
                 selection_key = (row.get("selection_key") or "").strip()
                 if selection_key:
                     unmatched_team_keys[selection_key] = unmatched_team_keys.get(selection_key, 0) + 1
+            market_key = (row.get("market_key") or "").strip()
+            if market_key in line_markets:
+                selection_key = (row.get("selection_key") or "").strip()
+                line_val = (row.get("line") or "").strip()
+                if not line_val:
+                    line_missing_keys[selection_key] = line_missing_keys.get(selection_key, 0) + 1
+                if market_key.startswith("team_") and not pid:
+                    team_unmapped_keys[selection_key] = team_unmapped_keys.get(selection_key, 0) + 1
     top_unmatched = sorted(unmatched_keys.items(), key=lambda item: item[1], reverse=True)[:top_n]
     top_team_unmatched = sorted(unmatched_team_keys.items(), key=lambda item: item[1], reverse=True)[:30]
+    top_line_missing = sorted(line_missing_keys.items(), key=lambda item: item[1], reverse=True)[:50]
+    top_team_unmapped = sorted(team_unmapped_keys.items(), key=lambda item: item[1], reverse=True)[:50]
     payload = {
         "total_rows": total_rows,
         "counts_by_participant_type": counts,
@@ -333,6 +351,12 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
         ],
         "unmatched_team_selection_keys": [
             {"selection_key": key, "count": count} for key, count in top_team_unmatched
+        ],
+        "line_missing_selection_keys": [
+            {"selection_key": key, "count": count} for key, count in top_line_missing
+        ],
+        "team_unmapped_selection_keys": [
+            {"selection_key": key, "count": count} for key, count in top_team_unmapped
         ],
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -177,6 +177,43 @@ def parse_line(row: Dict) -> Optional[float]:
     return None
 
 
+def parse_line_from_text(text: str) -> Optional[float]:
+    if not text:
+        return None
+    match = re.search(r"([0-9]+(?:[\\._][0-9]+)?)", text)
+    if not match:
+        return None
+    raw = match.group(1)
+    if "_" in raw:
+        parts = raw.split("_", 1)
+        if len(parts) == 2 and parts[0] and parts[1].isdigit():
+            return float(f"{parts[0]}.{parts[1]}")
+    return float(raw.replace("_", "."))
+
+
+def parse_line_side_from_selection_key(selection_key: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+    if not selection_key:
+        return None, None, None
+    key = selection_key.lower()
+    pattern_1 = re.match(r"^(over|under)_([0-9]+)(?:_([0-9]+))?(?:_(1|2))?$", key)
+    if pattern_1:
+        direction = pattern_1.group(1)
+        whole = pattern_1.group(2)
+        frac = pattern_1.group(3)
+        side = pattern_1.group(4)
+        line = float(f"{whole}.{frac}") if frac else float(whole)
+        return line, direction, side
+    pattern_2 = re.match(r"^([0-9]+)(?:_([0-9]+))?_(over|under)(?:_(1|2))?$", key)
+    if pattern_2:
+        whole = pattern_2.group(1)
+        frac = pattern_2.group(2)
+        direction = pattern_2.group(3)
+        side = pattern_2.group(4)
+        line = float(f"{whole}.{frac}") if frac else float(whole)
+        return line, direction, side
+    return None, None, None
+
+
 def parse_timestamp(value: Optional[object]) -> Optional[datetime]:
     if not value:
         return None
@@ -918,13 +955,23 @@ def parse_outcomes(
     debug_fuzzy_matches: Optional[List[Dict]] = None,
 ) -> List[Dict]:
     outcomes: List[Dict] = []
+    line_markets = {
+        "team_shots",
+        "team_shots_on_target",
+        "match_shots",
+        "match_shots_on_target",
+        "goals_over_under",
+        "corners_over_under",
+    }
+
     for row in data:
         market_key = resolve_market_key(row)
         participant_type = resolve_participant_type(row, market_key)
         name = row.get("name") or row.get("total") or row.get("label") or ""
         label = row.get("label") or row.get("total") or ""
         selection_text = merge_selection_text(str(name), str(label))
-        selection_key = normalize_slug(selection_text)
+        raw_selection_key = normalize_slug(selection_text)
+        selection_key = raw_selection_key
         canonical_selection = normalize_selection_key(
             market_key,
             str(name),
@@ -936,6 +983,13 @@ def parse_outcomes(
             selection_key = canonical_selection
 
         line = parse_line(row)
+        if line is None:
+            line = parse_line_from_text(selection_text)
+        key_line, key_direction, key_side = parse_line_side_from_selection_key(raw_selection_key)
+        if key_line is not None and (line is None or market_key in line_markets):
+            line = key_line
+        if key_direction in {"over", "under"} and market_key in line_markets:
+            selection_key = key_direction
         price_decimal = parse_float(row.get("value") or row.get("dp3"))
         if price_decimal is None:
             continue
@@ -955,6 +1009,10 @@ def parse_outcomes(
             home_aliases,
             away_aliases,
         )
+        if market_key in TEAM_TOTAL_MARKETS and key_side in {"1", "2"}:
+            side_team_id = home_team_id if key_side == "1" else away_team_id
+            if side_team_id:
+                team_id_candidate = int(side_team_id)
         if team_id_candidate is None and market_key in TEAM_TOTAL_MARKETS:
             team_id_candidate = resolve_team_id_from_label(
                 str(label),
