@@ -355,13 +355,15 @@ def stage_and_upsert(
         f"from '{csv_path_sql}' with (format csv, header true);"
     )
     lock_timeout = os.environ.get("ODDS_LOCK_TIMEOUT", "0")
-    statement_timeout = os.environ.get("ODDS_STATEMENT_TIMEOUT", "25min")
+    statement_timeout = os.environ.get("ODDS_STATEMENT_TIMEOUT", "0")
     advisory_lock_key = os.environ.get("ODDS_ADVISORY_LOCK_KEY", "982374")
+    idle_tx_timeout = os.environ.get("ODDS_IDLE_TX_TIMEOUT", "0")
     sql = "\n".join(
         [
             "\\set ON_ERROR_STOP on",
             f"set statement_timeout = '{statement_timeout}';",
             f"set lock_timeout = '{lock_timeout}';",
+            f"set idle_in_transaction_session_timeout = '{idle_tx_timeout}';",
             "begin;",
             f"select pg_advisory_xact_lock({advisory_lock_key});",
             "create temp table odds_outcomes_stage",
@@ -378,34 +380,28 @@ with src as (
   from odds_outcomes_stage
   order by fixture_id, bookmaker_id, market_key, selection_key, line,
            last_updated_at desc nulls last
-), upserted as (
-  insert into public.odds_outcomes as o (
-    fixture_id, bookmaker_id, market_key, selection_key, line,
-    price_decimal, price_american, participant_type, participant_id, last_updated_at
-  )
-  select
-    fixture_id, bookmaker_id, market_key, selection_key, line,
-    price_decimal, price_american, participant_type, participant_id, last_updated_at
-  from src
-  on conflict (fixture_id, bookmaker_id, market_key, selection_key, line)
-  do update set
-    price_decimal = excluded.price_decimal,
-    price_american = excluded.price_american,
-    participant_type = coalesce(excluded.participant_type, o.participant_type),
-    participant_id = coalesce(excluded.participant_id, o.participant_id),
-    last_updated_at = coalesce(excluded.last_updated_at, o.last_updated_at)
-  where
-    o.price_decimal is distinct from excluded.price_decimal
-    or o.price_american is distinct from excluded.price_american
-    or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
-    or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
-    or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at)
-  returning (xmax = 0) as inserted
 )
-select 'upserted_total', count(*)::bigint from upserted
-union all select 'inserted', count(*)::bigint from upserted where inserted
-union all select 'updated', count(*)::bigint from upserted where not inserted
-union all select 'src_count', (select count(*)::bigint from src);
+insert into public.odds_outcomes as o (
+  fixture_id, bookmaker_id, market_key, selection_key, line,
+  price_decimal, price_american, participant_type, participant_id, last_updated_at
+)
+select
+  fixture_id, bookmaker_id, market_key, selection_key, line,
+  price_decimal, price_american, participant_type, participant_id, last_updated_at
+from src
+on conflict (fixture_id, bookmaker_id, market_key, selection_key, line)
+do update set
+  price_decimal = excluded.price_decimal,
+  price_american = excluded.price_american,
+  participant_type = coalesce(excluded.participant_type, o.participant_type),
+  participant_id = coalesce(excluded.participant_id, o.participant_id),
+  last_updated_at = coalesce(excluded.last_updated_at, o.last_updated_at)
+where
+  o.price_decimal is distinct from excluded.price_decimal
+  or o.price_american is distinct from excluded.price_american
+  or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
+  or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
+  or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at);
 commit;
 """,
         ]
@@ -477,6 +473,8 @@ commit;
                 counts[parts[0]] = int(parts[1])
             except ValueError:
                 counts[parts[0]] = 0
+    if counts["src_count"] == 0 and counts["stage_count"] > 0:
+        counts["src_count"] = counts["stage_count"]
     counts["unchanged"] = max(0, counts["src_count"] - counts["upserted_total"])
     return counts
 
