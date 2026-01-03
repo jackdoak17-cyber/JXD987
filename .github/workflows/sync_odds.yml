@@ -69,6 +69,19 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+      - name: Compile odds scripts
+        run: |
+          python -m py_compile \
+            scripts/export_odds_to_supabase_psql.py \
+            scripts/sync_odds.py \
+            scripts/odds_retention_psql.py \
+            scripts/patch_odds_participants_psql.py
+      - name: Compile odds scripts
+        run: |
+          python -m py_compile \
+            scripts/export_odds_to_supabase_psql.py \
+            scripts/sync_odds.py \
+            scripts/odds_retention_psql.py
 
       - name: Supabase DB preflight (psql)
         id: preflight
@@ -517,6 +530,9 @@ jobs:
 
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
+      - name: Compile retention script
+        run: |
+          python -m py_compile scripts/odds_retention_psql.py
 
       - name: Run odds retention
         run: |

@@ -996,11 +996,11 @@ def main() -> None:
         allowlist_source = "default"
     if allowlist_enabled:
         print(
-            f\"Market allowlist enabled ({allowlist_source}): {','.join(sorted(market_allowlist))}\",
+            f"Market allowlist enabled ({allowlist_source}): {','.join(sorted(market_allowlist))}",
             flush=True,
         )
     else:
-        print(f\"Market allowlist bypassed (ODDS_MARKET_ALLOWLIST={raw_allowlist or 'unset'})\", flush=True)
+        print(f"Market allowlist bypassed (ODDS_MARKET_ALLOWLIST={raw_allowlist or 'unset'})", flush=True)
     league_ids = parse_league_ids(args.leagues)
     fixture_league_ids = fetch_fixture_league_ids(conn, args.days_forward) if args.include_fixture_leagues else []
     effective_leagues = sorted({*league_ids, *fixture_league_ids})
