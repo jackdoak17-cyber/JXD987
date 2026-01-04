@@ -534,6 +534,22 @@ def load_team_player_map(session, team_ids: Iterable[int]) -> Dict[str, List[Tup
     return mapping
 
 
+def fetch_team_player_counts(session, team_ids: Iterable[int]) -> Dict[int, int]:
+    ids = [int(x) for x in team_ids if x]
+    if not ids:
+        return {}
+    stmt = text(
+        """
+        select team_id, count(*) as cnt
+        from players
+        where team_id in :team_ids
+        group by team_id
+        """
+    ).bindparams(bindparam("team_ids", expanding=True))
+    rows = session.execute(stmt, {"team_ids": ids}).fetchall()
+    return {int(team_id): int(count) for team_id, count in rows}
+
+
 def build_fuzzy_candidates(session, team_ids: Iterable[int]) -> List[Dict[str, object]]:
     ids = [int(x) for x in team_ids if x]
     if not ids:
@@ -1283,6 +1299,23 @@ def main() -> None:
         help="Refresh upcoming fixtures from SportMonks before fetching odds.",
     )
     parser.add_argument(
+        "--refresh-squads",
+        action="store_true",
+        help="Refresh squads for all teams in the odds window.",
+    )
+    parser.add_argument(
+        "--refresh-squads-missing",
+        dest="refresh_squads_missing",
+        action="store_true",
+        help="Refresh squads for teams missing players (default).",
+    )
+    parser.add_argument(
+        "--no-refresh-squads-missing",
+        dest="refresh_squads_missing",
+        action="store_false",
+        help="Disable auto refresh of squads for missing teams.",
+    )
+    parser.add_argument(
         "--unmatched-out",
         default="",
         help="Write unmatched player odds to JSON (fixture_id, market_key, selection_key, raw_name)",
@@ -1302,6 +1335,7 @@ def main() -> None:
         default="",
         help="Write raw odds JSON",
     )
+    parser.set_defaults(refresh_squads_missing=True)
     args = parser.parse_args()
 
     raw_leagues = args.leagues.replace('"', "").replace("'", "")
@@ -1322,19 +1356,48 @@ def main() -> None:
     session = get_session(engine)
     Base.metadata.create_all(engine)
 
-    if args.refresh_upcoming:
+    svc = None
+    if args.refresh_upcoming or args.refresh_squads or args.refresh_squads_missing:
         if not os.environ.get("SPORTMONKS_API_TOKEN"):
-            raise SystemExit("Missing SPORTMONKS_API_TOKEN for --refresh-upcoming")
-        client_sm = SportMonksClient()
-        svc = SyncService(client_sm, session)
-        svc.ensure_schema()
-        log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
-        svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
+            log.warning("SPORTMONKS_API_TOKEN missing; skipping SportMonks refresh steps.")
+        else:
+            client_sm = SportMonksClient()
+            svc = SyncService(client_sm, session)
+            svc.ensure_schema()
+            if args.refresh_upcoming:
+                log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
+                svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
 
     fixtures = load_fixtures(session, league_ids, args.days_forward)
     if not fixtures:
         log.info("No fixtures found for odds window")
         return
+
+    teams_in_window = {
+        fixture.get("home_team_id")
+        for fixture in fixtures
+        if fixture.get("home_team_id")
+    } | {
+        fixture.get("away_team_id")
+        for fixture in fixtures
+        if fixture.get("away_team_id")
+    }
+    missing_team_ids: List[int] = []
+    refreshed_team_ids: List[int] = []
+    if svc and (args.refresh_squads or args.refresh_squads_missing) and teams_in_window:
+        if args.refresh_squads:
+            refreshed_team_ids = sorted(int(tid) for tid in teams_in_window if tid)
+        else:
+            counts = fetch_team_player_counts(session, teams_in_window)
+            missing_team_ids = [int(tid) for tid in teams_in_window if counts.get(int(tid), 0) == 0]
+            refreshed_team_ids = sorted(missing_team_ids)
+        if refreshed_team_ids:
+            log.info(
+                "Refreshing squads for %s/%s teams",
+                len(refreshed_team_ids),
+                len(teams_in_window),
+            )
+            svc.sync_squads_for_teams(refreshed_team_ids)
 
     league_map = load_league_map(Path(__file__).resolve().parent.parent / "config" / "odds_api_leagues.json")
 
@@ -1494,6 +1557,9 @@ def main() -> None:
             "bookmakers_seen": sorted(bookmaker_names_seen),
             "bookmakers_saved": sorted(bookmaker_names_saved),
             "bookmakers_unknown_seen": sorted(bookmaker_names_unknown),
+            "teams_in_window": len(teams_in_window),
+            "teams_missing_players": len(missing_team_ids),
+            "teams_squads_refreshed": len(refreshed_team_ids),
             "events_matched": len(event_map),
             "events_unmatched_samples": events_unmatched_samples,
             "league_stats": league_stats,
