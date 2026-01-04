@@ -350,6 +350,7 @@ def write_csv_head(csv_path: Path, out_path: Path, max_lines: int = 200) -> None
 def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
     counts: Dict[str, int] = {}
     mapped: Dict[str, int] = {}
+    bookmaker_counts: Dict[str, int] = {}
     unmatched_keys: Dict[str, int] = {}
     unmatched_team_keys: Dict[str, int] = {}
     line_missing_keys: Dict[str, int] = {}
@@ -370,6 +371,8 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
             pid = (row.get("participant_id") or "").strip()
             if pid:
                 mapped[ptype] = mapped.get(ptype, 0) + 1
+            bookmaker_id = (row.get("bookmaker_id") or "").strip() or "null"
+            bookmaker_counts[bookmaker_id] = bookmaker_counts.get(bookmaker_id, 0) + 1
             if ptype == "player" and not pid:
                 selection_key = (row.get("selection_key") or "").strip()
                 if selection_key:
@@ -394,6 +397,7 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
         "total_rows": total_rows,
         "counts_by_participant_type": counts,
         "mapped_by_participant_type": mapped,
+        "rows_by_bookmaker_id": bookmaker_counts,
         "unmatched_player_selection_keys": [
             {"selection_key": key, "count": count} for key, count in top_unmatched
         ],
@@ -409,6 +413,38 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def fetch_sqlite_bookmaker_counts(
+    conn: sqlite3.Connection,
+    league_ids: Iterable[int],
+    days_forward: int,
+    market_allowlist: Optional[Iterable[str]],
+) -> Dict[str, int]:
+    start_dt, end_dt = sqlite_window_bounds(days_forward)
+    params: List[object] = [start_dt, end_dt]
+    league_clause = ""
+    if league_ids:
+        placeholders = ",".join("?" for _ in league_ids)
+        league_clause = f"and f.league_id in ({placeholders})"
+        params.extend(league_ids)
+    market_clause, market_params = market_clause_and_params(market_allowlist)
+    params.extend(market_params)
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        select o.bookmaker_id, count(*)
+        from odds_outcomes o
+        join fixtures f on f.id = o.fixture_id
+        where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
+          {league_clause}
+          {market_clause}
+        group by o.bookmaker_id
+        order by o.bookmaker_id
+        """,
+        params,
+    )
+    return {str(row[0]): int(row[1]) for row in cur.fetchall()}
 
 
 def stage_and_upsert(
@@ -833,6 +869,40 @@ from scoped;
 """
 
 
+def bookmaker_counts_query(days_forward: int, league_ids: List[int]) -> str:
+    league_filter = ""
+    if league_ids:
+        league_filter = f"league_id = any({sql_array(league_ids)}) and"
+    return f"""
+select
+  o.bookmaker_id,
+  count(*)::bigint as rows
+from public.odds_outcomes o
+join public.fixtures f on f.id = o.fixture_id
+where {league_filter}
+  f.starting_at >= (now() at time zone 'utc')
+  and f.starting_at < (now() at time zone 'utc') + interval '{days_forward} days'
+group by o.bookmaker_id
+order by o.bookmaker_id;
+"""
+
+
+def parse_bookmaker_counts(output: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for line in (output or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        key = parts[0].strip()
+        if not key:
+            continue
+        try:
+            counts[key] = int(parts[1])
+        except ValueError:
+            continue
+    return counts
+
+
 def coverage_baseline_query(days_back: int, league_ids: List[int]) -> str:
     league_filter = ""
     if league_ids:
@@ -1041,6 +1111,7 @@ def main() -> None:
 
     total_rows_all = 0
     total_rows_estimate = 0
+    sqlite_bookmaker_counts: Dict[str, int] = {}
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
         start_dt, end_dt = sqlite_window_bounds(args.days_forward)
@@ -1066,6 +1137,12 @@ def main() -> None:
             """,
             [start_dt, end_dt, *effective_leagues, *market_params],
         ).fetchone()[0]
+        sqlite_bookmaker_counts = fetch_sqlite_bookmaker_counts(
+            conn,
+            effective_leagues,
+            args.days_forward,
+            market_allowlist,
+        )
 
     market_stats: List[Dict[str, object]] = []
     stored_by_market: Dict[str, int] = {}
@@ -1355,6 +1432,20 @@ def main() -> None:
         except ValueError:
             snapshots_deleted = 0
 
+    supabase_bookmaker_counts: Dict[str, int] = {}
+    if ingest_ok:
+        try:
+            bookmaker_out = run_psql(
+                DB_URL,
+                bookmaker_counts_query(args.days_forward, effective_leagues),
+                label="bookmaker_counts",
+                err_path=err_path,
+                out_path=out_path,
+            )
+            supabase_bookmaker_counts = parse_bookmaker_counts(bookmaker_out)
+        except subprocess.CalledProcessError as exc:
+            print(f"bookmaker counts failed; continuing: {exc}", flush=True)
+
     coverage_total = 0
     coverage_mapped = 0
     coverage_pct = 0.0
@@ -1449,6 +1540,11 @@ def main() -> None:
         "psql_err_tail": psql_err_tail,
         "psql_out_tail": psql_out_tail,
         "csv_summary": csv_summary_data,
+        "sqlite_rows_by_bookmaker": sqlite_bookmaker_counts,
+        "csv_rows_by_bookmaker": (
+            (csv_summary_data or {}).get("rows_by_bookmaker_id", {}) if csv_summary_data else {}
+        ),
+        "supabase_rows_by_bookmaker": supabase_bookmaker_counts,
         "start_time": start_iso,
         "end_time": end_iso,
         "runtime_seconds": round(end_time - start_time, 2),
