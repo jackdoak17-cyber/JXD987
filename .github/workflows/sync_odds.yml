@@ -139,11 +139,13 @@ jobs:
         if: env.PSQL_PREFLIGHT_OK == 'true'
         env:
           ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
           echo "LEAGUES_ARG=[${{ matrix.league_id }}]"
           python3 scripts/sync_odds.py \
             --leagues "${{ matrix.league_id }}" \
             --days-forward 14 \
+            --refresh-upcoming \
             --bookmakers "${ODDS_BOOKMAKERS}" \
             --report-out /tmp/odds_sync_report_${{ matrix.league_id }}.json \
             --unmatched-out /tmp/unmatched_players_${{ matrix.league_id }}.json
