@@ -1631,6 +1631,7 @@ def main() -> None:
     debug_samples: List[Dict] = []
     debug_fuzzy_matches: List[Dict] = []
     rate_limit_skipped: List[int] = []
+    rate_limit_first: Optional[Dict[str, object]] = None
     fixtures_processed = 0
     raw_allowlist = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
     market_allowlist = load_market_allowlist()
@@ -1673,7 +1674,21 @@ def main() -> None:
         except SportMonksError as exc:
             if exc.status_code == 429:
                 rate_limit_skipped.append(fixture_id)
+                if not rate_limit_first:
+                    endpoint_hint = (
+                        f"odds/pre-match/fixtures/{fixture_id}"
+                        if args.odds_endpoint == "fixture"
+                        else f"odds/pre-match/fixtures/{fixture_id}/bookmakers/{args.bookmaker_id}"
+                    )
+                    rate_limit_first = {
+                        "fixture_id": fixture_id,
+                        "endpoint": endpoint_hint,
+                    }
                 log.warning("Skipping fixture %s due to rate limit.", fixture_id)
+                max_skips = int(os.environ.get("SM_RATE_LIMIT_MAX_SKIPS", "0") or 0)
+                if max_skips and len(rate_limit_skipped) >= max_skips:
+                    log.warning("Rate limit skip cap reached (%s). Aborting league.", max_skips)
+                    break
                 continue
             raise
         snapshot = {
@@ -1800,6 +1815,7 @@ def main() -> None:
             "fixtures_processed": fixtures_processed,
             "fixtures_skipped_rate_limit": len(rate_limit_skipped),
             "fixtures_skipped_rate_limit_ids": rate_limit_skipped[:200],
+            "rate_limit_first": rate_limit_first,
             "market_ids_filter": market_ids,
             "odds_endpoint": args.odds_endpoint,
             "api_calls_total": stats.get("total_calls", 0),

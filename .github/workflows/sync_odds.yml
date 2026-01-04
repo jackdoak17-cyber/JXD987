@@ -49,9 +49,10 @@ jobs:
       ODDS_ADVISORY_LOCK_KEY: "982374"
       ODDS_MARKET_ALLOWLIST: ${{ vars.ODDS_MARKET_ALLOWLIST }}
       ODDS_MARKET_ID_ALLOWLIST: ${{ vars.ODDS_MARKET_ID_ALLOWLIST }}
-      SM_RATE_LIMIT_RETRIES: ${{ vars.SM_RATE_LIMIT_RETRIES || '6' }}
+      SM_RATE_LIMIT_RETRIES: ${{ vars.SM_RATE_LIMIT_RETRIES || '3' }}
       SM_RATE_LIMIT_SLEEP_BASE: ${{ vars.SM_RATE_LIMIT_SLEEP_BASE || '1' }}
-      SM_RATE_LIMIT_SLEEP_MAX: ${{ vars.SM_RATE_LIMIT_SLEEP_MAX || '60' }}
+      SM_RATE_LIMIT_SLEEP_MAX: ${{ vars.SM_RATE_LIMIT_SLEEP_MAX || '10' }}
+      SM_RATE_LIMIT_MAX_SKIPS: ${{ vars.SM_RATE_LIMIT_MAX_SKIPS || '3' }}
       SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       PGSSLMODE: require
@@ -147,7 +148,7 @@ jobs:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
           echo "LEAGUES_ARG=[${{ matrix.league_id }}]"
-          cmd="python3 scripts/sync_odds.py --leagues \"${{ matrix.league_id }}\" --days-forward 14 --refresh-upcoming --per-page 100 --report-out /tmp/odds_sync_report_${{ matrix.league_id }}.json --unmatched-out /tmp/unmatched_players_${{ matrix.league_id }}.json"
+          cmd="python3 scripts/sync_odds.py --leagues \"${{ matrix.league_id }}\" --days-forward 14 --refresh-upcoming --per-page 100 --odds-endpoint fixture --no-fixture-fallback --report-out /tmp/odds_sync_report_${{ matrix.league_id }}.json --unmatched-out /tmp/unmatched_players_${{ matrix.league_id }}.json"
           if [ "$MODE" = "full" ]; then
             cmd="$cmd --refresh-squads"
           else
