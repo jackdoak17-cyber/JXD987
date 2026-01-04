@@ -61,6 +61,8 @@ DEFAULT_MARKET_ALLOWLIST = {
     "player_to_assist",
     "player_to_score_or_assist",
     "player_card",
+    "player_tackles",
+    "player_goalkeeper_saves",
 }
 
 TEAM_MARKETS = {"team_shots", "team_shots_on_target"}
@@ -135,6 +137,16 @@ MARKET_NAME_MAP = {
     "player_to_score": "player_to_score",
     "player_to_assist": "player_to_assist",
     "player_to_score_or_assist": "player_to_score_or_assist",
+    "player_tackles": "player_tackles",
+    "player_tackles_over_under": "player_tackles",
+    "tackles": "player_tackles",
+    "goalkeeper_saves": "player_goalkeeper_saves",
+    "goalkeeper_saves_over_under": "player_goalkeeper_saves",
+    "goalie_saves": "player_goalkeeper_saves",
+    "keeper_saves": "player_goalkeeper_saves",
+    "player_saves": "player_goalkeeper_saves",
+    "player_saves_over_under": "player_goalkeeper_saves",
+    "player_goalkeeper_saves": "player_goalkeeper_saves",
 }
 
 
@@ -322,6 +334,11 @@ def resolve_market_key(market_name: str) -> Optional[str]:
         return mapped
     if mapped:
         return mapped
+    if "tackle" in key and "team" not in key and "match" not in key:
+        return "player_tackles"
+    if "save" in key and "team" not in key and "match" not in key:
+        if any(token in key for token in ("goalkeeper", "keeper", "goalie", "player")):
+            return "player_goalkeeper_saves"
     if key in DEFAULT_MARKET_ALLOWLIST:
         return key
     return None

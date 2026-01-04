@@ -45,6 +45,8 @@ DEFAULT_MARKET_ALLOWLIST = {
     "player_to_assist",
     "player_to_score_or_assist",
     "player_card",
+    "player_tackles",
+    "player_goalkeeper_saves",
 }
 
 
