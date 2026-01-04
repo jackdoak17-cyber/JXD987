@@ -1232,28 +1232,23 @@ def _extract_next_page(pagination: Optional[Dict], current_page: int) -> Optiona
     return None
 
 
-def fetch_odds_for_fixture(
+def _fetch_odds_endpoint(
     client: SportMonksClient,
-    fixture_id: int,
-    bookmaker_id: int,
-    market_ids: Optional[List[int]] = None,
-    per_page: int = 50,
+    endpoint: str,
+    params: Dict[str, object],
+    per_page: int,
 ) -> List[Dict]:
-    endpoint = f"odds/pre-match/fixtures/{fixture_id}/bookmakers/{bookmaker_id}"
-    base_params: Dict[str, object] = {"per_page": per_page}
-    if market_ids:
-        base_params["filters"] = f"markets:{','.join(str(m) for m in market_ids)}"
     rows: List[Dict] = []
     page = 1
     while True:
-        params = dict(base_params)
-        params["page"] = page
+        page_params = dict(params)
+        page_params["page"] = page
         try:
-            payload = client.request("GET", endpoint, params=params)
+            payload = client.request("GET", endpoint, params=page_params)
         except SportMonksError as exc:
             status = exc.status_code
             if status in {404, 422}:
-                log.info("No odds available for fixture %s (status %s)", fixture_id, status)
+                log.info("No odds available for endpoint %s (status %s)", endpoint, status)
                 return []
             raise
         data = payload.get("data") if isinstance(payload, dict) else None
@@ -1270,6 +1265,91 @@ def fetch_odds_for_fixture(
         if not page_rows or len(page_rows) < per_page:
             break
         page += 1
+    return rows
+
+
+def _rows_have_shot_totals(rows: List[Dict]) -> bool:
+    shot_keys = {
+        "team_shots",
+        "team_shots_on_target",
+        "match_shots",
+        "match_shots_on_target",
+    }
+    for row in rows:
+        if resolve_market_key(row) in shot_keys:
+            return True
+    return False
+
+
+def _merge_odds_rows(primary: List[Dict], extra: List[Dict]) -> List[Dict]:
+    seen = set()
+    merged: List[Dict] = []
+    for row in primary:
+        row_id = row.get("id")
+        key = ("id", row_id) if row_id is not None else (
+            row.get("market_id"),
+            row.get("name"),
+            row.get("label"),
+            row.get("line"),
+            row.get("value"),
+            row.get("total"),
+            row.get("participant_id"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    for row in extra:
+        row_id = row.get("id")
+        key = ("id", row_id) if row_id is not None else (
+            row.get("market_id"),
+            row.get("name"),
+            row.get("label"),
+            row.get("line"),
+            row.get("value"),
+            row.get("total"),
+            row.get("participant_id"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    return merged
+
+
+def fetch_odds_for_fixture(
+    client: SportMonksClient,
+    fixture_id: int,
+    bookmaker_id: int,
+    market_ids: Optional[List[int]] = None,
+    per_page: int = 50,
+    odds_endpoint: str = "bookmaker",
+    fallback_fixture: bool = True,
+) -> List[Dict]:
+    fixture_endpoint = f"odds/pre-match/fixtures/{fixture_id}"
+    bookmaker_endpoint = f"odds/pre-match/fixtures/{fixture_id}/bookmakers/{bookmaker_id}"
+
+    fixture_params: Dict[str, object] = {"per_page": per_page, "filter": f"bookmakers:{bookmaker_id}"}
+    if market_ids:
+        fixture_params["filters"] = f"markets:{','.join(str(m) for m in market_ids)}"
+
+    bookmaker_params: Dict[str, object] = {"per_page": per_page}
+    if market_ids:
+        bookmaker_params["filters"] = f"markets:{','.join(str(m) for m in market_ids)}"
+
+    odds_endpoint = (odds_endpoint or "bookmaker").lower()
+    if odds_endpoint == "fixture":
+        return _fetch_odds_endpoint(client, fixture_endpoint, fixture_params, per_page)
+    if odds_endpoint == "both":
+        fixture_rows = _fetch_odds_endpoint(client, fixture_endpoint, fixture_params, per_page)
+        bookmaker_rows = _fetch_odds_endpoint(client, bookmaker_endpoint, bookmaker_params, per_page)
+        return _merge_odds_rows(bookmaker_rows, fixture_rows)
+
+    rows = _fetch_odds_endpoint(client, bookmaker_endpoint, bookmaker_params, per_page)
+    if fallback_fixture and not market_ids and not _rows_have_shot_totals(rows):
+        fixture_rows = _fetch_odds_endpoint(client, fixture_endpoint, fixture_params, per_page)
+        if fixture_rows:
+            rows = _merge_odds_rows(rows, fixture_rows)
     return rows
 
 
@@ -1294,6 +1374,18 @@ def main() -> None:
         type=int,
         default=50,
         help="Rows per page when fetching odds.",
+    )
+    parser.add_argument(
+        "--odds-endpoint",
+        default="bookmaker",
+        choices=["bookmaker", "fixture", "both"],
+        help="Odds endpoint to use: bookmaker (default), fixture, or both (merge).",
+    )
+    parser.add_argument(
+        "--no-fixture-fallback",
+        dest="fixture_fallback",
+        action="store_false",
+        help="Disable fixture endpoint fallback when shot totals are missing.",
     )
     parser.add_argument(
         "--debug-fixture",
@@ -1345,6 +1437,7 @@ def main() -> None:
         help="Print line/side parsing examples and exit.",
     )
     parser.set_defaults(refresh_squads_missing=True)
+    parser.set_defaults(fixture_fallback=True)
     args = parser.parse_args()
 
     if args.debug_parse_examples:
@@ -1383,6 +1476,8 @@ def main() -> None:
             args.bookmaker_id,
             market_ids=market_ids or None,
             per_page=args.per_page,
+            odds_endpoint=args.odds_endpoint,
+            fallback_fixture=args.fixture_fallback,
         )
         log.info("Debug fixture %s markets=%s", fixture_id, len(data))
         markets = {}
@@ -1539,6 +1634,8 @@ def main() -> None:
             args.bookmaker_id,
             market_ids=market_ids or None,
             per_page=args.per_page,
+            odds_endpoint=args.odds_endpoint,
+            fallback_fixture=args.fixture_fallback,
         )
         snapshot = {
             "fixture_id": fixture_id,
