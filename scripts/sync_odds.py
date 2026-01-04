@@ -34,7 +34,12 @@ DEFAULT_BOOKMAKERS = ["Bet365", "Kambi", "Paddy Power"]
 BOOKMAKER_NAME_TO_ID = {
     "bet365": 2,
     "kambi": 3,
-    "paddy power": 4,
+    "paddypower": 4,
+}
+BOOKMAKER_CANONICAL = {
+    "bet365": "Bet365",
+    "kambi": "Kambi",
+    "paddypower": "Paddy Power",
 }
 
 DEFAULT_MARKET_ALLOWLIST = {
@@ -209,6 +214,34 @@ def normalize_market_key(value: str) -> str:
     if not value:
         return ""
     return re.sub(r"[^a-z0-9_]+", "_", value.strip().lower()).strip("_")
+
+
+def normalize_bookmaker_key(value: str) -> str:
+    raw = re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+    if "bet365" in raw:
+        return "bet365"
+    if "kambi" in raw:
+        return "kambi"
+    if "paddypower" in raw or ("paddy" in raw and "power" in raw):
+        return "paddypower"
+    return raw
+
+
+def canonicalize_bookmakers(raw_items: Iterable[str]) -> Tuple[List[str], List[str]]:
+    canonical: List[str] = []
+    unknown: List[str] = []
+    seen = set()
+    for item in raw_items:
+        key = normalize_bookmaker_key(item)
+        name = BOOKMAKER_CANONICAL.get(key)
+        if not name:
+            unknown.append(item)
+            continue
+        if name in seen:
+            continue
+        seen.add(name)
+        canonical.append(name)
+    return canonical, unknown
 
 
 def load_market_allowlist() -> Optional[set]:
@@ -394,6 +427,8 @@ def match_event_to_fixture(event: Dict[str, object], fixtures: List[Dict[str, ob
         event_dt = None
     best = None
     best_score = 0.0
+    best_min = 0.0
+    second_best = 0.0
     for fixture in fixtures:
         fixture_dt = fixture.get("starting_at")
         if event_dt and fixture_dt:
@@ -402,12 +437,22 @@ def match_event_to_fixture(event: Dict[str, object], fixtures: List[Dict[str, ob
                 continue
         home_score = score_name_match(event_home, fixture.get("home_alias") or [])
         away_score = score_name_match(event_away, fixture.get("away_alias") or [])
-        if home_score >= 0.9 and away_score >= 0.9:
-            combined = home_score + away_score
-            if combined > best_score:
-                best_score = combined
-                best = fixture
-    return best
+        combined = home_score + away_score
+        if combined > best_score:
+            second_best = best_score
+            best_score = combined
+            best_min = min(home_score, away_score)
+            best = fixture
+
+    if not best:
+        return None
+    if best_min < 0.8:
+        return None
+    if best_score >= 1.85:
+        return best
+    if best_score >= 1.7 and (best_score - second_best) >= 0.1:
+        return best
+    return None
 
 
 def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[int, Optional[int]]]]:
@@ -783,7 +828,7 @@ def parse_markets_for_fixture(
     unmatched_details: List[Dict[str, object]],
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
-    bookmaker_id = BOOKMAKER_NAME_TO_ID.get(bookmaker_name.lower())
+    bookmaker_id = BOOKMAKER_NAME_TO_ID.get(normalize_bookmaker_key(bookmaker_name))
     if not bookmaker_id:
         return rows
 
@@ -1022,7 +1067,7 @@ def parse_markets_for_fixture_extended(
     unmatched_details: List[Dict[str, object]],
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
-    bookmaker_id = BOOKMAKER_NAME_TO_ID.get(bookmaker_name.lower())
+    bookmaker_id = BOOKMAKER_NAME_TO_ID.get(normalize_bookmaker_key(bookmaker_name))
     if not bookmaker_id:
         return rows
     fixture_id = int(fixture["fixture_id"])
@@ -1242,10 +1287,13 @@ def main() -> None:
         raise SystemExit("No league IDs provided")
 
     market_allowlist = load_market_allowlist()
-    bookmakers = [b.strip() for b in str(args.bookmakers).split(",") if b.strip()]
+    raw_bookmakers = [b.strip() for b in str(args.bookmakers).split(",") if b.strip()]
+    if not raw_bookmakers:
+        raw_bookmakers = list(DEFAULT_BOOKMAKERS)
+    bookmakers, unknown_bookmakers_requested = canonicalize_bookmakers(raw_bookmakers)
     if not bookmakers:
-        bookmakers = list(DEFAULT_BOOKMAKERS)
-    bookmakers_by_lower = {b.lower(): b for b in bookmakers}
+        raise SystemExit("No valid bookmakers provided")
+    requested_bookmaker_keys = {normalize_bookmaker_key(b) for b in bookmakers}
 
     engine = get_engine()
     session = get_session(engine)
@@ -1264,6 +1312,11 @@ def main() -> None:
     event_map: Dict[int, int] = {}
     events_raw: Dict[int, object] = {}
     odds_raw: Dict[int, object] = {}
+    events_unmatched_samples: List[Dict[str, object]] = []
+    bookmaker_names_seen: set[str] = set()
+    bookmaker_names_saved: set[str] = set()
+    bookmaker_names_unknown: set[str] = set()
+    league_stats: Dict[int, Dict[str, int]] = {}
 
     for league_id in league_ids:
         odds_league = league_map.get(league_id)
@@ -1273,6 +1326,11 @@ def main() -> None:
         league_fixtures = [f for f in fixtures if f["league_id"] == league_id]
         if not league_fixtures:
             continue
+        league_stats[league_id] = {
+            "fixtures_in_window": len(league_fixtures),
+            "events_returned": 0,
+            "events_matched": 0,
+        }
         start_dt, end_dt = fixture_window_bounds(args.days_forward)
         params = {
             "sport": args.sport,
@@ -1292,12 +1350,24 @@ def main() -> None:
         events_raw[league_id] = events
 
         for event in events:
+            league_stats[league_id]["events_returned"] += 1
             fixture = match_event_to_fixture(event, league_fixtures)
             if not fixture:
+                if len(events_unmatched_samples) < 20:
+                    events_unmatched_samples.append(
+                        {
+                            "league_id": league_id,
+                            "event_id": event.get("id"),
+                            "home": event.get("home"),
+                            "away": event.get("away"),
+                            "date": event.get("date"),
+                        }
+                    )
                 continue
             event_id = event.get("id")
             if event_id is None:
                 continue
+            league_stats[league_id]["events_matched"] += 1
             event_map[int(event_id)] = fixture["fixture_id"]
 
     if not event_map:
@@ -1337,9 +1407,14 @@ def main() -> None:
             if args.debug_odds_out:
                 odds_raw[int(event_id)] = bookmakers_payload
             for bookmaker_name, markets in bookmakers_payload.items():
-                canonical_name = bookmakers_by_lower.get(bookmaker_name.lower())
-                if not canonical_name:
+                bookmaker_names_seen.add(bookmaker_name)
+                book_key = normalize_bookmaker_key(bookmaker_name)
+                if book_key not in requested_bookmaker_keys:
                     continue
+                if book_key not in BOOKMAKER_NAME_TO_ID:
+                    bookmaker_names_unknown.add(bookmaker_name)
+                    continue
+                canonical_name = BOOKMAKER_CANONICAL.get(book_key, bookmaker_name)
                 rows = parse_markets_for_fixture_extended(
                     fixture,
                     markets,
@@ -1351,6 +1426,7 @@ def main() -> None:
                 if rows:
                     upsert_outcomes(session, rows)
                     outcomes_total += len(rows)
+                    bookmaker_names_saved.add(canonical_name)
             session.commit()
 
     log.info("Odds sync complete: outcomes=%s", outcomes_total)
@@ -1381,7 +1457,14 @@ def main() -> None:
         report = {
             "league_ids": league_ids,
             "bookmakers": bookmakers,
+            "bookmakers_requested": bookmakers,
+            "bookmakers_unknown_requested": unknown_bookmakers_requested,
+            "bookmakers_seen": sorted(bookmaker_names_seen),
+            "bookmakers_saved": sorted(bookmaker_names_saved),
+            "bookmakers_unknown_seen": sorted(bookmaker_names_unknown),
             "events_matched": len(event_map),
+            "events_unmatched_samples": events_unmatched_samples,
+            "league_stats": league_stats,
             "outcomes_written": outcomes_total,
             "api_calls_total": client.stats.total_calls,
             "api_calls_by_endpoint": client.stats.calls_by_endpoint,
