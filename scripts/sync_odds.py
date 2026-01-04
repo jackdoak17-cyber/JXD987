@@ -23,6 +23,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import bindparam, text
 
+from jxd import SportMonksClient, SyncService
 from jxd.db import get_engine, get_session
 from jxd.models import Base
 from jxd.odds_api_client import OddsApiClient, OddsApiError
@@ -1260,6 +1261,11 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="Limit events processed")
     parser.add_argument("--sport", default="football")
     parser.add_argument(
+        "--refresh-upcoming",
+        action="store_true",
+        help="Refresh upcoming fixtures from SportMonks before fetching odds.",
+    )
+    parser.add_argument(
         "--unmatched-out",
         default="",
         help="Write unmatched player odds to JSON (fixture_id, market_key, selection_key, raw_name)",
@@ -1298,6 +1304,15 @@ def main() -> None:
     engine = get_engine()
     session = get_session(engine)
     Base.metadata.create_all(engine)
+
+    if args.refresh_upcoming:
+        if not os.environ.get("SPORTMONKS_API_TOKEN"):
+            raise SystemExit("Missing SPORTMONKS_API_TOKEN for --refresh-upcoming")
+        client_sm = SportMonksClient()
+        svc = SyncService(client_sm, session)
+        svc.ensure_schema()
+        log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
+        svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
 
     fixtures = load_fixtures(session, league_ids, args.days_forward)
     if not fixtures:
