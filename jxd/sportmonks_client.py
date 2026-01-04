@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from typing import Dict, Iterator, List, Optional
@@ -24,12 +25,56 @@ class SportMonksClient:
         timeout: int = 20,
         max_retries: int = 5,
     ) -> None:
+        self.log = logging.getLogger(__name__)
         self.api_token = api_token or os.environ.get("SPORTMONKS_API_TOKEN")
         if not self.api_token:
             raise SportMonksError("SPORTMONKS_API_TOKEN is required")
         self.base_url = base_url.rstrip("/") + "/"
         self.timeout = timeout
         self.max_retries = max_retries
+        self.rate_limit_retries = int(os.environ.get("SM_RATE_LIMIT_RETRIES", str(max_retries)))
+        self.rate_limit_sleep_base = float(os.environ.get("SM_RATE_LIMIT_SLEEP_BASE", "1"))
+        self.rate_limit_sleep_max = float(os.environ.get("SM_RATE_LIMIT_SLEEP_MAX", "60"))
+        self.stats: Dict[str, object] = {
+            "total_calls": 0,
+            "total_time_seconds": 0.0,
+            "by_endpoint": {},
+            "rate_limit_hits": 0,
+            "rate_limit_retries": 0,
+        }
+
+    def _record_stats(self, endpoint: str, elapsed: float) -> None:
+        self.stats["total_calls"] = int(self.stats.get("total_calls", 0)) + 1
+        self.stats["total_time_seconds"] = float(self.stats.get("total_time_seconds", 0.0)) + float(elapsed)
+        by_endpoint = self.stats.get("by_endpoint")
+        if not isinstance(by_endpoint, dict):
+            by_endpoint = {}
+            self.stats["by_endpoint"] = by_endpoint
+        by_endpoint[endpoint] = int(by_endpoint.get(endpoint, 0)) + 1
+
+    def _retry_after_seconds(self, resp: requests.Response) -> Optional[float]:
+        retry_after = resp.headers.get("Retry-After") or resp.headers.get("retry-after")
+        if retry_after:
+            try:
+                return float(retry_after)
+            except ValueError:
+                return None
+        reset = (
+            resp.headers.get("X-RateLimit-Reset")
+            or resp.headers.get("x-ratelimit-reset")
+            or resp.headers.get("RateLimit-Reset")
+        )
+        if reset:
+            try:
+                reset_val = float(reset)
+            except ValueError:
+                return None
+            now = time.time()
+            if reset_val > now:
+                return max(0.0, reset_val - now)
+            if reset_val > 0 and reset_val < 3600:
+                return reset_val
+        return None
 
     def request(self, method: str, endpoint: str, params: Optional[Dict[str, object]] = None) -> Dict:
         url = self.base_url + endpoint.lstrip("/")
@@ -40,7 +85,10 @@ class SportMonksClient:
         while True:
             attempt += 1
             try:
+                start = time.time()
                 resp = requests.request(method, url, params=params, timeout=self.timeout)
+                elapsed = time.time() - start
+                self._record_stats(endpoint, elapsed)
             except Exception as exc:
                 if attempt >= self.max_retries:
                     raise SportMonksError(f"Request failed after retries: {exc}") from exc
@@ -58,7 +106,29 @@ class SportMonksClient:
                         response_text=resp.text,
                     ) from exc
 
-            if resp.status_code in (429,) or 500 <= resp.status_code < 600:
+            if resp.status_code == 429:
+                self.stats["rate_limit_hits"] = int(self.stats.get("rate_limit_hits", 0)) + 1
+                if attempt >= self.rate_limit_retries:
+                    raise SportMonksError(
+                        f"SportMonks request failed 429: {resp.text}",
+                        status_code=resp.status_code,
+                        response_text=resp.text,
+                    )
+                retry_after = self._retry_after_seconds(resp)
+                sleep_for = retry_after if retry_after is not None else min(backoff, self.rate_limit_sleep_max)
+                self.stats["rate_limit_retries"] = int(self.stats.get("rate_limit_retries", 0)) + 1
+                self.log.warning(
+                    "Rate limited on %s (attempt %s/%s). Sleeping %.1fs.",
+                    endpoint,
+                    attempt,
+                    self.rate_limit_retries,
+                    sleep_for,
+                )
+                time.sleep(max(0.0, sleep_for))
+                backoff = min(backoff * 2, self.rate_limit_sleep_max)
+                continue
+
+            if 500 <= resp.status_code < 600:
                 if attempt >= self.max_retries:
                     raise SportMonksError(
                         f"SportMonks request failed {resp.status_code}: {resp.text}",

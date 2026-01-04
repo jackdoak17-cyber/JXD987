@@ -25,7 +25,7 @@ on:
 
 concurrency:
   group: sync-odds
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   prices:
@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         league_id: [8, 9, 384, 387, 564, 567, 82, 301, 600, 501, 444, 72]
     env:
@@ -48,6 +48,10 @@ jobs:
       ODDS_IDLE_TX_TIMEOUT: "0"
       ODDS_ADVISORY_LOCK_KEY: "982374"
       ODDS_MARKET_ALLOWLIST: ${{ vars.ODDS_MARKET_ALLOWLIST }}
+      ODDS_MARKET_ID_ALLOWLIST: ${{ vars.ODDS_MARKET_ID_ALLOWLIST }}
+      SM_RATE_LIMIT_RETRIES: ${{ vars.SM_RATE_LIMIT_RETRIES || '6' }}
+      SM_RATE_LIMIT_SLEEP_BASE: ${{ vars.SM_RATE_LIMIT_SLEEP_BASE || '1' }}
+      SM_RATE_LIMIT_SLEEP_MAX: ${{ vars.SM_RATE_LIMIT_SLEEP_MAX || '60' }}
       SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       PGSSLMODE: require
@@ -143,15 +147,29 @@ jobs:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
           echo "LEAGUES_ARG=[${{ matrix.league_id }}]"
-          cmd="python3 scripts/sync_odds.py --leagues \"${{ matrix.league_id }}\" --days-forward 14 --refresh-upcoming --unmatched-out /tmp/unmatched_players_${{ matrix.league_id }}.json"
+          cmd="python3 scripts/sync_odds.py --leagues \"${{ matrix.league_id }}\" --days-forward 14 --refresh-upcoming --per-page 100 --report-out /tmp/odds_sync_report_${{ matrix.league_id }}.json --unmatched-out /tmp/unmatched_players_${{ matrix.league_id }}.json"
           if [ "$MODE" = "full" ]; then
             cmd="$cmd --refresh-squads"
+          else
+            cmd="$cmd --no-refresh-squads-missing"
           fi
           $cmd
 
       - name: Upload unmatched players
-        if: false
-        run: echo "Skipping unmatched players artifact."
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unmatched_players_${{ matrix.league_id }}
+          path: /tmp/unmatched_players_${{ matrix.league_id }}.json
+          if-no-files-found: ignore
+
+      - name: Upload sync report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: odds_sync_report_${{ matrix.league_id }}
+          path: /tmp/odds_sync_report_${{ matrix.league_id }}.json
+          if-no-files-found: ignore
 
       - name: DB-direct odds ingest (psql)
         if: env.PSQL_PREFLIGHT_OK == 'true'
@@ -160,6 +178,7 @@ jobs:
           SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
           PGSSLMODE: require
+          ODDS_SYNC_REPORT_PATH: /tmp/odds_sync_report_${{ matrix.league_id }}.json
         run: |
           set +e
           set -o pipefail

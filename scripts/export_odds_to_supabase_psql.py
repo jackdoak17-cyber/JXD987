@@ -1442,6 +1442,16 @@ def main() -> None:
     if allowlist_enabled:
         allowlist_dropped_rows = max(0, total_rows_all - total_rows_estimate)
 
+    sync_report: Optional[Dict[str, object]] = None
+    sync_report_path = os.environ.get("ODDS_SYNC_REPORT_PATH")
+    if sync_report_path:
+        sync_path = Path(sync_report_path)
+        if sync_path.exists():
+            try:
+                sync_report = json.loads(sync_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                print(f"Failed to parse sync report {sync_report_path}: {exc}", flush=True)
+
     report = {
         "ok": ingest_ok,
         "error_stage": error_stage,
@@ -1467,6 +1477,7 @@ def main() -> None:
         "allowlist_dropped_rows": allowlist_dropped_rows,
         "dropped_by_allowlist": dropped_by_allowlist,
         "stored_by_market": stored_by_market,
+        "sync_report": sync_report,
         "league_ids": effective_leagues,
         "league_id": effective_leagues[0] if len(effective_leagues) == 1 else None,
         "sqlite_rows_total": total_rows_all,

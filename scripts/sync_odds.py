@@ -17,6 +17,7 @@ import unicodedata
 import difflib
 import urllib.parse
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import bindparam, text
@@ -1421,6 +1422,11 @@ def main() -> None:
         help="Write unmatched player odds to JSON (fixture_id, market_key, selection_key, raw_name)",
     )
     parser.add_argument(
+        "--report-out",
+        default="",
+        help="Write sync summary report JSON (per league).",
+    )
+    parser.add_argument(
         "--debug-mapping-out",
         default="",
         help="Write mapping debug samples to JSON.",
@@ -1463,22 +1469,36 @@ def main() -> None:
         raise SystemExit("No league IDs provided")
 
     market_ids: List[int] = []
-    if args.market_ids:
-        raw_markets = args.market_ids.replace('"', "").replace("'", "")
+    raw_markets = args.market_ids
+    if not raw_markets:
+        raw_markets = os.environ.get("ODDS_MARKET_ID_ALLOWLIST", "")
+    if raw_markets:
+        raw_markets = raw_markets.replace('"', "").replace("'", "")
         market_ids = [int(x) for x in raw_markets.split(",") if x.strip()]
 
     client = SportMonksClient()
     if args.debug_fixture:
         fixture_id = int(args.debug_fixture)
-        data = fetch_odds_for_fixture(
-            client,
-            fixture_id,
-            args.bookmaker_id,
-            market_ids=market_ids or None,
-            per_page=args.per_page,
-            odds_endpoint=args.odds_endpoint,
-            fallback_fixture=args.fixture_fallback,
-        )
+        try:
+            data = fetch_odds_for_fixture(
+                client,
+                fixture_id,
+                args.bookmaker_id,
+                market_ids=market_ids or None,
+                per_page=args.per_page,
+                odds_endpoint=args.odds_endpoint,
+                fallback_fixture=args.fixture_fallback,
+            )
+        except SportMonksError as exc:
+            log.warning("Debug fixture %s failed: %s", fixture_id, exc)
+            if args.report_out:
+                report = {
+                    "fixture_id": fixture_id,
+                    "error": str(exc),
+                    "status_code": exc.status_code,
+                }
+                Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+            return
         log.info("Debug fixture %s markets=%s", fixture_id, len(data))
         markets = {}
         shot_rows = []
@@ -1545,6 +1565,16 @@ def main() -> None:
                 log.info("%s", row)
         else:
             log.info("No shot totals markets (team/match) found for fixture %s", fixture_id)
+        if args.report_out:
+            report = {
+                "fixture_id": fixture_id,
+                "markets_total": len(data),
+                "shot_rows": shot_rows[:200],
+                "shot_totals_rows": shot_total_rows[:200],
+                "market_ids_filter": market_ids,
+                "odds_endpoint": args.odds_endpoint,
+            }
+            Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
         return
 
     engine = get_engine()
@@ -1600,6 +1630,8 @@ def main() -> None:
     unmatched_selection_counts: Dict[str, int] = {}
     debug_samples: List[Dict] = []
     debug_fuzzy_matches: List[Dict] = []
+    rate_limit_skipped: List[int] = []
+    fixtures_processed = 0
     raw_allowlist = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
     market_allowlist = load_market_allowlist()
     allowlist_enabled = market_allowlist is not None
@@ -1628,15 +1660,22 @@ def main() -> None:
         if args.debug_mapping_out:
             debug_team_players = load_team_player_names(session, [home_team_id, away_team_id], limit=50)
 
-        data = fetch_odds_for_fixture(
-            client,
-            fixture_id,
-            args.bookmaker_id,
-            market_ids=market_ids or None,
-            per_page=args.per_page,
-            odds_endpoint=args.odds_endpoint,
-            fallback_fixture=args.fixture_fallback,
-        )
+        try:
+            data = fetch_odds_for_fixture(
+                client,
+                fixture_id,
+                args.bookmaker_id,
+                market_ids=market_ids or None,
+                per_page=args.per_page,
+                odds_endpoint=args.odds_endpoint,
+                fallback_fixture=args.fixture_fallback,
+            )
+        except SportMonksError as exc:
+            if exc.status_code == 429:
+                rate_limit_skipped.append(fixture_id)
+                log.warning("Skipping fixture %s due to rate limit.", fixture_id)
+                continue
+            raise
         snapshot = {
             "fixture_id": fixture_id,
             "bookmaker_id": args.bookmaker_id,
@@ -1678,6 +1717,7 @@ def main() -> None:
         )
         upsert_outcomes(session, outcomes)
         session.commit()
+        fixtures_processed += 1
         if idx == 1 or idx % 100 == 0 or idx == len(fixtures):
             log.info(
                 "Processed fixture %s (%s/%s) outcomes=%s",
@@ -1751,6 +1791,28 @@ def main() -> None:
             log.info("Wrote debug mapping output to %s", args.debug_mapping_out)
         except OSError as exc:
             log.warning("Failed to write debug mapping output %s: %s", args.debug_mapping_out, exc)
+
+    if args.report_out:
+        stats = client.stats if hasattr(client, "stats") else {}
+        report = {
+            "league_ids": league_ids,
+            "fixtures_total": len(fixtures),
+            "fixtures_processed": fixtures_processed,
+            "fixtures_skipped_rate_limit": len(rate_limit_skipped),
+            "fixtures_skipped_rate_limit_ids": rate_limit_skipped[:200],
+            "market_ids_filter": market_ids,
+            "odds_endpoint": args.odds_endpoint,
+            "api_calls_total": stats.get("total_calls", 0),
+            "api_calls_by_endpoint": stats.get("by_endpoint", {}),
+            "api_time_seconds": round(float(stats.get("total_time_seconds", 0.0)), 2),
+            "api_rate_limit_hits": stats.get("rate_limit_hits", 0),
+            "api_rate_limit_retries": stats.get("rate_limit_retries", 0),
+        }
+        try:
+            Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+            log.info("Wrote sync report to %s", args.report_out)
+        except OSError as exc:
+            log.warning("Failed to write sync report %s: %s", args.report_out, exc)
 
 
 if __name__ == "__main__":
