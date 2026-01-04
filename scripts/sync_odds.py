@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Fetch Bet365 pre-match odds from SportMonks and store into SQLite.
-- Reads fixture IDs from the local SQLite fixtures table for the next N days
-- Calls /v3/football/odds/pre-match/fixtures/{fixture_id}?filter=bookmakers:2
-- Stores raw snapshots and normalized outcomes in odds_snapshots/odds_outcomes
+Sync pre-match odds from Odds-API.io into SQLite.
+
+- Maps Odds-API events to SportMonks fixtures in SQLite (by league + kickoff + team names).
+- Fetches odds via /odds/multi for selected bookmakers.
+- Normalizes markets into odds_outcomes.
 """
 
 from __future__ import annotations
@@ -15,113 +16,120 @@ import os
 import re
 import unicodedata
 import difflib
-import urllib.parse
-from datetime import datetime, timedelta
+import math
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy import bindparam, text
 
-from jxd import SportMonksClient
-from jxd.sportmonks_client import SportMonksError
-from jxd import SyncService
 from jxd.db import get_engine, get_session
 from jxd.models import Base
+from jxd.odds_api_client import OddsApiClient, OddsApiError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
-MARKET_ID_MAP = {
-    267: "player_shots_on_target",
-    268: "player_shots",
-    284: "team_shots_on_target",
-    285: "team_shots",
-    291: "match_shots_on_target",
-    292: "match_shots",
-    331: "player_to_score",
-    332: "player_to_assist",
-    333: "player_to_score_or_assist",
-}
-
-CANONICAL_TEAM_MARKETS = {
-    "moneyline",
-    "double_chance",
-    "draw_no_bet",
-    "handicap",
-    "card_handicap",
-    "team_shots",
-    "team_shots_on_target",
-    "team_cards",
-    "team_corners",
-    "team_most_cards",
-    "team_most_corners",
-    "team_most_shots",
-    "team_most_shots_on_target",
-    "to_score_a_penalty",
-}
-
-CANONICAL_MATCH_MARKETS = {
-    "goals_over_under",
-    "btts",
-    "corners_over_under",
-    "total_offsides",
-    "match_shots",
-    "match_shots_on_target",
-    "match_cards",
-}
-
-CANONICAL_PLAYER_MARKETS = {
-    "1st_goal_scorer",
-    "player_to_score",
-    "player_to_assist",
-    "player_to_score_or_assist",
-    "player_card",
-    "player_shots",
-    "player_shots_on_target",
-    "player_goalkeeper_saves",
-    "multi_scorers",
-    "last_goal_scorer",
+DEFAULT_BOOKMAKERS = ["Bet365", "Kambi", "Paddy Power"]
+BOOKMAKER_NAME_TO_ID = {
+    "bet365": 2,
+    "kambi": 3,
+    "paddy power": 4,
 }
 
 DEFAULT_MARKET_ALLOWLIST = {
     "moneyline",
     "double_chance",
     "draw_no_bet",
-    "handicap",
-    "card_handicap",
     "goals_over_under",
     "btts",
-    "corners_over_under",
-    "total_offsides",
     "match_shots",
     "match_shots_on_target",
-    "match_cards",
     "team_shots",
     "team_shots_on_target",
-    "team_cards",
-    "team_corners",
-    "team_most_cards",
-    "team_most_corners",
-    "team_most_shots",
-    "team_most_shots_on_target",
     "player_shots",
     "player_shots_on_target",
+    "player_fouls_committed",
+    "player_fouls_drawn",
+    "player_to_score",
     "player_to_assist",
     "player_to_score_or_assist",
     "player_card",
-    "player_goalkeeper_saves",
-    "full_time_result",
+}
+
+TEAM_MARKETS = {"team_shots", "team_shots_on_target"}
+MATCH_MARKETS = {"match_shots", "match_shots_on_target", "goals_over_under", "btts"}
+
+TEAM_NAME_ALIAS = {
+    "manutd": "manchesterunited",
+    "manunited": "manchesterunited",
+    "manchesterutd": "manchesterunited",
+    "mancity": "manchestercity",
+    "manchestercity": "manchestercity",
+    "manchester city": "manchestercity",
+    "psg": "parissaintgermain",
+    "paris saint germain": "parissaintgermain",
+    "spurs": "tottenhamhotspur",
+    "tottenham": "tottenhamhotspur",
+    "inter": "internazionale",
+    "acmilan": "milan",
+}
+
+TEAM_TOKEN_DROP = {
+    "fc",
+    "cf",
+    "sc",
+    "ac",
+    "afc",
+    "cfc",
+    "club",
+    "the",
+    "de",
+    "da",
+    "cd",
 }
 
 
-def load_market_allowlist() -> Optional[set]:
-    raw = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
-    if raw:
-        if raw.lower() in {"all", "*"}:
-            return None
-        items = {normalize_slug(item) for item in raw.split(",") if item.strip()}
-        return {item for item in items if item}
-    return set(DEFAULT_MARKET_ALLOWLIST)
+MARKET_NAME_MAP = {
+    "ml": "moneyline",
+    "match_result": "moneyline",
+    "full_time_result": "moneyline",
+    "full_time_result_90": "moneyline",
+    "draw_no_bet": "draw_no_bet",
+    "double_chance": "double_chance",
+    "goals_over_under": "goals_over_under",
+    "totals": "goals_over_under",
+    "both_teams_to_score": "btts",
+    "btts": "btts",
+    "match_shots": "match_shots",
+    "match_shots_on_target": "match_shots_on_target",
+    "total_shots": "match_shots",
+    "total_shots_on_target": "match_shots_on_target",
+    "team_shots_home": "team_shots_home",
+    "team_shots_away": "team_shots_away",
+    "team_shots_on_target_home": "team_shots_on_target_home",
+    "team_shots_on_target_away": "team_shots_on_target_away",
+    "total_shots_home": "team_shots_home",
+    "total_shots_away": "team_shots_away",
+    "total_shots_on_target_home": "team_shots_on_target_home",
+    "total_shots_on_target_away": "team_shots_on_target_away",
+    "player_shots": "player_shots",
+    "player_shots_over_under": "player_shots",
+    "player_shots_on_target": "player_shots_on_target",
+    "player_shots_on_target_over_under": "player_shots_on_target",
+    "player_fouls": "player_fouls_committed",
+    "player_fouls_committed": "player_fouls_committed",
+    "player_fouls_drawn": "player_fouls_drawn",
+    "player_fouls_won": "player_fouls_drawn",
+    "player_to_be_fouled": "player_fouls_drawn",
+    "player_cards": "player_card",
+    "player_to_be_booked": "player_card",
+    "player_booked": "player_card",
+    "anytime_goalscorer": "player_to_score",
+    "player_to_score": "player_to_score",
+    "player_to_assist": "player_to_assist",
+    "player_to_score_or_assist": "player_to_score_or_assist",
+}
 
 
 def normalize_slug(value: str) -> str:
@@ -143,6 +151,29 @@ def normalize_name_tokens(value: str) -> List[str]:
 def normalize_name(value: str) -> str:
     tokens = normalize_name_tokens(value)
     return "".join(tokens)
+
+
+def normalize_team_name(value: str) -> str:
+    if not value:
+        return ""
+    raw = value.lower().strip()
+    raw = raw.replace("&", "and")
+    tokens = [token for token in normalize_name_tokens(raw) if token not in TEAM_TOKEN_DROP]
+    normalized = "".join(tokens)
+    normalized = TEAM_NAME_ALIAS.get(normalized, normalized)
+    return normalized
+
+
+def team_aliases(value: str, short_code: Optional[str] = None) -> List[str]:
+    aliases = set()
+    if value:
+        aliases.add(normalize_team_name(value))
+    if short_code:
+        aliases.add(normalize_team_name(short_code))
+    for item in list(aliases):
+        if item in TEAM_NAME_ALIAS:
+            aliases.add(TEAM_NAME_ALIAS[item])
+    return [alias for alias in aliases if alias]
 
 
 def name_variants(value: str) -> List[str]:
@@ -174,112 +205,34 @@ def name_variants(value: str) -> List[str]:
     return [variant for variant in variants if variant]
 
 
-def merge_selection_text(raw_name: str, raw_label: str) -> str:
-    name = (raw_name or "").strip()
-    label = (raw_label or "").strip()
-    if not name:
-        return label
-    if not label:
-        return name
-    if normalize_name(name) == normalize_name(label):
-        return name
-    return f"{name} {label}".strip()
+def normalize_market_key(value: str) -> str:
+    if not value:
+        return ""
+    return re.sub(r"[^a-z0-9_]+", "_", value.strip().lower()).strip("_")
+
+
+def load_market_allowlist() -> Optional[set]:
+    raw = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
+    if raw:
+        if raw.lower() in {"all", "*"}:
+            return None
+        items = {normalize_market_key(item) for item in raw.split(",") if item.strip()}
+        return {item for item in items if item}
+    return set(DEFAULT_MARKET_ALLOWLIST)
 
 
 def parse_float(value: Optional[object]) -> Optional[float]:
     if value is None:
         return None
     try:
-        return float(value)
+        num = float(value)
+        return num if math.isfinite(num) else None
     except Exception:
         try:
-            return float(str(value).replace("%", ""))
+            num = float(str(value).replace("%", ""))
+            return num if math.isfinite(num) else None
         except Exception:
             return None
-
-
-def parse_int(value: Optional[object]) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except Exception:
-        try:
-            return int(float(value))
-        except Exception:
-            return None
-
-
-def parse_line(row: Dict) -> Optional[float]:
-    for key in ("line", "handicap", "total", "label"):
-        raw = row.get(key)
-        if raw is None:
-            continue
-        if isinstance(raw, (int, float)):
-            return float(raw)
-        text_val = str(raw).strip()
-        match = re.search(r"([0-9]+(?:\.[0-9]+)?)", text_val)
-        if match:
-            return float(match.group(1))
-    return None
-
-
-def parse_line_from_text(text: str) -> Optional[float]:
-    if not text:
-        return None
-    match = re.search(r"([0-9]+(?:[\\._][0-9]+)?)", text)
-    if not match:
-        return None
-    raw = match.group(1)
-    if "_" in raw:
-        parts = raw.split("_", 1)
-        if len(parts) == 2 and parts[0] and parts[1].isdigit():
-            return float(f"{parts[0]}.{parts[1]}")
-    return float(raw.replace("_", "."))
-
-
-def parse_line_side_from_selection_key(selection_key: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
-    if not selection_key:
-        return None, None, None
-    key = selection_key.lower().strip()
-    pattern_1 = re.match(
-        r"^(over|under)_([0-9]+)(?:_([0-9]+))?(?:_(?:team_)?(1|2))?$",
-        key,
-    )
-    if pattern_1:
-        direction = pattern_1.group(1)
-        whole = pattern_1.group(2)
-        frac = pattern_1.group(3)
-        side = pattern_1.group(4)
-        line = float(f"{whole}.{frac}") if frac else float(whole)
-        return line, direction, side
-    pattern_2 = re.match(
-        r"^([0-9]+)(?:_([0-9]+))?_(over|under)(?:_(?:team_)?(1|2))?$",
-        key,
-    )
-    if pattern_2:
-        whole = pattern_2.group(1)
-        frac = pattern_2.group(2)
-        direction = pattern_2.group(3)
-        side = pattern_2.group(4)
-        line = float(f"{whole}.{frac}") if frac else float(whole)
-        return line, direction, side
-    return None, None, None
-
-
-def extract_side_from_tokens(tokens: List[str]) -> Optional[str]:
-    if not tokens:
-        return None
-    token_set = set(tokens)
-    if "team1" in token_set or ("team" in token_set and "1" in token_set):
-        return "1"
-    if "team2" in token_set or ("team" in token_set and "2" in token_set):
-        return "2"
-    if "home" in token_set or "host" in token_set or "hosts" in token_set:
-        return "1"
-    if "away" in token_set or "visitor" in token_set or "visitors" in token_set or "guest" in token_set:
-        return "2"
-    return None
 
 
 def parse_timestamp(value: Optional[object]) -> Optional[datetime]:
@@ -290,6 +243,14 @@ def parse_timestamp(value: Optional[object]) -> Optional[datetime]:
         return datetime.fromisoformat(text_val)
     except Exception:
         return None
+
+
+def decimal_to_american(decimal_price: Optional[float]) -> Optional[int]:
+    if decimal_price is None or not math.isfinite(decimal_price) or decimal_price <= 1:
+        return None
+    if decimal_price >= 2:
+        return int(round((decimal_price - 1) * 100))
+    return int(round(-100 / (decimal_price - 1)))
 
 
 def extract_player_name(raw_name: str) -> str:
@@ -315,366 +276,138 @@ def extract_player_name(raw_name: str) -> str:
     return name
 
 
-def resolve_market_key(row: Dict) -> str:
-    market_id = parse_int(row.get("market_id"))
-    if market_id in MARKET_ID_MAP:
-        return MARKET_ID_MAP[market_id]
-
-    desc = str(row.get("market_description") or row.get("market") or "")
-    desc_lower = desc.lower()
-
-    if "full time result" in desc_lower or "full-time result" in desc_lower or "fulltime result" in desc_lower:
-        return "moneyline"
-    if "match result" in desc_lower:
-        return "moneyline"
-    if "draw no bet" in desc_lower or "dnb" in desc_lower:
-        return "draw_no_bet"
-    if "double chance" in desc_lower:
-        return "double_chance"
-    if "both teams to score" in desc_lower or "btts" in desc_lower:
-        return "btts"
-    if "moneyline" in desc_lower or "1x2" in desc_lower or "match winner" in desc_lower:
-        return "moneyline"
-    if "win-draw-win" in desc_lower or "1x2 (90" in desc_lower:
-        return "moneyline"
-
-    if "handicap" in desc_lower and "card" in desc_lower:
-        return "card_handicap"
-    if "handicap" in desc_lower:
-        return "handicap"
-
-    if "corner" in desc_lower and ("over" in desc_lower or "under" in desc_lower or "total" in desc_lower):
-        return "corners_over_under"
-    if "corner" in desc_lower and "most" in desc_lower:
-        return "team_most_corners"
-
-    if "player" in desc_lower and ("booked" in desc_lower or "card" in desc_lower):
-        return "player_card"
-    if "card" in desc_lower and "most" in desc_lower:
-        return "team_most_cards"
-    if "card" in desc_lower and "team" in desc_lower:
-        return "team_cards"
-    if "card" in desc_lower:
-        return "match_cards"
-
-    if "offsides" in desc_lower or "offside" in desc_lower:
-        return "total_offsides"
-
-    if "shots on target" in desc_lower:
-        if "player" in desc_lower:
-            return "player_shots_on_target"
-        if "team" in desc_lower:
-            return "team_shots_on_target"
-        return "match_shots_on_target"
-
-    if "shots" in desc_lower:
-        if "player" in desc_lower:
-            return "player_shots"
-        if "team" in desc_lower:
-            return "team_shots"
-        if "match" in desc_lower or "total" in desc_lower:
-            return "match_shots"
-
-    if "goalkeeper" in desc_lower and "save" in desc_lower:
-        return "player_goalkeeper_saves"
-
-    if "score or assist" in desc_lower:
-        return "player_to_score_or_assist"
-    if "assist" in desc_lower and "player" in desc_lower:
-        return "player_to_assist"
-    if "to score" in desc_lower and "penalty" in desc_lower:
-        return "to_score_a_penalty"
-    if "to score" in desc_lower or "anytime goalscorer" in desc_lower or "anytime goal scorer" in desc_lower:
-        return "player_to_score"
-
-    if ("first goal" in desc_lower or "1st goal" in desc_lower) and "scorer" in desc_lower:
-        return "1st_goal_scorer"
-    if "last goal" in desc_lower and "scorer" in desc_lower:
-        return "last_goal_scorer"
-    if "multi" in desc_lower and "goal" in desc_lower and "scorer" in desc_lower:
-        return "multi_scorers"
-
-    if "goal line" in desc_lower:
-        return "goals_over_under"
-    if "goals" in desc_lower and ("over" in desc_lower or "under" in desc_lower or "total" in desc_lower):
-        return "goals_over_under"
-
-    return normalize_slug(desc or "market")
-
-
-PLAYER_MARKET_KEYS = set(CANONICAL_PLAYER_MARKETS) | {
-    "goalscorers",
-}
-
-TEAM_MARKET_KEYS = set(CANONICAL_TEAM_MARKETS)
-
-MATCH_MARKET_KEYS = set(CANONICAL_MATCH_MARKETS)
-
-TEAM_TOTAL_MARKETS = {
-    "team_shots",
-    "team_shots_on_target",
-    "team_cards",
-    "team_corners",
-}
-
-
-def resolve_participant_type(row: Dict, market_key: str) -> Optional[str]:
-    desc = str(row.get("market_description") or row.get("market") or "").lower()
-    if market_key in MATCH_MARKET_KEYS:
-        return None
-    if market_key in TEAM_MARKET_KEYS:
-        return "team"
-    if "team" in desc or market_key.startswith("team_"):
-        return "team"
-    if "player" in desc or market_key.startswith("player_") or market_key in PLAYER_MARKET_KEYS:
-        return "player"
-    if any(
-        token in market_key
-        for token in (
-            "goalscorer",
-            "goal_scorer",
-            "scorer",
-            "to_score",
-            "to_assist",
-            "assist",
-            "shots",
-            "shot",
-            "sot",
-        )
-    ):
-        return "player"
-    return None
-
-
-def normalize_selection_tokens(value: str) -> List[str]:
-    return normalize_name_tokens(value)
-
-
-def detect_yes_no(tokens: List[str]) -> Optional[str]:
-    if "yes" in tokens:
-        return "yes"
-    if "no" in tokens:
-        return "no"
-    return None
-
-
-def detect_over_under(tokens: List[str]) -> Optional[str]:
-    if "over" in tokens:
-        return "over"
-    if "under" in tokens:
-        return "under"
-    return None
-
-
-def normalize_team_side_selection(
-    text: str,
-    home_aliases: Iterable[str],
-    away_aliases: Iterable[str],
-) -> Optional[str]:
-    tokens = normalize_selection_tokens(text)
-    if "draw" in tokens or "tie" in tokens or "x" in tokens:
-        return "draw"
-    if "home" in tokens or "host" in tokens or "hosts" in tokens or "local" in tokens:
-        return "home"
-    if "away" in tokens or "visitor" in tokens or "visitors" in tokens or "guest" in tokens:
-        return "away"
-    if "team1" in tokens or "team_1" in tokens or "1" in tokens:
-        return "home"
-    if "team2" in tokens or "team_2" in tokens or "2" in tokens:
-        return "away"
-
-    normalized = normalize_name(text)
-    for alias in home_aliases:
-        if alias and alias in normalized:
-            return "home"
-    for alias in away_aliases:
-        if alias and alias in normalized:
-            return "away"
-    return None
-
-
-def normalize_double_chance_selection(
-    text: str,
-    home_aliases: Iterable[str],
-    away_aliases: Iterable[str],
-) -> Optional[str]:
-    raw = (text or "").replace(" ", "").upper()
-    if "1X" in raw or "X1" in raw:
-        return "home_or_draw"
-    if "X2" in raw or "2X" in raw:
-        return "draw_or_away"
-    if "12" in raw or "1-2" in raw or "1&2" in raw:
-        return "home_or_away"
-    tokens = normalize_selection_tokens(text)
-    if "home" in tokens and "draw" in tokens:
-        return "home_or_draw"
-    if "away" in tokens and "draw" in tokens:
-        return "draw_or_away"
-    if "home" in tokens and "away" in tokens:
-        return "home_or_away"
-    normalized = normalize_name(text)
-    has_home = any(alias and alias in normalized for alias in home_aliases)
-    has_away = any(alias and alias in normalized for alias in away_aliases)
-    if has_home and has_away:
-        return "home_or_away"
-    if has_home and ("draw" in tokens or "tie" in tokens):
-        return "home_or_draw"
-    if has_away and ("draw" in tokens or "tie" in tokens):
-        return "draw_or_away"
-    return None
-
-
-def normalize_selection_key(
-    market_key: str,
-    raw_name: str,
-    raw_label: str,
-    home_aliases: Iterable[str],
-    away_aliases: Iterable[str],
-) -> Optional[str]:
-    text = merge_selection_text(raw_name, raw_label)
-    tokens = normalize_selection_tokens(text)
-
-    if market_key in {"btts"}:
-        return detect_yes_no(tokens)
-
-    if market_key in {
-        "goals_over_under",
-        "corners_over_under",
-        "match_shots",
-        "match_shots_on_target",
-        "match_cards",
-        "total_offsides",
-        "team_shots",
-        "team_shots_on_target",
-        "team_cards",
-        "team_corners",
+def resolve_market_key(market_name: str) -> Optional[str]:
+    key = normalize_market_key(market_name)
+    mapped = MARKET_NAME_MAP.get(key)
+    if mapped in {
+        "team_shots_home",
+        "team_shots_away",
+        "team_shots_on_target_home",
+        "team_shots_on_target_away",
     }:
-        return detect_over_under(tokens)
-
-    if market_key == "double_chance":
-        return normalize_double_chance_selection(text, home_aliases, away_aliases)
-
-    if market_key in {
-        "moneyline",
-        "draw_no_bet",
-        "handicap",
-        "card_handicap",
-        "team_most_cards",
-        "team_most_corners",
-        "team_most_shots",
-        "team_most_shots_on_target",
-        "to_score_a_penalty",
-    }:
-        return normalize_team_side_selection(text, home_aliases, away_aliases)
-
+        return mapped
+    if mapped:
+        return mapped
+    if key in DEFAULT_MARKET_ALLOWLIST:
+        return key
     return None
 
 
-def fixture_window_bounds(days_forward: int) -> Tuple[str, str]:
+def load_league_map(path: Path) -> Dict[int, str]:
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    return {int(k): str(v) for k, v in raw.items() if v}
+
+
+def fixture_window_bounds(days_forward: int) -> Tuple[datetime, datetime]:
     start_dt = datetime.utcnow()
     end_dt = start_dt + timedelta(days=days_forward)
-    fmt = "%Y-%m-%d %H:%M:%S"
-    return start_dt.strftime(fmt), end_dt.strftime(fmt)
+    return start_dt, end_dt
 
 
-def fetch_fixture_rows(
-    session,
-    league_ids: List[int],
-    start_dt: str,
-    end_dt: str,
-) -> List[Dict]:
-    league_list = ",".join(str(x) for x in league_ids)
+def load_fixtures(session, league_ids: List[int], days_forward: int) -> List[Dict[str, object]]:
+    if not league_ids:
+        return []
+    start_dt, end_dt = fixture_window_bounds(days_forward)
+    stmt = text(
+        """
+        select f.id,
+               f.league_id,
+               f.starting_at,
+               f.home_team_id,
+               f.away_team_id,
+               th.name as home_name,
+               th.short_code as home_short,
+               ta.name as away_name,
+               ta.short_code as away_short
+        from fixtures f
+        left join teams th on th.id = f.home_team_id
+        left join teams ta on ta.id = f.away_team_id
+        where f.league_id in :league_ids
+          and f.starting_at >= :start_dt
+          and f.starting_at < :end_dt
+        """
+    ).bindparams(bindparam("league_ids", expanding=True))
     rows = session.execute(
-        text(
-            f"""
-            select id, home_team_id, away_team_id
-            from fixtures
-            where league_id in ({league_list})
-              and datetime(starting_at) >= :start_dt
-              and datetime(starting_at) < :end_dt
-            """
-        ),
-        {"start_dt": start_dt, "end_dt": end_dt},
+        stmt,
+        {
+            "league_ids": league_ids,
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+        },
     ).fetchall()
-    return [
-        {"fixture_id": r[0], "home_team_id": r[1], "away_team_id": r[2]} for r in rows
-    ]
+
+    fixtures = []
+    for row in rows:
+        try:
+            start_val = row.starting_at
+            if isinstance(start_val, str):
+                start_val = datetime.fromisoformat(start_val.replace("Z", "+00:00"))
+            if isinstance(start_val, datetime) and start_val.tzinfo:
+                start_val = start_val.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            start_val = None
+        home_alias = team_aliases(str(row.home_name or ""), str(row.home_short or ""))
+        away_alias = team_aliases(str(row.away_name or ""), str(row.away_short or ""))
+        fixtures.append(
+            {
+                "fixture_id": int(row.id),
+                "league_id": int(row.league_id),
+                "starting_at": start_val,
+                "home_team_id": row.home_team_id,
+                "away_team_id": row.away_team_id,
+                "home_alias": home_alias,
+                "away_alias": away_alias,
+            }
+        )
+    return fixtures
 
 
-def load_team_context(
-    session,
-    team_ids: Iterable[int],
-) -> Tuple[Dict[str, int], Dict[int, List[str]]]:
-    ids = [int(x) for x in team_ids if x]
-    if not ids:
-        return {}, {}
-    stmt = text("select id, name, short_code from teams where id in :ids").bindparams(
-        bindparam("ids", expanding=True),
-    )
-    rows = session.execute(stmt, {"ids": ids}).fetchall()
-    mapping: Dict[str, int] = {}
-    aliases: Dict[int, List[str]] = {}
-    for team_id, name, short_code in rows:
-        alias_list: List[str] = []
-        for label in (name, short_code):
-            if not label:
-                continue
-            normalized = normalize_name(str(label))
-            if not normalized:
-                continue
-            mapping[normalized] = int(team_id)
-            alias_list.append(normalized)
-        aliases[int(team_id)] = alias_list
-    return mapping, aliases
-
-
-def fetch_team_player_counts(session, team_ids: Iterable[int]) -> Dict[int, int]:
-    ids = [int(x) for x in team_ids if x]
-    if not ids:
-        return {}
-    stmt = text(
-        """
-        select team_id, count(*) as cnt
-        from players
-        where team_id in :team_ids
-        group by team_id
-        """
-    ).bindparams(bindparam("team_ids", expanding=True))
-    rows = session.execute(stmt, {"team_ids": ids}).fetchall()
-    return {int(team_id): int(count) for team_id, count in rows}
-
-
-def load_team_player_names(
-    session,
-    team_ids: Iterable[int],
-    limit: int = 50,
-) -> Dict[int, List[str]]:
-    ids = [int(x) for x in team_ids if x]
-    if not ids:
-        return {}
-    stmt = text(
-        """
-        select team_id, name, common_name, short_name
-        from players
-        where team_id in :team_ids
-        order by name
-        """
-    ).bindparams(bindparam("team_ids", expanding=True))
-    rows = session.execute(stmt, {"team_ids": ids}).fetchall()
-    names: Dict[int, List[str]] = {}
-    for team_id, name, common_name, short_name in rows:
-        tid = int(team_id) if team_id else None
-        if tid is None:
+def score_name_match(event_name: str, aliases: Iterable[str]) -> float:
+    event_norm = normalize_team_name(event_name)
+    if not event_norm:
+        return 0.0
+    best = 0.0
+    for alias in aliases:
+        if not alias:
             continue
-        for candidate in (name, common_name, short_name):
-            if not candidate:
+        if event_norm == alias:
+            return 1.0
+        score = difflib.SequenceMatcher(None, event_norm, alias).ratio()
+        if score > best:
+            best = score
+    return best
+
+
+def match_event_to_fixture(event: Dict[str, object], fixtures: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    if not fixtures:
+        return None
+    event_home = str(event.get("home") or "")
+    event_away = str(event.get("away") or "")
+    event_date = event.get("date") or ""
+    try:
+        event_dt = datetime.fromisoformat(str(event_date).replace("Z", "+00:00"))
+        if event_dt.tzinfo:
+            event_dt = event_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    except Exception:
+        event_dt = None
+    best = None
+    best_score = 0.0
+    for fixture in fixtures:
+        fixture_dt = fixture.get("starting_at")
+        if event_dt and fixture_dt:
+            delta = abs((fixture_dt - event_dt).total_seconds())
+            if delta > 3 * 3600:
                 continue
-            names.setdefault(tid, [])
-            if candidate not in names[tid]:
-                names[tid].append(candidate)
-                if limit and len(names[tid]) >= limit:
-                    break
-    return names
+        home_score = score_name_match(event_home, fixture.get("home_alias") or [])
+        away_score = score_name_match(event_away, fixture.get("away_alias") or [])
+        if home_score >= 0.9 and away_score >= 0.9:
+            combined = home_score + away_score
+            if combined > best_score:
+                best_score = combined
+                best = fixture
+    return best
 
 
 def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[int, Optional[int]]]]:
@@ -736,170 +469,6 @@ def load_team_player_map(session, team_ids: Iterable[int]) -> Dict[str, List[Tup
                     (int(player_id), int(team_id) if team_id else None)
                 )
     return mapping
-
-
-def resolve_player_id(
-    raw_name: str,
-    fixture_map: Dict[str, List[Tuple[int, Optional[int]]]],
-    team_map: Dict[str, List[Tuple[int, Optional[int]]]],
-    team_ids: Optional[Iterable[int]] = None,
-) -> Optional[int]:
-    team_id_set = {int(x) for x in team_ids or [] if x}
-    variants = name_variants(raw_name)
-    if not variants:
-        return None
-    for variant in variants:
-        candidates = fixture_map.get(variant)
-        if candidates:
-            filtered = [
-                (pid, tid)
-                for pid, tid in candidates
-                if not team_id_set or (tid and tid in team_id_set)
-            ]
-            if filtered:
-                candidates = filtered
-            unique = {pid for pid, _ in candidates}
-            if len(unique) == 1:
-                return next(iter(unique))
-            return candidates[0][0]
-    for variant in variants:
-        candidates = team_map.get(variant)
-        if candidates:
-            filtered = [
-                (pid, tid)
-                for pid, tid in candidates
-                if not team_id_set or (tid and tid in team_id_set)
-            ]
-            if filtered:
-                candidates = filtered
-            unique = {pid for pid, _ in candidates}
-            if len(unique) == 1:
-                return next(iter(unique))
-            return candidates[0][0]
-    return None
-
-
-HOME_ALIASES = {
-    "home",
-    "hometeam",
-    "team1",
-    "team_1",
-    "host",
-    "hosts",
-    "local",
-    "homeclub",
-}
-AWAY_ALIASES = {
-    "away",
-    "awayteam",
-    "team2",
-    "team_2",
-    "visitor",
-    "visitors",
-    "guest",
-    "awayclub",
-}
-
-
-def resolve_team_id(
-    raw_name: str,
-    selection_key: str,
-    team_map: Dict[str, int],
-    home_team_id: Optional[int],
-    away_team_id: Optional[int],
-    home_aliases: Iterable[str],
-    away_aliases: Iterable[str],
-) -> Optional[int]:
-    selection_key = selection_key or ""
-    if selection_key in {"1", "team_1", "team1"} and home_team_id:
-        return int(home_team_id)
-    if selection_key in {"2", "team_2", "team2"} and away_team_id:
-        return int(away_team_id)
-    tokens = [token for token in selection_key.lower().split("_") if token]
-    home_tokens = {"home", "host", "hosts", "local"}
-    away_tokens = {"away", "visitor", "visitors", "guest"}
-    if home_tokens.intersection(tokens) and not away_tokens.intersection(tokens) and home_team_id:
-        return int(home_team_id)
-    if away_tokens.intersection(tokens) and not home_tokens.intersection(tokens) and away_team_id:
-        return int(away_team_id)
-    normalized_name = normalize_name(raw_name)
-    if normalized_name and normalized_name in team_map:
-        return team_map[normalized_name]
-    if normalized_name in HOME_ALIASES and home_team_id:
-        return int(home_team_id)
-    if normalized_name in AWAY_ALIASES and away_team_id:
-        return int(away_team_id)
-    normalized_selection = normalize_name(selection_key)
-    if normalized_selection in HOME_ALIASES and home_team_id:
-        return int(home_team_id)
-    if normalized_selection in AWAY_ALIASES and away_team_id:
-        return int(away_team_id)
-    for alias in home_aliases:
-        if alias and alias in normalized_selection and home_team_id:
-            return int(home_team_id)
-    for alias in away_aliases:
-        if alias and alias in normalized_selection and away_team_id:
-            return int(away_team_id)
-    return None
-
-
-def resolve_team_id_from_label(
-    raw_label: str,
-    home_team_id: Optional[int],
-    away_team_id: Optional[int],
-    home_aliases: Iterable[str],
-    away_aliases: Iterable[str],
-) -> Optional[int]:
-    side = normalize_team_side_selection(raw_label or "", home_aliases, away_aliases)
-    if side == "home" and home_team_id:
-        return int(home_team_id)
-    if side == "away" and away_team_id:
-        return int(away_team_id)
-    return None
-
-
-NON_PLAYER_MARKETS = {
-    "match_shots",
-    "match_shots_on_target",
-    "to_score_in_half",
-}
-
-
-def is_non_player_selection(selection_key: str, market_key: str) -> bool:
-    selection_key = selection_key or ""
-    if market_key in NON_PLAYER_MARKETS:
-        return True
-    if selection_key.startswith(("no_goalscorer", "no_goal", "no_goals")):
-        return True
-    if "1st_half" in selection_key or "2nd_half" in selection_key:
-        return True
-    if selection_key.startswith(
-        (
-            "home_yes",
-            "home_no",
-            "away_yes",
-            "away_no",
-            "draw_yes",
-            "draw_no",
-            "tie_yes",
-            "tie_no",
-            "yes_yes",
-            "no_no",
-        )
-    ):
-        return True
-    return False
-
-
-def is_generic_team_prop(selection_key: str) -> bool:
-    selection_key = selection_key or ""
-    if re.fullmatch(r"\d+_\d+", selection_key):
-        return True
-    if selection_key in {"yes_yes", "no_no"}:
-        return True
-    if selection_key in {"tie_tie", "draw_draw"}:
-        return True
-    return False
 
 
 def build_fuzzy_candidates(session, team_ids: Iterable[int]) -> List[Dict[str, object]]:
@@ -975,6 +544,53 @@ def fuzzy_match_player(
     return None
 
 
+def resolve_player_id(
+    raw_name: str,
+    fixture_map: Dict[str, List[Tuple[int, Optional[int]]]],
+    team_map: Dict[str, List[Tuple[int, Optional[int]]]],
+    team_ids: Optional[Iterable[int]] = None,
+    fuzzy_candidates: Optional[List[Dict[str, object]]] = None,
+) -> Optional[int]:
+    team_id_set = {int(x) for x in team_ids or [] if x}
+    variants = name_variants(raw_name)
+    if not variants:
+        return None
+    for variant in variants:
+        candidates = fixture_map.get(variant)
+        if candidates:
+            filtered = [
+                (pid, tid)
+                for pid, tid in candidates
+                if not team_id_set or (tid and tid in team_id_set)
+            ]
+            if filtered:
+                candidates = filtered
+            unique = {pid for pid, _ in candidates}
+            if len(unique) == 1:
+                return next(iter(unique))
+            return candidates[0][0]
+    for variant in variants:
+        candidates = team_map.get(variant)
+        if candidates:
+            filtered = [
+                (pid, tid)
+                for pid, tid in candidates
+                if not team_id_set or (tid and tid in team_id_set)
+            ]
+            if filtered:
+                candidates = filtered
+            unique = {pid for pid, _ in candidates}
+            if len(unique) == 1:
+                return next(iter(unique))
+            return candidates[0][0]
+    if fuzzy_candidates:
+        fuzzy_match = fuzzy_match_player(raw_name, fuzzy_candidates)
+        if fuzzy_match:
+            candidate, _score = fuzzy_match
+            return int(candidate["player_id"])
+    return None
+
+
 def upsert_outcomes(session, rows: List[Dict]) -> None:
     if not rows:
         return
@@ -1001,421 +617,603 @@ def upsert_outcomes(session, rows: List[Dict]) -> None:
     session.execute(sql, rows)
 
 
-def parse_outcomes(
+def market_over_under_rows(
     fixture_id: int,
     bookmaker_id: int,
-    data: List[Dict],
-    player_map: Dict[str, List[Tuple[int, Optional[int]]]],
-    team_map: Dict[str, int],
-    team_player_map: Dict[str, List[Tuple[int, Optional[int]]]],
+    market_key: str,
+    odds_list: List[Dict[str, object]],
+    participant_type: Optional[str],
+    participant_id: Optional[int],
+    updated_at: Optional[datetime],
+    selection_prefix: Optional[str] = None,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for odd in odds_list or []:
+        line = parse_float(odd.get("hdp"))
+        over_price = parse_float(odd.get("over"))
+        under_price = parse_float(odd.get("under"))
+        if line is None:
+            continue
+        if over_price is not None:
+            sel = "over" if not selection_prefix else f"{selection_prefix}_over"
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker_id": bookmaker_id,
+                    "market_key": market_key,
+                    "selection_key": sel,
+                    "participant_type": participant_type,
+                    "participant_id": participant_id,
+                    "line": line,
+                    "price_decimal": over_price,
+                    "price_american": decimal_to_american(over_price),
+                    "last_updated_at": updated_at,
+                }
+            )
+        if under_price is not None:
+            sel = "under" if not selection_prefix else f"{selection_prefix}_under"
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker_id": bookmaker_id,
+                    "market_key": market_key,
+                    "selection_key": sel,
+                    "participant_type": participant_type,
+                    "participant_id": participant_id,
+                    "line": line,
+                    "price_decimal": under_price,
+                    "price_american": decimal_to_american(under_price),
+                    "last_updated_at": updated_at,
+                }
+            )
+    return rows
+
+
+def market_yes_no_rows(
+    fixture_id: int,
+    bookmaker_id: int,
+    market_key: str,
+    odds_list: List[Dict[str, object]],
+    updated_at: Optional[datetime],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for odd in odds_list or []:
+        yes_price = parse_float(odd.get("yes"))
+        no_price = parse_float(odd.get("no"))
+        if yes_price is not None:
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker_id": bookmaker_id,
+                    "market_key": market_key,
+                    "selection_key": "yes",
+                    "participant_type": None,
+                    "participant_id": None,
+                    "line": None,
+                    "price_decimal": yes_price,
+                    "price_american": decimal_to_american(yes_price),
+                    "last_updated_at": updated_at,
+                }
+            )
+        if no_price is not None:
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker_id": bookmaker_id,
+                    "market_key": market_key,
+                    "selection_key": "no",
+                    "participant_type": None,
+                    "participant_id": None,
+                    "line": None,
+                    "price_decimal": no_price,
+                    "price_american": decimal_to_american(no_price),
+                    "last_updated_at": updated_at,
+                }
+            )
+    return rows
+
+
+def market_moneyline_rows(
+    fixture_id: int,
+    bookmaker_id: int,
+    odds_list: List[Dict[str, object]],
+    updated_at: Optional[datetime],
     home_team_id: Optional[int],
     away_team_id: Optional[int],
-    home_aliases: Iterable[str],
-    away_aliases: Iterable[str],
-    fuzzy_candidates: Optional[List[Dict[str, object]]] = None,
-    unmatched_details: Optional[List[Dict]] = None,
-    unmatched_counts: Optional[Dict[Tuple[str, str], int]] = None,
-    unmatched_team_counts: Optional[Dict[str, int]] = None,
-    unmatched_selection_counts: Optional[Dict[str, int]] = None,
-    debug_samples: Optional[List[Dict]] = None,
-    debug_team_players: Optional[Dict[int, List[str]]] = None,
-    debug_limit: int = 0,
-    debug_fuzzy_matches: Optional[List[Dict]] = None,
-    market_allowlist: Optional[set] = None,
-    allowlist_counts: Optional[Dict[str, int]] = None,
-) -> List[Dict]:
-    outcomes: List[Dict] = []
-    line_markets = {
-        "team_shots",
-        "team_shots_on_target",
-        "match_shots",
-        "match_shots_on_target",
-        "goals_over_under",
-        "corners_over_under",
-    }
-
-    for row in data:
-        market_key = resolve_market_key(row)
-        if market_allowlist is not None and market_key not in market_allowlist:
-            if allowlist_counts is not None:
-                allowlist_counts["dropped"] = allowlist_counts.get("dropped", 0) + 1
-            continue
-        participant_type = resolve_participant_type(row, market_key)
-        name = row.get("name") or row.get("total") or row.get("label") or ""
-        label = row.get("label") or row.get("total") or ""
-        total = row.get("total")
-        selection_text = merge_selection_text(str(name), str(label))
-        if total is not None:
-            total_text = str(total).strip()
-            if total_text and total_text not in selection_text:
-                selection_text = f"{selection_text} {total_text}".strip()
-        raw_selection_key = normalize_slug(selection_text)
-        selection_key = raw_selection_key
-        canonical_selection = normalize_selection_key(
-            market_key,
-            str(name),
-            str(label),
-            home_aliases,
-            away_aliases,
-        )
-        if canonical_selection:
-            selection_key = canonical_selection
-
-        line = parse_line(row)
-        if line is None:
-            line = parse_line_from_text(selection_text)
-        key_line, key_direction, key_side = parse_line_side_from_selection_key(raw_selection_key)
-        if key_side is None:
-            key_side = extract_side_from_tokens(normalize_selection_tokens(selection_text))
-        if key_line is not None and market_key in line_markets:
-            line = key_line
-        if key_direction in {"over", "under"} and market_key in line_markets:
-            selection_key = key_direction
-        if (
-            market_key in TEAM_TOTAL_MARKETS
-            and key_side in {"1", "2"}
-            and key_line is None
-            and line in (1.0, 2.0)
-        ):
-            line = None
-        price_decimal = parse_float(row.get("value") or row.get("dp3"))
-        if price_decimal is None:
-            continue
-        price_american = parse_int(row.get("american"))
-        last_updated_at = parse_timestamp(row.get("latest_bookmaker_update") or row.get("updated_at"))
-
-        participant_id = None
-        raw_participant_id = parse_int(row.get("participant_id") or row.get("player_id"))
-        non_player_selection = is_non_player_selection(selection_key, market_key)
-        generic_team_prop = is_generic_team_prop(selection_key)
-        team_id_candidate = resolve_team_id(
-            str(name),
-            selection_key,
-            team_map,
-            home_team_id,
-            away_team_id,
-            home_aliases,
-            away_aliases,
-        )
-        if market_key in TEAM_TOTAL_MARKETS and key_side in {"1", "2"}:
-            side_team_id = home_team_id if key_side == "1" else away_team_id
-            if side_team_id:
-                team_id_candidate = int(side_team_id)
-        if team_id_candidate is None and market_key in TEAM_TOTAL_MARKETS:
-            team_id_candidate = resolve_team_id_from_label(
-                str(label),
-                home_team_id,
-                away_team_id,
-                home_aliases,
-                away_aliases,
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for odd in odds_list or []:
+        home_price = parse_float(odd.get("home"))
+        draw_price = parse_float(odd.get("draw"))
+        away_price = parse_float(odd.get("away"))
+        if home_price is not None and home_team_id:
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker_id": bookmaker_id,
+                    "market_key": "moneyline",
+                    "selection_key": "home",
+                    "participant_type": "team",
+                    "participant_id": home_team_id,
+                    "line": None,
+                    "price_decimal": home_price,
+                    "price_american": decimal_to_american(home_price),
+                    "last_updated_at": updated_at,
+                }
             )
-        neutral_team_selection = selection_key in {"draw", "home_or_away"}
-        if neutral_team_selection:
-            team_id_candidate = None
-        if participant_type == "player" and non_player_selection:
-            participant_type = None
-        if participant_type == "team":
-            if selection_key in {"draw", "home_or_away"}:
-                participant_type = None
-            if generic_team_prop or team_id_candidate is None:
-                participant_type = None
-        if market_key.startswith("match_"):
-            participant_type = None
-        if participant_type is None and team_id_candidate is not None and not generic_team_prop:
-            participant_type = "team"
-        if participant_type == "player":
-            mapped_name = extract_player_name(str(name))
-            if raw_participant_id is not None:
-                participant_id = raw_participant_id
-            else:
-                participant_id = resolve_player_id(
-                    mapped_name,
+        if away_price is not None and away_team_id:
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker_id": bookmaker_id,
+                    "market_key": "moneyline",
+                    "selection_key": "away",
+                    "participant_type": "team",
+                    "participant_id": away_team_id,
+                    "line": None,
+                    "price_decimal": away_price,
+                    "price_american": decimal_to_american(away_price),
+                    "last_updated_at": updated_at,
+                }
+            )
+        if draw_price is not None:
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker_id": bookmaker_id,
+                    "market_key": "moneyline",
+                    "selection_key": "draw",
+                    "participant_type": None,
+                    "participant_id": None,
+                    "line": None,
+                    "price_decimal": draw_price,
+                    "price_american": decimal_to_american(draw_price),
+                    "last_updated_at": updated_at,
+                }
+            )
+    return rows
+
+
+def parse_markets_for_fixture(
+    fixture: Dict[str, object],
+    markets: List[Dict[str, object]],
+    bookmaker_name: str,
+    market_allowlist: Optional[set],
+    session,
+    unmatched_details: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    bookmaker_id = BOOKMAKER_NAME_TO_ID.get(bookmaker_name.lower())
+    if not bookmaker_id:
+        return rows
+
+    fixture_id = int(fixture["fixture_id"])
+    home_team_id = fixture.get("home_team_id")
+    away_team_id = fixture.get("away_team_id")
+
+    player_map = load_fixture_player_map(session, fixture_id)
+    team_player_map = load_team_player_map(session, [home_team_id, away_team_id])
+    fuzzy_candidates = build_fuzzy_candidates(session, [home_team_id, away_team_id])
+
+    for market in markets or []:
+        market_name = str(market.get("name") or "")
+        market_key = resolve_market_key(market_name)
+        if not market_key:
+            continue
+        normalized_key = market_key
+        side = None
+        if market_key.endswith("_home"):
+            normalized_key = market_key.replace("_home", "")
+            side = "home"
+        elif market_key.endswith("_away"):
+            normalized_key = market_key.replace("_away", "")
+            side = "away"
+
+        if market_allowlist is not None and normalized_key not in market_allowlist:
+            continue
+
+        updated_at = parse_timestamp(market.get("updatedAt"))
+        odds_list = market.get("odds") or []
+
+        if normalized_key == "moneyline":
+            rows.extend(
+                market_moneyline_rows(
+                    fixture_id,
+                    bookmaker_id,
+                    odds_list,
+                    updated_at,
+                    home_team_id,
+                    away_team_id,
+                )
+            )
+            continue
+
+        if normalized_key == "btts":
+            rows.extend(market_yes_no_rows(fixture_id, bookmaker_id, normalized_key, odds_list, updated_at))
+            continue
+
+        if normalized_key in {"goals_over_under", "match_shots", "match_shots_on_target"}:
+            rows.extend(
+                market_over_under_rows(
+                    fixture_id,
+                    bookmaker_id,
+                    normalized_key,
+                    odds_list,
+                    None,
+                    None,
+                    updated_at,
+                )
+            )
+            continue
+
+        if normalized_key in TEAM_MARKETS:
+            team_id = None
+            if side == "home":
+                team_id = home_team_id
+            elif side == "away":
+                team_id = away_team_id
+            if not team_id:
+                continue
+            rows.extend(
+                market_over_under_rows(
+                    fixture_id,
+                    bookmaker_id,
+                    normalized_key,
+                    odds_list,
+                    "team",
+                    int(team_id),
+                    updated_at,
+                )
+            )
+            continue
+
+        if normalized_key.startswith("player_"):
+            for odd in odds_list or []:
+                label = odd.get("label") or odd.get("name") or ""
+                player_name = extract_player_name(str(label))
+                if not player_name:
+                    continue
+                line = parse_float(odd.get("hdp"))
+                price = None
+                side_key = None
+                for key in ("over", "yes", "home"):
+                    price = parse_float(odd.get(key))
+                    if price is not None:
+                        side_key = "over" if key == "over" else key
+                        break
+                if price is None:
+                    continue
+                player_id = resolve_player_id(
+                    player_name,
                     player_map,
                     team_player_map,
                     team_ids=[home_team_id, away_team_id],
+                    fuzzy_candidates=fuzzy_candidates,
                 )
-                if participant_id is None and fuzzy_candidates:
-                    fuzzy_match = fuzzy_match_player(mapped_name, fuzzy_candidates)
-                    if fuzzy_match:
-                        candidate, score = fuzzy_match
-                        participant_id = int(candidate["player_id"])
-                        if debug_fuzzy_matches is not None:
-                            debug_fuzzy_matches.append(
-                                {
-                                    "fixture_id": fixture_id,
-                                    "market_key": market_key,
-                                    "selection_key": selection_key,
-                                    "raw_name": str(name),
-                                    "mapped_name": mapped_name,
-                                    "matched_name": candidate.get("name"),
-                                    "matched_player_id": participant_id,
-                                    "matched_team_id": candidate.get("team_id"),
-                                    "score": round(float(score), 3),
-                                }
-                            )
-            if participant_id is None:
-                if unmatched_counts is not None:
-                    key = (market_key, str(name))
-                    unmatched_counts[key] = unmatched_counts.get(key, 0) + 1
-                if unmatched_selection_counts is not None:
-                    unmatched_selection_counts[selection_key] = unmatched_selection_counts.get(selection_key, 0) + 1
-                if unmatched_details is not None:
+                selection_slug = normalize_slug(player_name)
+                selection_key = selection_slug if side_key in {"yes", "home", None} else f"{selection_slug}_{side_key}"
+                if player_id is None:
                     unmatched_details.append(
                         {
                             "fixture_id": fixture_id,
-                            "market_key": market_key,
+                            "market_key": normalized_key,
                             "selection_key": selection_key,
-                            "raw_name": str(name),
+                            "raw_name": player_name,
                         }
                     )
-                if (
-                    debug_samples is not None
-                    and debug_team_players is not None
-                    and debug_limit > 0
-                    and len(debug_samples) < debug_limit
-                ):
-                    debug_samples.append(
-                        {
-                            "fixture_id": fixture_id,
-                            "market_key": market_key,
-                            "selection_key": selection_key,
-                            "raw_name": str(name),
-                            "mapped_name": mapped_name,
-                            "home_team_id": home_team_id,
-                            "away_team_id": away_team_id,
-                            "home_team_players": debug_team_players.get(home_team_id, [])[:20],
-                            "away_team_players": debug_team_players.get(away_team_id, [])[:20],
-                        }
-                    )
-        elif participant_type == "team":
-            participant_id = team_id_candidate
-            if participant_id is None and unmatched_team_counts is not None:
-                unmatched_team_counts[selection_key] = unmatched_team_counts.get(selection_key, 0) + 1
+                rows.append(
+                    {
+                        "fixture_id": fixture_id,
+                        "bookmaker_id": bookmaker_id,
+                        "market_key": normalized_key,
+                        "selection_key": selection_key,
+                        "participant_type": "player",
+                        "participant_id": player_id,
+                        "line": line,
+                        "price_decimal": price,
+                        "price_american": decimal_to_american(price),
+                        "last_updated_at": updated_at,
+                    }
+                )
+            continue
 
-        outcomes.append(
+    return rows
+
+
+def parse_double_chance_rows(
+    fixture: Dict[str, object],
+    bookmaker_id: int,
+    odds_list: List[Dict[str, object]],
+    updated_at: Optional[datetime],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    fixture_id = int(fixture["fixture_id"])
+    home_aliases = fixture.get("home_alias") or []
+    away_aliases = fixture.get("away_alias") or []
+    for odd in odds_list or []:
+        label = normalize_team_name(str(odd.get("label") or ""))
+        price = None
+        for key in ("under", "over", "price", "odd"):
+            price = parse_float(odd.get(key))
+            if price is not None:
+                break
+        if price is None:
+            continue
+        has_home = any(alias and alias in label for alias in home_aliases)
+        has_away = any(alias and alias in label for alias in away_aliases)
+        has_draw = "draw" in label or "tie" in label
+        selection = None
+        if has_home and has_away:
+            selection = "home_or_away"
+        elif has_draw and has_home:
+            selection = "home_or_draw"
+        elif has_draw and has_away:
+            selection = "draw_or_away"
+        if not selection:
+            continue
+        rows.append(
+            {
+                "fixture_id": fixture_id,
+                "bookmaker_id": bookmaker_id,
+                "market_key": "double_chance",
+                "selection_key": selection,
+                "participant_type": None,
+                "participant_id": None,
+                "line": None,
+                "price_decimal": price,
+                "price_american": decimal_to_american(price),
+                "last_updated_at": updated_at,
+            }
+        )
+    return rows
+
+
+def parse_draw_no_bet_rows(
+    fixture_id: int,
+    bookmaker_id: int,
+    odds_list: List[Dict[str, object]],
+    updated_at: Optional[datetime],
+    home_team_id: Optional[int],
+    away_team_id: Optional[int],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    for odd in odds_list or []:
+        home_price = parse_float(odd.get("home"))
+        away_price = parse_float(odd.get("away"))
+        if home_price is not None and home_team_id:
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker_id": bookmaker_id,
+                    "market_key": "draw_no_bet",
+                    "selection_key": "home",
+                    "participant_type": "team",
+                    "participant_id": home_team_id,
+                    "line": None,
+                    "price_decimal": home_price,
+                    "price_american": decimal_to_american(home_price),
+                    "last_updated_at": updated_at,
+                }
+            )
+        if away_price is not None and away_team_id:
+            rows.append(
+                {
+                    "fixture_id": fixture_id,
+                    "bookmaker_id": bookmaker_id,
+                    "market_key": "draw_no_bet",
+                    "selection_key": "away",
+                    "participant_type": "team",
+                    "participant_id": away_team_id,
+                    "line": None,
+                    "price_decimal": away_price,
+                    "price_american": decimal_to_american(away_price),
+                    "last_updated_at": updated_at,
+                }
+            )
+    return rows
+
+
+def parse_markets_for_fixture_extended(
+    fixture: Dict[str, object],
+    markets: List[Dict[str, object]],
+    bookmaker_name: str,
+    market_allowlist: Optional[set],
+    session,
+    unmatched_details: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    rows: List[Dict[str, object]] = []
+    bookmaker_id = BOOKMAKER_NAME_TO_ID.get(bookmaker_name.lower())
+    if not bookmaker_id:
+        return rows
+    fixture_id = int(fixture["fixture_id"])
+    home_team_id = fixture.get("home_team_id")
+    away_team_id = fixture.get("away_team_id")
+
+    for market in markets or []:
+        market_name = str(market.get("name") or "")
+        market_key = resolve_market_key(market_name)
+        if not market_key:
+            continue
+        normalized_key = market_key
+        side = None
+        if market_key.endswith("_home"):
+            normalized_key = market_key.replace("_home", "")
+            side = "home"
+        elif market_key.endswith("_away"):
+            normalized_key = market_key.replace("_away", "")
+            side = "away"
+
+        if market_allowlist is not None and normalized_key not in market_allowlist:
+            continue
+
+        updated_at = parse_timestamp(market.get("updatedAt"))
+        odds_list = market.get("odds") or []
+
+        if normalized_key == "moneyline":
+            rows.extend(
+                market_moneyline_rows(
+                    fixture_id,
+                    bookmaker_id,
+                    odds_list,
+                    updated_at,
+                    home_team_id,
+                    away_team_id,
+                )
+            )
+            continue
+
+        if normalized_key == "double_chance":
+            rows.extend(parse_double_chance_rows(fixture, bookmaker_id, odds_list, updated_at))
+            continue
+
+        if normalized_key == "draw_no_bet":
+            rows.extend(
+                parse_draw_no_bet_rows(
+                    fixture_id,
+                    bookmaker_id,
+                    odds_list,
+                    updated_at,
+                    home_team_id,
+                    away_team_id,
+                )
+            )
+            continue
+
+        if normalized_key == "btts":
+            rows.extend(market_yes_no_rows(fixture_id, bookmaker_id, normalized_key, odds_list, updated_at))
+            continue
+
+        if normalized_key in {"goals_over_under", "match_shots", "match_shots_on_target"}:
+            rows.extend(
+                market_over_under_rows(
+                    fixture_id,
+                    bookmaker_id,
+                    normalized_key,
+                    odds_list,
+                    None,
+                    None,
+                    updated_at,
+                )
+            )
+            continue
+
+        if normalized_key in TEAM_MARKETS:
+            team_id = None
+            if side == "home":
+                team_id = home_team_id
+            elif side == "away":
+                team_id = away_team_id
+            if not team_id:
+                continue
+            rows.extend(
+                market_over_under_rows(
+                    fixture_id,
+                    bookmaker_id,
+                    normalized_key,
+                    odds_list,
+                    "team",
+                    int(team_id),
+                    updated_at,
+                )
+            )
+            continue
+
+        if normalized_key.startswith("player_"):
+            rows.extend(
+                parse_player_market_rows(
+                    fixture,
+                    normalized_key,
+                    odds_list,
+                    bookmaker_id,
+                    updated_at,
+                    session,
+                    unmatched_details,
+                )
+            )
+            continue
+
+    return rows
+
+
+def parse_player_market_rows(
+    fixture: Dict[str, object],
+    market_key: str,
+    odds_list: List[Dict[str, object]],
+    bookmaker_id: int,
+    updated_at: Optional[datetime],
+    session,
+    unmatched_details: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    fixture_id = int(fixture["fixture_id"])
+    home_team_id = fixture.get("home_team_id")
+    away_team_id = fixture.get("away_team_id")
+
+    player_map = load_fixture_player_map(session, fixture_id)
+    team_player_map = load_team_player_map(session, [home_team_id, away_team_id])
+    fuzzy_candidates = build_fuzzy_candidates(session, [home_team_id, away_team_id])
+
+    rows: List[Dict[str, object]] = []
+    for odd in odds_list or []:
+        label = odd.get("label") or odd.get("name") or ""
+        player_name = extract_player_name(str(label))
+        if not player_name:
+            continue
+        line = parse_float(odd.get("hdp"))
+        price = None
+        side_key = None
+        for key in ("over", "yes", "home"):
+            price = parse_float(odd.get(key))
+            if price is not None:
+                side_key = "over" if key == "over" else key
+                break
+        if price is None:
+            continue
+        player_id = resolve_player_id(
+            player_name,
+            player_map,
+            team_player_map,
+            team_ids=[home_team_id, away_team_id],
+            fuzzy_candidates=fuzzy_candidates,
+        )
+        selection_slug = normalize_slug(player_name)
+        selection_key = selection_slug if side_key in {"yes", "home", None} else f"{selection_slug}_{side_key}"
+        if player_id is None:
+            unmatched_details.append(
+                {
+                    "fixture_id": fixture_id,
+                    "market_key": market_key,
+                    "selection_key": selection_key,
+                    "raw_name": player_name,
+                }
+            )
+        rows.append(
             {
                 "fixture_id": fixture_id,
                 "bookmaker_id": bookmaker_id,
                 "market_key": market_key,
                 "selection_key": selection_key,
-                "participant_type": participant_type,
-                "participant_id": participant_id,
+                "participant_type": "player",
+                "participant_id": player_id,
                 "line": line,
-                "price_decimal": price_decimal,
-                "price_american": price_american,
-                "last_updated_at": last_updated_at,
+                "price_decimal": price,
+                "price_american": decimal_to_american(price),
+                "last_updated_at": updated_at,
             }
         )
-    return outcomes
-
-
-def _extract_next_page(pagination: Optional[Dict], current_page: int) -> Optional[int]:
-    if not pagination:
-        return None
-    next_page_val = pagination.get("next_page")
-    if isinstance(next_page_val, int):
-        return next_page_val if next_page_val > current_page else None
-    if isinstance(next_page_val, str) and "page=" in next_page_val:
-        try:
-            parsed = urllib.parse.urlparse(next_page_val)
-            query = urllib.parse.parse_qs(parsed.query)
-            page_vals = query.get("page")
-            if page_vals:
-                page_num = int(page_vals[0])
-                return page_num if page_num > current_page else None
-        except Exception:
-            pass
-    total_pages = pagination.get("total_pages")
-    if isinstance(total_pages, int) and current_page < total_pages:
-        return current_page + 1
-    if pagination.get("has_more"):
-        return current_page + 1
-    return None
-
-
-def _fetch_odds_endpoint(
-    client: SportMonksClient,
-    endpoint: str,
-    params: Dict[str, object],
-    per_page: int,
-) -> List[Dict]:
-    rows: List[Dict] = []
-    page = 1
-    while True:
-        page_params = dict(params)
-        page_params["page"] = page
-        try:
-            payload = client.request("GET", endpoint, params=page_params)
-        except SportMonksError as exc:
-            status = exc.status_code
-            if status in {404, 422}:
-                log.info("No odds available for endpoint %s (status %s)", endpoint, status)
-                return []
-            raise
-        data = payload.get("data") if isinstance(payload, dict) else None
-        page_rows = data if isinstance(data, list) else []
-        if page_rows:
-            rows.extend(page_rows)
-        pagination = None
-        if isinstance(payload, dict):
-            pagination = payload.get("pagination") or (payload.get("meta") or {}).get("pagination")
-        next_page = _extract_next_page(pagination, page)
-        if next_page:
-            page = next_page
-            continue
-        if not page_rows or len(page_rows) < per_page:
-            break
-        page += 1
-    return rows
-
-
-def _rows_have_shot_totals(rows: List[Dict]) -> bool:
-    shot_keys = {
-        "team_shots",
-        "team_shots_on_target",
-        "match_shots",
-        "match_shots_on_target",
-    }
-    for row in rows:
-        if resolve_market_key(row) in shot_keys:
-            return True
-    return False
-
-
-def _merge_odds_rows(primary: List[Dict], extra: List[Dict]) -> List[Dict]:
-    seen = set()
-    merged: List[Dict] = []
-    for row in primary:
-        row_id = row.get("id")
-        key = ("id", row_id) if row_id is not None else (
-            row.get("market_id"),
-            row.get("name"),
-            row.get("label"),
-            row.get("line"),
-            row.get("value"),
-            row.get("total"),
-            row.get("participant_id"),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(row)
-    for row in extra:
-        row_id = row.get("id")
-        key = ("id", row_id) if row_id is not None else (
-            row.get("market_id"),
-            row.get("name"),
-            row.get("label"),
-            row.get("line"),
-            row.get("value"),
-            row.get("total"),
-            row.get("participant_id"),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        merged.append(row)
-    return merged
-
-
-def fetch_odds_for_fixture(
-    client: SportMonksClient,
-    fixture_id: int,
-    bookmaker_id: int,
-    market_ids: Optional[List[int]] = None,
-    per_page: int = 50,
-    odds_endpoint: str = "bookmaker",
-    fallback_fixture: bool = True,
-) -> List[Dict]:
-    fixture_endpoint = f"odds/pre-match/fixtures/{fixture_id}"
-    bookmaker_endpoint = f"odds/pre-match/fixtures/{fixture_id}/bookmakers/{bookmaker_id}"
-
-    fixture_params: Dict[str, object] = {"per_page": per_page, "filter": f"bookmakers:{bookmaker_id}"}
-    if market_ids:
-        fixture_params["filters"] = f"markets:{','.join(str(m) for m in market_ids)}"
-
-    bookmaker_params: Dict[str, object] = {"per_page": per_page}
-    if market_ids:
-        bookmaker_params["filters"] = f"markets:{','.join(str(m) for m in market_ids)}"
-
-    odds_endpoint = (odds_endpoint or "bookmaker").lower()
-    if odds_endpoint == "fixture":
-        return _fetch_odds_endpoint(client, fixture_endpoint, fixture_params, per_page)
-    if odds_endpoint == "both":
-        fixture_rows = _fetch_odds_endpoint(client, fixture_endpoint, fixture_params, per_page)
-        bookmaker_rows = _fetch_odds_endpoint(client, bookmaker_endpoint, bookmaker_params, per_page)
-        return _merge_odds_rows(bookmaker_rows, fixture_rows)
-
-    rows = _fetch_odds_endpoint(client, bookmaker_endpoint, bookmaker_params, per_page)
-    if fallback_fixture and not market_ids and not _rows_have_shot_totals(rows):
-        fixture_rows = _fetch_odds_endpoint(client, fixture_endpoint, fixture_params, per_page)
-        if fixture_rows:
-            rows = _merge_odds_rows(rows, fixture_rows)
     return rows
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--leagues",
-        default="8,384",
-        help="Comma-separated league IDs",
-    )
+    parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
     parser.add_argument("--days-forward", type=int, default=14)
-    parser.add_argument("--bookmaker-id", type=int, default=2)
-    parser.add_argument("--sleep", type=float, default=0.05)
-    parser.add_argument("--limit", type=int, default=0, help="Limit fixtures processed")
     parser.add_argument(
-        "--market-ids",
-        default="",
-        help="Comma-separated SportMonks market IDs to filter odds by.",
+        "--bookmakers",
+        default=",".join(DEFAULT_BOOKMAKERS),
+        help="Comma-separated bookmaker names",
     )
-    parser.add_argument(
-        "--per-page",
-        type=int,
-        default=50,
-        help="Rows per page when fetching odds.",
-    )
-    parser.add_argument(
-        "--odds-endpoint",
-        default="bookmaker",
-        choices=["bookmaker", "fixture", "both"],
-        help="Odds endpoint to use: bookmaker (default), fixture, or both (merge).",
-    )
-    parser.add_argument(
-        "--no-fixture-fallback",
-        dest="fixture_fallback",
-        action="store_false",
-        help="Disable fixture endpoint fallback when shot totals are missing.",
-    )
-    parser.add_argument(
-        "--debug-fixture",
-        type=int,
-        default=0,
-        help="Debug a single fixture's odds payload (no DB writes).",
-    )
-    parser.add_argument(
-        "--refresh-upcoming",
-        action="store_true",
-        help="Refresh upcoming fixtures for the league ids before fetching odds",
-    )
-    parser.add_argument(
-        "--refresh-squads",
-        action="store_true",
-        help="Refresh team squads for upcoming fixtures to improve player mapping",
-    )
-    parser.add_argument(
-        "--refresh-squads-missing",
-        dest="refresh_squads_missing",
-        action="store_true",
-        help="Refresh squads for teams missing players (default).",
-    )
-    parser.add_argument(
-        "--no-refresh-squads-missing",
-        dest="refresh_squads_missing",
-        action="store_false",
-        help="Disable auto refresh of squads for missing teams.",
-    )
+    parser.add_argument("--limit", type=int, default=0, help="Limit events processed")
+    parser.add_argument("--sport", default="football")
     parser.add_argument(
         "--unmatched-out",
         default="",
@@ -1424,350 +1222,138 @@ def main() -> None:
     parser.add_argument(
         "--report-out",
         default="",
-        help="Write sync summary report JSON (per league).",
+        help="Write sync report JSON",
     )
     parser.add_argument(
-        "--debug-mapping-out",
+        "--debug-events-out",
         default="",
-        help="Write mapping debug samples to JSON.",
+        help="Write raw events JSON",
     )
     parser.add_argument(
-        "--debug-mapping-limit",
-        type=int,
-        default=100,
-        help="Max debug samples to capture.",
+        "--debug-odds-out",
+        default="",
+        help="Write raw odds JSON",
     )
-    parser.add_argument(
-        "--debug-parse-examples",
-        action="store_true",
-        help="Print line/side parsing examples and exit.",
-    )
-    parser.set_defaults(refresh_squads_missing=True)
-    parser.set_defaults(fixture_fallback=True)
     args = parser.parse_args()
-
-    if args.debug_parse_examples:
-        examples = [
-            "25_5_over",
-            "8_5_under",
-            "over_10_5_2",
-            "under_3_5_1",
-            "over_10_5_team_2",
-        ]
-        for raw in examples:
-            normalized = normalize_slug(raw)
-            line, direction, side = parse_line_side_from_selection_key(normalized)
-            print(
-                f"{raw} -> normalized={normalized} line={line} direction={direction} side={side}",
-                flush=True,
-            )
-        raise SystemExit(0)
 
     raw_leagues = args.leagues.replace('"', "").replace("'", "")
     league_ids = [int(x) for x in raw_leagues.split(",") if x.strip()]
     if not league_ids:
         raise SystemExit("No league IDs provided")
 
-    market_ids: List[int] = []
-    raw_markets = args.market_ids
-    if not raw_markets:
-        raw_markets = os.environ.get("ODDS_MARKET_ID_ALLOWLIST", "")
-    if raw_markets:
-        raw_markets = raw_markets.replace('"', "").replace("'", "")
-        market_ids = [int(x) for x in raw_markets.split(",") if x.strip()]
-
-    client = SportMonksClient()
-    if args.debug_fixture:
-        fixture_id = int(args.debug_fixture)
-        try:
-            data = fetch_odds_for_fixture(
-                client,
-                fixture_id,
-                args.bookmaker_id,
-                market_ids=market_ids or None,
-                per_page=args.per_page,
-                odds_endpoint=args.odds_endpoint,
-                fallback_fixture=args.fixture_fallback,
-            )
-        except SportMonksError as exc:
-            log.warning("Debug fixture %s failed: %s", fixture_id, exc)
-            if args.report_out:
-                report = {
-                    "fixture_id": fixture_id,
-                    "error": str(exc),
-                    "status_code": exc.status_code,
-                }
-                Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
-            return
-        log.info("Debug fixture %s markets=%s", fixture_id, len(data))
-        markets = {}
-        shot_rows = []
-        shot_total_rows = []
-        shot_total_keys = {
-            "team_shots",
-            "team_shots_on_target",
-            "match_shots",
-            "match_shots_on_target",
-        }
-        for row in data:
-            market_id = parse_int(row.get("market_id"))
-            market_desc = str(row.get("market_description") or row.get("market") or "")
-            market_key = resolve_market_key(row)
-            markets.setdefault((market_id, market_desc, market_key), 0)
-            markets[(market_id, market_desc, market_key)] += 1
-            desc_lower = market_desc.lower()
-            selection_text = merge_selection_text(str(row.get("name") or ""), str(row.get("label") or ""))
-            selection_lower = selection_text.lower()
-            if (
-                "shot" in desc_lower
-                or "on target" in desc_lower
-                or "shot" in selection_lower
-                or "on target" in selection_lower
-            ):
-                shot_rows.append(
-                    {
-                        "market_id": market_id,
-                        "market_description": market_desc,
-                        "market_key": market_key,
-                        "name": row.get("name"),
-                        "label": row.get("label"),
-                        "total": row.get("total"),
-                        "selection_key": normalize_slug(selection_text),
-                        "value": row.get("value"),
-                        "american": row.get("american"),
-                    }
-                )
-            if market_key in shot_total_keys:
-                shot_total_rows.append(
-                    {
-                        "market_id": market_id,
-                        "market_description": market_desc,
-                        "market_key": market_key,
-                        "name": row.get("name"),
-                        "label": row.get("label"),
-                        "total": row.get("total"),
-                        "selection_key": normalize_slug(selection_text),
-                        "value": row.get("value"),
-                        "american": row.get("american"),
-                    }
-                )
-        for (market_id, market_desc, market_key), count in sorted(markets.items(), key=lambda item: item[0][1]):
-            log.info("market_id=%s market_key=%s desc=%s outcomes=%s", market_id, market_key, market_desc, count)
-        if shot_rows:
-            log.info("Shot-related markets (first 200 rows):")
-            for row in shot_rows[:200]:
-                log.info("%s", row)
-        else:
-            log.info("No shot-related markets found for fixture %s", fixture_id)
-        if shot_total_rows:
-            log.info("Shot totals markets (first 200 rows):")
-            for row in shot_total_rows[:200]:
-                log.info("%s", row)
-        else:
-            log.info("No shot totals markets (team/match) found for fixture %s", fixture_id)
-        if args.report_out:
-            report = {
-                "fixture_id": fixture_id,
-                "markets_total": len(data),
-                "shot_rows": shot_rows[:200],
-                "shot_totals_rows": shot_total_rows[:200],
-                "market_ids_filter": market_ids,
-                "odds_endpoint": args.odds_endpoint,
-            }
-            Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
-        return
+    market_allowlist = load_market_allowlist()
+    bookmakers = [b.strip() for b in str(args.bookmakers).split(",") if b.strip()]
+    if not bookmakers:
+        bookmakers = list(DEFAULT_BOOKMAKERS)
+    bookmakers_by_lower = {b.lower(): b for b in bookmakers}
 
     engine = get_engine()
     session = get_session(engine)
     Base.metadata.create_all(engine)
 
-    svc = None
-    if args.refresh_upcoming or args.refresh_squads or args.refresh_squads_missing:
-        svc = SyncService(client, session)
-        svc.ensure_schema()
-        if args.refresh_upcoming:
-            log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
-            svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
-    start_dt, end_dt = fixture_window_bounds(args.days_forward)
-    fixtures = fetch_fixture_rows(session, league_ids, start_dt, end_dt)
-    if args.limit and args.limit > 0:
-        fixtures = fixtures[: args.limit]
-
+    fixtures = load_fixtures(session, league_ids, args.days_forward)
     if not fixtures:
         log.info("No fixtures found for odds window")
         return
 
-    log.info("Found %s fixtures for odds window", len(fixtures))
+    league_map = load_league_map(Path(__file__).resolve().parent.parent / "config" / "odds_api_leagues.json")
 
-    team_ids = {
-        fixture.get("home_team_id")
-        for fixture in fixtures
-        if fixture.get("home_team_id")
-    } | {
-        fixture.get("away_team_id")
-        for fixture in fixtures
-        if fixture.get("away_team_id")
-    }
-    if (args.refresh_squads or args.refresh_squads_missing) and svc is not None and team_ids:
-        team_ids_list = sorted(team_ids)
-        if args.refresh_squads:
-            log.info("Refreshing squads for %s teams", len(team_ids_list))
-            svc.sync_squads_for_teams(team_ids_list)
-        else:
-            counts = fetch_team_player_counts(session, team_ids_list)
-            missing = [team_id for team_id in team_ids_list if counts.get(team_id, 0) == 0]
-            if missing:
-                log.info(
-                    "Refreshing squads for %s/%s teams missing players",
-                    len(missing),
-                    len(team_ids_list),
-                )
-                svc.sync_squads_for_teams(missing)
+    client = OddsApiClient()
 
-    unmatched_details: List[Dict] = []
-    unmatched_counts: Dict[Tuple[str, str], int] = {}
-    unmatched_team_counts: Dict[str, int] = {}
-    unmatched_selection_counts: Dict[str, int] = {}
-    debug_samples: List[Dict] = []
-    debug_fuzzy_matches: List[Dict] = []
-    rate_limit_skipped: List[int] = []
-    rate_limit_first: Optional[Dict[str, object]] = None
-    fixtures_processed = 0
-    raw_allowlist = (os.environ.get("ODDS_MARKET_ALLOWLIST") or "").strip()
-    market_allowlist = load_market_allowlist()
-    allowlist_enabled = market_allowlist is not None
-    if not allowlist_enabled and os.environ.get("ALLOWLIST_BYPASS", "").lower() not in {"1", "true", "yes"}:
-        raise SystemExit("Allowlist disabled. Set ALLOWLIST_BYPASS=1 to proceed.")
-    if allowlist_enabled:
-        log.info("Market allowlist (%s): %s", len(market_allowlist), ", ".join(sorted(market_allowlist)))
-    else:
-        log.warning("Market allowlist bypassed (ODDS_MARKET_ALLOWLIST=%s)", raw_allowlist or "unset")
-    allowlist_counts: Dict[str, int] = {"dropped": 0}
+    unmatched_details: List[Dict[str, object]] = []
+    event_map: Dict[int, int] = {}
+    events_raw: Dict[int, object] = {}
+    odds_raw: Dict[int, object] = {}
 
-    for idx, fixture in enumerate(fixtures, start=1):
-        fixture_id = fixture["fixture_id"]
-        home_team_id = fixture.get("home_team_id")
-        away_team_id = fixture.get("away_team_id")
-        team_map, team_aliases = load_team_context(session, [home_team_id, away_team_id])
-        home_aliases = team_aliases.get(home_team_id, []) if home_team_id else []
-        away_aliases = team_aliases.get(away_team_id, []) if away_team_id else []
-        player_map = load_fixture_player_map(session, fixture_id)
-        team_player_map = load_team_player_map(
-            session,
-            [home_team_id, away_team_id],
-        )
-        fuzzy_candidates = build_fuzzy_candidates(session, [home_team_id, away_team_id])
-        debug_team_players = None
-        if args.debug_mapping_out:
-            debug_team_players = load_team_player_names(session, [home_team_id, away_team_id], limit=50)
-
-        try:
-            data = fetch_odds_for_fixture(
-                client,
-                fixture_id,
-                args.bookmaker_id,
-                market_ids=market_ids or None,
-                per_page=args.per_page,
-                odds_endpoint=args.odds_endpoint,
-                fallback_fixture=args.fixture_fallback,
-            )
-        except SportMonksError as exc:
-            if exc.status_code == 429:
-                rate_limit_skipped.append(fixture_id)
-                if not rate_limit_first:
-                    endpoint_hint = (
-                        f"odds/pre-match/fixtures/{fixture_id}"
-                        if args.odds_endpoint == "fixture"
-                        else f"odds/pre-match/fixtures/{fixture_id}/bookmakers/{args.bookmaker_id}"
-                    )
-                    rate_limit_first = {
-                        "fixture_id": fixture_id,
-                        "endpoint": endpoint_hint,
-                    }
-                log.warning("Skipping fixture %s due to rate limit.", fixture_id)
-                max_skips = int(os.environ.get("SM_RATE_LIMIT_MAX_SKIPS", "0") or 0)
-                if max_skips and len(rate_limit_skipped) >= max_skips:
-                    log.warning("Rate limit skip cap reached (%s). Aborting league.", max_skips)
-                    break
-                continue
-            raise
-        snapshot = {
-            "fixture_id": fixture_id,
-            "bookmaker_id": args.bookmaker_id,
-            "pulled_at": datetime.utcnow(),
-            "raw": json.dumps({"data": data}),
+    for league_id in league_ids:
+        odds_league = league_map.get(league_id)
+        if not odds_league:
+            log.warning("No Odds-API league mapping for league_id=%s (skipping)", league_id)
+            continue
+        league_fixtures = [f for f in fixtures if f["league_id"] == league_id]
+        if not league_fixtures:
+            continue
+        start_dt, end_dt = fixture_window_bounds(args.days_forward)
+        params = {
+            "sport": args.sport,
+            "league": odds_league,
+            "status": "pending,live",
+            "from": start_dt.isoformat() + "Z",
+            "to": end_dt.isoformat() + "Z",
         }
-        session.execute(
-            text(
-                """
-                insert into odds_snapshots (fixture_id, bookmaker_id, pulled_at, raw)
-                values (:fixture_id, :bookmaker_id, :pulled_at, :raw)
-                """
-            ),
-            snapshot,
-        )
+        try:
+            events = client.request("events", params=params)
+        except OddsApiError as exc:
+            log.error("Odds-API events failed for league %s: %s", odds_league, exc)
+            continue
+        if not isinstance(events, list):
+            log.warning("Unexpected events response for league %s", odds_league)
+            continue
+        events_raw[league_id] = events
 
-        outcomes = parse_outcomes(
-            fixture_id,
-            args.bookmaker_id,
-            data,
-            player_map,
-            team_map,
-            team_player_map,
-            home_team_id,
-            away_team_id,
-            home_aliases,
-            away_aliases,
-            fuzzy_candidates,
-            unmatched_details,
-            unmatched_counts,
-            unmatched_team_counts,
-            unmatched_selection_counts,
-            debug_samples,
-            debug_team_players,
-            args.debug_mapping_limit,
-            debug_fuzzy_matches,
-            market_allowlist,
-            allowlist_counts,
-        )
-        upsert_outcomes(session, outcomes)
-        session.commit()
-        fixtures_processed += 1
-        if idx == 1 or idx % 100 == 0 or idx == len(fixtures):
-            log.info(
-                "Processed fixture %s (%s/%s) outcomes=%s",
-                fixture_id,
-                idx,
-                len(fixtures),
-                len(outcomes),
-            )
+        for event in events:
+            fixture = match_event_to_fixture(event, league_fixtures)
+            if not fixture:
+                continue
+            event_id = event.get("id")
+            if event_id is None:
+                continue
+            event_map[int(event_id)] = fixture["fixture_id"]
 
-    log.info("Odds sync complete")
-    if market_allowlist is not None:
-        log.info(
-            "Market allowlist active (size=%s). Dropped outcomes=%s",
-            len(market_allowlist),
-            allowlist_counts.get("dropped", 0),
-        )
+    if not event_map:
+        log.info("No events matched to fixtures")
+        return
 
-    if unmatched_counts:
-        by_market: Dict[str, Dict[str, int]] = {}
-        for (market_key, raw_name), count in unmatched_counts.items():
-            by_market.setdefault(market_key, {})[raw_name] = count
-        for market_key, names in sorted(by_market.items()):
-            top = sorted(names.items(), key=lambda item: item[1], reverse=True)[:20]
-            summary = ", ".join(f"{name}({count})" for name, count in top)
-            log.info("Unmatched player names summary %s: %s", market_key, summary)
+    event_ids = list(event_map.keys())
+    if args.limit and args.limit > 0:
+        event_ids = event_ids[: args.limit]
+    log.info("Matched %s events to fixtures", len(event_ids))
 
-    if unmatched_team_counts:
-        top = sorted(unmatched_team_counts.items(), key=lambda item: item[1], reverse=True)[:20]
-        summary = ", ".join(f"{key}({count})" for key, count in top)
-        log.info("Unmatched team selection_key summary: %s", summary)
+    outcomes_total = 0
+    batches = [event_ids[i : i + 10] for i in range(0, len(event_ids), 10)]
+    for batch in batches:
+        params = {
+            "eventIds": ",".join(str(e) for e in batch),
+            "bookmakers": ",".join(bookmakers),
+        }
+        try:
+            odds_batch = client.request("odds/multi", params=params)
+        except OddsApiError as exc:
+            log.error("Odds-API odds/multi failed for events %s: %s", batch[:3], exc)
+            continue
+        if not isinstance(odds_batch, list):
+            continue
+        for odds_event in odds_batch:
+            event_id = odds_event.get("id")
+            if event_id is None:
+                continue
+            fixture_id = event_map.get(int(event_id))
+            if not fixture_id:
+                continue
+            fixture = next((f for f in fixtures if f["fixture_id"] == fixture_id), None)
+            if not fixture:
+                continue
+            bookmakers_payload = odds_event.get("bookmakers") or {}
+            if args.debug_odds_out:
+                odds_raw[int(event_id)] = bookmakers_payload
+            for bookmaker_name, markets in bookmakers_payload.items():
+                canonical_name = bookmakers_by_lower.get(bookmaker_name.lower())
+                if not canonical_name:
+                    continue
+                rows = parse_markets_for_fixture_extended(
+                    fixture,
+                    markets,
+                    canonical_name,
+                    market_allowlist,
+                    session,
+                    unmatched_details,
+                )
+                if rows:
+                    upsert_outcomes(session, rows)
+                    outcomes_total += len(rows)
+            session.commit()
 
-    if unmatched_selection_counts:
-        top = sorted(unmatched_selection_counts.items(), key=lambda item: item[1], reverse=True)[:20]
-        summary = ", ".join(f"{key}({count})" for key, count in top)
-        log.info("Unmatched player selection_key summary: %s", summary)
+    log.info("Odds sync complete: outcomes=%s", outcomes_total)
 
     if args.unmatched_out:
         try:
@@ -1777,58 +1363,35 @@ def main() -> None:
         except OSError as exc:
             log.warning("Failed to write unmatched output %s: %s", args.unmatched_out, exc)
 
-    if args.debug_mapping_out:
+    if args.debug_events_out:
         try:
-            payload = {
-                "unmatched_player_names": [
-                    {"market_key": market_key, "raw_name": raw_name, "count": count}
-                    for (market_key, raw_name), count in sorted(
-                        unmatched_counts.items(), key=lambda item: item[1], reverse=True
-                    )[:200]
-                ],
-                "unmatched_player_selection_keys": [
-                    {"selection_key": key, "count": count}
-                    for key, count in sorted(
-                        unmatched_selection_counts.items(), key=lambda item: item[1], reverse=True
-                    )[:200]
-                ],
-                "unmatched_team_selection_keys": [
-                    {"selection_key": key, "count": count}
-                    for key, count in sorted(
-                        unmatched_team_counts.items(), key=lambda item: item[1], reverse=True
-                    )[:200]
-                ],
-                "samples": debug_samples,
-                "fuzzy_matches": debug_fuzzy_matches,
-            }
-            with open(args.debug_mapping_out, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2)
-            log.info("Wrote debug mapping output to %s", args.debug_mapping_out)
+            with open(args.debug_events_out, "w", encoding="utf-8") as f:
+                json.dump(events_raw, f, indent=2)
         except OSError as exc:
-            log.warning("Failed to write debug mapping output %s: %s", args.debug_mapping_out, exc)
+            log.warning("Failed to write debug events %s: %s", args.debug_events_out, exc)
+
+    if args.debug_odds_out:
+        try:
+            with open(args.debug_odds_out, "w", encoding="utf-8") as f:
+                json.dump(odds_raw, f, indent=2)
+        except OSError as exc:
+            log.warning("Failed to write debug odds %s: %s", args.debug_odds_out, exc)
 
     if args.report_out:
-        stats = client.stats if hasattr(client, "stats") else {}
         report = {
             "league_ids": league_ids,
-            "fixtures_total": len(fixtures),
-            "fixtures_processed": fixtures_processed,
-            "fixtures_skipped_rate_limit": len(rate_limit_skipped),
-            "fixtures_skipped_rate_limit_ids": rate_limit_skipped[:200],
-            "rate_limit_first": rate_limit_first,
-            "market_ids_filter": market_ids,
-            "odds_endpoint": args.odds_endpoint,
-            "api_calls_total": stats.get("total_calls", 0),
-            "api_calls_by_endpoint": stats.get("by_endpoint", {}),
-            "api_time_seconds": round(float(stats.get("total_time_seconds", 0.0)), 2),
-            "api_rate_limit_hits": stats.get("rate_limit_hits", 0),
-            "api_rate_limit_retries": stats.get("rate_limit_retries", 0),
+            "bookmakers": bookmakers,
+            "events_matched": len(event_map),
+            "outcomes_written": outcomes_total,
+            "api_calls_total": client.stats.total_calls,
+            "api_calls_by_endpoint": client.stats.calls_by_endpoint,
+            "api_time_seconds": round(client.stats.api_time_seconds, 2),
+            "rate_limit_hits": client.stats.rate_limit_hits,
+            "rate_limit_sleeps": client.stats.rate_limit_sleeps,
+            "last_rate_limit": client.stats.last_rate_limit,
+            "unmatched_players": len(unmatched_details),
         }
-        try:
-            Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
-            log.info("Wrote sync report to %s", args.report_out)
-        except OSError as exc:
-            log.warning("Failed to write sync report %s: %s", args.report_out, exc)
+        Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":

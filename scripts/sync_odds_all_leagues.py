@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Sync Bet365 odds for all configured leagues (plus leagues with fixtures in the odds window).
+Sync odds for configured leagues (plus leagues with fixtures in the odds window).
 
 - Reads config/league_ids.txt
-- Refreshes upcoming fixtures (next N days)
-- Fetches odds into SQLite (odds_snapshots/odds_outcomes)
+- Uses Odds-API.io events + odds endpoints
+- Stores allowlisted markets in odds_outcomes (SQLite)
 """
 
 from __future__ import annotations
@@ -69,13 +69,11 @@ def load_fixture_league_ids(db_path: Path, start_dt: str, end_dt: str) -> list[i
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days-forward", type=int, default=14)
-    parser.add_argument("--bookmaker-id", type=int, default=2)
-    parser.add_argument("--sleep", type=float, default=0.05)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
-        "--refresh-squads",
-        action="store_true",
-        help="Refresh team squads for upcoming fixtures to improve player mapping",
+        "--bookmakers",
+        default=os.environ.get("ODDS_BOOKMAKERS", "Bet365,Kambi,Paddy Power"),
+        help="Comma-separated bookmaker names",
     )
     args = parser.parse_args()
 
@@ -99,14 +97,9 @@ def main() -> None:
         league_ids_csv,
         "--days-forward",
         str(args.days_forward),
-        "--bookmaker-id",
-        str(args.bookmaker_id),
-        "--sleep",
-        str(args.sleep),
-        "--refresh-upcoming",
+        "--bookmakers",
+        args.bookmakers,
     ]
-    if args.refresh_squads:
-        cmd.append("--refresh-squads")
     if args.limit and args.limit > 0:
         cmd += ["--limit", str(args.limit)]
 

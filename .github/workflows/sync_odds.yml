@@ -48,11 +48,10 @@ jobs:
       ODDS_IDLE_TX_TIMEOUT: "0"
       ODDS_ADVISORY_LOCK_KEY: "982374"
       ODDS_MARKET_ALLOWLIST: ${{ vars.ODDS_MARKET_ALLOWLIST }}
-      ODDS_MARKET_ID_ALLOWLIST: ${{ vars.ODDS_MARKET_ID_ALLOWLIST }}
-      SM_RATE_LIMIT_RETRIES: ${{ vars.SM_RATE_LIMIT_RETRIES || '3' }}
-      SM_RATE_LIMIT_SLEEP_BASE: ${{ vars.SM_RATE_LIMIT_SLEEP_BASE || '1' }}
-      SM_RATE_LIMIT_SLEEP_MAX: ${{ vars.SM_RATE_LIMIT_SLEEP_MAX || '10' }}
-      SM_RATE_LIMIT_MAX_SKIPS: ${{ vars.SM_RATE_LIMIT_MAX_SKIPS || '3' }}
+      ODDS_BOOKMAKERS: ${{ vars.ODDS_BOOKMAKERS || 'Bet365,Kambi,Paddy Power' }}
+      ODDS_API_RETRIES: ${{ vars.ODDS_API_RETRIES || '3' }}
+      ODDS_API_SLEEP_BASE: ${{ vars.ODDS_API_SLEEP_BASE || '1' }}
+      ODDS_API_SLEEP_MAX: ${{ vars.ODDS_API_SLEEP_MAX || '10' }}
       SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
       PGSSLMODE: require
@@ -81,12 +80,6 @@ jobs:
             scripts/sync_odds.py \
             scripts/odds_retention_psql.py \
             scripts/patch_odds_participants_psql.py
-      - name: Compile odds scripts
-        run: |
-          python -m py_compile \
-            scripts/export_odds_to_supabase_psql.py \
-            scripts/sync_odds.py \
-            scripts/odds_retention_psql.py
 
       - name: Supabase DB preflight (psql)
         id: preflight
@@ -145,16 +138,15 @@ jobs:
       - name: Sync pre-match odds (next 14 days)
         if: env.PSQL_PREFLIGHT_OK == 'true'
         env:
-          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
         run: |
           echo "LEAGUES_ARG=[${{ matrix.league_id }}]"
-          cmd="python3 scripts/sync_odds.py --leagues \"${{ matrix.league_id }}\" --days-forward 14 --refresh-upcoming --per-page 100 --odds-endpoint fixture --no-fixture-fallback --report-out /tmp/odds_sync_report_${{ matrix.league_id }}.json --unmatched-out /tmp/unmatched_players_${{ matrix.league_id }}.json"
-          if [ "$MODE" = "full" ]; then
-            cmd="$cmd --refresh-squads"
-          else
-            cmd="$cmd --no-refresh-squads-missing"
-          fi
-          $cmd
+          python3 scripts/sync_odds.py \
+            --leagues "${{ matrix.league_id }}" \
+            --days-forward 14 \
+            --bookmakers "${ODDS_BOOKMAKERS}" \
+            --report-out /tmp/odds_sync_report_${{ matrix.league_id }}.json \
+            --unmatched-out /tmp/unmatched_players_${{ matrix.league_id }}.json
 
       - name: Upload unmatched players
         if: always()
