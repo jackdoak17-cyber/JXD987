@@ -100,9 +100,16 @@ TEAM_TOKEN_DROP = {
 
 MARKET_NAME_MAP = {
     "ml": "moneyline",
+    "moneyline": "moneyline",
     "match_result": "moneyline",
+    "match_winner": "moneyline",
+    "match_winner_90": "moneyline",
+    "match_winner_90_min": "moneyline",
     "full_time_result": "moneyline",
     "full_time_result_90": "moneyline",
+    "home_draw_away": "moneyline",
+    "1x2": "moneyline",
+    "h2h": "moneyline",
     "draw_no_bet": "draw_no_bet",
     "double_chance": "double_chance",
     "goals_over_under": "goals_over_under",
