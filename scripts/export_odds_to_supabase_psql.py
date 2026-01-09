@@ -151,6 +151,14 @@ def sql_array(values: List[int]) -> str:
     return f"array[{items}]::int[]"
 
 
+def sql_text_array(values: Iterable[str]) -> str:
+    items = [value for value in values if value]
+    if not items:
+        return "array[]::text[]"
+    quoted = ",".join("'" + value.replace("'", "''") + "'" for value in items)
+    return f"array[{quoted}]::text[]"
+
+
 def run_psql(
     db_url: str,
     sql: str,
@@ -456,6 +464,7 @@ def stage_and_upsert(
     league_label: str,
     league_ids: List[int],
     days_forward: int,
+    market_allowlist: Optional[Iterable[str]],
     keep_sql: bool,
     err_path: Optional[str],
     out_path: Optional[str],
@@ -486,6 +495,8 @@ def stage_and_upsert(
     league_filter = ""
     if league_ids:
         league_filter = f"and f.league_id = any({sql_array(league_ids)})"
+    allowlist_items = [value for value in (market_allowlist or []) if value]
+    allowlist_array = sql_text_array(sorted(allowlist_items)) if allowlist_items else ""
     fixture_window_sql = (
         f"with fixture_window as (\n"
         f"  select f.id, f.home_team_id, f.away_team_id\n"
@@ -718,6 +729,40 @@ where o.fixture_id = fw.id
   and o.line in (1,2)
   and o.selection_key in ('over','under');
 """
+    missing_markets_sql = ""
+    if allowlist_items:
+        missing_markets_sql = f"""
+with stage_markets as (
+  select distinct fixture_id, bookmaker_id, market_key
+  from odds_outcomes_stage
+),
+fixture_bookmakers as (
+  select distinct fixture_id, bookmaker_id
+  from odds_outcomes_stage
+),
+allowlist as (
+  select unnest({allowlist_array})::text as market_key
+),
+missing as (
+  select fb.fixture_id, fb.bookmaker_id, al.market_key
+  from fixture_bookmakers fb
+  cross join allowlist al
+  left join stage_markets sm
+    on sm.fixture_id = fb.fixture_id
+   and sm.bookmaker_id = fb.bookmaker_id
+   and sm.market_key = al.market_key
+  where sm.market_key is null
+),
+deleted as (
+  delete from public.odds_outcomes o
+  using missing m
+  where o.fixture_id = m.fixture_id
+    and o.bookmaker_id = m.bookmaker_id
+    and o.market_key = m.market_key
+  returning 1
+)
+select 'deleted_missing_markets', count(*)::bigint from deleted;
+"""
     sql_lines = [
         "\\set ON_ERROR_STOP on",
         f"set statement_timeout = '{statement_timeout}';",
@@ -749,6 +794,11 @@ with deleted as (
 select 'deleted_existing', count(*)::bigint from deleted;
 """,
         "",
+    ]
+    if missing_markets_sql:
+        sql_lines.append(missing_markets_sql)
+        sql_lines.append("")
+    sql_lines += [
         """
 with src as (
   select distinct on (fixture_id, bookmaker_id, market_key, selection_key, line)
@@ -851,6 +901,7 @@ where
     counts = {
         "stage_count": 0,
         "deleted_existing": 0,
+        "deleted_missing_markets": 0,
         "src_count": 0,
         "upserted_total": 0,
         "inserted": 0,
@@ -1388,6 +1439,7 @@ def main() -> None:
     counts = {
         "stage_count": 0,
         "deleted_existing": 0,
+        "deleted_missing_markets": 0,
         "src_count": 0,
         "upserted_total": 0,
         "inserted": 0,
@@ -1407,6 +1459,7 @@ def main() -> None:
             league_label,
             effective_leagues,
             args.days_forward,
+            market_allowlist,
             args.keep_sql,
             err_path,
             out_path,
@@ -1606,6 +1659,7 @@ def main() -> None:
         "copy_rows": counts.get("stage_count", 0),
         "rows_copied": counts.get("stage_count", 0),
         "deleted_existing_rows": counts.get("deleted_existing", 0),
+        "deleted_missing_markets": counts.get("deleted_missing_markets", 0),
         "inserted_rows": counts.get("inserted", 0),
         "rows_inserted": counts.get("inserted", 0),
         "updated_rows": counts.get("updated", 0),
