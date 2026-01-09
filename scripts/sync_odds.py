@@ -201,6 +201,27 @@ def normalize_team_name(value: str) -> str:
     return normalized
 
 
+def normalize_team_variants(value: str) -> List[str]:
+    if not value:
+        return []
+    raw = value.lower().strip()
+    raw = raw.replace("&", "and")
+    tokens = [token for token in normalize_name_tokens(raw) if token not in TEAM_TOKEN_DROP]
+    if not tokens:
+        return []
+    variants = {"".join(tokens)}
+    if len(tokens) > 1:
+        variants.add("".join(tokens[:-1]))
+    if len(tokens) > 2:
+        variants.add("".join(tokens[1:]))
+    expanded = set()
+    for alias in variants:
+        expanded.add(alias)
+        if alias in TEAM_NAME_ALIAS:
+            expanded.add(TEAM_NAME_ALIAS[alias])
+    return [item for item in expanded if item]
+
+
 def team_aliases(value: str, short_code: Optional[str] = None) -> List[str]:
     aliases = set()
     if value:
@@ -441,18 +462,19 @@ def load_fixtures(session, league_ids: List[int], days_forward: int) -> List[Dic
 
 
 def score_name_match(event_name: str, aliases: Iterable[str]) -> float:
-    event_norm = normalize_team_name(event_name)
-    if not event_norm:
+    event_variants = normalize_team_variants(event_name)
+    if not event_variants:
         return 0.0
     best = 0.0
     for alias in aliases:
         if not alias:
             continue
-        if event_norm == alias:
-            return 1.0
-        score = difflib.SequenceMatcher(None, event_norm, alias).ratio()
-        if score > best:
-            best = score
+        for event_norm in event_variants:
+            if event_norm == alias:
+                return 1.0
+            score = difflib.SequenceMatcher(None, event_norm, alias).ratio()
+            if score > best:
+                best = score
     return best
 
 
