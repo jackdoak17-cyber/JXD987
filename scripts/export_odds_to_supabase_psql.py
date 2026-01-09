@@ -735,6 +735,21 @@ where o.fixture_id = fw.id
         "select 'stage_count', count(*)::bigint from odds_outcomes_stage;",
         "",
         """
+with deleted as (
+  delete from public.odds_outcomes o
+  using (
+    select distinct fixture_id, bookmaker_id, market_key
+    from odds_outcomes_stage
+  ) s
+  where o.fixture_id = s.fixture_id
+    and o.bookmaker_id = s.bookmaker_id
+    and o.market_key = s.market_key
+  returning 1
+)
+select 'deleted_existing', count(*)::bigint from deleted;
+""",
+        "",
+        """
 with src as (
   select distinct on (fixture_id, bookmaker_id, market_key, selection_key, line)
     fixture_id, bookmaker_id, market_key, selection_key, line,
@@ -833,7 +848,14 @@ where
         except OSError:
             pass
 
-    counts = {"stage_count": 0, "src_count": 0, "upserted_total": 0, "inserted": 0, "updated": 0}
+    counts = {
+        "stage_count": 0,
+        "deleted_existing": 0,
+        "src_count": 0,
+        "upserted_total": 0,
+        "inserted": 0,
+        "updated": 0,
+    }
     for line in output.splitlines():
         parts = line.split("\t")
         if len(parts) >= 2 and parts[0] in counts:
@@ -1363,7 +1385,15 @@ def main() -> None:
     except (OSError, json.JSONDecodeError) as exc:
         print(f"Failed to write CSV proof artifacts: {exc}", flush=True)
 
-    counts = {"stage_count": 0, "src_count": 0, "upserted_total": 0, "inserted": 0, "updated": 0, "unchanged": 0}
+    counts = {
+        "stage_count": 0,
+        "deleted_existing": 0,
+        "src_count": 0,
+        "upserted_total": 0,
+        "inserted": 0,
+        "updated": 0,
+        "unchanged": 0,
+    }
     ingest_ok = True
     error_stage: Optional[str] = None
     error_message: Optional[str] = None
@@ -1575,6 +1605,7 @@ def main() -> None:
         "rows_exported_csv": total_rows,
         "copy_rows": counts.get("stage_count", 0),
         "rows_copied": counts.get("stage_count", 0),
+        "deleted_existing_rows": counts.get("deleted_existing", 0),
         "inserted_rows": counts.get("inserted", 0),
         "rows_inserted": counts.get("inserted", 0),
         "updated_rows": counts.get("updated", 0),
