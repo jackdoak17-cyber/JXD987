@@ -84,6 +84,7 @@ TEAM_NAME_ALIAS = {
     "manchester city": "manchestercity",
     "psg": "parissaintgermain",
     "paris saint germain": "parissaintgermain",
+    "lilleosc": "losclille",
     "spurs": "tottenhamhotspur",
     "tottenham": "tottenhamhotspur",
     "inter": "internazionale",
