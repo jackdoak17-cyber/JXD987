@@ -465,7 +465,7 @@ def count_invalid_goals_over_under(
         join fixtures f on f.id = o.fixture_id
         where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
           {league_clause}
-          and o.market_key = 'goals_over_under'
+          and o.market_key in ('goals_over_under','goals_over_under_first_half')
           and (o.selection_key not in ('over','under') or o.line is null)
         """,
         params,
@@ -768,6 +768,14 @@ where o.fixture_id = fw.id
   and o.line is null
   and o.selection_key in ('over','under');
 """
+    cleanup_goals_sql = f"""
+{fixture_window_sql}
+delete from public.odds_outcomes o
+using fixture_window fw
+where o.fixture_id = fw.id
+  and o.market_key in ('goals_over_under','goals_over_under_first_half')
+  and (o.selection_key not in ('over','under') or o.line is null);
+"""
     cleanup_team_sql = f"""
 {fixture_window_sql}
 delete from public.odds_outcomes o
@@ -882,6 +890,7 @@ where
         match_update_sql,
         team_delete_sql,
         team_update_sql,
+        cleanup_goals_sql,
         cleanup_match_sql,
         cleanup_team_sql,
         "commit;",
