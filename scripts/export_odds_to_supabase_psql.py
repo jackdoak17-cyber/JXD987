@@ -32,6 +32,7 @@ DEFAULT_MARKET_ALLOWLIST = {
     "double_chance",
     "draw_no_bet",
     "goals_over_under",
+    "goals_over_under_first_half",
     "btts",
     "match_shots",
     "match_shots_on_target",

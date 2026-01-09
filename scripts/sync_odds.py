@@ -48,6 +48,7 @@ DEFAULT_MARKET_ALLOWLIST = {
     "double_chance",
     "draw_no_bet",
     "goals_over_under",
+    "goals_over_under_first_half",
     "btts",
     "match_shots",
     "match_shots_on_target",
@@ -66,7 +67,13 @@ DEFAULT_MARKET_ALLOWLIST = {
 }
 
 TEAM_MARKETS = {"team_shots", "team_shots_on_target"}
-MATCH_MARKETS = {"match_shots", "match_shots_on_target", "goals_over_under", "btts"}
+MATCH_MARKETS = {
+    "match_shots",
+    "match_shots_on_target",
+    "goals_over_under",
+    "goals_over_under_first_half",
+    "btts",
+}
 
 TEAM_NAME_ALIAS = {
     "manutd": "manchesterunited",
@@ -113,6 +120,11 @@ MARKET_NAME_MAP = {
     "draw_no_bet": "draw_no_bet",
     "double_chance": "double_chance",
     "goals_over_under": "goals_over_under",
+    "totals_ht": "goals_over_under_first_half",
+    "totals_1st_half": "goals_over_under_first_half",
+    "totals_first_half": "goals_over_under_first_half",
+    "goals_over_under_1st_half": "goals_over_under_first_half",
+    "goals_over_under_first_half": "goals_over_under_first_half",
     "totals": "goals_over_under",
     "both_teams_to_score": "btts",
     "btts": "btts",
@@ -341,6 +353,12 @@ def resolve_market_key(market_name: str) -> Optional[str]:
         return mapped
     if mapped:
         return mapped
+    if "totals" in key and any(token in key for token in ("ht", "1st_half", "first_half", "half_time")):
+        return "goals_over_under_first_half"
+    if "goals_over_under" in key and any(
+        token in key for token in ("ht", "1st_half", "first_half", "half_time")
+    ):
+        return "goals_over_under_first_half"
     if "tackle" in key and "team" not in key and "match" not in key:
         return "player_tackles"
     if "save" in key and "team" not in key and "match" not in key:
@@ -918,7 +936,12 @@ def parse_markets_for_fixture(
             rows.extend(market_yes_no_rows(fixture_id, bookmaker_id, normalized_key, odds_list, updated_at))
             continue
 
-        if normalized_key in {"goals_over_under", "match_shots", "match_shots_on_target"}:
+        if normalized_key in {
+            "goals_over_under",
+            "goals_over_under_first_half",
+            "match_shots",
+            "match_shots_on_target",
+        }:
             rows.extend(
                 market_over_under_rows(
                     fixture_id,

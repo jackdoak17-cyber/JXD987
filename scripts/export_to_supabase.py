@@ -124,6 +124,45 @@ def fetch_seasons(conn: sqlite3.Connection, keep_ids: Sequence[int]) -> List[Dic
     ]
 
 
+def extract_half_time_scores(extra_raw: object) -> Tuple[Optional[int], Optional[int]]:
+    if not extra_raw:
+        return None, None
+    extra = None
+    if isinstance(extra_raw, (dict, list)):
+        extra = extra_raw
+    else:
+        try:
+            extra = json.loads(extra_raw)
+        except Exception:
+            extra = None
+    if not isinstance(extra, dict):
+        return None, None
+    scores = extra.get("scores")
+    if not isinstance(scores, list):
+        return None, None
+    home_ht = None
+    away_ht = None
+    for score in scores:
+        if not isinstance(score, dict):
+            continue
+        if str(score.get("description") or "").upper() != "1ST_HALF":
+            continue
+        score_obj = score.get("score") or {}
+        if not isinstance(score_obj, dict):
+            continue
+        goals = score_obj.get("goals")
+        participant = score_obj.get("participant")
+        try:
+            goals_val = int(goals) if goals is not None else None
+        except Exception:
+            goals_val = None
+        if participant == "home":
+            home_ht = goals_val
+        elif participant == "away":
+            away_ht = goals_val
+    return home_ht, away_ht
+
+
 def fetch_fixtures(conn: sqlite3.Connection, keep_ids: Sequence[int], upcoming_days: int = 14) -> List[Dict]:
     cur = conn.cursor()
     q = ",".join("?" for _ in keep_ids)
@@ -140,7 +179,7 @@ def fetch_fixtures(conn: sqlite3.Connection, keep_ids: Sequence[int], upcoming_d
     cur.execute(
         f"""
         select id, league_id, season_id, starting_at, status, status_code,
-               home_team_id, away_team_id, home_score, away_score
+               home_team_id, away_team_id, home_score, away_score, extra
         from fixtures
         where season_id in ({q})
           and home_team_id is not null
@@ -154,6 +193,7 @@ def fetch_fixtures(conn: sqlite3.Connection, keep_ids: Sequence[int], upcoming_d
     )
     fixtures = []
     for row in cur.fetchall():
+        home_ht_score, away_ht_score = extract_half_time_scores(row[10])
         fixtures.append(
             {
                 "id": row[0],
@@ -166,6 +206,8 @@ def fetch_fixtures(conn: sqlite3.Connection, keep_ids: Sequence[int], upcoming_d
                 "away_team_id": row[7],
                 "home_score": row[8],
                 "away_score": row[9],
+                "home_ht_score": home_ht_score,
+                "away_ht_score": away_ht_score,
             }
         )
     return fixtures
