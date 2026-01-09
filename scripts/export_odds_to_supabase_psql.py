@@ -49,6 +49,14 @@ DEFAULT_MARKET_ALLOWLIST = {
     "player_tackles",
     "player_goalkeeper_saves",
 }
+LINE_MARKET_KEYS = {
+    "goals_over_under",
+    "goals_over_under_first_half",
+    "match_shots",
+    "match_shots_on_target",
+    "team_shots",
+    "team_shots_on_target",
+}
 
 
 def normalize_market_key(value: str) -> str:
@@ -246,6 +254,7 @@ def build_outcomes_csv(
     total_rows_estimate: int,
     total_fixtures_estimate: int,
     max_runtime_seconds: int,
+    line_market_keys: Iterable[str],
 ) -> Tuple[int, bool, Optional[int]]:
     start_dt, end_dt = sqlite_window_bounds(days_forward)
     params: List[object] = [start_dt, end_dt]
@@ -256,6 +265,15 @@ def build_outcomes_csv(
         params.extend(league_ids)
     market_clause, market_params = market_clause_and_params(market_allowlist)
     params.extend(market_params)
+    line_keys = [key for key in line_market_keys if key]
+    line_clause = ""
+    if line_keys:
+        line_placeholders = ",".join("?" for _ in line_keys)
+        line_clause = (
+            f"and (o.market_key not in ({line_placeholders}) "
+            "or (o.selection_key in ('over','under') and o.line is not null))"
+        )
+        params.extend(line_keys)
 
     cur = conn.cursor()
     cur.execute(
@@ -275,6 +293,7 @@ def build_outcomes_csv(
         where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
           {league_clause}
           {market_clause}
+          {line_clause}
         order by o.fixture_id
         """,
         params,
@@ -424,6 +443,35 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
     }
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def count_invalid_goals_over_under(
+    conn: sqlite3.Connection,
+    league_ids: Iterable[int],
+    days_forward: int,
+) -> int:
+    start_dt, end_dt = sqlite_window_bounds(days_forward)
+    params: List[object] = [start_dt, end_dt]
+    league_clause = ""
+    if league_ids:
+        placeholders = ",".join("?" for _ in league_ids)
+        league_clause = f"and f.league_id in ({placeholders})"
+        params.extend(league_ids)
+    cur = conn.cursor()
+    cur.execute(
+        f"""
+        select count(*)
+        from odds_outcomes o
+        join fixtures f on f.id = o.fixture_id
+        where datetime(f.starting_at) >= ? and datetime(f.starting_at) < ?
+          {league_clause}
+          and o.market_key = 'goals_over_under'
+          and (o.selection_key not in ('over','under') or o.line is null)
+        """,
+        params,
+    )
+    row = cur.fetchone()
+    return int(row[0] or 0)
 
 
 def fetch_sqlite_bookmaker_counts(
@@ -1408,6 +1456,7 @@ def main() -> None:
         total_rows_estimate,
         fixture_count,
         max_runtime_seconds,
+        LINE_MARKET_KEYS,
     )
     conn.close()
 
@@ -1418,6 +1467,22 @@ def main() -> None:
             f"Last fixture_id exported: {last_fixture_id}",
             flush=True,
         )
+    invalid_goals_over_under = 0
+    if effective_leagues:
+        validation_conn = sqlite3.connect(args.db)
+        try:
+            invalid_goals_over_under = count_invalid_goals_over_under(
+                validation_conn,
+                effective_leagues,
+                args.days_forward,
+            )
+        finally:
+            validation_conn.close()
+        if invalid_goals_over_under:
+            raise SystemExit(
+                f"Invalid goals_over_under rows detected in SQLite: {invalid_goals_over_under}. "
+                "selection_key must be over/under and line must be non-null."
+            )
 
     league_label = str(effective_leagues[0]) if len(effective_leagues) == 1 else "multi"
     err_path = f"/tmp/psql_err_{league_label}.txt"
@@ -1656,6 +1721,7 @@ def main() -> None:
         "sqlite_rows_filtered": total_rows_estimate,
         "sqlite_rows_exported": total_rows,
         "rows_exported_csv": total_rows,
+        "invalid_goals_over_under": invalid_goals_over_under,
         "copy_rows": counts.get("stage_count", 0),
         "rows_copied": counts.get("stage_count", 0),
         "deleted_existing_rows": counts.get("deleted_existing", 0),

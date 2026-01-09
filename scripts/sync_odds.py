@@ -743,6 +743,32 @@ def upsert_outcomes(session, rows: List[Dict]) -> None:
     session.execute(sql, rows)
 
 
+def delete_fixture_market_rows(
+    session,
+    fixture_id: int,
+    bookmaker_id: int,
+    market_keys: Iterable[str],
+) -> None:
+    keys = [key for key in market_keys if key]
+    if not keys:
+        return
+    stmt = (
+        text(
+            """
+            delete from odds_outcomes
+            where fixture_id = :fixture_id
+              and bookmaker_id = :bookmaker_id
+              and market_key in :market_keys
+            """
+        )
+        .bindparams(bindparam("market_keys", expanding=True))
+    )
+    session.execute(
+        stmt,
+        {"fixture_id": fixture_id, "bookmaker_id": bookmaker_id, "market_keys": keys},
+    )
+
+
 def market_over_under_rows(
     fixture_id: int,
     bookmaker_id: int,
@@ -1571,6 +1597,13 @@ def main() -> None:
                     unmatched_details,
                 )
                 if rows:
+                    market_keys = {row.get("market_key") for row in rows if row.get("market_key")}
+                    delete_fixture_market_rows(
+                        session,
+                        int(fixture_id),
+                        BOOKMAKER_NAME_TO_ID[book_key],
+                        market_keys,
+                    )
                     upsert_outcomes(session, rows)
                     outcomes_total += len(rows)
                     bookmaker_names_saved.add(canonical_name)
