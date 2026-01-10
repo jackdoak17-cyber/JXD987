@@ -326,6 +326,77 @@ def parse_float(value: Optional[object]) -> Optional[float]:
             return None
 
 
+ORDINAL_SUFFIX_RE = re.compile(r"(\d)(st|nd|rd|th)\b", re.IGNORECASE)
+LINE_TOKEN_RE = re.compile(r"\d+(?:[._]\d+)?")
+LINE_SIDE_RE = re.compile(
+    r"(?:(?P<side>over|under)[_\\s-]*)?(?P<line>\d+(?:[._]\d+)?)"
+    r"(?:[_\\s-]*(?P<side2>over|under))?",
+    re.IGNORECASE,
+)
+
+
+def parse_line_from_text(value: Optional[object]) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return parse_float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = ORDINAL_SUFFIX_RE.sub("", text.lower())
+    tokens = LINE_TOKEN_RE.findall(normalized)
+    if not tokens:
+        return None
+    numbers: List[float] = []
+    for token in tokens:
+        num = parse_float(token.replace("_", "."))
+        if num is not None:
+            numbers.append(num)
+    if not numbers:
+        return None
+    if len(numbers) == 1:
+        return numbers[0]
+    if "," in normalized or "/" in normalized or re.search(r"\d\s*-\s*\d", normalized):
+        return sum(numbers) / len(numbers)
+    return numbers[-1]
+
+
+def parse_side_from_text(value: Optional[object]) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).lower()
+    if "over" in text:
+        return "over"
+    if "under" in text:
+        return "under"
+    return None
+
+
+def parse_line_side_from_key(key: str) -> Tuple[Optional[float], Optional[str]]:
+    if not key:
+        return None, None
+    match = LINE_SIDE_RE.search(key.replace("__", "_"))
+    if not match:
+        return None, None
+    side = (match.group("side") or match.group("side2") or "").lower()
+    line = parse_line_from_text(match.group("line"))
+    if side not in {"over", "under"}:
+        return None, None
+    return line, side
+
+
+def extract_over_under_line(odd: Dict[str, object]) -> Optional[float]:
+    for key in ("hdp", "line", "total", "handicap"):
+        line = parse_line_from_text(odd.get(key))
+        if line is not None:
+            return line
+    for key in ("name", "label"):
+        line = parse_line_from_text(odd.get(key))
+        if line is not None:
+            return line
+    return None
+
+
 def parse_timestamp(value: Optional[object]) -> Optional[datetime]:
     if not value:
         return None
@@ -790,13 +861,41 @@ def market_over_under_rows(
 ) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
     for odd in odds_list or []:
-        line = parse_float(odd.get("hdp"))
+        entries: Dict[Tuple[str, float], float] = {}
+        line = extract_over_under_line(odd)
         over_price = parse_float(odd.get("over"))
         under_price = parse_float(odd.get("under"))
-        if line is None:
-            continue
-        if over_price is not None:
-            sel = "over" if not selection_prefix else f"{selection_prefix}_over"
+        if line is not None:
+            line = round(line, 2)
+            if over_price is not None:
+                entries[("over", line)] = over_price
+            if under_price is not None:
+                entries[("under", line)] = under_price
+
+        if not entries:
+            side = parse_side_from_text(odd.get("label") or odd.get("name"))
+            price = parse_float(odd.get("price") or odd.get("odd"))
+            if side and price is not None:
+                line = extract_over_under_line(odd)
+                if line is not None:
+                    line = round(line, 2)
+                    entries[(side, line)] = price
+
+        if not entries:
+            for key, value in odd.items():
+                if key in {"hdp", "line", "total", "handicap", "over", "under", "label", "name"}:
+                    continue
+                line_from_key, side_from_key = parse_line_side_from_key(str(key))
+                if line_from_key is None or side_from_key is None:
+                    continue
+                price = parse_float(value)
+                if price is None:
+                    continue
+                line_from_key = round(line_from_key, 2)
+                entries[(side_from_key, line_from_key)] = price
+
+        for (side, line_value), price in entries.items():
+            sel = side if not selection_prefix else f"{selection_prefix}_{side}"
             rows.append(
                 {
                     "fixture_id": fixture_id,
@@ -805,25 +904,9 @@ def market_over_under_rows(
                     "selection_key": sel,
                     "participant_type": participant_type,
                     "participant_id": participant_id,
-                    "line": line,
-                    "price_decimal": over_price,
-                    "price_american": decimal_to_american(over_price),
-                    "last_updated_at": updated_at,
-                }
-            )
-        if under_price is not None:
-            sel = "under" if not selection_prefix else f"{selection_prefix}_under"
-            rows.append(
-                {
-                    "fixture_id": fixture_id,
-                    "bookmaker_id": bookmaker_id,
-                    "market_key": market_key,
-                    "selection_key": sel,
-                    "participant_type": participant_type,
-                    "participant_id": participant_id,
-                    "line": line,
-                    "price_decimal": under_price,
-                    "price_american": decimal_to_american(under_price),
+                    "line": line_value,
+                    "price_decimal": price,
+                    "price_american": decimal_to_american(price),
                     "last_updated_at": updated_at,
                 }
             )
