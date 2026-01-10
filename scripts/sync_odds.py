@@ -858,6 +858,39 @@ def delete_fixture_market_rows(
     )
 
 
+def delete_invalid_goals_over_under(
+    session,
+    league_ids: Iterable[int],
+    days_forward: int,
+) -> int:
+    league_list = [int(value) for value in league_ids if value]
+    if not league_list:
+        return 0
+    start_dt, end_dt = fixture_window_bounds(days_forward)
+    stmt = (
+        text(
+            """
+            delete from odds_outcomes
+            where fixture_id in (
+                select id
+                from fixtures
+                where league_id in :league_ids
+                  and starting_at >= :start_dt
+                  and starting_at < :end_dt
+            )
+              and market_key in ('goals_over_under','goals_over_under_first_half')
+              and (selection_key not in ('over','under') or line is null)
+            """
+        )
+        .bindparams(bindparam("league_ids", expanding=True))
+    )
+    result = session.execute(
+        stmt,
+        {"league_ids": league_list, "start_dt": start_dt, "end_dt": end_dt},
+    )
+    return int(result.rowcount or 0)
+
+
 def market_over_under_rows(
     fixture_id: int,
     bookmaker_id: int,
@@ -1760,6 +1793,11 @@ def main() -> None:
                     outcomes_total += len(rows)
                     bookmaker_names_saved.add(canonical_name)
             session.commit()
+
+    removed_invalid = delete_invalid_goals_over_under(session, league_ids, args.days_forward)
+    if removed_invalid:
+        log.warning("Removed %s invalid goals_over_under rows after sync.", removed_invalid)
+        session.commit()
 
     log.info("Odds sync complete: outcomes=%s", outcomes_total)
 
