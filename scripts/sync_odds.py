@@ -127,6 +127,10 @@ MARKET_NAME_MAP = {
     "goals_over_under_1st_half": "goals_over_under_first_half",
     "goals_over_under_first_half": "goals_over_under_first_half",
     "totals": "goals_over_under",
+    "alternative_goal_line": "goals_over_under",
+    "alternative_goal_lines": "goals_over_under",
+    "alternate_goal_line": "goals_over_under",
+    "alternate_goal_lines": "goals_over_under",
     "both_teams_to_score": "btts",
     "btts": "btts",
     "match_shots": "match_shots",
@@ -375,6 +379,10 @@ def resolve_market_key(market_name: str) -> Optional[str]:
         return mapped
     if mapped:
         return mapped
+    if "alternative_goal_line" in key or "alternate_goal_line" in key:
+        if any(token in key for token in ("ht", "1st_half", "first_half", "half_time")):
+            return "goals_over_under_first_half"
+        return "goals_over_under"
     if "totals" in key and any(token in key for token in ("ht", "1st_half", "first_half", "half_time")):
         return "goals_over_under_first_half"
     if "goals_over_under" in key and any(
@@ -1179,16 +1187,44 @@ def parse_markets_for_fixture_extended(
     session,
     unmatched_details: List[Dict[str, object]],
 ) -> List[Dict[str, object]]:
-    rows: List[Dict[str, object]] = []
+    row_map: Dict[Tuple[int, int, str, str, Optional[float]], Dict[str, object]] = {}
+    priority_map: Dict[Tuple[int, int, str, str, Optional[float]], int] = {}
     bookmaker_id = BOOKMAKER_NAME_TO_ID.get(normalize_bookmaker_key(bookmaker_name))
     if not bookmaker_id:
-        return rows
+        return []
     fixture_id = int(fixture["fixture_id"])
     home_team_id = fixture.get("home_team_id")
     away_team_id = fixture.get("away_team_id")
 
+    def merge_rows(new_rows: List[Dict[str, object]], priority: int) -> None:
+        for row in new_rows:
+            key = (
+                int(row.get("fixture_id") or 0),
+                int(row.get("bookmaker_id") or 0),
+                str(row.get("market_key") or ""),
+                str(row.get("selection_key") or ""),
+                row.get("line"),
+            )
+            existing_priority = priority_map.get(key)
+            if existing_priority is None or priority > existing_priority:
+                row_map[key] = row
+                priority_map[key] = priority
+                continue
+            if existing_priority > priority:
+                continue
+            current = row_map.get(key)
+            if not current:
+                row_map[key] = row
+                priority_map[key] = priority
+                continue
+            current_updated = current.get("last_updated_at")
+            next_updated = row.get("last_updated_at")
+            if next_updated and (not current_updated or next_updated > current_updated):
+                row_map[key] = row
+
     for market in markets or []:
         market_name = str(market.get("name") or "")
+        market_source_key = normalize_market_key(market_name)
         market_key = resolve_market_key(market_name)
         if not market_key:
             continue
@@ -1206,9 +1242,15 @@ def parse_markets_for_fixture_extended(
 
         updated_at = parse_timestamp(market.get("updatedAt"))
         odds_list = market.get("odds") or []
+        priority = 0
+        if normalized_key in {"goals_over_under", "goals_over_under_first_half"}:
+            if "alternative_goal_line" in market_source_key or "alternate_goal_line" in market_source_key:
+                priority = 1
+            else:
+                priority = 2
 
         if normalized_key == "moneyline":
-            rows.extend(
+            merge_rows(
                 market_moneyline_rows(
                     fixture_id,
                     bookmaker_id,
@@ -1216,16 +1258,20 @@ def parse_markets_for_fixture_extended(
                     updated_at,
                     home_team_id,
                     away_team_id,
-                )
+                ),
+                priority,
             )
             continue
 
         if normalized_key == "double_chance":
-            rows.extend(parse_double_chance_rows(fixture, bookmaker_id, odds_list, updated_at))
+            merge_rows(
+                parse_double_chance_rows(fixture, bookmaker_id, odds_list, updated_at),
+                priority,
+            )
             continue
 
         if normalized_key == "draw_no_bet":
-            rows.extend(
+            merge_rows(
                 parse_draw_no_bet_rows(
                     fixture_id,
                     bookmaker_id,
@@ -1233,16 +1279,26 @@ def parse_markets_for_fixture_extended(
                     updated_at,
                     home_team_id,
                     away_team_id,
-                )
+                ),
+                priority,
             )
             continue
 
         if normalized_key == "btts":
-            rows.extend(market_yes_no_rows(fixture_id, bookmaker_id, normalized_key, odds_list, updated_at))
+            merge_rows(
+                market_yes_no_rows(
+                    fixture_id,
+                    bookmaker_id,
+                    normalized_key,
+                    odds_list,
+                    updated_at,
+                ),
+                priority,
+            )
             continue
 
         if normalized_key in {"goals_over_under", "match_shots", "match_shots_on_target"}:
-            rows.extend(
+            merge_rows(
                 market_over_under_rows(
                     fixture_id,
                     bookmaker_id,
@@ -1251,7 +1307,8 @@ def parse_markets_for_fixture_extended(
                     None,
                     None,
                     updated_at,
-                )
+                ),
+                priority,
             )
             continue
 
@@ -1263,7 +1320,7 @@ def parse_markets_for_fixture_extended(
                 team_id = away_team_id
             if not team_id:
                 continue
-            rows.extend(
+            merge_rows(
                 market_over_under_rows(
                     fixture_id,
                     bookmaker_id,
@@ -1272,12 +1329,13 @@ def parse_markets_for_fixture_extended(
                     "team",
                     int(team_id),
                     updated_at,
-                )
+                ),
+                priority,
             )
             continue
 
         if normalized_key.startswith("player_"):
-            rows.extend(
+            merge_rows(
                 parse_player_market_rows(
                     fixture,
                     normalized_key,
@@ -1286,11 +1344,12 @@ def parse_markets_for_fixture_extended(
                     updated_at,
                     session,
                     unmatched_details,
-                )
+                ),
+                priority,
             )
             continue
 
-    return rows
+    return list(row_map.values())
 
 
 def parse_player_market_rows(
