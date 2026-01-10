@@ -1764,6 +1764,7 @@ def main() -> None:
             bookmakers_payload = odds_event.get("bookmakers") or {}
             if args.debug_odds_out:
                 odds_raw[int(event_id)] = bookmakers_payload
+            bookmaker_groups: Dict[str, List[List[Dict[str, object]]]] = {}
             for bookmaker_name, markets in bookmakers_payload.items():
                 bookmaker_names_seen.add(bookmaker_name)
                 book_key = normalize_bookmaker_key(bookmaker_name)
@@ -1772,10 +1773,16 @@ def main() -> None:
                 if book_key not in BOOKMAKER_NAME_TO_ID:
                     bookmaker_names_unknown.add(bookmaker_name)
                     continue
-                canonical_name = BOOKMAKER_CANONICAL.get(book_key, bookmaker_name)
+                bookmaker_groups.setdefault(book_key, []).append(list(markets or []))
+
+            for book_key, market_lists in bookmaker_groups.items():
+                canonical_name = BOOKMAKER_CANONICAL.get(book_key, book_key)
+                merged_markets: List[Dict[str, object]] = []
+                for market_list in market_lists:
+                    merged_markets.extend(market_list)
                 rows = parse_markets_for_fixture_extended(
                     fixture,
-                    markets,
+                    merged_markets,
                     canonical_name,
                     market_allowlist,
                     session,
