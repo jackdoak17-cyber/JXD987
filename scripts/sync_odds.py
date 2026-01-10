@@ -87,6 +87,8 @@ TEAM_NAME_ALIAS = {
     "lilleosc": "losclille",
     "spurs": "tottenhamhotspur",
     "tottenham": "tottenhamhotspur",
+    "koln": "cologne",
+    "cologne": "koln",
     "inter": "internazionale",
     "acmilan": "milan",
 }
@@ -95,6 +97,7 @@ TEAM_TOKEN_DROP = {
     "fc",
     "cf",
     "sc",
+    "ssc",
     "ac",
     "afc",
     "cfc",
@@ -217,8 +220,13 @@ def normalize_team_variants(value: str) -> List[str]:
     variants = {"".join(tokens)}
     if len(tokens) > 1:
         variants.add("".join(tokens[:-1]))
-    if len(tokens) > 2:
         variants.add("".join(tokens[1:]))
+    tokens_no_digits = [token for token in tokens if not token.isdigit()]
+    if tokens_no_digits and tokens_no_digits != tokens:
+        variants.add("".join(tokens_no_digits))
+        if len(tokens_no_digits) > 1:
+            variants.add("".join(tokens_no_digits[:-1]))
+            variants.add("".join(tokens_no_digits[1:]))
     expanded = set()
     for alias in variants:
         expanded.add(alias)
@@ -230,6 +238,7 @@ def normalize_team_variants(value: str) -> List[str]:
 def team_aliases(value: str, short_code: Optional[str] = None) -> List[str]:
     aliases = set()
     if value:
+        aliases.update(normalize_team_variants(value))
         aliases.add(normalize_team_name(value))
     if short_code:
         aliases.add(normalize_team_name(short_code))
