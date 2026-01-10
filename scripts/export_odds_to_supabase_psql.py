@@ -16,6 +16,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import shutil
 import urllib.parse
 import tempfile
 import time
@@ -167,6 +168,40 @@ def sql_text_array(values: Iterable[str]) -> str:
     return f"array[{quoted}]::text[]"
 
 
+def run_psql_via_psycopg(
+    db_url: str,
+    sql: str,
+    from_file: bool = False,
+    label: str = "psql",
+    err_path: Optional[str] = None,
+    out_path: Optional[str] = None,
+) -> str:
+    import psycopg2
+
+    sql_text = Path(sql).read_text(encoding="utf-8") if from_file else sql
+    conn = None
+    try:
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+        cur.execute(sql_text)
+        output_lines: List[str] = []
+        if cur.description:
+            rows = cur.fetchall()
+            for row in rows:
+                output_lines.append("\t".join("" if v is None else str(v) for v in row))
+        conn.commit()
+        output = "\n".join(output_lines).strip()
+        append_output(out_path, f"{label} stdout", output)
+        return output
+    except Exception as exc:
+        message = f"psycopg2 failed ({label}): {exc}"
+        append_output(err_path, f"{label} stderr", message)
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def run_psql(
     db_url: str,
     sql: str,
@@ -175,6 +210,15 @@ def run_psql(
     err_path: Optional[str] = None,
     out_path: Optional[str] = None,
 ) -> str:
+    if not shutil.which("psql"):
+        return run_psql_via_psycopg(
+            db_url,
+            sql,
+            from_file=from_file,
+            label=label,
+            err_path=err_path,
+            out_path=out_path,
+        )
     cmd = [
         "psql",
         db_url,
@@ -554,6 +598,73 @@ def stage_and_upsert(
         f"    {league_filter}\n"
         f")"
     )
+    src_cte = """
+with src as (
+  select distinct on (fixture_id, bookmaker_id, market_key, selection_key, line)
+    fixture_id, bookmaker_id, market_key, selection_key, line,
+    price_decimal, price_american, participant_type, participant_id, last_updated_at
+  from odds_outcomes_stage
+  order by fixture_id, bookmaker_id, market_key, selection_key, line,
+           last_updated_at desc nulls last
+)
+"""
+    upsert_sql = f"""{src_cte}
+insert into public.odds_outcomes as o (
+  fixture_id, bookmaker_id, market_key, selection_key, line,
+  price_decimal, price_american, participant_type, participant_id, last_updated_at
+)
+select
+  fixture_id, bookmaker_id, market_key, selection_key, line,
+  price_decimal, price_american, participant_type, participant_id, last_updated_at
+from src
+on conflict (fixture_id, bookmaker_id, market_key, selection_key, line)
+do update set
+  price_decimal = excluded.price_decimal,
+  price_american = excluded.price_american,
+  participant_type = coalesce(excluded.participant_type, o.participant_type),
+  participant_id = coalesce(excluded.participant_id, o.participant_id),
+  last_updated_at = coalesce(excluded.last_updated_at, o.last_updated_at)
+where
+  o.price_decimal is distinct from excluded.price_decimal
+  or o.price_american is distinct from excluded.price_american
+  or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
+  or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
+  or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at);
+"""
+    src_count_sql = f"""{src_cte}
+select count(*)::bigint from src;
+"""
+    upsert_counts_sql = f"""{src_cte},
+upserted as (
+  insert into public.odds_outcomes as o (
+    fixture_id, bookmaker_id, market_key, selection_key, line,
+    price_decimal, price_american, participant_type, participant_id, last_updated_at
+  )
+  select
+    fixture_id, bookmaker_id, market_key, selection_key, line,
+    price_decimal, price_american, participant_type, participant_id, last_updated_at
+  from src
+  on conflict (fixture_id, bookmaker_id, market_key, selection_key, line)
+  do update set
+    price_decimal = excluded.price_decimal,
+    price_american = excluded.price_american,
+    participant_type = coalesce(excluded.participant_type, o.participant_type),
+    participant_id = coalesce(excluded.participant_id, o.participant_id),
+    last_updated_at = coalesce(excluded.last_updated_at, o.last_updated_at)
+  where
+    o.price_decimal is distinct from excluded.price_decimal
+    or o.price_american is distinct from excluded.price_american
+    or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
+    or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
+    or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at)
+  returning (xmax = 0) as inserted
+)
+select
+  count(*)::bigint as upserted_total,
+  coalesce(sum(case when inserted then 1 else 0 end), 0)::bigint as inserted,
+  coalesce(sum(case when not inserted then 1 else 0 end), 0)::bigint as updated
+from upserted;
+"""
     match_delete_sql = f"""
 {fixture_window_sql},
 parsed_match as (
@@ -855,37 +966,7 @@ select 'deleted_existing', count(*)::bigint from deleted;
         sql_lines.append(missing_markets_sql)
         sql_lines.append("")
     sql_lines += [
-        """
-with src as (
-  select distinct on (fixture_id, bookmaker_id, market_key, selection_key, line)
-    fixture_id, bookmaker_id, market_key, selection_key, line,
-    price_decimal, price_american, participant_type, participant_id, last_updated_at
-  from odds_outcomes_stage
-  order by fixture_id, bookmaker_id, market_key, selection_key, line,
-           last_updated_at desc nulls last
-)
-insert into public.odds_outcomes as o (
-  fixture_id, bookmaker_id, market_key, selection_key, line,
-  price_decimal, price_american, participant_type, participant_id, last_updated_at
-)
-select
-  fixture_id, bookmaker_id, market_key, selection_key, line,
-  price_decimal, price_american, participant_type, participant_id, last_updated_at
-from src
-on conflict (fixture_id, bookmaker_id, market_key, selection_key, line)
-do update set
-  price_decimal = excluded.price_decimal,
-  price_american = excluded.price_american,
-  participant_type = coalesce(excluded.participant_type, o.participant_type),
-  participant_id = coalesce(excluded.participant_id, o.participant_id),
-  last_updated_at = coalesce(excluded.last_updated_at, o.last_updated_at)
-where
-  o.price_decimal is distinct from excluded.price_decimal
-  or o.price_american is distinct from excluded.price_american
-  or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
-  or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
-  or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at);
-""",
+        upsert_sql,
         match_delete_sql,
         match_update_sql,
         team_delete_sql,
@@ -895,6 +976,92 @@ where
         cleanup_team_sql,
         "commit;",
     ]
+
+    def stage_and_upsert_psycopg() -> Dict[str, int]:
+        import psycopg2
+
+        counts = {
+            "stage_count": 0,
+            "deleted_existing": 0,
+            "deleted_missing_markets": 0,
+            "src_count": 0,
+            "upserted_total": 0,
+            "inserted": 0,
+            "updated": 0,
+        }
+        conn = psycopg2.connect(db_url)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"set statement_timeout = '{statement_timeout}';")
+            cur.execute(f"set lock_timeout = '{lock_timeout}';")
+            cur.execute(f"set idle_in_transaction_session_timeout = '{idle_tx_timeout}';")
+            cur.execute("begin;")
+            if use_advisory_lock:
+                cur.execute(f"select pg_advisory_xact_lock({advisory_lock_key});")
+            cur.execute(
+                "create temp table odds_outcomes_stage "
+                "(like public.odds_outcomes including defaults) on commit drop;"
+            )
+            copy_sql = (
+                f"COPY odds_outcomes_stage ({cols_sql}) "
+                "FROM STDIN WITH (FORMAT csv, HEADER true);"
+            )
+            with csv_path.open("r", encoding="utf-8") as f:
+                cur.copy_expert(copy_sql, f)
+            cur.execute("select count(*)::bigint from odds_outcomes_stage;")
+            row = cur.fetchone()
+            if row:
+                counts["stage_count"] = int(row[0])
+            deleted_existing_sql = """
+with deleted as (
+  delete from public.odds_outcomes o
+  using (
+    select distinct fixture_id, bookmaker_id, market_key
+    from odds_outcomes_stage
+  ) s
+  where o.fixture_id = s.fixture_id
+    and o.bookmaker_id = s.bookmaker_id
+    and o.market_key = s.market_key
+  returning 1
+)
+select count(*)::bigint from deleted;
+"""
+            cur.execute(deleted_existing_sql)
+            row = cur.fetchone()
+            if row:
+                counts["deleted_existing"] = int(row[0])
+            if missing_markets_sql:
+                cur.execute(missing_markets_sql)
+                row = cur.fetchone()
+                if row:
+                    counts["deleted_missing_markets"] = int(row[-1])
+            cur.execute(src_count_sql)
+            row = cur.fetchone()
+            if row:
+                counts["src_count"] = int(row[0])
+            cur.execute(upsert_counts_sql)
+            row = cur.fetchone()
+            if row and len(row) >= 3:
+                counts["upserted_total"] = int(row[0])
+                counts["inserted"] = int(row[1])
+                counts["updated"] = int(row[2])
+            cur.execute(match_delete_sql)
+            cur.execute(match_update_sql)
+            cur.execute(team_delete_sql)
+            cur.execute(team_update_sql)
+            cur.execute(cleanup_goals_sql)
+            cur.execute(cleanup_match_sql)
+            cur.execute(cleanup_team_sql)
+            cur.execute("commit;")
+            return counts
+        finally:
+            conn.close()
+
+    if not shutil.which("psql"):
+        counts = stage_and_upsert_psycopg()
+        counts["unchanged"] = max(0, counts["src_count"] - counts["upserted_total"])
+        return counts
+
     sql = "\n".join(sql_lines)
     sql_path: Optional[str] = None
     if keep_sql or os.environ.get("KEEP_SQL") == "1":
