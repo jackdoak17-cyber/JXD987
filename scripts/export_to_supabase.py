@@ -20,7 +20,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 
