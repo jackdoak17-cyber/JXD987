@@ -725,6 +725,7 @@ def build_fuzzy_candidates(session, team_ids: Iterable[int]) -> List[Dict[str, o
             if not tokens:
                 continue
             first_initial = tokens[0][0]
+            first = tokens[0]
             last = tokens[-1]
             key = (int(player_id), first_initial, last)
             if key in seen:
@@ -735,6 +736,7 @@ def build_fuzzy_candidates(session, team_ids: Iterable[int]) -> List[Dict[str, o
                     "player_id": int(player_id),
                     "team_id": int(team_id) if team_id else None,
                     "first_initial": first_initial,
+                    "first": first,
                     "last": last,
                     "name": str(candidate_name),
                 }
@@ -783,7 +785,34 @@ def resolve_player_id(
     team_ids: Optional[Iterable[int]] = None,
     fuzzy_candidates: Optional[List[Dict[str, object]]] = None,
 ) -> Optional[int]:
+    raw_tokens = normalize_name_tokens(raw_name)
+    raw_first = raw_tokens[0] if len(raw_tokens) >= 2 else ""
+    require_first_match = len(raw_first) > 1
     team_id_set = {int(x) for x in team_ids or [] if x}
+    candidate_first: Dict[int, str] = {}
+    for candidate in fuzzy_candidates or []:
+        player_id = candidate.get("player_id")
+        if player_id is None:
+            continue
+        first = str(candidate.get("first") or "")
+        existing = candidate_first.get(int(player_id), "")
+        if not existing or (len(existing) <= 1 and len(first) > 1):
+            candidate_first[int(player_id)] = first
+
+    def apply_first_name_filter(
+        candidates: List[Tuple[int, Optional[int]]],
+    ) -> List[Tuple[int, Optional[int]]]:
+        if not require_first_match:
+            return candidates
+        filtered: List[Tuple[int, Optional[int]]] = []
+        for pid, tid in candidates:
+            first = candidate_first.get(pid, "")
+            if not first or len(first) <= 1:
+                continue
+            if first == raw_first:
+                filtered.append((pid, tid))
+        return filtered
+
     variants = name_variants(raw_name)
     if not variants:
         return None
@@ -799,6 +828,9 @@ def resolve_player_id(
             ]
             if filtered:
                 candidates = filtered
+            candidates = apply_first_name_filter(candidates)
+            if not candidates:
+                continue
             unique = {pid for pid, _ in candidates}
             if len(unique) == 1:
                 return next(iter(unique))
@@ -814,6 +846,9 @@ def resolve_player_id(
             ]
             if filtered:
                 candidates = filtered
+            candidates = apply_first_name_filter(candidates)
+            if not candidates:
+                continue
             unique = {pid for pid, _ in candidates}
             if len(unique) == 1:
                 return next(iter(unique))
@@ -843,7 +878,7 @@ def upsert_outcomes(session, rows: List[Dict]) -> None:
         on conflict(fixture_id, bookmaker_id, market_key, selection_key, line)
         do update set
           participant_type = coalesce(excluded.participant_type, odds_outcomes.participant_type),
-          participant_id = coalesce(excluded.participant_id, odds_outcomes.participant_id),
+          participant_id = excluded.participant_id,
           price_decimal = excluded.price_decimal,
           price_american = excluded.price_american,
           last_updated_at = excluded.last_updated_at
