@@ -252,29 +252,46 @@ def name_variants(value: str) -> List[str]:
     tokens = normalize_name_tokens(value)
     if not tokens:
         return []
-    variants = {normalize_name(value)}
-    if len(tokens) == 2:
-        first, last = tokens
-        variants.add(last + first)
-        variants.add(first[0] + last)
-        variants.add(last + first[0])
-    elif len(tokens) >= 3:
+    variants: List[str] = []
+    seen: Set[str] = set()
+
+    def add(variant: str) -> None:
+        if not variant or variant in seen:
+            return
+        seen.add(variant)
+        variants.append(variant)
+
+    add(normalize_name(value))
+    if len(tokens) >= 2:
+        first, last = tokens[0], tokens[-1]
+        add(first + last)
+        add(last + first)
+        add(first[0] + last)
+        add(last + first[0])
+    if len(tokens) >= 3:
         first = tokens[0]
+        second = tokens[1]
         last = tokens[-1]
+        second_last = tokens[-2]
         middle = tokens[1:-1]
         tail = "".join(tokens[1:])
-        variants.add(last + "".join([first, *middle]))
-        variants.add(first + last)
-        variants.add(last + first)
-        variants.add(first[0] + last)
-        variants.add(last + first[0])
+        add(first + second)
+        add(second + first)
+        add(first[0] + second)
+        add(second + first[0])
+        if second_last != second:
+            add(first + second_last)
+            add(second_last + first)
+            add(first[0] + second_last)
+            add(second_last + first[0])
+        add(last + "".join([first, *middle]))
         if tail:
-            variants.add(tail)
-            variants.add(last + "".join(middle))
+            add(tail)
+            add(last + "".join(middle))
         if len(tokens[1]) == 1:
-            variants.add(first + last)
-            variants.add(last + first)
-    return [variant for variant in variants if variant]
+            add(first + last)
+            add(last + first)
+    return variants
 
 
 def normalize_market_key(value: str) -> str:
@@ -770,9 +787,11 @@ def resolve_player_id(
     variants = name_variants(raw_name)
     if not variants:
         return None
+    saw_candidates = False
     for variant in variants:
         candidates = fixture_map.get(variant)
         if candidates:
+            saw_candidates = True
             filtered = [
                 (pid, tid)
                 for pid, tid in candidates
@@ -783,10 +802,11 @@ def resolve_player_id(
             unique = {pid for pid, _ in candidates}
             if len(unique) == 1:
                 return next(iter(unique))
-            return candidates[0][0]
+            continue
     for variant in variants:
         candidates = team_map.get(variant)
         if candidates:
+            saw_candidates = True
             filtered = [
                 (pid, tid)
                 for pid, tid in candidates
@@ -797,8 +817,8 @@ def resolve_player_id(
             unique = {pid for pid, _ in candidates}
             if len(unique) == 1:
                 return next(iter(unique))
-            return candidates[0][0]
-    if fuzzy_candidates:
+            continue
+    if fuzzy_candidates and not saw_candidates:
         fuzzy_match = fuzzy_match_player(raw_name, fuzzy_candidates)
         if fuzzy_match:
             candidate, _score = fuzzy_match
