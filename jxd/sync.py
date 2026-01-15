@@ -108,6 +108,22 @@ def _extract_stat_value(data) -> Optional[int]:
     return None
 
 
+def _sum_stat_values(details: Iterable[Dict], type_id: int) -> Optional[int]:
+    total = 0
+    found = False
+    for d in details or []:
+        type_info = d.get("type") or {}
+        stat_type_id = d.get("type_id") or type_info.get("id")
+        if stat_type_id != type_id:
+            continue
+        value = _extract_stat_value(d.get("data") or d.get("value") or d.get("stat"))
+        if value is None:
+            continue
+        total += value
+        found = True
+    return total if found else None
+
+
 def _is_starter(lineup_type: Optional[object]) -> Optional[bool]:
     if lineup_type is None:
         return None
@@ -121,6 +137,12 @@ def _is_starter(lineup_type: Optional[object]) -> Optional[bool]:
 
 MINUTES_TYPE_IDS = {119, 1584}
 MINUTES_NAME_HINTS = ("minute", "minutes")
+
+GOALS_TYPE_ID = 52
+ASSISTS_TYPE_ID = 79
+GOAL_CONTRIBUTIONS_TYPE_ID = 200001
+GOAL_CONTRIBUTIONS_CODE = "goal_contributions"
+GOAL_CONTRIBUTIONS_NAME = "Goal Contributions"
 
 
 
@@ -552,6 +574,33 @@ class SyncService:
                     "name": name,
                     "value": value,
                     "extra": d,
+                }
+                if obj_stat:
+                    for k, v in payload_stat.items():
+                        setattr(obj_stat, k, v)
+                else:
+                    self.session.add(FixturePlayerStatistic(**payload_stat))
+
+            goals = _sum_stat_values(details, GOALS_TYPE_ID)
+            assists = _sum_stat_values(details, ASSISTS_TYPE_ID)
+            if goals is not None or assists is not None:
+                derived_value = (goals or 0) + (assists or 0)
+                pk = (
+                    fixture_id,
+                    player_id,
+                    GOAL_CONTRIBUTIONS_TYPE_ID,
+                    GOAL_CONTRIBUTIONS_CODE,
+                )
+                obj_stat = self.session.get(FixturePlayerStatistic, pk)
+                payload_stat = {
+                    "fixture_id": fixture_id,
+                    "player_id": player_id,
+                    "team_id": team_id,
+                    "type_id": GOAL_CONTRIBUTIONS_TYPE_ID,
+                    "code": GOAL_CONTRIBUTIONS_CODE,
+                    "name": GOAL_CONTRIBUTIONS_NAME,
+                    "value": derived_value,
+                    "extra": {"source": "derived", "goals": goals or 0, "assists": assists or 0},
                 }
                 if obj_stat:
                     for k, v in payload_stat.items():
