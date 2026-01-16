@@ -1,0 +1,2 @@
+ALTER TABLE IF EXISTS public.players
+  ADD COLUMN IF NOT EXISTS display_name TEXT;

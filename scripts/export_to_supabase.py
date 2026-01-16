@@ -391,18 +391,23 @@ def fetch_players(conn: sqlite3.Connection, player_ids: Sequence[int]) -> List[D
     cur = conn.cursor()
     q = ",".join("?" for _ in player_ids)
     cur.execute(
-        f"select id, name, short_name, common_name, team_id, team_updated_at, image_path from players where id in ({q})",
+        f"""
+        select id, name, display_name, short_name, common_name, team_id, team_updated_at, image_path
+        from players
+        where id in ({q})
+        """,
         player_ids,
     )
     return [
         {
             "id": r[0],
             "name": r[1],
-            "short_name": r[2],
-            "common_name": r[3],
-            "team_id": r[4],
-            "team_updated_at": r[5],
-            "image_path": r[6],
+            "display_name": r[2],
+            "short_name": r[3],
+            "common_name": r[4],
+            "team_id": r[5],
+            "team_updated_at": r[6],
+            "image_path": r[7],
         }
         for r in cur.fetchall()
     ]

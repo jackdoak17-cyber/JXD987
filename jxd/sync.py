@@ -74,7 +74,7 @@ def _ensure_team_player_columns(engine) -> None:
             if "image_path" not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN image_path TEXT")
             if table == "players":
-                for col in ("common_name", "short_name", "team_updated_at"):
+                for col in ("common_name", "short_name", "display_name", "team_updated_at"):
                     if col not in cols:
                         col_type = "TEXT" if col != "team_updated_at" else "DATETIME"
                         conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
@@ -342,6 +342,7 @@ class SyncService:
                     payload = {
                         "id": player_id,
                         "name": player.get("name") or player.get("display_name"),
+                        "display_name": player.get("display_name") or player.get("name"),
                         "common_name": player.get("common_name"),
                         "short_name": player.get("short_name"),
                         "image_path": player.get("image_path"),
@@ -519,6 +520,7 @@ class SyncService:
             player_payload = {
                 "id": player_id,
                 "name": player.get("fullname") or player.get("name") or l.get("player_name"),
+                "display_name": player.get("display_name") or player.get("name"),
                 "short_name": player.get("short_name") or player.get("short_code"),
                 "common_name": player.get("common_name"),
                 "team_id": team_id,

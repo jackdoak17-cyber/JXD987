@@ -44,6 +44,7 @@ class Player(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=True)
+    display_name = Column(String, nullable=True)
     short_name = Column(String, nullable=True)
     common_name = Column(String, nullable=True)
     team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
