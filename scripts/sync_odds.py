@@ -1716,6 +1716,7 @@ def main() -> None:
                 len(teams_in_window),
             )
             svc.sync_squads_for_teams(refreshed_team_ids)
+            svc.sync_sidelined_for_teams(refreshed_team_ids)
 
     league_map = load_league_map(Path(__file__).resolve().parent.parent / "config" / "odds_api_leagues.json")
 

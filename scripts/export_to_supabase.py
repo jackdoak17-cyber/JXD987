@@ -37,6 +37,7 @@ REQUIRED_TABLES = [
     "teams",
     "fixtures",
     "players",
+    "sidelined_players",
     "player_team_history",
     "fixture_players",
     "fixture_statistics",
@@ -441,6 +442,39 @@ def fetch_player_team_history(conn: sqlite3.Connection, player_ids: Sequence[int
     ]
 
 
+def fetch_sidelined_players(conn: sqlite3.Connection, team_ids: Sequence[int]) -> List[Dict]:
+    if not team_ids:
+        return []
+    cur = conn.cursor()
+    q = ",".join("?" for _ in team_ids)
+    cur.execute(
+        f"""
+        select id, player_id, team_id, category, type_id, season_id,
+               start_date, end_date, games_missed, completed, updated_at, extra
+        from sidelined_players
+        where team_id in ({q})
+        """,
+        team_ids,
+    )
+    return [
+        {
+            "id": r[0],
+            "player_id": r[1],
+            "team_id": r[2],
+            "category": r[3],
+            "type_id": r[4],
+            "season_id": r[5],
+            "start_date": r[6],
+            "end_date": r[7],
+            "games_missed": r[8],
+            "completed": r[9],
+            "updated_at": r[10],
+            "extra": r[11],
+        }
+        for r in cur.fetchall()
+    ]
+
+
 def rest_headers() -> Dict[str, str]:
     return {
         "apikey": SUPABASE_KEY,
@@ -565,6 +599,7 @@ def main():
 
     players = fetch_players(conn, list(player_ids))
     player_team_history = fetch_player_team_history(conn, list(player_ids))
+    sidelined_players = fetch_sidelined_players(conn, list(team_ids))
 
     log.info("Payload counts: seasons=%s teams=%s fixtures=%s players=%s", len(seasons), len(teams), len(fixtures), len(players))
     log.info(
@@ -573,7 +608,11 @@ def main():
         len(fixture_stats),
         len(fixture_player_stats),
     )
-    log.info("Payload counts: player_team_history=%s", len(player_team_history))
+    log.info(
+        "Payload counts: player_team_history=%s sidelined_players=%s",
+        len(player_team_history),
+        len(sidelined_players),
+    )
     log.info("Payload counts: odds_snapshots=%s odds_outcomes=%s", len(odds_snapshots), len(odds_outcomes))
 
     exported: Dict[str, int] = {}
@@ -582,6 +621,7 @@ def main():
         ("teams", teams, "id"),
         ("fixtures", fixtures, "id"),
         ("players", players, "id"),
+        ("sidelined_players", sidelined_players, "id"),
         ("player_team_history", player_team_history, "id"),
         ("fixture_players", fixture_players, "fixture_id,player_id"),
         ("fixture_statistics", fixture_stats, "fixture_id,team_id,type_id"),

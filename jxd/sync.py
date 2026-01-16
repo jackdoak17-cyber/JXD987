@@ -19,6 +19,7 @@ from .models import (
     FixtureStatistic,
     FixturePlayerStatistic,
     FixturePlayer,
+    SidelinedPlayer,
 )
 
 log = logging.getLogger(__name__)
@@ -30,6 +31,17 @@ def parse_dt(raw: Optional[str]) -> Optional[datetime]:
     txt = str(raw).replace("T", " ").replace("Z", "")
     try:
         return datetime.fromisoformat(txt)
+    except Exception:
+        return None
+
+
+def _parse_date(raw: Optional[str]) -> Optional[date]:
+    if not raw:
+        return None
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw
+    try:
+        return date.fromisoformat(str(raw))
     except Exception:
         return None
 
@@ -371,6 +383,50 @@ class SyncService:
                 raise
         self.session.commit()
         log.info("Synced squads for %s teams (%s players)", len(seen), count)
+        return count
+
+    def sync_sidelined_for_teams(self, team_ids: Sequence[int]) -> int:
+        if not team_ids:
+            return 0
+        count = 0
+        seen: Set[int] = set()
+        sync_run_at = datetime.utcnow()
+        for team_id in team_ids:
+            if not team_id or team_id in seen:
+                continue
+            seen.add(team_id)
+            endpoint = f"teams/{team_id}"
+            try:
+                team_data = self.client.fetch_single(endpoint, includes=["sidelined"])
+            except SportMonksError as exc:
+                if exc.status_code in {404, 422}:
+                    log.info("No sidelined data for team %s (status %s)", team_id, exc.status_code)
+                    continue
+                raise
+            sidelined = team_data.get("sidelined") or []
+            for entry in sidelined:
+                sidelined_id = entry.get("id")
+                player_id = entry.get("player_id")
+                if not sidelined_id or not player_id:
+                    continue
+                payload = {
+                    "id": sidelined_id,
+                    "player_id": player_id,
+                    "team_id": entry.get("team_id") or team_id,
+                    "category": entry.get("category"),
+                    "type_id": _safe_int(entry.get("type_id")),
+                    "season_id": _safe_int(entry.get("season_id")),
+                    "start_date": _parse_date(entry.get("start_date")),
+                    "end_date": _parse_date(entry.get("end_date")),
+                    "games_missed": _safe_int(entry.get("games_missed")),
+                    "completed": entry.get("completed"),
+                    "updated_at": sync_run_at,
+                    "extra": entry,
+                }
+                _upsert(self.session, SidelinedPlayer, payload)
+                count += 1
+        self.session.commit()
+        log.info("Synced sidelined entries for %s teams (%s rows)", len(seen), count)
         return count
 
     # --- fixtures ---

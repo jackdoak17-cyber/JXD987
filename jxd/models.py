@@ -3,6 +3,7 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     Column,
+    Date,
     DateTime,
     ForeignKey,
     Integer,
@@ -50,6 +51,23 @@ class Player(Base):
     team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
     team_updated_at = Column(DateTime, nullable=True)
     image_path = Column(String, nullable=True)
+    extra = Column(JSON, nullable=True)
+
+
+class SidelinedPlayer(Base):
+    __tablename__ = "sidelined_players"
+
+    id = Column(Integer, primary_key=True)
+    player_id = Column(Integer, nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    category = Column(String, nullable=True)
+    type_id = Column(Integer, nullable=True)
+    season_id = Column(Integer, nullable=True)
+    start_date = Column(Date, nullable=True)
+    end_date = Column(Date, nullable=True)
+    games_missed = Column(Integer, nullable=True)
+    completed = Column(Boolean, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
     extra = Column(JSON, nullable=True)
 
 
