@@ -13,6 +13,7 @@ from .models import (
     Season,
     Team,
     Player,
+    PlayerTeamHistory,
     Fixture,
     FixtureParticipant,
     FixtureStatistic,
@@ -73,9 +74,10 @@ def _ensure_team_player_columns(engine) -> None:
             if "image_path" not in cols:
                 conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN image_path TEXT")
             if table == "players":
-                for col in ("common_name", "short_name"):
+                for col in ("common_name", "short_name", "team_updated_at"):
                     if col not in cols:
-                        conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
+                        col_type = "TEXT" if col != "team_updated_at" else "DATETIME"
+                        conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
 
 
 def _extract_stat_value(data) -> Optional[int]:
@@ -245,6 +247,31 @@ class SyncService:
         _ensure_fixture_player_columns(self.session.get_bind())
         _ensure_team_player_columns(self.session.get_bind())
 
+    def _track_player_team_history(self, player_id: int, team_id: int, sync_run_at: datetime) -> None:
+        if not player_id or not team_id:
+            return
+        latest = (
+            self.session.query(PlayerTeamHistory)
+            .filter(PlayerTeamHistory.player_id == player_id)
+            .order_by(PlayerTeamHistory.effective_from.desc(), PlayerTeamHistory.id.desc())
+            .first()
+        )
+        if latest and latest.team_id == team_id and (latest.effective_to is None):
+            latest.updated_at = sync_run_at
+            return
+        if latest and latest.effective_to is None:
+            latest.effective_to = sync_run_at
+        entry = PlayerTeamHistory(
+            player_id=player_id,
+            team_id=team_id,
+            source="squad_sync",
+            effective_from=sync_run_at,
+            effective_to=None,
+            created_at=sync_run_at,
+            updated_at=sync_run_at,
+        )
+        self.session.add(entry)
+
     # --- seasons & teams ---
     def sync_seasons(self, league_ids: Sequence[int]) -> int:
         count = 0
@@ -300,6 +327,7 @@ class SyncService:
             return 0
         count = 0
         seen: Set[int] = set()
+        sync_run_at = datetime.utcnow()
         for team_id in team_ids:
             if not team_id or team_id in seen:
                 continue
@@ -313,14 +341,27 @@ class SyncService:
                         continue
                     payload = {
                         "id": player_id,
-                        "team_id": item.get("team_id") or team_id,
                         "name": player.get("name") or player.get("display_name"),
                         "common_name": player.get("common_name"),
                         "short_name": player.get("short_name"),
                         "image_path": player.get("image_path"),
                         "extra": player,
                     }
+                    next_team_id = item.get("team_id") or team_id
+                    existing = self.session.get(Player, player_id)
+                    payload["team_id"] = next_team_id
+                    track_history = True
+                    if existing is not None:
+                        existing_updated_at = getattr(existing, "team_updated_at", None)
+                        if existing_updated_at and existing_updated_at >= sync_run_at:
+                            payload["team_id"] = existing.team_id
+                            payload["team_updated_at"] = existing_updated_at
+                            track_history = False
+                    if track_history:
+                        payload["team_updated_at"] = sync_run_at
                     _upsert(self.session, Player, payload)
+                    if track_history and payload.get("team_id"):
+                        self._track_player_team_history(player_id, payload["team_id"], sync_run_at)
                     count += 1
             except SportMonksError as exc:
                 if exc.status_code in {404, 422}:

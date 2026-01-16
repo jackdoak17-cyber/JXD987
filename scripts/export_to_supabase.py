@@ -5,6 +5,7 @@ Export a pruned subset of SQLite data to Supabase via REST.
 - teams: only those referenced by exported fixtures
 - fixtures: finished fixtures plus upcoming scheduled fixtures (next 14 days)
 - players: only players referenced by exported fixture player stats/lineups
+- player_team_history: player team timeline from squad syncs
 - fixture_players: only for exported fixtures
 - fixture_statistics: only for exported fixtures
 - fixture_player_statistics: only for exported fixtures
@@ -36,6 +37,7 @@ REQUIRED_TABLES = [
     "teams",
     "fixtures",
     "players",
+    "player_team_history",
     "fixture_players",
     "fixture_statistics",
     "fixture_player_statistics",
@@ -389,7 +391,7 @@ def fetch_players(conn: sqlite3.Connection, player_ids: Sequence[int]) -> List[D
     cur = conn.cursor()
     q = ",".join("?" for _ in player_ids)
     cur.execute(
-        f"select id, name, short_name, common_name, team_id, image_path from players where id in ({q})",
+        f\"select id, name, short_name, common_name, team_id, team_updated_at, image_path from players where id in ({q})\",
         player_ids,
     )
     return [
@@ -399,7 +401,30 @@ def fetch_players(conn: sqlite3.Connection, player_ids: Sequence[int]) -> List[D
             "short_name": r[2],
             "common_name": r[3],
             "team_id": r[4],
-            "image_path": r[5],
+            "team_updated_at": r[5],
+            "image_path": r[6],
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def fetch_player_team_history(conn: sqlite3.Connection, player_ids: Sequence[int]) -> List[Dict]:
+    if not player_ids:
+        return []
+    cur = conn.cursor()
+    q = ",".join("?" for _ in player_ids)
+    cur.execute(
+        f\"\"\"\n        select id, player_id, team_id, source, effective_from, effective_to, created_at, updated_at\n        from player_team_history\n        where player_id in ({q})\n        \"\"\",\n+        player_ids,\n+    )
+    return [
+        {
+            "id": r[0],
+            "player_id": r[1],
+            "team_id": r[2],
+            "source": r[3],
+            "effective_from": r[4],
+            "effective_to": r[5],
+            "created_at": r[6],
+            "updated_at": r[7],
         }
         for r in cur.fetchall()
     ]
@@ -528,6 +553,7 @@ def main():
             player_ids.add(fps["player_id"])
 
     players = fetch_players(conn, list(player_ids))
+    player_team_history = fetch_player_team_history(conn, list(player_ids))
 
     log.info("Payload counts: seasons=%s teams=%s fixtures=%s players=%s", len(seasons), len(teams), len(fixtures), len(players))
     log.info(
@@ -536,6 +562,7 @@ def main():
         len(fixture_stats),
         len(fixture_player_stats),
     )
+    log.info("Payload counts: player_team_history=%s", len(player_team_history))
     log.info("Payload counts: odds_snapshots=%s odds_outcomes=%s", len(odds_snapshots), len(odds_outcomes))
 
     exported: Dict[str, int] = {}
@@ -544,6 +571,7 @@ def main():
         ("teams", teams, "id"),
         ("fixtures", fixtures, "id"),
         ("players", players, "id"),
+        ("player_team_history", player_team_history, "id"),
         ("fixture_players", fixture_players, "fixture_id,player_id"),
         ("fixture_statistics", fixture_stats, "fixture_id,team_id,type_id"),
         ("fixture_player_statistics", fixture_player_stats, "fixture_id,player_id,type_id"),
@@ -575,6 +603,7 @@ def main():
         "teams_exported": exported["teams"],
         "seasons_exported": exported["seasons"],
         "players_exported": exported["players"],
+        "player_team_history_exported": exported["player_team_history"],
         "fixture_players_exported": exported["fixture_players"],
         "fixture_statistics_exported": exported["fixture_statistics"],
         "fixture_player_statistics_exported": exported["fixture_player_statistics"],

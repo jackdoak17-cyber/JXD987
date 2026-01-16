@@ -47,8 +47,22 @@ class Player(Base):
     short_name = Column(String, nullable=True)
     common_name = Column(String, nullable=True)
     team_id = Column(Integer, ForeignKey("teams.id"), nullable=True)
+    team_updated_at = Column(DateTime, nullable=True)
     image_path = Column(String, nullable=True)
     extra = Column(JSON, nullable=True)
+
+
+class PlayerTeamHistory(Base):
+    __tablename__ = "player_team_history"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
+    source = Column(String, nullable=True)
+    effective_from = Column(DateTime, nullable=False)
+    effective_to = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class Fixture(Base):
