@@ -30,6 +30,22 @@ class Season(Base):
     extra = Column(JSON, nullable=True)
 
 
+class Round(Base):
+    __tablename__ = "rounds"
+
+    id = Column(Integer, primary_key=True)
+    league_id = Column(Integer, nullable=False)
+    season_id = Column(Integer, nullable=False)
+    stage_id = Column(Integer, nullable=True)
+    name = Column(String, nullable=True)
+    starting_at = Column(Date, nullable=True)
+    ending_at = Column(Date, nullable=True)
+    is_current = Column(Boolean, default=False)
+    games_in_current_week = Column(Boolean, default=False)
+    finished = Column(Boolean, default=False)
+    extra = Column(JSON, nullable=True)
+
+
 class Team(Base):
     __tablename__ = "teams"
 

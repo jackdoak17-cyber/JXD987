@@ -34,6 +34,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 log = logging.getLogger(__name__)
 REQUIRED_TABLES = [
     "seasons",
+    "rounds",
     "teams",
     "fixtures",
     "players",
@@ -122,6 +123,35 @@ def fetch_seasons(conn: sqlite3.Connection, keep_ids: Sequence[int]) -> List[Dic
             "start_date": r[3],
             "end_date": r[4],
             "is_current": bool(r[5]),
+        }
+        for r in cur.fetchall()
+    ]
+
+
+def fetch_rounds(conn: sqlite3.Connection, keep_ids: Sequence[int]) -> List[Dict]:
+    cur = conn.cursor()
+    q = ",".join("?" for _ in keep_ids)
+    cur.execute(
+        f"""
+        select id, league_id, season_id, stage_id, name, starting_at, ending_at,
+               is_current, games_in_current_week, finished
+        from rounds
+        where season_id in ({q})
+        """,
+        keep_ids,
+    )
+    return [
+        {
+            "id": r[0],
+            "league_id": r[1],
+            "season_id": r[2],
+            "stage_id": r[3],
+            "name": r[4],
+            "starting_at": r[5],
+            "ending_at": r[6],
+            "is_current": bool(r[7]),
+            "games_in_current_week": bool(r[8]),
+            "finished": bool(r[9]),
         }
         for r in cur.fetchall()
     ]
@@ -571,6 +601,7 @@ def main():
         raise SystemExit("No seasons to export")
 
     seasons = fetch_seasons(conn, list(keep_ids))
+    rounds = fetch_rounds(conn, list(keep_ids))
     fixtures = fetch_fixtures(conn, list(keep_ids))
     team_ids = {f["home_team_id"] for f in fixtures} | {f["away_team_id"] for f in fixtures}
     teams = fetch_teams(conn, list(team_ids))
@@ -602,6 +633,7 @@ def main():
     sidelined_players = fetch_sidelined_players(conn, list(team_ids))
 
     log.info("Payload counts: seasons=%s teams=%s fixtures=%s players=%s", len(seasons), len(teams), len(fixtures), len(players))
+    log.info("Payload counts: rounds=%s", len(rounds))
     log.info(
         "Payload counts: fixture_players=%s fixture_statistics=%s fixture_player_statistics=%s",
         len(fixture_players),
@@ -618,6 +650,7 @@ def main():
     exported: Dict[str, int] = {}
     exports = [
         ("seasons", seasons, "id"),
+        ("rounds", rounds, "id"),
         ("teams", teams, "id"),
         ("fixtures", fixtures, "id"),
         ("players", players, "id"),
@@ -653,6 +686,7 @@ def main():
         "fixtures_exported": exported["fixtures"],
         "teams_exported": exported["teams"],
         "seasons_exported": exported["seasons"],
+        "rounds_exported": exported["rounds"],
         "players_exported": exported["players"],
         "player_team_history_exported": exported["player_team_history"],
         "fixture_players_exported": exported["fixture_players"],

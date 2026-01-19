@@ -114,6 +114,8 @@ def main(
 
     log.info("Syncing seasons for leagues %s", league_ids)
     svc.sync_seasons(league_ids)
+    log.info("Syncing rounds for leagues %s", league_ids)
+    svc.sync_rounds_for_leagues(league_ids)
     log.info("Syncing teams for leagues %s", league_ids)
     svc.sync_teams_for_leagues(league_ids)
 

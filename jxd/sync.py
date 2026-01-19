@@ -11,6 +11,7 @@ from .sportmonks_client import SportMonksClient, SportMonksError
 from .models import (
     Base,
     Season,
+    Round,
     Team,
     Player,
     PlayerTeamHistory,
@@ -304,6 +305,33 @@ class SyncService:
             count += 1
         self.session.commit()
         log.info("Synced seasons: %s", count)
+        return count
+
+    def sync_rounds_for_leagues(self, league_ids: Sequence[int]) -> int:
+        if not league_ids:
+            return 0
+        seasons = self.session.query(Season).filter(Season.league_id.in_(league_ids)).all()
+        count = 0
+        for season in seasons:
+            endpoint = f"rounds/seasons/{season.id}"
+            for item in self.client.fetch_collection(endpoint, per_page=200):
+                payload = {
+                    "id": item.get("id"),
+                    "league_id": item.get("league_id") or season.league_id,
+                    "season_id": item.get("season_id") or season.id,
+                    "stage_id": _safe_int(item.get("stage_id")),
+                    "name": item.get("name"),
+                    "starting_at": _parse_date(item.get("starting_at")),
+                    "ending_at": _parse_date(item.get("ending_at")),
+                    "is_current": bool(item.get("is_current")),
+                    "games_in_current_week": bool(item.get("games_in_current_week")),
+                    "finished": bool(item.get("finished")),
+                    "extra": item,
+                }
+                _upsert(self.session, Round, payload)
+                count += 1
+        self.session.commit()
+        log.info("Synced rounds: %s", count)
         return count
 
     def sync_teams_for_leagues(self, league_ids: Sequence[int]) -> int:
