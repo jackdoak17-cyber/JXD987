@@ -54,6 +54,7 @@ DEFAULT_MARKET_ALLOWLIST = {
     "match_shots_on_target",
     "team_shots",
     "team_shots_on_target",
+    "team_total_goals",
     "player_shots",
     "player_shots_on_target",
     "player_fouls_committed",
@@ -66,7 +67,7 @@ DEFAULT_MARKET_ALLOWLIST = {
     "player_goalkeeper_saves",
 }
 
-TEAM_MARKETS = {"team_shots", "team_shots_on_target"}
+TEAM_MARKETS = {"team_shots", "team_shots_on_target", "team_total_goals"}
 MATCH_MARKETS = {
     "match_shots",
     "match_shots_on_target",
@@ -144,6 +145,10 @@ MARKET_NAME_MAP = {
     "team_shots_away": "team_shots_away",
     "team_shots_on_target_home": "team_shots_on_target_home",
     "team_shots_on_target_away": "team_shots_on_target_away",
+    "team_total_home": "team_total_goals_home",
+    "team_total_away": "team_total_goals_away",
+    "team_totals_home": "team_total_goals_home",
+    "team_totals_away": "team_total_goals_away",
     "total_shots_home": "team_shots_home",
     "total_shots_away": "team_shots_away",
     "total_shots_on_target_home": "team_shots_on_target_home",

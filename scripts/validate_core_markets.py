@@ -35,6 +35,7 @@ CANONICAL_MARKETS: Dict[str, Dict[str, str]] = {
     "match_cards": {"type": "match"},
     "team_shots": {"type": "team"},
     "team_shots_on_target": {"type": "team"},
+    "team_total_goals": {"type": "team"},
     "team_cards": {"type": "team"},
     "team_corners": {"type": "team"},
     "team_most_cards": {"type": "team"},

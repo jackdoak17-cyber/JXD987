@@ -39,6 +39,7 @@ DEFAULT_MARKET_ALLOWLIST = {
     "match_shots_on_target",
     "team_shots",
     "team_shots_on_target",
+    "team_total_goals",
     "player_shots",
     "player_shots_on_target",
     "player_fouls_committed",
@@ -57,6 +58,7 @@ LINE_MARKET_KEYS = {
     "match_shots_on_target",
     "team_shots",
     "team_shots_on_target",
+    "team_total_goals",
 }
 
 
