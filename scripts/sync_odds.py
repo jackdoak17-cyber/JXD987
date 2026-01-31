@@ -1578,6 +1578,17 @@ def parse_player_market_rows(
             fuzzy_candidates=fuzzy_candidates,
         )
         selection_slug = normalize_slug(player_name)
+        if market_key == "player_to_score_or_assist":
+            label_lower = str(label).lower()
+            if "score or assist" in label_lower or "goal or assist" in label_lower:
+                goa_tag = "score_or_assist"
+            elif "assist" in label_lower:
+                goa_tag = "assist"
+            elif "score" in label_lower or "goal" in label_lower:
+                goa_tag = "score"
+            else:
+                goa_tag = "score_or_assist"
+            selection_slug = f"{selection_slug}_{goa_tag}"
         selection_key = selection_slug if side_key in {"yes", "home", None} else f"{selection_slug}_{side_key}"
         if player_id is None:
             unmatched_details.append(
