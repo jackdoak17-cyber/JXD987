@@ -1557,6 +1557,10 @@ def parse_player_market_rows(
     rows: List[Dict[str, object]] = []
     for odd in odds_list or []:
         label = odd.get("label") or odd.get("name") or ""
+        if market_key == "player_to_score_or_assist":
+            label_lower = str(label).lower()
+            if "score or assist" not in label_lower:
+                continue
         player_name = extract_player_name(str(label))
         if not player_name:
             continue
