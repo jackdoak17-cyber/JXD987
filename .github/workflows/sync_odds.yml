@@ -2,7 +2,7 @@ name: Sync Odds
 
 on:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/30 * * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -25,7 +25,7 @@ on:
 
 concurrency:
   group: sync-odds
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   prices:
@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         league_id: [8, 9, 384, 387, 564, 567, 82, 301, 600, 501, 444, 72]
     env:
