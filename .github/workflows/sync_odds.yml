@@ -33,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 2
+      max-parallel: 1
       matrix:
         league_id: [8, 9, 384, 387, 564, 567, 82, 301, 600, 501, 444, 72]
     env:
