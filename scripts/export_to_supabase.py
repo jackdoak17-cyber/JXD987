@@ -9,6 +9,7 @@ Export a pruned subset of SQLite data to Supabase via REST.
 - fixture_players: only for exported fixtures
 - fixture_statistics: only for exported fixtures
 - fixture_player_statistics: only for exported fixtures
+- fixture_players/fixture_player_statistics: replace rows per fixture to avoid stale data
 - odds_snapshots/odds_outcomes: only for exported fixtures
 
 Supports --dry-run to print the payload counts without hitting Supabase.
@@ -514,6 +515,58 @@ def rest_headers() -> Dict[str, str]:
     }
 
 
+def delete_fixture_rows(table: str, fixture_ids: Sequence[int], dry_run: bool) -> int:
+    if not fixture_ids or dry_run:
+        return 0
+
+    url = SUPABASE_URL.rstrip("/") + REST_PATH + f"/{table}"
+    chunk = max(int(os.environ.get("SUPABASE_DELETE_CHUNK", os.environ.get("SUPABASE_EXPORT_CHUNK", "50"))), 1)
+    pause = max(float(os.environ.get("SUPABASE_EXPORT_SLEEP", "0.5")), 0.0)
+    max_retries = max(int(os.environ.get("SUPABASE_EXPORT_RETRIES", "3")), 0)
+    headers = {**rest_headers(), "Prefer": "count=exact"}
+    fixture_ids = list(fixture_ids)
+    total_batches = (len(fixture_ids) + chunk - 1) // chunk
+    total = 0
+    for i in range(0, len(fixture_ids), chunk):
+        batch_ids = fixture_ids[i : i + chunk]
+        batch_index = i // chunk + 1
+        log.info("Deleting %s batch %s/%s (%s fixtures)", table, batch_index, total_batches, len(batch_ids))
+        attempt = 0
+        while True:
+            try:
+                resp = requests.delete(
+                    url,
+                    headers=headers,
+                    params={"fixture_id": f"in.({','.join(str(x) for x in batch_ids)})"},
+                    timeout=60,
+                )
+            except requests.RequestException as exc:
+                if attempt >= max_retries:
+                    raise SystemExit(f"Supabase delete from {table} failed: {exc}") from exc
+                attempt += 1
+                time.sleep(pause * (2**attempt))
+                continue
+            if resp.ok:
+                break
+            if attempt >= max_retries:
+                raise SystemExit(
+                    f"Supabase delete from {table} failed {resp.status_code}: {resp.text}"
+                )
+            attempt += 1
+            time.sleep(pause * (2**attempt))
+        content_range = resp.headers.get("Content-Range", "")
+        if "/" in content_range:
+            count = content_range.split("/")[-1]
+            if count and count != "*":
+                try:
+                    total += int(count)
+                except ValueError:
+                    pass
+        if pause:
+            time.sleep(pause)
+    return total
+
+
 def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) -> int:
     if not rows:
         return 0
@@ -646,6 +699,18 @@ def main():
         len(sidelined_players),
     )
     log.info("Payload counts: odds_snapshots=%s odds_outcomes=%s", len(odds_snapshots), len(odds_outcomes))
+
+    if fixture_ids:
+        log.info("Deleting existing fixture-scoped rows before upsert")
+        deleted_fixture_players = delete_fixture_rows("fixture_players", fixture_ids, args.dry_run)
+        deleted_fixture_player_stats = delete_fixture_rows(
+            "fixture_player_statistics", fixture_ids, args.dry_run
+        )
+        log.info(
+            "Deleted rows: fixture_players=%s fixture_player_statistics=%s",
+            deleted_fixture_players,
+            deleted_fixture_player_stats,
+        )
 
     exported: Dict[str, int] = {}
     exports = [
