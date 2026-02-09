@@ -150,7 +150,8 @@ def _is_starter(lineup_type: Optional[object]) -> Optional[bool]:
     return None
 
 
-MINUTES_TYPE_IDS = {119, 1584}
+# SportMonks minutes played type id.
+MINUTES_TYPE_IDS = {119}
 MINUTES_NAME_HINTS = ("minute", "minutes")
 
 GOALS_TYPE_ID = 52
