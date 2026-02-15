@@ -898,8 +898,13 @@ where o.fixture_id = fw.id
   and o.line in (1,2)
   and o.selection_key in ('over','under');
 """
+    delete_missing_markets = os.environ.get("ODDS_DELETE_MISSING_MARKETS", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
     missing_markets_sql = ""
-    if allowlist_items:
+    if allowlist_items and delete_missing_markets:
         missing_markets_sql = f"""
 with stage_markets as (
   select distinct fixture_id, bookmaker_id, market_key
