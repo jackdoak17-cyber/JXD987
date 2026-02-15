@@ -1214,6 +1214,7 @@ def parse_markets_for_fixture(
                     "team",
                     int(team_id),
                     updated_at,
+                    selection_prefix=side,
                 )
             )
             continue
@@ -1514,6 +1515,7 @@ def parse_markets_for_fixture_extended(
                     "team",
                     int(team_id),
                     updated_at,
+                    selection_prefix=side,
                 ),
                 priority,
             )

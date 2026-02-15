@@ -317,7 +317,7 @@ def build_outcomes_csv(
         line_placeholders = ",".join("?" for _ in line_keys)
         line_clause = (
             f"and (o.market_key not in ({line_placeholders}) "
-            "or (o.selection_key in ('over','under') and o.line is not null))"
+            "or o.line is not null)"
         )
         params.extend(line_keys)
 
