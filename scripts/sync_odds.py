@@ -1411,6 +1411,9 @@ def parse_markets_for_fixture_extended(
     for market in markets or []:
         market_name = str(market.get("name") or "")
         market_source_key = normalize_market_key(market_name)
+        if "alternative_goal_line" in market_source_key or "alternate_goal_line" in market_source_key:
+            # Exclude alternative goal lines; keep only main goals over/under markets.
+            continue
         market_key = resolve_market_key(market_name)
         if not market_key:
             continue
