@@ -27,6 +27,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 DB_PATH = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
 DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL_SESSION")
+ODDS_MIN_PRICE = float(os.environ.get("ODDS_MIN_PRICE", "1.0"))
+ODDS_MAX_PRICE = float(os.environ.get("ODDS_MAX_PRICE", "500"))
 
 DEFAULT_MARKET_ALLOWLIST = {
     "moneyline",
@@ -600,12 +602,13 @@ def stage_and_upsert(
         f"    {league_filter}\n"
         f")"
     )
-    src_cte = """
+    src_cte = f"""
 with src as (
   select distinct on (fixture_id, bookmaker_id, market_key, selection_key, line)
     fixture_id, bookmaker_id, market_key, selection_key, line,
     price_decimal, price_american, participant_type, participant_id, last_updated_at
   from odds_outcomes_stage
+  where price_decimal is null or (price_decimal > {ODDS_MIN_PRICE} and price_decimal <= {ODDS_MAX_PRICE})
   order by fixture_id, bookmaker_id, market_key, selection_key, line,
            last_updated_at desc nulls last
 )
