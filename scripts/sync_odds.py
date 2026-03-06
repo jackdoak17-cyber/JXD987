@@ -19,7 +19,7 @@ import difflib
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy import bindparam, text
 
@@ -107,6 +107,22 @@ TEAM_TOKEN_DROP = {
     "de",
     "da",
     "cd",
+}
+
+# Generic suffix/prefix tokens that should not be treated as strong standalone team matches.
+TEAM_VARIANT_NOISE = {
+    "city",
+    "united",
+    "town",
+    "county",
+    "athletic",
+    "rovers",
+    "wanderers",
+    "albion",
+    "hotspur",
+    "sporting",
+    "real",
+    "club",
 }
 
 
@@ -224,20 +240,28 @@ def normalize_team_variants(value: str) -> List[str]:
         return []
     variants = {"".join(tokens)}
     if len(tokens) > 1:
-        variants.add("".join(tokens[:-1]))
-        variants.add("".join(tokens[1:]))
+        prefix = "".join(tokens[:-1])
+        suffix = "".join(tokens[1:])
+        if prefix:
+            variants.add(prefix)
+        if suffix and suffix not in TEAM_VARIANT_NOISE:
+            variants.add(suffix)
     tokens_no_digits = [token for token in tokens if not token.isdigit()]
     if tokens_no_digits and tokens_no_digits != tokens:
         variants.add("".join(tokens_no_digits))
         if len(tokens_no_digits) > 1:
-            variants.add("".join(tokens_no_digits[:-1]))
-            variants.add("".join(tokens_no_digits[1:]))
+            prefix = "".join(tokens_no_digits[:-1])
+            suffix = "".join(tokens_no_digits[1:])
+            if prefix:
+                variants.add(prefix)
+            if suffix and suffix not in TEAM_VARIANT_NOISE:
+                variants.add(suffix)
     expanded = set()
     for alias in variants:
         expanded.add(alias)
         if alias in TEAM_NAME_ALIAS:
             expanded.add(TEAM_NAME_ALIAS[alias])
-    return [item for item in expanded if item]
+    return [item for item in expanded if item and item not in TEAM_VARIANT_NOISE]
 
 
 def team_aliases(value: str, short_code: Optional[str] = None) -> List[str]:
@@ -576,9 +600,12 @@ def score_name_match(event_name: str, aliases: Iterable[str]) -> float:
     event_variants = normalize_team_variants(event_name)
     if not event_variants:
         return 0.0
+    event_variants = [variant for variant in event_variants if variant not in TEAM_VARIANT_NOISE]
+    if not event_variants:
+        return 0.0
     best = 0.0
     for alias in aliases:
-        if not alias:
+        if not alias or alias in TEAM_VARIANT_NOISE:
             continue
         for event_norm in event_variants:
             if event_norm == alias:
@@ -1655,6 +1682,18 @@ def main() -> None:
         help="Disable auto refresh of squads for missing teams.",
     )
     parser.add_argument(
+        "--refresh-sidelined-window",
+        dest="refresh_sidelined_window",
+        action="store_true",
+        help="Refresh sidelined status for all teams in the odds window (default).",
+    )
+    parser.add_argument(
+        "--no-refresh-sidelined-window",
+        dest="refresh_sidelined_window",
+        action="store_false",
+        help="Disable auto refresh of sidelined status for teams in the odds window.",
+    )
+    parser.add_argument(
         "--unmatched-out",
         default="",
         help="Write unmatched player odds to JSON (fixture_id, market_key, selection_key, raw_name)",
@@ -1674,7 +1713,7 @@ def main() -> None:
         default="",
         help="Write raw odds JSON",
     )
-    parser.set_defaults(refresh_squads_missing=True)
+    parser.set_defaults(refresh_squads_missing=True, refresh_sidelined_window=True)
     args = parser.parse_args()
 
     raw_leagues = args.leagues.replace('"', "").replace("'", "")
@@ -1696,7 +1735,7 @@ def main() -> None:
     Base.metadata.create_all(engine)
 
     svc = None
-    if args.refresh_upcoming or args.refresh_squads or args.refresh_squads_missing:
+    if args.refresh_upcoming or args.refresh_squads or args.refresh_squads_missing or args.refresh_sidelined_window:
         if not os.environ.get("SPORTMONKS_API_TOKEN"):
             log.warning("SPORTMONKS_API_TOKEN missing; skipping SportMonks refresh steps.")
         else:
@@ -1721,11 +1760,12 @@ def main() -> None:
         for fixture in fixtures
         if fixture.get("away_team_id")
     }
+    window_team_ids = sorted(int(tid) for tid in teams_in_window if tid)
     missing_team_ids: List[int] = []
     refreshed_team_ids: List[int] = []
     if svc and (args.refresh_squads or args.refresh_squads_missing) and teams_in_window:
         if args.refresh_squads:
-            refreshed_team_ids = sorted(int(tid) for tid in teams_in_window if tid)
+            refreshed_team_ids = window_team_ids
         else:
             counts = fetch_team_player_counts(session, teams_in_window)
             missing_team_ids = [int(tid) for tid in teams_in_window if counts.get(int(tid), 0) == 0]
@@ -1737,7 +1777,14 @@ def main() -> None:
                 len(teams_in_window),
             )
             svc.sync_squads_for_teams(refreshed_team_ids)
-            svc.sync_sidelined_for_teams(refreshed_team_ids)
+    sidelined_refreshed_team_ids: List[int] = []
+    if svc and args.refresh_sidelined_window and window_team_ids:
+        sidelined_refreshed_team_ids = window_team_ids
+        log.info(
+            "Refreshing sidelined status for %s teams in odds window",
+            len(sidelined_refreshed_team_ids),
+        )
+        svc.sync_sidelined_for_teams(sidelined_refreshed_team_ids)
 
     league_map = load_league_map(Path(__file__).resolve().parent.parent / "config" / "odds_api_leagues.json")
 
@@ -1919,6 +1966,7 @@ def main() -> None:
             "teams_in_window": len(teams_in_window),
             "teams_missing_players": len(missing_team_ids),
             "teams_squads_refreshed": len(refreshed_team_ids),
+            "teams_sidelined_refreshed": len(sidelined_refreshed_team_ids),
             "events_matched": len(event_map),
             "events_unmatched_samples": events_unmatched_samples,
             "league_stats": league_stats,
