@@ -296,7 +296,6 @@ def upsert_countries(cur: Any, rows: List[Dict[str, Any]]) -> None:
             row["image_path"],
             row["image_path"],
             "sportmonks",
-            "now()",
         )
         for row in rows
     ]
