@@ -1,0 +1,134 @@
+name: Metadata Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      player_mode:
+        description: "Player nationality source mode"
+        required: true
+        default: "squads"
+        type: choice
+        options:
+          - squads
+          - all
+          - off
+      player_id_limit:
+        description: "Max missing player IDs to backfill (0 = all)"
+        required: true
+        default: "0"
+        type: string
+      max_player_pages:
+        description: "Max player pages when mode=all (0 = all)"
+        required: true
+        default: "0"
+        type: string
+  schedule:
+    - cron: "20 3 * * *"
+
+concurrency:
+  group: metadata-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      PYTHONPATH: .
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Resolve runtime inputs
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "PLAYER_MODE=${{ inputs.player_mode }}" >> "$GITHUB_ENV"
+            echo "PLAYER_ID_LIMIT=${{ inputs.player_id_limit }}" >> "$GITHUB_ENV"
+            echo "MAX_PLAYER_PAGES=${{ inputs.max_player_pages }}" >> "$GITHUB_ENV"
+          else
+            echo "PLAYER_MODE=squads" >> "$GITHUB_ENV"
+            echo "PLAYER_ID_LIMIT=0" >> "$GITHUB_ENV"
+            echo "MAX_PLAYER_PAGES=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Preflight required secrets
+        run: |
+          if [ -z "$SUPABASE_DB_URL_SESSION" ]; then
+            echo "Missing SUPABASE_DB_URL_SESSION secret"
+            exit 1
+          fi
+          if [ -z "$SPORTMONKS_API_TOKEN" ]; then
+            echo "Missing SPORTMONKS_API_TOKEN secret"
+            exit 1
+          fi
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+
+      - name: Sync metadata
+        run: |
+          python3 scripts/sync_metadata_identity.py \
+            --player-mode "$PLAYER_MODE" \
+            --max-player-pages "$MAX_PLAYER_PAGES" \
+            --team-concurrency 6 \
+            --player-id-concurrency 12 \
+            --player-id-limit "$PLAYER_ID_LIMIT"
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          FOOTBALL_API_BASE_URL: ${{ vars.FOOTBALL_API_BASE_URL }}
+          ALLOW_INSECURE_TLS: ${{ secrets.ALLOW_INSECURE_TLS }}
+          PLAYER_MODE: ${{ env.PLAYER_MODE }}
+          PLAYER_ID_LIMIT: ${{ env.PLAYER_ID_LIMIT }}
+          MAX_PLAYER_PAGES: ${{ env.MAX_PLAYER_PAGES }}
+
+      - name: Audit metadata coverage
+        run: |
+          mkdir -p artifacts
+          python3 scripts/audit_metadata_coverage.py | tee artifacts/metadata_coverage_report.json
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+
+      - name: Publish audit summary
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report = Path('artifacts/metadata_coverage_report.json')
+          data = json.loads(report.read_text(encoding='utf-8'))
+          c = data.get('coverage', {})
+          lines = [
+              "## Metadata Coverage",
+              f"- Teams with badge: {c.get('teams', {}).get('withBadge', 0)}/{c.get('teams', {}).get('total', 0)} ({c.get('teams', {}).get('badgePct', '0.0%')})",
+              f"- Teams with country: {c.get('teams', {}).get('withCountry', 0)}/{c.get('teams', {}).get('total', 0)} ({c.get('teams', {}).get('countryPct', '0.0%')})",
+              f"- Players with nationality: {c.get('players', {}).get('withNationality', 0)}/{c.get('players', {}).get('total', 0)} ({c.get('players', {}).get('nationalityPct', '0.0%')})",
+              f"- Leagues with badge: {c.get('leagues', {}).get('withBadge', 0)}/{c.get('leagues', {}).get('total', 0)} ({c.get('leagues', {}).get('badgePct', '0.0%')})",
+              f"- Countries with flag: {c.get('countries', {}).get('withFlag', 0)}/{c.get('countries', {}).get('total', 0)} ({c.get('countries', {}).get('flagPct', '0.0%')})",
+          ]
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+            with open(summary, 'a', encoding='utf-8') as fh:
+              fh.write("\n".join(lines) + "\n")
+          else:
+            print("\n".join(lines))
+          PY
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metadata-coverage-report
+          path: artifacts/metadata_coverage_report.json
