@@ -1,0 +1,178 @@
+name: Referee Sync
+
+on:
+  schedule:
+    - cron: "10 2 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        required: true
+        default: "daily"
+        type: choice
+        options:
+          - daily
+          - backfill
+      days_back:
+        description: "Days back for fixture referee sync"
+        required: true
+        default: "30"
+        type: string
+      days_forward:
+        description: "Days forward for fixture referee sync"
+        required: true
+        default: "14"
+        type: string
+      limit_fixtures:
+        description: "Limit fixtures (0 = all in window)"
+        required: true
+        default: "0"
+        type: string
+      sleep_seconds:
+        description: "Throttle delay between fixture API calls"
+        required: true
+        default: "0.3"
+        type: string
+      max_referee_pages:
+        description: "Limit referee pages (0 = all pages)"
+        required: true
+        default: "0"
+        type: string
+
+concurrency:
+  group: referee-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PYTHONPATH: .
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Resolve inputs
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "RUN_MODE=${{ inputs.mode }}" >> "$GITHUB_ENV"
+            echo "DAYS_BACK=${{ inputs.days_back }}" >> "$GITHUB_ENV"
+            echo "DAYS_FORWARD=${{ inputs.days_forward }}" >> "$GITHUB_ENV"
+            echo "LIMIT_FIXTURES=${{ inputs.limit_fixtures }}" >> "$GITHUB_ENV"
+            echo "SLEEP_SECONDS=${{ inputs.sleep_seconds }}" >> "$GITHUB_ENV"
+            echo "MAX_REFEREE_PAGES=${{ inputs.max_referee_pages }}" >> "$GITHUB_ENV"
+          else
+            echo "RUN_MODE=daily" >> "$GITHUB_ENV"
+            echo "DAYS_BACK=30" >> "$GITHUB_ENV"
+            echo "DAYS_FORWARD=14" >> "$GITHUB_ENV"
+            echo "LIMIT_FIXTURES=0" >> "$GITHUB_ENV"
+            echo "SLEEP_SECONDS=0.3" >> "$GITHUB_ENV"
+            echo "MAX_REFEREE_PAGES=0" >> "$GITHUB_ENV"
+          fi
+
+      - name: Preflight required secrets
+        run: |
+          if [ -z "$SUPABASE_DB_URL_SESSION" ]; then
+            echo "Missing SUPABASE_DB_URL_SESSION secret"
+            exit 1
+          fi
+          if [ -z "$SPORTMONKS_API_TOKEN" ]; then
+            echo "Missing SPORTMONKS_API_TOKEN secret"
+            exit 1
+          fi
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+
+      - name: Sync referee profiles
+        run: |
+          mkdir -p artifacts
+          python3 scripts/sync_referees.py \
+            --max-pages "$MAX_REFEREE_PAGES" \
+            --report-json artifacts/referee_profiles_report.json
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          FOOTBALL_API_BASE_URL: ${{ vars.FOOTBALL_API_BASE_URL }}
+
+      - name: Sync fixture referee assignments (daily)
+        if: ${{ env.RUN_MODE == 'daily' }}
+        run: |
+          python3 scripts/sync_fixture_referees.py \
+            --days-back "$DAYS_BACK" \
+            --days-forward "$DAYS_FORWARD" \
+            --limit-fixtures "$LIMIT_FIXTURES" \
+            --sleep-seconds "$SLEEP_SECONDS" \
+            --report-json artifacts/fixture_referees_report.json
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          FOOTBALL_API_BASE_URL: ${{ vars.FOOTBALL_API_BASE_URL }}
+
+      - name: Sync fixture referee assignments (backfill)
+        if: ${{ env.RUN_MODE == 'backfill' }}
+        run: |
+          python3 scripts/sync_fixture_referees.py \
+            --days-back "$DAYS_BACK" \
+            --days-forward "$DAYS_FORWARD" \
+            --limit-fixtures "$LIMIT_FIXTURES" \
+            --sleep-seconds "$SLEEP_SECONDS" \
+            --enforce-backfill-window \
+            --report-json artifacts/fixture_referees_report.json
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          FOOTBALL_API_BASE_URL: ${{ vars.FOOTBALL_API_BASE_URL }}
+
+      - name: Publish coverage summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          profile_path = Path('artifacts/referee_profiles_report.json')
+          fixture_path = Path('artifacts/fixture_referees_report.json')
+
+          profile = json.loads(profile_path.read_text(encoding='utf-8')) if profile_path.exists() else {}
+          fixture = json.loads(fixture_path.read_text(encoding='utf-8')) if fixture_path.exists() else {}
+
+          lines = [
+              "## Referee Sync",
+              f"- Mode: {os.getenv('RUN_MODE', 'daily')}",
+              f"- Referees fetched: {profile.get('fetched', 0)}",
+              f"- Fixtures scanned: {fixture.get('fixtures_scanned', 0)}",
+              f"- Fixtures with referees: {fixture.get('fixtures_with_referees', 0)}",
+              f"- Fixtures without referees: {fixture.get('fixtures_without_referees', 0)}",
+              f"- Unique referees in assignments: {fixture.get('unique_referees', 0)}",
+              f"- Assignment rows (deduped): {fixture.get('assignments_total_deduped', 0)}",
+              f"- Fixture fetch failures: {fixture.get('fixtures_failed', 0)}",
+          ]
+
+          summary = os.environ.get('GITHUB_STEP_SUMMARY')
+          if summary:
+              with open(summary, 'a', encoding='utf-8') as fh:
+                  fh.write("\n".join(lines) + "\n")
+          else:
+              print("\n".join(lines))
+          PY
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: referee-sync-reports
+          path: artifacts/*.json
