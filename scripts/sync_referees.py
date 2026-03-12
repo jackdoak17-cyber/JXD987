@@ -169,12 +169,29 @@ def normalize_referee(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def upsert_referees(conn: psycopg2.extensions.connection, rows: List[Dict[str, Any]]) -> int:
+def load_country_ids(conn: psycopg2.extensions.connection) -> Optional[set[int]]:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select id from public.countries")
+            rows = cur.fetchall()
+        return {int(row[0]) for row in rows if row and row[0] is not None}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def upsert_referees(
+    conn: psycopg2.extensions.connection,
+    rows: List[Dict[str, Any]],
+    valid_country_ids: Optional[set[int]] = None,
+) -> int:
     if not rows:
         return 0
 
     values: List[Tuple[Any, ...]] = []
     for row in rows:
+        country_id = row.get("country_id")
+        if valid_country_ids is not None and country_id is not None and country_id not in valid_country_ids:
+            country_id = None
         values.append(
             (
                 row["id"],
@@ -182,7 +199,7 @@ def upsert_referees(conn: psycopg2.extensions.connection, rows: List[Dict[str, A
                 row.get("short_name"),
                 row.get("common_name"),
                 row.get("image_path"),
-                row.get("country_id"),
+                country_id,
                 row.get("city_id"),
                 row.get("source", "sportmonks"),
                 Json(row.get("extra") or {}),
@@ -271,7 +288,8 @@ def main() -> int:
 
     conn = psycopg2.connect(get_db_url())
     try:
-        written = upsert_referees(conn, normalized)
+        valid_country_ids = load_country_ids(conn)
+        written = upsert_referees(conn, normalized, valid_country_ids=valid_country_ids)
     finally:
         conn.close()
 

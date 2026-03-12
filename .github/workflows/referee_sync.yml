@@ -136,6 +136,19 @@ jobs:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
           FOOTBALL_API_BASE_URL: ${{ vars.FOOTBALL_API_BASE_URL }}
 
+      - name: Sync fixture referee stats snapshot
+        run: |
+          python3 scripts/sync_fixture_referee_stats.py \
+            --days-back "$DAYS_BACK" \
+            --days-forward "$DAYS_FORWARD" \
+            --limit-fixtures "$LIMIT_FIXTURES" \
+            --sleep-seconds "$SLEEP_SECONDS" \
+            --report-json artifacts/fixture_referee_stats_report.json
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          FOOTBALL_API_BASE_URL: ${{ vars.FOOTBALL_API_BASE_URL }}
+
       - name: Publish coverage summary
         if: always()
         run: |
@@ -146,9 +159,11 @@ jobs:
 
           profile_path = Path('artifacts/referee_profiles_report.json')
           fixture_path = Path('artifacts/fixture_referees_report.json')
+          stats_path = Path('artifacts/fixture_referee_stats_report.json')
 
           profile = json.loads(profile_path.read_text(encoding='utf-8')) if profile_path.exists() else {}
           fixture = json.loads(fixture_path.read_text(encoding='utf-8')) if fixture_path.exists() else {}
+          stats = json.loads(stats_path.read_text(encoding='utf-8')) if stats_path.exists() else {}
 
           lines = [
               "## Referee Sync",
@@ -159,7 +174,9 @@ jobs:
               f"- Fixtures without referees: {fixture.get('fixtures_without_referees', 0)}",
               f"- Unique referees in assignments: {fixture.get('unique_referees', 0)}",
               f"- Assignment rows (deduped): {fixture.get('assignments_total_deduped', 0)}",
+              f"- Fixture referee stats rows upserted: {stats.get('upserted', stats.get('rows_to_upsert', 0))}",
               f"- Fixture fetch failures: {fixture.get('fixtures_failed', 0)}",
+              f"- Referee detail fetch failures: {stats.get('referee_fetch_failures', 0)}",
           ]
 
           summary = os.environ.get('GITHUB_STEP_SUMMARY')

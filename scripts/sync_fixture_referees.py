@@ -27,6 +27,15 @@ DEFAULT_BASE_URL = "https://api.sportmonks.com/v3/football"
 
 logger = logging.getLogger("sync_fixture_referees")
 
+REFEREE_TYPE_ROLE_MAP: Dict[int, Tuple[str, bool]] = {
+    6: ("main", True),
+    7: ("assistant_1", False),
+    8: ("assistant_2", False),
+    9: ("fourth_official", False),
+    10: ("var", False),
+    11: ("avar", False),
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync SportMonks fixture-referee assignments into Supabase")
@@ -168,6 +177,28 @@ def fetch_fixture_ids(
     return [int(row[0]) for row in rows if row and row[0] is not None]
 
 
+def load_country_ids(conn: psycopg2.extensions.connection) -> Optional[set[int]]:
+    try:
+        with conn.cursor() as cur:
+            cur.execute("select id from public.countries")
+            rows = cur.fetchall()
+        return {int(row[0]) for row in rows if row and row[0] is not None}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_existing_referee_ids(
+    conn: psycopg2.extensions.connection, referee_ids: Iterable[int]
+) -> set[int]:
+    ids = sorted({int(rid) for rid in referee_ids if int(rid) > 0})
+    if not ids:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute("select id from public.referees where id = any(%s)", (ids,))
+        rows = cur.fetchall()
+    return {int(row[0]) for row in rows if row and row[0] is not None}
+
+
 def extract_referee_items(fixture_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     root = fixture_payload.get("data")
     if not isinstance(root, dict):
@@ -183,8 +214,13 @@ def extract_referee_items(fixture_payload: Dict[str, Any]) -> List[Dict[str, Any
 
 
 def normalize_referee_profile(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    rid = to_positive_int(row.get("id") or row.get("referee_id"))
+    rid = to_positive_int(row.get("referee_id") or row.get("id"))
     if not rid:
+        return None
+
+    # Fixture referee includes usually return relation rows only (id, fixture_id, referee_id, type_id).
+    # In that case, avoid writing placeholder profile rows that would overwrite canonical names.
+    if not any(non_empty(row.get(key)) for key in ("name", "fullname", "short_name", "common_name", "image_path")):
         return None
 
     country_id = to_positive_int(row.get("country_id"))
@@ -211,13 +247,19 @@ def normalize_referee_profile(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def normalize_assignment(fixture_id: int, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    rid = to_positive_int(row.get("id") or row.get("referee_id"))
+    rid = to_positive_int(row.get("referee_id") or row.get("id"))
     if not rid:
         return None
 
     pivot = row.get("pivot") if isinstance(row.get("pivot"), dict) else {}
+    type_id = to_positive_int(row.get("type_id"))
+    mapped_role, mapped_primary = ("unknown", False)
+    if type_id is not None and type_id in REFEREE_TYPE_ROLE_MAP:
+        mapped_role, mapped_primary = REFEREE_TYPE_ROLE_MAP[type_id]
+
     role = normalize_role(
-        row.get("role")
+        mapped_role if mapped_role != "unknown" else None
+        or row.get("role")
         or row.get("type")
         or row.get("designation")
         or pivot.get("role")
@@ -227,6 +269,7 @@ def normalize_assignment(fixture_id: int, row: Dict[str, Any]) -> Optional[Dict[
     is_primary = bool(
         row.get("is_primary")
         or row.get("main")
+        or mapped_primary
         or role == "main"
         or str(row.get("referee_type", "")).lower() == "main"
     )
@@ -241,7 +284,11 @@ def normalize_assignment(fixture_id: int, row: Dict[str, Any]) -> Optional[Dict[
     }
 
 
-def upsert_referees(conn: psycopg2.extensions.connection, rows: Iterable[Dict[str, Any]]) -> int:
+def upsert_referees(
+    conn: psycopg2.extensions.connection,
+    rows: Iterable[Dict[str, Any]],
+    valid_country_ids: Optional[set[int]] = None,
+) -> int:
     dedup: Dict[int, Dict[str, Any]] = {}
     for row in rows:
         dedup[row["id"]] = row
@@ -250,6 +297,9 @@ def upsert_referees(conn: psycopg2.extensions.connection, rows: Iterable[Dict[st
 
     values: List[Tuple[Any, ...]] = []
     for row in dedup.values():
+        country_id = row.get("country_id")
+        if valid_country_ids is not None and country_id is not None and country_id not in valid_country_ids:
+            country_id = None
         values.append(
             (
                 row["id"],
@@ -257,7 +307,7 @@ def upsert_referees(conn: psycopg2.extensions.connection, rows: Iterable[Dict[st
                 row.get("short_name"),
                 row.get("common_name"),
                 row.get("image_path"),
-                row.get("country_id"),
+                country_id,
                 row.get("city_id"),
                 row.get("source", "sportmonks"),
                 Json(row.get("extra") or {}),
@@ -318,6 +368,33 @@ def upsert_assignments(conn: psycopg2.extensions.connection, rows: Iterable[Dict
         execute_values(cur, sql, values, page_size=500)
     conn.commit()
     return len(values)
+
+
+def cleanup_legacy_assignment_ids(
+    conn: psycopg2.extensions.connection, fixture_ids: Iterable[int]
+) -> int:
+    ids = sorted({int(fid) for fid in fixture_ids if int(fid) > 0})
+    if not ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            delete from public.fixture_referees fr
+            where fr.fixture_id = any(%s)
+              and fr.source = 'sportmonks'
+              and fr.role = 'unknown'
+              and fr.extra ? 'id'
+              and fr.extra ? 'referee_id'
+              and (fr.extra->>'id') ~ '^[0-9]+$'
+              and (fr.extra->>'referee_id') ~ '^[0-9]+$'
+              and fr.referee_id = (fr.extra->>'id')::bigint
+              and fr.referee_id <> (fr.extra->>'referee_id')::bigint
+            """,
+            (ids,),
+        )
+        deleted = cur.rowcount
+    conn.commit()
+    return deleted
 
 
 def touch_fixture_sync_timestamp(conn: psycopg2.extensions.connection, fixture_id: int) -> None:
@@ -417,6 +494,27 @@ def main() -> int:
     dedup_assignments = {
         (row["fixture_id"], row["referee_id"], row["role"]): row for row in all_assignments
     }
+    assignment_referee_ids = sorted({row["referee_id"] for row in dedup_assignments.values()})
+
+    conn_meta = psycopg2.connect(db_url)
+    try:
+        existing_referee_ids = load_existing_referee_ids(conn_meta, assignment_referee_ids)
+        valid_country_ids = load_country_ids(conn_meta)
+    finally:
+        conn_meta.close()
+
+    missing_referee_ids = sorted(set(assignment_referee_ids) - existing_referee_ids)
+    if missing_referee_ids:
+        logger.warning(
+            "Skipping %s assignment referee IDs not present in public.referees (run sync_referees first)",
+            len(missing_referee_ids),
+        )
+
+    dedup_assignments = {
+        key: row
+        for key, row in dedup_assignments.items()
+        if row["referee_id"] in existing_referee_ids
+    }
 
     report: Dict[str, Any] = {
         "ok": True,
@@ -428,9 +526,11 @@ def main() -> int:
         "fixtures_touched": touched_fixtures,
         "assignments_total_raw": total_assignments,
         "assignments_total_deduped": len(dedup_assignments),
-        "unique_referees": len(dedup_profiles),
+        "unique_referees": len(assignment_referee_ids),
+        "missing_referees_in_db": len(missing_referee_ids),
+        "missing_referee_ids_sample": missing_referee_ids[:10],
         "sample_fixture_ids": fixture_ids[:10],
-        "sample_referee_ids": list(dedup_profiles.keys())[:10],
+        "sample_referee_ids": assignment_referee_ids[:10],
     }
 
     if args.dry_run:
@@ -440,13 +540,17 @@ def main() -> int:
 
     conn_write = psycopg2.connect(db_url)
     try:
-        upserted_referees = upsert_referees(conn_write, dedup_profiles.values())
+        upserted_referees = upsert_referees(conn_write, dedup_profiles.values(), valid_country_ids=valid_country_ids)
         upserted_assignments = upsert_assignments(conn_write, dedup_assignments.values())
+        cleaned_legacy_assignments = cleanup_legacy_assignment_ids(
+            conn_write, {row["fixture_id"] for row in dedup_assignments.values()}
+        )
     finally:
         conn_write.close()
 
     report["upserted_referees"] = upserted_referees
     report["upserted_assignments"] = upserted_assignments
+    report["cleaned_legacy_assignments"] = cleaned_legacy_assignments
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
     write_report(args.report_json, report)
