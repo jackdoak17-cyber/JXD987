@@ -41,6 +41,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync SportMonks fixture-referee assignments into Supabase")
     parser.add_argument("--days-back", type=int, default=30)
     parser.add_argument("--days-forward", type=int, default=14)
+    parser.add_argument(
+        "--resync-hours",
+        type=int,
+        default=12,
+        help="Only re-fetch fixtures whose referee assignments are missing or stale by this many hours",
+    )
     parser.add_argument("--limit-fixtures", type=int, default=0, help="Limit number of fixtures for testing")
     parser.add_argument("--sleep-seconds", type=float, default=0.3, help="Delay between fixture API calls")
     parser.add_argument("--timeout", type=int, default=30)
@@ -157,6 +163,7 @@ def fetch_fixture_ids(
     *,
     days_back: int,
     days_forward: int,
+    resync_hours: int,
     limit_fixtures: int,
 ) -> List[int]:
     sql = """
@@ -164,15 +171,30 @@ def fetch_fixture_ids(
         from public.fixtures
         where starting_at >= (now() - make_interval(days => %s))
           and starting_at <= (now() + make_interval(days => %s))
+          and (
+            not exists (
+              select 1
+              from public.fixture_referees fr
+              where fr.fixture_id = public.fixtures.id
+                and fr.source = 'sportmonks'
+            )
+            or exists (
+              select 1
+              from public.fixture_referees fr
+              where fr.fixture_id = public.fixtures.id
+                and fr.source = 'sportmonks'
+                and fr.last_synced_at < (now() - make_interval(hours => %s))
+            )
+          )
         order by starting_at asc
     """
     if limit_fixtures > 0:
         sql += " limit %s"
     with conn.cursor() as cur:
         if limit_fixtures > 0:
-            cur.execute(sql, (max(0, days_back), max(0, days_forward), limit_fixtures))
+            cur.execute(sql, (max(0, days_back), max(0, days_forward), max(1, resync_hours), limit_fixtures))
         else:
-            cur.execute(sql, (max(0, days_back), max(0, days_forward)))
+            cur.execute(sql, (max(0, days_back), max(0, days_forward), max(1, resync_hours)))
         rows = cur.fetchall()
     return [int(row[0]) for row in rows if row and row[0] is not None]
 
@@ -435,12 +457,19 @@ def main() -> int:
             conn,
             days_back=args.days_back,
             days_forward=args.days_forward,
+            resync_hours=args.resync_hours,
             limit_fixtures=args.limit_fixtures,
         )
     finally:
         conn.close()
 
-    logger.info("Fixtures queued=%s (days_back=%s days_forward=%s)", len(fixture_ids), args.days_back, args.days_forward)
+    logger.info(
+        "Fixtures queued=%s (days_back=%s days_forward=%s resync_hours=%s)",
+        len(fixture_ids),
+        args.days_back,
+        args.days_forward,
+        args.resync_hours,
+    )
 
     total_assignments = 0
     fixtures_with_refs = 0

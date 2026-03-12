@@ -38,6 +38,11 @@ on:
         required: true
         default: "0"
         type: string
+      history_days_back:
+        description: "History window for referee assignment hydration"
+        required: true
+        default: "700"
+        type: string
 
 concurrency:
   group: referee-sync
@@ -73,6 +78,7 @@ jobs:
             echo "LIMIT_FIXTURES=${{ inputs.limit_fixtures }}" >> "$GITHUB_ENV"
             echo "SLEEP_SECONDS=${{ inputs.sleep_seconds }}" >> "$GITHUB_ENV"
             echo "MAX_REFEREE_PAGES=${{ inputs.max_referee_pages }}" >> "$GITHUB_ENV"
+            echo "HISTORY_DAYS_BACK=${{ inputs.history_days_back }}" >> "$GITHUB_ENV"
           else
             echo "RUN_MODE=daily" >> "$GITHUB_ENV"
             echo "DAYS_BACK=30" >> "$GITHUB_ENV"
@@ -80,6 +86,7 @@ jobs:
             echo "LIMIT_FIXTURES=0" >> "$GITHUB_ENV"
             echo "SLEEP_SECONDS=0.3" >> "$GITHUB_ENV"
             echo "MAX_REFEREE_PAGES=0" >> "$GITHUB_ENV"
+            echo "HISTORY_DAYS_BACK=700" >> "$GITHUB_ENV"
           fi
 
       - name: Preflight required secrets
@@ -136,6 +143,21 @@ jobs:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
           FOOTBALL_API_BASE_URL: ${{ vars.FOOTBALL_API_BASE_URL }}
 
+      - name: Hydrate historical referee assignments (main referee)
+        run: |
+          python3 scripts/hydrate_referee_history.py \
+            --seed-days-back "$DAYS_BACK" \
+            --seed-days-forward "$DAYS_FORWARD" \
+            --history-days-back "$HISTORY_DAYS_BACK" \
+            --history-days-forward "$DAYS_FORWARD" \
+            --sleep-seconds "$SLEEP_SECONDS" \
+            --main-only \
+            --report-json artifacts/referee_history_report.json
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          FOOTBALL_API_BASE_URL: ${{ vars.FOOTBALL_API_BASE_URL }}
+
       - name: Sync fixture referee stats snapshot
         run: |
           python3 scripts/sync_fixture_referee_stats.py \
@@ -163,6 +185,7 @@ jobs:
 
           profile = json.loads(profile_path.read_text(encoding='utf-8')) if profile_path.exists() else {}
           fixture = json.loads(fixture_path.read_text(encoding='utf-8')) if fixture_path.exists() else {}
+          history = json.loads(Path('artifacts/referee_history_report.json').read_text(encoding='utf-8')) if Path('artifacts/referee_history_report.json').exists() else {}
           stats = json.loads(stats_path.read_text(encoding='utf-8')) if stats_path.exists() else {}
 
           lines = [
@@ -174,7 +197,9 @@ jobs:
               f"- Fixtures without referees: {fixture.get('fixtures_without_referees', 0)}",
               f"- Unique referees in assignments: {fixture.get('unique_referees', 0)}",
               f"- Assignment rows (deduped): {fixture.get('assignments_total_deduped', 0)}",
+              f"- Historical assignment rows (deduped): {history.get('rows_deduped', 0)}",
               f"- Fixture referee stats rows upserted: {stats.get('upserted', stats.get('rows_to_upsert', 0))}",
+              f"- Fixtures with sample_20 history: {stats.get('fixtures_with_history_sample_20', 0)}",
               f"- Fixture fetch failures: {fixture.get('fixtures_failed', 0)}",
               f"- Referee detail fetch failures: {stats.get('referee_fetch_failures', 0)}",
           ]
