@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-Build fixture-level referee stats snapshot rows from assigned primary referees.
+Build fixture-level referee card metrics from database stats only.
 
-- Reads fixture -> primary referee mapping from DB within a time window
-- Fetches /referees/{id}?include=statistics.details.type from SportMonks (one call per unique referee)
-- Upserts public.fixture_referee_stats
+- Uses assigned primary/main referee per fixture
+- Uses historical completed fixtures officiated by the same referee
+- Derives card metrics from fixture_statistics type IDs:
+    84 = yellow cards
+    83 = red cards
+- Produces Last 5 / Last 10 / Last 20 windows per fixture
+- Upserts into public.fixture_referee_stats (including windows JSON)
 """
 
 from __future__ import annotations
@@ -13,40 +17,23 @@ import argparse
 import json
 import logging
 import os
-import time
-from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import psycopg2
-from psycopg2.extras import execute_values
-import requests
+from psycopg2.extras import Json, execute_values
 
-DEFAULT_BASE_URL = "https://api.sportmonks.com/v3/football"
-
-TYPE_YELLOW_CARDS = 84
-TYPE_FOULS = 56
-TYPE_RED_CARDS = 83
-TYPE_CORNERS = 34
+FINISHED_STATUSES = ["FT", "AET", "PEN"]
 
 logger = logging.getLogger("sync_fixture_referee_stats")
 
 
-@dataclass
-class RefereeSnapshot:
-    name: Optional[str]
-    avg_yellow_cards: Optional[float]
-    avg_fouls: Optional[float]
-    avg_corners: Optional[float]
-    avg_red_cards: Optional[float]
-    sample: int
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sync fixture_referee_stats from SportMonks referee stats")
+    parser = argparse.ArgumentParser(description="Sync fixture_referee_stats from database card history")
     parser.add_argument("--days-back", type=int, default=30)
     parser.add_argument("--days-forward", type=int, default=14)
     parser.add_argument("--limit-fixtures", type=int, default=0)
-    parser.add_argument("--sleep-seconds", type=float, default=0.2)
+    # Kept for workflow CLI compatibility; no external API calls are made.
+    parser.add_argument("--sleep-seconds", type=float, default=0.0)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--report-json", type=str, default="")
@@ -64,224 +51,21 @@ def get_db_url() -> str:
     return value
 
 
-def get_api_token() -> str:
-    value = os.getenv("SPORTMONKS_API_TOKEN") or os.getenv("ODDS_API_KEY")
-    if not value:
-        raise RuntimeError("Missing SPORTMONKS_API_TOKEN (or ODDS_API_KEY)")
-    return value
-
-
-def get_base_url() -> str:
-    return (os.getenv("FOOTBALL_API_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
-
-
-def to_number(value: Any) -> Optional[float]:
+def to_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
     try:
-        n = float(value)
+        number = float(value)
     except Exception:  # noqa: BLE001
         return None
-    return n if n == n else None
+    return number if number == number else None
 
 
-def fetch_json_with_retry(
-    *, session: requests.Session, url: str, timeout: int, max_attempts: int = 5
-) -> Dict[str, Any]:
-    last_exc: Optional[Exception] = None
-    for attempt in range(1, max_attempts + 1):
-        try:
-            resp = session.get(url, timeout=timeout)
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                sleep_for = int(retry_after) if retry_after and retry_after.isdigit() else attempt
-                logger.warning("Rate limited (429) for %s; sleeping %ss", url, sleep_for)
-                time.sleep(max(1, sleep_for))
-                continue
-            if 500 <= resp.status_code < 600:
-                logger.warning("Server error %s for %s", resp.status_code, url)
-                time.sleep(min(10, attempt))
-                continue
-            resp.raise_for_status()
-            payload = resp.json()
-            if not isinstance(payload, dict):
-                raise RuntimeError(f"Unexpected payload type: {type(payload)}")
-            return payload
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt >= max_attempts:
-                break
-            time.sleep(min(10, attempt))
-    raise RuntimeError(f"Request failed after retries: {url}") from last_exc
-
-
-def weighted_average_for_type(stats_entries: Iterable[Dict[str, Any]], type_id: int) -> Tuple[Optional[float], int]:
-    weighted_sum = 0.0
-    total_count = 0
-    for entry in stats_entries:
-        details = entry.get("details")
-        if not isinstance(details, list):
-            continue
-        for detail in details:
-            if not isinstance(detail, dict):
-                continue
-            if int(detail.get("type_id") or 0) != type_id:
-                continue
-            all_stats = (((detail.get("value") or {}).get("all") or {}))
-            avg = to_number(all_stats.get("average"))
-            cnt = to_number(all_stats.get("count"))
-            if avg is None or cnt is None or cnt <= 0:
-                continue
-            weighted_sum += avg * cnt
-            total_count += int(cnt)
-    if total_count <= 0:
-        return None, 0
-    return weighted_sum / total_count, total_count
-
-
-def fetch_referee_snapshot(
-    *, session: requests.Session, base_url: str, token: str, referee_id: int, timeout: int
-) -> Optional[RefereeSnapshot]:
-    url = f"{base_url}/referees/{referee_id}?api_token={token}&include=statistics.details.type"
-    payload = fetch_json_with_retry(session=session, url=url, timeout=timeout)
-    root = payload.get("data")
-    if not isinstance(root, dict):
-        return None
-
-    name = root.get("name")
-    if isinstance(name, str):
-        name = name.strip() or None
-    else:
-        name = None
-
-    statistics = root.get("statistics")
-    if isinstance(statistics, dict):
-        stats_entries = statistics.get("data")
-    else:
-        stats_entries = statistics
-
-    if not isinstance(stats_entries, list):
-        stats_entries = []
-
-    avg_yellow, c_yellow = weighted_average_for_type(stats_entries, TYPE_YELLOW_CARDS)
-    avg_fouls, c_fouls = weighted_average_for_type(stats_entries, TYPE_FOULS)
-    avg_corners, c_corners = weighted_average_for_type(stats_entries, TYPE_CORNERS)
-    avg_red, c_red = weighted_average_for_type(stats_entries, TYPE_RED_CARDS)
-    sample = max(c_yellow, c_fouls, c_corners, c_red, 0)
-
-    return RefereeSnapshot(
-        name=name,
-        avg_yellow_cards=avg_yellow,
-        avg_fouls=avg_fouls,
-        avg_corners=avg_corners,
-        avg_red_cards=avg_red,
-        sample=sample,
-    )
-
-
-def fetch_fixture_primary_referees(
-    conn: psycopg2.extensions.connection,
-    *,
-    days_back: int,
-    days_forward: int,
-    limit_fixtures: int,
-) -> List[Tuple[int, int, Optional[str]]]:
-    sql = """
-        select
-          f.id as fixture_id,
-          pick.referee_id,
-          r.name as referee_name
-        from public.fixtures f
-        join lateral (
-          select fr.referee_id
-          from public.fixture_referees fr
-          where fr.fixture_id = f.id
-          order by
-            fr.is_primary desc,
-            case when fr.role = 'main' then 0 else 1 end,
-            fr.updated_at desc
-          limit 1
-        ) pick on true
-        left join public.referees r
-          on r.id = pick.referee_id
-        where f.starting_at >= (now() - make_interval(days => %s))
-          and f.starting_at <= (now() + make_interval(days => %s))
-        order by f.starting_at asc
-    """
-    if limit_fixtures > 0:
-        sql += " limit %s"
-
-    with conn.cursor() as cur:
-        if limit_fixtures > 0:
-            cur.execute(sql, (max(0, days_back), max(0, days_forward), limit_fixtures))
-        else:
-            cur.execute(sql, (max(0, days_back), max(0, days_forward)))
-        rows = cur.fetchall()
-
-    out: List[Tuple[int, int, Optional[str]]] = []
-    for row in rows:
-        fixture_id = int(row[0])
-        referee_id = int(row[1])
-        referee_name = row[2] if isinstance(row[2], str) else None
-        out.append((fixture_id, referee_id, referee_name))
-    return out
-
-
-def upsert_fixture_referee_stats(
-    conn: psycopg2.extensions.connection,
-    rows: Iterable[Tuple[int, int, str, Optional[float], Optional[float], Optional[float], Optional[float], int]],
-) -> int:
-    values: List[Tuple[Any, ...]] = []
-    for row in rows:
-        fixture_id, referee_id, referee_name, avg_yellow, avg_fouls, avg_corners, red_pct, sample = row
-        values.append(
-            (
-                fixture_id,
-                referee_id,
-                referee_name,
-                avg_yellow,
-                avg_fouls,
-                None,
-                red_pct,
-                avg_corners,
-                sample,
-                "sportmonks",
-            )
-        )
-
-    if not values:
+def to_int(value: Any) -> int:
+    try:
+        return int(value)
+    except Exception:  # noqa: BLE001
         return 0
-
-    sql = """
-        insert into public.fixture_referee_stats
-          (
-            fixture_id,
-            referee_id,
-            referee_name,
-            avg_yellow_cards,
-            avg_fouls,
-            games_with_3plus_cards_pct,
-            games_with_red_card_pct,
-            avg_corners,
-            sample,
-            source
-          )
-        values %s
-        on conflict (fixture_id) do update
-        set
-          referee_id = excluded.referee_id,
-          referee_name = excluded.referee_name,
-          avg_yellow_cards = excluded.avg_yellow_cards,
-          avg_fouls = excluded.avg_fouls,
-          games_with_3plus_cards_pct = excluded.games_with_3plus_cards_pct,
-          games_with_red_card_pct = excluded.games_with_red_card_pct,
-          avg_corners = excluded.avg_corners,
-          sample = excluded.sample,
-          source = excluded.source,
-          updated_at = now()
-    """
-    with conn.cursor() as cur:
-        execute_values(cur, sql, values, page_size=500)
-    conn.commit()
-    return len(values)
 
 
 def write_report(path: str, report: Dict[str, Any]) -> None:
@@ -292,17 +76,271 @@ def write_report(path: str, report: Dict[str, Any]) -> None:
         json.dump(report, fh, indent=2, ensure_ascii=False)
 
 
+def fetch_fixture_referee_metrics(
+    conn: psycopg2.extensions.connection,
+    *,
+    days_back: int,
+    days_forward: int,
+    limit_fixtures: int,
+) -> List[Dict[str, Any]]:
+    limit_clause = ""
+    params: List[Any] = [max(0, days_back), max(0, days_forward), FINISHED_STATUSES]
+    if limit_fixtures > 0:
+        limit_clause = "\n          limit %s"
+        params.append(limit_fixtures)
+
+    sql = f"""
+      with target as (
+        select
+          f.id::bigint as fixture_id,
+          f.starting_at as fixture_starting_at,
+          pick.referee_id::bigint as referee_id,
+          coalesce(r.name, 'Referee ' || pick.referee_id::text) as referee_name
+        from public.fixtures f
+        join lateral (
+          select fr.referee_id
+          from public.fixture_referees fr
+          where fr.fixture_id = f.id
+          order by
+            fr.is_primary desc,
+            case when lower(coalesce(fr.role, '')) in ('main', 'referee') then 0 else 1 end,
+            fr.updated_at desc
+          limit 1
+        ) pick on true
+        left join public.referees r
+          on r.id = pick.referee_id
+        where f.starting_at >= (now() - make_interval(days => %s))
+          and f.starting_at <= (now() + make_interval(days => %s))
+        order by f.starting_at asc
+        {limit_clause}
+      ),
+      referee_history as (
+        select
+          t.fixture_id,
+          h.id::bigint as history_fixture_id,
+          h.starting_at as history_starting_at,
+          coalesce(sum(case when fs.type_id = 84 then fs.value else 0 end), 0)::float8 as yellow_cards,
+          coalesce(sum(case when fs.type_id = 83 then fs.value else 0 end), 0)::float8 as red_cards,
+          count(fs.type_id)::int as card_stat_points
+        from target t
+        join public.fixture_referees frh
+          on frh.referee_id = t.referee_id
+         and (frh.is_primary = true or lower(coalesce(frh.role, '')) in ('main', 'referee'))
+        join public.fixtures h
+          on h.id = frh.fixture_id
+         and h.starting_at < t.fixture_starting_at
+         and (h.status = any(%s::text[]) or (h.home_score is not null and h.away_score is not null))
+        left join public.fixture_statistics fs
+          on fs.fixture_id = h.id
+         and fs.type_id in (83, 84)
+        group by t.fixture_id, h.id, h.starting_at
+      ),
+      ranked as (
+        select
+          fixture_id,
+          history_fixture_id,
+          history_starting_at,
+          yellow_cards,
+          red_cards,
+          row_number() over (
+            partition by fixture_id
+            order by history_starting_at desc, history_fixture_id desc
+          ) as rn
+        from referee_history
+        where card_stat_points > 0
+      ),
+      agg as (
+        select
+          fixture_id,
+          count(*) filter (where rn <= 5)::int as sample_5,
+          count(*) filter (where rn <= 10)::int as sample_10,
+          count(*) filter (where rn <= 20)::int as sample_20,
+
+          avg(yellow_cards) filter (where rn <= 5)::float8 as avg_cards_5,
+          avg(yellow_cards) filter (where rn <= 10)::float8 as avg_cards_10,
+          avg(yellow_cards) filter (where rn <= 20)::float8 as avg_cards_20,
+
+          avg(yellow_cards + red_cards) filter (where rn <= 5)::float8 as avg_total_cards_5,
+          avg(yellow_cards + red_cards) filter (where rn <= 10)::float8 as avg_total_cards_10,
+          avg(yellow_cards + red_cards) filter (where rn <= 20)::float8 as avg_total_cards_20,
+
+          avg(case when yellow_cards + red_cards >= 3 then 100.0 else 0.0 end) filter (where rn <= 5)::float8 as pct_3plus_5,
+          avg(case when yellow_cards + red_cards >= 3 then 100.0 else 0.0 end) filter (where rn <= 10)::float8 as pct_3plus_10,
+          avg(case when yellow_cards + red_cards >= 3 then 100.0 else 0.0 end) filter (where rn <= 20)::float8 as pct_3plus_20,
+
+          avg(case when yellow_cards + red_cards >= 4 then 100.0 else 0.0 end) filter (where rn <= 5)::float8 as pct_4plus_5,
+          avg(case when yellow_cards + red_cards >= 4 then 100.0 else 0.0 end) filter (where rn <= 10)::float8 as pct_4plus_10,
+          avg(case when yellow_cards + red_cards >= 4 then 100.0 else 0.0 end) filter (where rn <= 20)::float8 as pct_4plus_20,
+
+          avg(case when yellow_cards + red_cards >= 5 then 100.0 else 0.0 end) filter (where rn <= 5)::float8 as pct_5plus_5,
+          avg(case when yellow_cards + red_cards >= 5 then 100.0 else 0.0 end) filter (where rn <= 10)::float8 as pct_5plus_10,
+          avg(case when yellow_cards + red_cards >= 5 then 100.0 else 0.0 end) filter (where rn <= 20)::float8 as pct_5plus_20,
+
+          avg(case when red_cards > 0 then 100.0 else 0.0 end) filter (where rn <= 5)::float8 as pct_red_5,
+          avg(case when red_cards > 0 then 100.0 else 0.0 end) filter (where rn <= 10)::float8 as pct_red_10,
+          avg(case when red_cards > 0 then 100.0 else 0.0 end) filter (where rn <= 20)::float8 as pct_red_20
+        from ranked
+        where rn <= 20
+        group by fixture_id
+      )
+      select
+        t.fixture_id,
+        t.referee_id,
+        t.referee_name,
+
+        coalesce(a.sample_5, 0) as sample_5,
+        coalesce(a.sample_10, 0) as sample_10,
+        coalesce(a.sample_20, 0) as sample_20,
+
+        a.avg_cards_5,
+        a.avg_cards_10,
+        a.avg_cards_20,
+
+        a.avg_total_cards_5,
+        a.avg_total_cards_10,
+        a.avg_total_cards_20,
+
+        a.pct_3plus_5,
+        a.pct_3plus_10,
+        a.pct_3plus_20,
+
+        a.pct_4plus_5,
+        a.pct_4plus_10,
+        a.pct_4plus_20,
+
+        a.pct_5plus_5,
+        a.pct_5plus_10,
+        a.pct_5plus_20,
+
+        a.pct_red_5,
+        a.pct_red_10,
+        a.pct_red_20
+      from target t
+      left join agg a
+        on a.fixture_id = t.fixture_id
+      order by t.fixture_id asc
+    """
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        column_names = [desc[0] for desc in cur.description]
+        rows = cur.fetchall()
+
+    output: List[Dict[str, Any]] = []
+    for row in rows:
+        output.append(dict(zip(column_names, row)))
+    return output
+
+
+def build_windows_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    def pack(window: int) -> Dict[str, Any]:
+        return {
+            "sample": to_int(row.get(f"sample_{window}")),
+            "avg_cards": to_float(row.get(f"avg_cards_{window}")),
+            "avg_total_cards": to_float(row.get(f"avg_total_cards_{window}")),
+            "games_with_3plus_cards_pct": to_float(row.get(f"pct_3plus_{window}")),
+            "games_with_4plus_cards_pct": to_float(row.get(f"pct_4plus_{window}")),
+            "games_with_5plus_cards_pct": to_float(row.get(f"pct_5plus_{window}")),
+            "games_with_red_card_pct": to_float(row.get(f"pct_red_{window}")),
+        }
+
+    return {
+        "5": pack(5),
+        "10": pack(10),
+        "20": pack(20),
+    }
+
+
+def upsert_fixture_referee_stats(conn: psycopg2.extensions.connection, rows: Iterable[Dict[str, Any]]) -> int:
+    values: List[Tuple[Any, ...]] = []
+
+    for row in rows:
+        windows_payload = build_windows_payload(row)
+        sample_5 = to_int(row.get("sample_5"))
+        sample_10 = to_int(row.get("sample_10"))
+        sample_20 = to_int(row.get("sample_20"))
+
+        values.append(
+            (
+                to_int(row.get("fixture_id")),
+                to_int(row.get("referee_id")),
+                (str(row.get("referee_name") or "").strip() or f"Referee {to_int(row.get('referee_id'))}"),
+                to_float(row.get("avg_cards_20")),
+                None,  # avg_fouls deprecated for referee panel
+                to_float(row.get("pct_3plus_20")),
+                to_float(row.get("pct_red_20")),
+                None,  # avg_corners deprecated for referee panel
+                sample_20,
+                "db_derived",
+                to_float(row.get("avg_total_cards_20")),
+                to_float(row.get("pct_4plus_20")),
+                to_float(row.get("pct_5plus_20")),
+                sample_5,
+                sample_10,
+                sample_20,
+                Json(windows_payload),
+            )
+        )
+
+    if not values:
+        return 0
+
+    sql = """
+      insert into public.fixture_referee_stats (
+        fixture_id,
+        referee_id,
+        referee_name,
+        avg_yellow_cards,
+        avg_fouls,
+        games_with_3plus_cards_pct,
+        games_with_red_card_pct,
+        avg_corners,
+        sample,
+        source,
+        avg_total_cards,
+        games_with_4plus_cards_pct,
+        games_with_5plus_cards_pct,
+        sample_5,
+        sample_10,
+        sample_20,
+        windows
+      )
+      values %s
+      on conflict (fixture_id) do update
+      set
+        referee_id = excluded.referee_id,
+        referee_name = excluded.referee_name,
+        avg_yellow_cards = excluded.avg_yellow_cards,
+        avg_fouls = excluded.avg_fouls,
+        games_with_3plus_cards_pct = excluded.games_with_3plus_cards_pct,
+        games_with_red_card_pct = excluded.games_with_red_card_pct,
+        avg_corners = excluded.avg_corners,
+        sample = excluded.sample,
+        source = excluded.source,
+        avg_total_cards = excluded.avg_total_cards,
+        games_with_4plus_cards_pct = excluded.games_with_4plus_cards_pct,
+        games_with_5plus_cards_pct = excluded.games_with_5plus_cards_pct,
+        sample_5 = excluded.sample_5,
+        sample_10 = excluded.sample_10,
+        sample_20 = excluded.sample_20,
+        windows = excluded.windows,
+        updated_at = now()
+    """
+
+    with conn.cursor() as cur:
+        execute_values(cur, sql, values, page_size=500)
+    conn.commit()
+    return len(values)
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = parse_args()
 
     db_url = get_db_url()
-    token = get_api_token()
-    base_url = get_base_url()
-
     conn = psycopg2.connect(db_url)
     try:
-        fixture_rows = fetch_fixture_primary_referees(
+        rows = fetch_fixture_referee_metrics(
             conn,
             days_back=args.days_back,
             days_forward=args.days_forward,
@@ -311,65 +349,16 @@ def main() -> int:
     finally:
         conn.close()
 
-    unique_referees = sorted({row[1] for row in fixture_rows})
-    logger.info("Fixtures with assigned referee=%s unique_referees=%s", len(fixture_rows), len(unique_referees))
-
-    snapshots: Dict[int, RefereeSnapshot] = {}
-    fetch_failures = 0
-
-    session = requests.Session()
-    try:
-        for idx, referee_id in enumerate(unique_referees, start=1):
-            try:
-                snapshot = fetch_referee_snapshot(
-                    session=session,
-                    base_url=base_url,
-                    token=token,
-                    referee_id=referee_id,
-                    timeout=args.timeout,
-                )
-                if snapshot is not None:
-                    snapshots[referee_id] = snapshot
-            except Exception as exc:  # noqa: BLE001
-                fetch_failures += 1
-                logger.warning("referee_id=%s fetch failed: %s", referee_id, exc)
-            if args.sleep_seconds > 0 and idx < len(unique_referees):
-                time.sleep(args.sleep_seconds)
-    finally:
-        session.close()
-
-    upsert_rows: List[Tuple[int, int, str, Optional[float], Optional[float], Optional[float], Optional[float], int]] = []
-    for fixture_id, referee_id, referee_name in fixture_rows:
-        snapshot = snapshots.get(referee_id)
-        effective_name = (snapshot.name if snapshot and snapshot.name else None) or referee_name or f"Referee {referee_id}"
-
-        red_pct: Optional[float] = None
-        if snapshot and snapshot.avg_red_cards is not None:
-            red_pct = max(0.0, min(100.0, snapshot.avg_red_cards * 100.0))
-
-        upsert_rows.append(
-            (
-                fixture_id,
-                referee_id,
-                effective_name,
-                snapshot.avg_yellow_cards if snapshot else None,
-                snapshot.avg_fouls if snapshot else None,
-                snapshot.avg_corners if snapshot else None,
-                red_pct,
-                snapshot.sample if snapshot else 0,
-            )
-        )
-
     report: Dict[str, Any] = {
         "ok": True,
         "dry_run": bool(args.dry_run),
-        "fixtures_with_assigned_referee": len(fixture_rows),
-        "unique_referees": len(unique_referees),
-        "referee_stats_fetched": len(snapshots),
-        "referee_fetch_failures": fetch_failures,
-        "rows_to_upsert": len(upsert_rows),
-        "sample_fixture_ids": [row[0] for row in fixture_rows[:10]],
-        "sample_referee_ids": unique_referees[:10],
+        "rows_to_upsert": len(rows),
+        "fixtures_with_ref_assignment": sum(1 for row in rows if to_int(row.get("referee_id")) > 0),
+        "fixtures_with_history_sample_5": sum(1 for row in rows if to_int(row.get("sample_5")) > 0),
+        "fixtures_with_history_sample_10": sum(1 for row in rows if to_int(row.get("sample_10")) > 0),
+        "fixtures_with_history_sample_20": sum(1 for row in rows if to_int(row.get("sample_20")) > 0),
+        "sample_fixture_ids": [to_int(row.get("fixture_id")) for row in rows[:10]],
+        "sample_referee_ids": [to_int(row.get("referee_id")) for row in rows[:10]],
     }
 
     if args.dry_run:
@@ -379,7 +368,7 @@ def main() -> int:
 
     conn_write = psycopg2.connect(db_url)
     try:
-        upserted = upsert_fixture_referee_stats(conn_write, upsert_rows)
+        upserted = upsert_fixture_referee_stats(conn_write, rows)
     finally:
         conn_write.close()
 
