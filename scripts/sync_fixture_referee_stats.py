@@ -164,6 +164,10 @@ def fetch_fixture_referee_metrics(
           avg(yellow_cards + red_cards) filter (where rn <= 10)::float8 as avg_total_cards_10,
           avg(yellow_cards + red_cards) filter (where rn <= 20)::float8 as avg_total_cards_20,
 
+          avg(red_cards) filter (where rn <= 5)::float8 as avg_red_cards_5,
+          avg(red_cards) filter (where rn <= 10)::float8 as avg_red_cards_10,
+          avg(red_cards) filter (where rn <= 20)::float8 as avg_red_cards_20,
+
           avg(case when yellow_cards + red_cards >= 3 then 100.0 else 0.0 end) filter (where rn <= 5)::float8 as pct_3plus_5,
           avg(case when yellow_cards + red_cards >= 3 then 100.0 else 0.0 end) filter (where rn <= 10)::float8 as pct_3plus_10,
           avg(case when yellow_cards + red_cards >= 3 then 100.0 else 0.0 end) filter (where rn <= 20)::float8 as pct_3plus_20,
@@ -199,6 +203,10 @@ def fetch_fixture_referee_metrics(
         a.avg_total_cards_5,
         a.avg_total_cards_10,
         a.avg_total_cards_20,
+
+        a.avg_red_cards_5,
+        a.avg_red_cards_10,
+        a.avg_red_cards_20,
 
         a.pct_3plus_5,
         a.pct_3plus_10,
@@ -238,6 +246,7 @@ def build_windows_payload(row: Dict[str, Any]) -> Dict[str, Any]:
             "sample": to_int(row.get(f"sample_{window}")),
             "avg_cards": to_float(row.get(f"avg_cards_{window}")),
             "avg_total_cards": to_float(row.get(f"avg_total_cards_{window}")),
+            "avg_red_cards": to_float(row.get(f"avg_red_cards_{window}")),
             "games_with_3plus_cards_pct": to_float(row.get(f"pct_3plus_{window}")),
             "games_with_4plus_cards_pct": to_float(row.get(f"pct_4plus_{window}")),
             "games_with_5plus_cards_pct": to_float(row.get(f"pct_5plus_{window}")),
