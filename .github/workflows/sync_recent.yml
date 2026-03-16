@@ -41,12 +41,6 @@ jobs:
         run: |
           python3 scripts/run_sync.py --mode recent --recent-days "$RECENT_DAYS" --leagues "$LEAGUE_IDS"
 
-      - name: Reconcile recent fixtures
-        env:
-          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
-        run: |
-          python3 scripts/reconcile_recent_fixtures.py --days 7 --leagues "$LEAGUE_IDS"
-
       - name: Freshness report
         run: python3 scripts/sqlite_freshness_report.py
 
