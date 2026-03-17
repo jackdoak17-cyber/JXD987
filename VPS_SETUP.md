@@ -1,0 +1,142 @@
+# VPS Setup - Odds Sync Migration (V6)
+
+This guide migrates odds sync scheduling from GitHub Actions cron to VPS cron, with lock-safe wrappers and priority tiers.
+
+## 1) Prerequisites
+- Ubuntu VPS with Python 3.12+, `git`, `sqlite3`, `psql`, `curl`, `jq`
+- Repo cloned to `/opt/odds-sync/JXD987`
+- `.venv` created and `pip install -r requirements.txt` completed
+- `.env` present with production secrets
+
+Install packages:
+```bash
+sudo apt-get update
+sudo apt-get install -y git python3 python3-venv python3-pip sqlite3 postgresql-client curl jq
+```
+
+## 2) Required environment variables
+Existing required secrets:
+- `ODDS_API_KEY`
+- `SPORTMONKS_API_TOKEN`
+- `SUPABASE_DB_URL` (or `SUPABASE_DB_URL_SESSION`)
+- Optional REST check: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`
+
+New operational vars:
+- `ODDS_SYNC_LOCK_FILE=/var/lock/odds-sync.lock`
+- `ODDS_SYNC_P3_MAX_DURATION_SECONDS=600`
+- `ODDS_API_RATE_LIMIT_PER_HOUR=5000`
+- `ODDS_SYNC_MAX_CONCURRENT=3`
+- `HEALTHCHECK_PING_URL=` (optional global)
+- `HEALTHCHECK_PING_URL_P1=` (optional)
+- `HEALTHCHECK_PING_URL_P2=` (optional)
+- `HEALTHCHECK_PING_URL_P3=` (optional)
+
+## 3) Wrapper scripts
+Location:
+- `scripts/vps/common.sh`
+- `scripts/vps/run_sync.sh`
+- `scripts/vps/run_p1.sh`
+- `scripts/vps/run_p2.sh`
+- `scripts/vps/run_p3.sh`
+
+Exit codes:
+- `0`: success (healthcheck ping sent)
+- `1`: failure (no ping)
+- `2`: skipped due to lock contention (no ping)
+
+Lock/timeout behavior:
+- Single global lock file across all wrappers
+- Non-blocking lock (`flock --nonblock`) -> immediate skip on contention
+- `timeout` enforces kill-on-overrun
+- **The full chain is wrapped as one subshell command**, so timeout covers every step (not only the first command)
+
+## 4) Phase 1 schedule (parity mode)
+Use one cron entry equivalent to existing cadence:
+```cron
+*/20 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_sync.sh >> /var/log/odds-sync.log 2>&1
+```
+
+`run_sync.sh` chain:
+1. preflight per league
+2. sync per league (`sync_odds.py` + refresh-upcoming)
+3. ingest per league (`export_odds_to_supabase_psql.py`, retention skipped)
+4. retention once (`odds_retention_psql.py`)
+
+## 5) Phase 2 schedule (Path B)
+Path B is enforced:
+- P1/P2: fetch-only
+- P3: SportMonks refresh + fetch + ingest + retention
+
+Cron entries:
+```cron
+*/2 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
+*/5 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
+*/20 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
+```
+
+Important:
+- No separate SportMonks cron entry (SportMonks refresh is inside `run_p3.sh`)
+- Retention runs only in `run_p3.sh` (and `run_sync.sh` parity mode)
+
+## 6) Healthcheck timeout formula
+Because P1/P2 can skip while P3 holds the global lock, heartbeat timeout must include worst-case lock occupancy.
+
+Use:
+- P1 timeout: `ODDS_SYNC_P3_MAX_DURATION_SECONDS + 120`
+- P2 timeout: `ODDS_SYNC_P3_MAX_DURATION_SECONDS + 120`
+- P3 timeout: `ODDS_SYNC_P3_MAX_DURATION_SECONDS + 60`
+
+Example (`ODDS_SYNC_P3_MAX_DURATION_SECONDS=600`):
+- P1/P2 heartbeat timeout: 720s
+- P3 heartbeat timeout: 660s
+
+## 7) P1 SLO note (expected behavior)
+P1 is best-effort every 2 minutes, but can skip while P3 holds the lock.
+- Typical off-peak gap: ~2 minutes
+- Worst-case gap: approximately `ODDS_SYNC_P3_MAX_DURATION_SECONDS`
+
+## 8) Cutover checklist (strict order)
+1. Setup VPS dependencies and repo
+   - Pass: wrappers exist and are executable
+2. Load secrets into `.env`
+   - Pass: preflight succeeds
+3. Run manually once:
+   ```bash
+   cd /opt/odds-sync/JXD987
+   scripts/vps/run_sync.sh
+   ```
+   - Pass: exit `0`, retention report present, healthcheck pinged (if configured)
+4. Spot-check Supabase writes
+   - Pass: verify at least 5 rows across 2 leagues are updated
+5. Disable GitHub Actions workflow **via GitHub UI only**
+   - Actions tab -> `Sync Odds` workflow -> `Disable workflow`
+   - Pass: workflow status shows disabled
+6. Wait one full cycle
+   - Pass: no scheduled GitHub run fires
+7. Enable VPS crontab entries
+   - Pass: `crontab -l` shows expected entries
+8. Monitor 2 full P3 cycles (40 min)
+   - Pass: freshness within expected windows, no repeated failures
+9. Rollback if needed
+   - Re-enable workflow in GitHub UI
+   - Disable VPS cron (`crontab -e` remove entries)
+
+## 9) Verification commands
+```bash
+# last logs
+tail -n 200 /var/log/odds-sync.log
+
+tail -n 200 /var/log/odds-sync-p1.log
+tail -n 200 /var/log/odds-sync-p2.log
+tail -n 200 /var/log/odds-sync-p3.log
+
+# inspect reports
+ls -lah /tmp/odds_*_report*.json
+jq . /tmp/odds_sync_report_p3.json | head -n 40
+jq . /tmp/odds_ingest_report_p3.json | head -n 40
+jq . /tmp/odds_retention_report_p3.json | head -n 40
+```
+
+## 10) Notes on Phase 3B
+If local intermediate DB remains SQLite, concurrent writes are not implemented.
+Phase 3A (parallel fetch, sequential write) is final state for SQLite deployment.

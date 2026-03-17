@@ -10,6 +10,7 @@ Sync pre-match odds from Odds-API.io into SQLite.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
@@ -17,6 +18,8 @@ import re
 import unicodedata
 import difflib
 import math
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
@@ -196,6 +199,32 @@ MARKET_NAME_MAP = {
     "player_saves_over_under": "player_goalkeeper_saves",
     "player_goalkeeper_saves": "player_goalkeeper_saves",
 }
+
+
+@dataclass
+class LeagueResult:
+    """
+    Stage-1 fetch handoff object for Phase 3A.
+    Each worker returns one object; Stage-2 writes these sequentially.
+    """
+
+    league_id: int
+    league_name: str
+    fixtures_fetched: int
+    odds_records: List[Dict[str, object]]
+    api_calls_made: int
+    fetch_duration_seconds: float
+    error: Exception | None
+    events_returned: int = 0
+    events_matched: int = 0
+    unmatched_samples: List[Dict[str, object]] = field(default_factory=list)
+    raw_events: List[Dict[str, object]] = field(default_factory=list)
+    raw_odds_payloads: Dict[int, object] = field(default_factory=dict)
+    api_calls_by_endpoint: Dict[str, int] = field(default_factory=dict)
+    api_time_seconds: float = 0.0
+    rate_limit_hits: int = 0
+    rate_limit_sleeps: int = 0
+    last_rate_limit: Optional[Dict[str, object]] = None
 
 
 def normalize_slug(value: str) -> str:
@@ -594,6 +623,152 @@ def load_fixtures(session, league_ids: List[int], days_forward: int) -> List[Dic
             }
         )
     return fixtures
+
+
+def fixture_priority_bucket(starting_at: Optional[datetime], now_utc: datetime) -> Optional[str]:
+    if starting_at is None:
+        return None
+    hours_to_kickoff = (starting_at - now_utc).total_seconds() / 3600.0
+    if hours_to_kickoff < 0:
+        return None
+    if hours_to_kickoff <= 2:
+        return "p1"
+    if hours_to_kickoff <= 24:
+        return "p2"
+    if hours_to_kickoff <= 14 * 24:
+        return "p3"
+    return None
+
+
+def filter_fixtures_by_priority(
+    fixtures: List[Dict[str, object]],
+    priority: Optional[str],
+) -> List[Dict[str, object]]:
+    if priority is None:
+        return fixtures
+    now_utc = datetime.utcnow()
+    filtered: List[Dict[str, object]] = []
+    for fixture in fixtures:
+        bucket = fixture_priority_bucket(fixture.get("starting_at"), now_utc)
+        if bucket == priority:
+            filtered.append(fixture)
+    return filtered
+
+
+def estimate_api_calls_for_scope(
+    fixtures: List[Dict[str, object]],
+    scoped_league_ids: Iterable[int],
+) -> int:
+    # One /events call per league plus a conservative /odds/multi batch estimate.
+    league_count = len({int(league_id) for league_id in scoped_league_ids})
+    odds_batches = math.ceil(len(fixtures) / 10) if fixtures else 0
+    return league_count + odds_batches
+
+
+def fetch_league_odds_payload(
+    league_id: int,
+    odds_league: str,
+    league_fixtures: List[Dict[str, object]],
+    sport: str,
+    days_forward: int,
+    bookmakers: List[str],
+    per_league_limit: int,
+) -> LeagueResult:
+    started = time.time()
+    client = OddsApiClient()
+    result = LeagueResult(
+        league_id=league_id,
+        league_name=odds_league,
+        fixtures_fetched=len(league_fixtures),
+        odds_records=[],
+        api_calls_made=0,
+        fetch_duration_seconds=0.0,
+        error=None,
+    )
+
+    try:
+        start_dt, end_dt = fixture_window_bounds(days_forward)
+        params = {
+            "sport": sport,
+            "league": odds_league,
+            "status": "pending,live",
+            "from": start_dt.isoformat() + "Z",
+            "to": end_dt.isoformat() + "Z",
+        }
+        events = client.request("events", params=params)
+        if not isinstance(events, list):
+            raise OddsApiError(f"Unexpected events response for league {odds_league}")
+
+        result.raw_events = events
+        result.events_returned = len(events)
+
+        event_to_fixture: Dict[int, int] = {}
+        for event in events:
+            fixture = match_event_to_fixture(event, league_fixtures)
+            if not fixture:
+                if len(result.unmatched_samples) < 20:
+                    result.unmatched_samples.append(
+                        {
+                            "league_id": league_id,
+                            "event_id": event.get("id"),
+                            "home": event.get("home"),
+                            "away": event.get("away"),
+                            "date": event.get("date"),
+                        }
+                    )
+                continue
+            event_id = event.get("id")
+            if event_id is None:
+                continue
+            event_to_fixture[int(event_id)] = int(fixture["fixture_id"])
+
+        result.events_matched = len(event_to_fixture)
+        if not event_to_fixture:
+            return result
+
+        event_ids = list(event_to_fixture.keys())
+        if per_league_limit > 0:
+            event_ids = event_ids[:per_league_limit]
+        batches = [event_ids[i : i + 10] for i in range(0, len(event_ids), 10)]
+
+        for batch in batches:
+            odds_batch = client.request(
+                "odds/multi",
+                params={
+                    "eventIds": ",".join(str(event_id) for event_id in batch),
+                    "bookmakers": ",".join(bookmakers),
+                },
+            )
+            if not isinstance(odds_batch, list):
+                continue
+            for odds_event in odds_batch:
+                event_id = odds_event.get("id")
+                if event_id is None:
+                    continue
+                fixture_id = event_to_fixture.get(int(event_id))
+                if not fixture_id:
+                    continue
+                bookmakers_payload = odds_event.get("bookmakers") or {}
+                result.raw_odds_payloads[int(event_id)] = bookmakers_payload
+                result.odds_records.append(
+                    {
+                        "event_id": int(event_id),
+                        "fixture_id": int(fixture_id),
+                        "bookmakers_payload": bookmakers_payload,
+                    }
+                )
+    except Exception as exc:
+        result.error = exc
+    finally:
+        result.fetch_duration_seconds = round(time.time() - started, 2)
+        result.api_calls_made = client.stats.total_calls
+        result.api_calls_by_endpoint = dict(client.stats.calls_by_endpoint)
+        result.api_time_seconds = round(client.stats.api_time_seconds, 2)
+        result.rate_limit_hits = client.stats.rate_limit_hits
+        result.rate_limit_sleeps = client.stats.rate_limit_sleeps
+        result.last_rate_limit = client.stats.last_rate_limit
+
+    return result
 
 
 def score_name_match(event_name: str, aliases: Iterable[str]) -> float:
@@ -1660,6 +1835,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="Limit events processed")
     parser.add_argument("--sport", default="football")
     parser.add_argument(
+        "--priority",
+        choices=["p1", "p2", "p3"],
+        default=None,
+        help="Optional kickoff tier filter: p1<=2h, p2=2-24h, p3=24h-14d.",
+    )
+    parser.add_argument(
         "--refresh-upcoming",
         action="store_true",
         help="Refresh upcoming fixtures from SportMonks before fetching odds.",
@@ -1713,6 +1894,11 @@ def main() -> None:
         default="",
         help="Write raw odds JSON",
     )
+    parser.add_argument(
+        "--refresh-only",
+        action="store_true",
+        help="Run SportMonks refresh steps only and skip odds fetch/write.",
+    )
     parser.set_defaults(refresh_squads_missing=True, refresh_sidelined_window=True)
     args = parser.parse_args()
 
@@ -1734,21 +1920,48 @@ def main() -> None:
     session = get_session(engine)
     Base.metadata.create_all(engine)
 
-    svc = None
-    if args.refresh_upcoming or args.refresh_squads or args.refresh_squads_missing or args.refresh_sidelined_window:
+    refresh_upcoming = bool(args.refresh_upcoming)
+    refresh_squads = bool(args.refresh_squads)
+    refresh_squads_missing = bool(args.refresh_squads_missing)
+    refresh_sidelined_window = bool(args.refresh_sidelined_window)
+    if args.priority:
+        if refresh_upcoming or refresh_squads or refresh_squads_missing or refresh_sidelined_window:
+            log.info("Priority mode %s active: skipping SportMonks refresh steps.", args.priority)
+        refresh_upcoming = False
+        refresh_squads = False
+        refresh_squads_missing = False
+        refresh_sidelined_window = False
+
+    svc: Optional[SyncService] = None
+    if refresh_upcoming or refresh_squads or refresh_squads_missing or refresh_sidelined_window:
         if not os.environ.get("SPORTMONKS_API_TOKEN"):
             log.warning("SPORTMONKS_API_TOKEN missing; skipping SportMonks refresh steps.")
         else:
             client_sm = SportMonksClient()
             svc = SyncService(client_sm, session)
             svc.ensure_schema()
-            if args.refresh_upcoming:
+            if refresh_upcoming:
                 log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
                 svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
 
     fixtures = load_fixtures(session, league_ids, args.days_forward)
+    if args.priority:
+        before = len(fixtures)
+        fixtures = filter_fixtures_by_priority(fixtures, args.priority)
+        log.info("Priority filter=%s fixtures_in_scope=%s/%s", args.priority, len(fixtures), before)
     if not fixtures:
         log.info("No fixtures found for odds window")
+        if args.report_out:
+            report = {
+                "league_ids": league_ids,
+                "priority": args.priority,
+                "refresh_only": args.refresh_only,
+                "fixtures_in_scope": 0,
+                "events_matched": 0,
+                "outcomes_written": 0,
+                "errors": [],
+            }
+            Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
         return
 
     teams_in_window = {
@@ -1763,8 +1976,8 @@ def main() -> None:
     window_team_ids = sorted(int(tid) for tid in teams_in_window if tid)
     missing_team_ids: List[int] = []
     refreshed_team_ids: List[int] = []
-    if svc and (args.refresh_squads or args.refresh_squads_missing) and teams_in_window:
-        if args.refresh_squads:
+    if svc and (refresh_squads or refresh_squads_missing) and teams_in_window:
+        if refresh_squads:
             refreshed_team_ids = window_team_ids
         else:
             counts = fetch_team_player_counts(session, teams_in_window)
@@ -1778,7 +1991,7 @@ def main() -> None:
             )
             svc.sync_squads_for_teams(refreshed_team_ids)
     sidelined_refreshed_team_ids: List[int] = []
-    if svc and args.refresh_sidelined_window and window_team_ids:
+    if svc and refresh_sidelined_window and window_team_ids:
         sidelined_refreshed_team_ids = window_team_ids
         log.info(
             "Refreshing sidelined status for %s teams in odds window",
@@ -1786,12 +1999,28 @@ def main() -> None:
         )
         svc.sync_sidelined_for_teams(sidelined_refreshed_team_ids)
 
+    if args.refresh_only:
+        log.info("Refresh-only mode complete; skipping odds fetch/write stage.")
+        if args.report_out:
+            report = {
+                "league_ids": league_ids,
+                "priority": args.priority,
+                "refresh_only": True,
+                "fixtures_in_scope": len(fixtures),
+                "teams_in_window": len(teams_in_window),
+                "teams_missing_players": len(missing_team_ids),
+                "teams_squads_refreshed": len(refreshed_team_ids),
+                "teams_sidelined_refreshed": len(sidelined_refreshed_team_ids),
+                "events_matched": 0,
+                "outcomes_written": 0,
+                "errors": [],
+            }
+            Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        return
+
     league_map = load_league_map(Path(__file__).resolve().parent.parent / "config" / "odds_api_leagues.json")
 
-    client = OddsApiClient()
-
     unmatched_details: List[Dict[str, object]] = []
-    event_map: Dict[int, int] = {}
     events_raw: Dict[int, object] = {}
     odds_raw: Dict[int, object] = {}
     events_unmatched_samples: List[Dict[str, object]] = []
@@ -1799,95 +2028,129 @@ def main() -> None:
     bookmaker_names_saved: set[str] = set()
     bookmaker_names_unknown: set[str] = set()
     league_stats: Dict[int, Dict[str, int]] = {}
+    fetch_errors: List[str] = []
 
+    fixtures_by_id: Dict[int, Dict[str, object]] = {int(fixture["fixture_id"]): fixture for fixture in fixtures}
+    leagues_with_fixtures: List[Tuple[int, str, List[Dict[str, object]]]] = []
     for league_id in league_ids:
         odds_league = league_map.get(league_id)
         if not odds_league:
             log.warning("No Odds-API league mapping for league_id=%s (skipping)", league_id)
             continue
-        league_fixtures = [f for f in fixtures if f["league_id"] == league_id]
+        league_fixtures = [fixture for fixture in fixtures if fixture["league_id"] == league_id]
         if not league_fixtures:
             continue
-        league_stats[league_id] = {
-            "fixtures_in_window": len(league_fixtures),
-            "events_returned": 0,
-            "events_matched": 0,
-        }
-        start_dt, end_dt = fixture_window_bounds(args.days_forward)
-        params = {
-            "sport": args.sport,
-            "league": odds_league,
-            "status": "pending,live",
-            "from": start_dt.isoformat() + "Z",
-            "to": end_dt.isoformat() + "Z",
-        }
+        leagues_with_fixtures.append((league_id, odds_league, league_fixtures))
+
+    scoped_league_ids = [league_id for league_id, _, _ in leagues_with_fixtures]
+    predicted_calls = estimate_api_calls_for_scope(fixtures, scoped_league_ids)
+    configured_rate_limit = 0
+    configured_raw = (os.environ.get("ODDS_API_RATE_LIMIT_PER_HOUR") or "").strip()
+    if configured_raw:
         try:
-            events = client.request("events", params=params)
-        except OddsApiError as exc:
-            log.error("Odds-API events failed for league %s: %s", odds_league, exc)
-            continue
-        if not isinstance(events, list):
-            log.warning("Unexpected events response for league %s", odds_league)
-            continue
-        events_raw[league_id] = events
+            configured_rate_limit = int(configured_raw)
+        except ValueError:
+            configured_rate_limit = 0
+            log.warning("Invalid ODDS_API_RATE_LIMIT_PER_HOUR=%s (ignored)", configured_raw)
+    log.info(
+        "Sync scope priority=%s fixtures=%s leagues=%s predicted_api_calls=%s configured_rate_limit=%s",
+        args.priority or "all",
+        len(fixtures),
+        len(scoped_league_ids),
+        predicted_calls,
+        configured_rate_limit or "unset",
+    )
+    if configured_rate_limit and predicted_calls > int(configured_rate_limit * 0.8):
+        log.warning(
+            "Predicted API calls (%s) exceed 80%% of configured hourly limit (%s).",
+            predicted_calls,
+            configured_rate_limit,
+        )
 
-        for event in events:
-            league_stats[league_id]["events_returned"] += 1
-            fixture = match_event_to_fixture(event, league_fixtures)
-            if not fixture:
-                if len(events_unmatched_samples) < 20:
-                    events_unmatched_samples.append(
-                        {
-                            "league_id": league_id,
-                            "event_id": event.get("id"),
-                            "home": event.get("home"),
-                            "away": event.get("away"),
-                            "date": event.get("date"),
-                        }
+    max_concurrent = max(1, int(os.environ.get("ODDS_SYNC_MAX_CONCURRENT", "3")))
+    results_by_league: Dict[int, LeagueResult] = {}
+    if leagues_with_fixtures:
+        workers = min(max_concurrent, len(leagues_with_fixtures))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    fetch_league_odds_payload,
+                    league_id,
+                    odds_league,
+                    league_fixtures,
+                    args.sport,
+                    args.days_forward,
+                    bookmakers,
+                    args.limit,
+                ): league_id
+                for league_id, odds_league, league_fixtures in leagues_with_fixtures
+            }
+            for future in as_completed(futures):
+                league_id = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = LeagueResult(
+                        league_id=league_id,
+                        league_name=league_map.get(league_id, ""),
+                        fixtures_fetched=0,
+                        odds_records=[],
+                        api_calls_made=0,
+                        fetch_duration_seconds=0.0,
+                        error=exc,
                     )
-                continue
-            event_id = event.get("id")
-            if event_id is None:
-                continue
-            league_stats[league_id]["events_matched"] += 1
-            event_map[int(event_id)] = fixture["fixture_id"]
-
-    if not event_map:
-        log.info("No events matched to fixtures")
-        return
-
-    event_ids = list(event_map.keys())
-    if args.limit and args.limit > 0:
-        event_ids = event_ids[: args.limit]
-    log.info("Matched %s events to fixtures", len(event_ids))
+                results_by_league[league_id] = result
 
     outcomes_total = 0
-    batches = [event_ids[i : i + 10] for i in range(0, len(event_ids), 10)]
-    for batch in batches:
-        params = {
-            "eventIds": ",".join(str(e) for e in batch),
-            "bookmakers": ",".join(bookmakers),
+    api_calls_total = 0
+    api_calls_by_endpoint: Dict[str, int] = {}
+    api_time_seconds = 0.0
+    rate_limit_hits = 0
+    rate_limit_sleeps = 0
+    last_rate_limit: Optional[Dict[str, object]] = None
+    events_matched_total = 0
+
+    for league_id in league_ids:
+        result = results_by_league.get(league_id)
+        if result is None:
+            continue
+        league_stats[league_id] = {
+            "fixtures_in_window": result.fixtures_fetched,
+            "events_returned": result.events_returned,
+            "events_matched": result.events_matched,
         }
-        try:
-            odds_batch = client.request("odds/multi", params=params)
-        except OddsApiError as exc:
-            log.error("Odds-API odds/multi failed for events %s: %s", batch[:3], exc)
+        events_matched_total += result.events_matched
+        api_calls_total += result.api_calls_made
+        api_time_seconds += result.api_time_seconds
+        rate_limit_hits += result.rate_limit_hits
+        rate_limit_sleeps += result.rate_limit_sleeps
+        if result.last_rate_limit:
+            last_rate_limit = result.last_rate_limit
+        for endpoint, count in result.api_calls_by_endpoint.items():
+            api_calls_by_endpoint[endpoint] = api_calls_by_endpoint.get(endpoint, 0) + int(count)
+
+        if args.debug_events_out:
+            events_raw[league_id] = result.raw_events
+        for sample in result.unmatched_samples:
+            if len(events_unmatched_samples) >= 20:
+                break
+            events_unmatched_samples.append(sample)
+
+        if result.error is not None:
+            message = f"league {league_id} fetch failed: {result.error}"
+            log.error(message)
+            fetch_errors.append(message)
             continue
-        if not isinstance(odds_batch, list):
-            continue
-        for odds_event in odds_batch:
-            event_id = odds_event.get("id")
-            if event_id is None:
+
+        for odds_record in result.odds_records:
+            fixture_id = int(odds_record["fixture_id"])
+            event_id = int(odds_record["event_id"])
+            fixture = fixtures_by_id.get(fixture_id)
+            if fixture is None:
                 continue
-            fixture_id = event_map.get(int(event_id))
-            if not fixture_id:
-                continue
-            fixture = next((f for f in fixtures if f["fixture_id"] == fixture_id), None)
-            if not fixture:
-                continue
-            bookmakers_payload = odds_event.get("bookmakers") or {}
+            bookmakers_payload = odds_record.get("bookmakers_payload") or {}
             if args.debug_odds_out:
-                odds_raw[int(event_id)] = bookmakers_payload
+                odds_raw[event_id] = bookmakers_payload
             bookmaker_groups: Dict[str, List[List[Dict[str, object]]]] = {}
             for bookmaker_name, markets in bookmakers_payload.items():
                 bookmaker_names_seen.add(bookmaker_name)
@@ -1912,25 +2175,33 @@ def main() -> None:
                     session,
                     unmatched_details,
                 )
-                if rows:
-                    market_keys = {row.get("market_key") for row in rows if row.get("market_key")}
-                    delete_fixture_market_rows(
-                        session,
-                        int(fixture_id),
-                        BOOKMAKER_NAME_TO_ID[book_key],
-                        market_keys,
-                    )
-                    upsert_outcomes(session, rows)
-                    outcomes_total += len(rows)
-                    bookmaker_names_saved.add(canonical_name)
+                if not rows:
+                    continue
+                market_keys = {row.get("market_key") for row in rows if row.get("market_key")}
+                delete_fixture_market_rows(
+                    session,
+                    fixture_id,
+                    BOOKMAKER_NAME_TO_ID[book_key],
+                    market_keys,
+                )
+                upsert_outcomes(session, rows)
+                outcomes_total += len(rows)
+                bookmaker_names_saved.add(canonical_name)
             session.commit()
 
-    removed_invalid = delete_invalid_goals_over_under(session, league_ids, args.days_forward)
+    removed_invalid = 0
+    if args.priority is None:
+        removed_invalid = delete_invalid_goals_over_under(session, league_ids, args.days_forward)
     if removed_invalid:
         log.warning("Removed %s invalid goals_over_under rows after sync.", removed_invalid)
         session.commit()
 
-    log.info("Odds sync complete: outcomes=%s", outcomes_total)
+    log.info(
+        "Odds sync complete: outcomes=%s events_matched=%s actual_api_calls=%s",
+        outcomes_total,
+        events_matched_total,
+        api_calls_total,
+    )
 
     if args.unmatched_out:
         try:
@@ -1967,19 +2238,29 @@ def main() -> None:
             "teams_missing_players": len(missing_team_ids),
             "teams_squads_refreshed": len(refreshed_team_ids),
             "teams_sidelined_refreshed": len(sidelined_refreshed_team_ids),
-            "events_matched": len(event_map),
+            "priority": args.priority,
+            "refresh_only": False,
+            "fixtures_in_scope": len(fixtures),
+            "leagues_in_scope": len(scoped_league_ids),
+            "predicted_api_calls": predicted_calls,
+            "configured_rate_limit_per_hour": configured_rate_limit or None,
+            "events_matched": events_matched_total,
             "events_unmatched_samples": events_unmatched_samples,
             "league_stats": league_stats,
             "outcomes_written": outcomes_total,
-            "api_calls_total": client.stats.total_calls,
-            "api_calls_by_endpoint": client.stats.calls_by_endpoint,
-            "api_time_seconds": round(client.stats.api_time_seconds, 2),
-            "rate_limit_hits": client.stats.rate_limit_hits,
-            "rate_limit_sleeps": client.stats.rate_limit_sleeps,
-            "last_rate_limit": client.stats.last_rate_limit,
+            "api_calls_total": api_calls_total,
+            "api_calls_by_endpoint": api_calls_by_endpoint,
+            "api_time_seconds": round(api_time_seconds, 2),
+            "rate_limit_hits": rate_limit_hits,
+            "rate_limit_sleeps": rate_limit_sleeps,
+            "last_rate_limit": last_rate_limit,
+            "errors": fetch_errors,
             "unmatched_players": len(unmatched_details),
         }
         Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    if fetch_errors:
+        raise SystemExit("One or more league fetches failed.")
 
 
 if __name__ == "__main__":
