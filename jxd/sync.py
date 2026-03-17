@@ -57,6 +57,21 @@ def _safe_int(val) -> Optional[int]:
             return None
 
 
+def _fixture_status_values(raw: Dict) -> Tuple[Optional[str], Optional[str]]:
+    state = raw.get("state") or {}
+    state_short = state.get("short_name") if isinstance(state, dict) else None
+    state_name = state.get("state") if isinstance(state, dict) else None
+    state_developer = state.get("developer_name") if isinstance(state, dict) else None
+
+    status = raw.get("status") or state_short or state_name or state_developer
+    status_code = raw.get("status_code") or state_name or state_developer or state_short
+
+    return (
+        str(status).upper() if status else None,
+        str(status_code).upper() if status_code else None,
+    )
+
+
 def _ensure_fixture_player_columns(engine) -> None:
     if engine.dialect.name != "sqlite":
         return
@@ -418,6 +433,7 @@ class SyncService:
         if not team_ids:
             return 0
         count = 0
+        stale_marked_complete = 0
         seen: Set[int] = set()
         sync_run_at = datetime.utcnow()
         for team_id in team_ids:
@@ -433,11 +449,13 @@ class SyncService:
                     continue
                 raise
             sidelined = team_data.get("sidelined") or []
+            seen_ids: Set[int] = set()
             for entry in sidelined:
                 sidelined_id = entry.get("id")
                 player_id = entry.get("player_id")
                 if not sidelined_id or not player_id:
                     continue
+                seen_ids.add(int(sidelined_id))
                 payload = {
                     "id": sidelined_id,
                     "player_id": player_id,
@@ -454,20 +472,43 @@ class SyncService:
                 }
                 _upsert(self.session, SidelinedPlayer, payload)
                 count += 1
+
+            # If an entry disappears from the provider list, mark it complete so it
+            # no longer appears in sidelined_active.
+            stale_query = self.session.query(SidelinedPlayer).filter(
+                SidelinedPlayer.team_id == team_id,
+            ).filter(
+                (SidelinedPlayer.completed.is_(None)) | (SidelinedPlayer.completed.is_(False)),
+            )
+            if seen_ids:
+                stale_query = stale_query.filter(~SidelinedPlayer.id.in_(list(seen_ids)))
+            stale_rows = stale_query.all()
+            for stale_row in stale_rows:
+                stale_row.completed = True
+                if stale_row.end_date is None:
+                    stale_row.end_date = sync_run_at.date()
+                stale_row.updated_at = sync_run_at
+            stale_marked_complete += len(stale_rows)
         self.session.commit()
-        log.info("Synced sidelined entries for %s teams (%s rows)", len(seen), count)
+        log.info(
+            "Synced sidelined entries for %s teams (%s rows, %s marked complete)",
+            len(seen),
+            count,
+            stale_marked_complete,
+        )
         return count
 
     # --- fixtures ---
     def _map_fixture(self, raw: Dict) -> Dict:
         home_score, away_score = self._extract_scores(raw.get("scores") or raw.get("score"))
+        status, status_code = _fixture_status_values(raw)
         return {
             "id": raw.get("id"),
             "league_id": raw.get("league_id"),
             "season_id": raw.get("season_id"),
             "starting_at": parse_dt(raw.get("starting_at")),
-            "status": raw.get("status"),
-            "status_code": raw.get("status_code") or (raw.get("state") or {}).get("state"),
+            "status": status,
+            "status_code": status_code,
             "home_team_id": raw.get("home_team_id"),
             "away_team_id": raw.get("away_team_id"),
             "home_score": home_score,
@@ -557,7 +598,12 @@ class SyncService:
             data["image_path"] = image_path
         _upsert(self.session, Team, data)
 
-    def _store_statistics(self, fixture_id: int, stats: Iterable[Dict]) -> None:
+    def _store_statistics(
+        self,
+        fixture_id: int,
+        stats: Iterable[Dict],
+        log_changes: bool = False,
+    ) -> None:
         for s in stats or []:
             type_info = s.get("type") or {}
             type_id = s.get("type_id") or type_info.get("id")
@@ -582,13 +628,54 @@ class SyncService:
                 "value": value,
                 "extra": s,
             }
+            if log_changes and value is not None:
+                old_value = obj.value if obj else None
+                if old_value != value:
+                    log.info(
+                        "RECONCILED: fixture %s | team_stat | type_id %s | team %s | old=%s new=%s",
+                        fixture_id,
+                        type_id,
+                        team_id,
+                        old_value,
+                        value,
+                    )
+                if type_id is not None:
+                    dupes = (
+                        self.session.query(FixtureStatistic)
+                        .filter(
+                            FixtureStatistic.fixture_id == fixture_id,
+                            FixtureStatistic.team_id == team_id,
+                            FixtureStatistic.type_id == type_id,
+                            FixtureStatistic.location == location,
+                            FixtureStatistic.code != code,
+                        )
+                        .all()
+                    )
+                    for dupe in dupes:
+                        if dupe.value != value:
+                            log.info(
+                                "RECONCILED: fixture %s | team_stat | type_id %s | team %s | old=%s new=%s",
+                                fixture_id,
+                                type_id,
+                                team_id,
+                                dupe.value,
+                                value,
+                            )
+                        dupe.value = value
+                        if name and not dupe.name:
+                            dupe.name = name
             if obj:
                 for k, v in payload.items():
                     setattr(obj, k, v)
             else:
                 self.session.add(FixtureStatistic(**payload))
 
-    def _store_lineups(self, fixture_id: int, lineups: Iterable[Dict]) -> None:
+    def _store_lineups(
+        self,
+        fixture_id: int,
+        lineups: Iterable[Dict],
+        log_changes: bool = False,
+    ) -> None:
         for l in lineups or []:
             player_id = l.get("player_id") or (l.get("player") or {}).get("id")
             if not player_id:
@@ -616,7 +703,13 @@ class SyncService:
             _upsert(self.session, Player, player_payload)
 
             details = l.get("details") or []
-            self._store_lineup_details_stats(fixture_id, player_id, team_id, details)
+            self._store_lineup_details_stats(
+                fixture_id,
+                player_id,
+                team_id,
+                details,
+                log_changes=log_changes,
+            )
             minutes_played = _extract_minutes(
                 l,
                 details,
@@ -685,29 +778,30 @@ class SyncService:
             else:
                 self.session.add(FixturePlayer(**payload))
 
-            for d in l.get("details") or []:
-                type_info = d.get("type") or {}
-                type_id = d.get("type_id") or type_info.get("id")
-                code = type_info.get("code") or (type_id and str(type_id))
-                name = type_info.get("name")
-                value = _extract_stat_value(d.get("data") or d.get("value"))
-                pk = (fixture_id, player_id, type_id, code)
-                obj_stat = self.session.get(FixturePlayerStatistic, pk)
-                payload_stat = {
-                    "fixture_id": fixture_id,
-                    "player_id": player_id,
-                    "team_id": team_id,
-                    "type_id": type_id,
-                    "code": code,
-                    "name": name,
-                    "value": value,
-                    "extra": d,
-                }
-                if obj_stat:
-                    for k, v in payload_stat.items():
-                        setattr(obj_stat, k, v)
-                else:
-                    self.session.add(FixturePlayerStatistic(**payload_stat))
+            if not log_changes:
+                for d in l.get("details") or []:
+                    type_info = d.get("type") or {}
+                    type_id = d.get("type_id") or type_info.get("id")
+                    code = type_info.get("code") or (type_id and str(type_id))
+                    name = type_info.get("name")
+                    value = _extract_stat_value(d.get("data") or d.get("value"))
+                    pk = (fixture_id, player_id, type_id, code)
+                    obj_stat = self.session.get(FixturePlayerStatistic, pk)
+                    payload_stat = {
+                        "fixture_id": fixture_id,
+                        "player_id": player_id,
+                        "team_id": team_id,
+                        "type_id": type_id,
+                        "code": code,
+                        "name": name,
+                        "value": value,
+                        "extra": d,
+                    }
+                    if obj_stat:
+                        for k, v in payload_stat.items():
+                            setattr(obj_stat, k, v)
+                    else:
+                        self.session.add(FixturePlayerStatistic(**payload_stat))
 
             goals = _sum_stat_values(details, GOALS_TYPE_ID)
             assists = _sum_stat_values(details, ASSISTS_TYPE_ID)
@@ -742,6 +836,7 @@ class SyncService:
         player_id: int,
         team_id: Optional[int],
         details: Iterable[Dict],
+        log_changes: bool = False,
     ) -> None:
         for d in details or []:
             type_info = d.get("type") or {}
@@ -765,6 +860,17 @@ class SyncService:
                 "value": value,
                 "extra": d,
             }
+            if log_changes:
+                old_value = obj.value if obj else None
+                if old_value != value:
+                    log.info(
+                        "RECONCILED: fixture %s | player_stat | type_id %s | player %s | old=%s new=%s",
+                        fixture_id,
+                        type_id,
+                        player_id,
+                        old_value,
+                        value,
+                    )
             if obj:
                 for k, v in payload.items():
                     setattr(obj, k, v)
@@ -784,7 +890,7 @@ class SyncService:
         if fixture.away_score is None and away_part:
             fixture.away_score = _safe_int(away_part.get("score"))
 
-    def _store_fixture_raw(self, raw: Dict) -> None:
+    def _store_fixture_raw(self, raw: Dict, log_changes: bool = False) -> None:
         data = self._map_fixture(raw)
         fixture = self.session.get(Fixture, data["id"])
         if fixture:
@@ -796,8 +902,16 @@ class SyncService:
 
         loc_map = self._store_participants(fixture.id, raw.get("participants") or [])
         self._apply_participant_derivations(fixture, loc_map)
-        self._store_statistics(fixture.id, raw.get("statistics") or [])
-        self._store_lineups(fixture.id, raw.get("lineups") or [])
+        self._store_statistics(
+            fixture.id,
+            raw.get("statistics") or [],
+            log_changes=log_changes,
+        )
+        self._store_lineups(
+            fixture.id,
+            raw.get("lineups") or [],
+            log_changes=log_changes,
+        )
 
     def _chunks_newest_first(self, start: date, end: date, span_days: int = 90):
         cursor = end
@@ -820,6 +934,7 @@ class SyncService:
             includes = [
                 "participants",
                 "scores",
+                "state",
                 "statistics",
                 "statistics.type",
                 "lineups.details",
@@ -847,6 +962,7 @@ class SyncService:
         includes = [
             "participants",
             "scores",
+            "state",
             "statistics",
             "statistics.type",
             "lineups.details",
@@ -870,10 +986,59 @@ class SyncService:
         end = today + timedelta(days=1)
         return self.sync_fixtures_between(start, end, league_ids=league_ids)
 
+    def reconcile_fixtures(self, fixture_ids: Sequence[int]) -> int:
+        includes = [
+            "participants",
+            "scores",
+            "statistics",
+            "statistics.type",
+            "lineups.details",
+            "lineups.position",
+            "lineups.detailedposition",
+            "lineups.player",
+        ]
+        count = 0
+        for fixture_id in fixture_ids:
+            endpoint = f"fixtures/{fixture_id}"
+            try:
+                payload = self.client.request(
+                    "GET",
+                    endpoint,
+                    params={"include": ";".join(includes)},
+                )
+            except SportMonksError as exc:
+                log.warning("Reconcile failed for fixture %s: %s", fixture_id, exc)
+                continue
+            data = payload.get("data") or {}
+            if not data:
+                log.warning("Reconcile missing data for fixture %s", fixture_id)
+                continue
+            self._store_fixture_raw(data, log_changes=True)
+            count += 1
+        self.session.commit()
+        log.info("Reconciled %s fixtures by ID", count)
+        return count
+
+    def reconcile_recent_fixtures(self, league_ids: Sequence[int], days: int = 7) -> int:
+        cutoff = datetime.utcnow() - timedelta(days=days)
+        query = (
+            self.session.query(Fixture)
+            .filter(Fixture.starting_at >= cutoff)
+            .filter(Fixture.home_score.isnot(None))
+            .filter(Fixture.away_score.isnot(None))
+        )
+        if league_ids:
+            query = query.filter(Fixture.league_id.in_(league_ids))
+        fixture_ids = [row.id for row in query.order_by(Fixture.starting_at.desc()).all()]
+        if not fixture_ids:
+            log.info("No recent fixtures found for reconciliation (last %s days).", days)
+            return 0
+        return self.reconcile_fixtures(fixture_ids)
+
     def sync_upcoming_window(self, league_ids: Sequence[int], days_forward: int = 14) -> int:
         today = datetime.utcnow().date()
         end = today + timedelta(days=days_forward)
-        includes = ["participants", "scores"]
+        includes = ["participants", "scores", "state"]
         return self.sync_fixtures_between(today, end, league_ids=league_ids, includes=includes)
 
     def sync_history_window(self, league_ids: Sequence[int], keep_season_ids: Set[int]) -> int:
