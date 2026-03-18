@@ -561,8 +561,16 @@ def load_league_map(path: Path) -> Dict[int, str]:
     return {int(k): str(v) for k, v in raw.items() if v}
 
 
+def utc_now_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def sqlite_utc_timestamp(value: datetime) -> str:
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def fixture_window_bounds(days_forward: int) -> Tuple[datetime, datetime]:
-    start_dt = datetime.utcnow()
+    start_dt = utc_now_naive()
     end_dt = start_dt + timedelta(days=days_forward)
     return start_dt, end_dt
 
@@ -571,6 +579,8 @@ def load_fixtures(session, league_ids: List[int], days_forward: int) -> List[Dic
     if not league_ids:
         return []
     start_dt, end_dt = fixture_window_bounds(days_forward)
+    start_dt_sql = sqlite_utc_timestamp(start_dt)
+    end_dt_sql = sqlite_utc_timestamp(end_dt)
     stmt = text(
         """
         select f.id,
@@ -594,8 +604,8 @@ def load_fixtures(session, league_ids: List[int], days_forward: int) -> List[Dic
         stmt,
         {
             "league_ids": league_ids,
-            "start_dt": start_dt,
-            "end_dt": end_dt,
+            "start_dt": start_dt_sql,
+            "end_dt": end_dt_sql,
         },
     ).fetchall()
 
@@ -646,7 +656,7 @@ def filter_fixtures_by_priority(
 ) -> List[Dict[str, object]]:
     if priority is None:
         return fixtures
-    now_utc = datetime.utcnow()
+    now_utc = utc_now_naive()
     filtered: List[Dict[str, object]] = []
     for fixture in fixtures:
         bucket = fixture_priority_bucket(fixture.get("starting_at"), now_utc)
@@ -1185,6 +1195,8 @@ def delete_invalid_goals_over_under(
     if not league_list:
         return 0
     start_dt, end_dt = fixture_window_bounds(days_forward)
+    start_dt_sql = sqlite_utc_timestamp(start_dt)
+    end_dt_sql = sqlite_utc_timestamp(end_dt)
     stmt = (
         text(
             """
@@ -1204,7 +1216,7 @@ def delete_invalid_goals_over_under(
     )
     result = session.execute(
         stmt,
-        {"league_ids": league_list, "start_dt": start_dt, "end_dt": end_dt},
+        {"league_ids": league_list, "start_dt": start_dt_sql, "end_dt": end_dt_sql},
     )
     return int(result.rowcount or 0)
 
