@@ -1071,6 +1071,9 @@ def resolve_player_id(
 def upsert_outcomes(session, rows: List[Dict]) -> None:
     if not rows:
         return
+    rows = dedupe_outcome_rows(rows)
+    if not rows:
+        return
     sql = text(
         """
         insert into odds_outcomes (
@@ -1092,6 +1095,59 @@ def upsert_outcomes(session, rows: List[Dict]) -> None:
         """
     )
     session.execute(sql, rows)
+
+
+def normalize_outcome_line(value: object) -> Optional[float]:
+    parsed = parse_float(value)
+    if parsed is None:
+        return None
+    return round(parsed, 6)
+
+
+def outcome_write_key(row: Dict[str, object]) -> Tuple[int, int, str, str, Optional[float]]:
+    return (
+        int(row.get("fixture_id") or 0),
+        int(row.get("bookmaker_id") or 0),
+        str(row.get("market_key") or ""),
+        str(row.get("selection_key") or ""),
+        normalize_outcome_line(row.get("line")),
+    )
+
+
+def should_replace_outcome_row(current: Dict[str, object], candidate: Dict[str, object]) -> bool:
+    current_updated = current.get("last_updated_at")
+    candidate_updated = candidate.get("last_updated_at")
+    if candidate_updated and (not current_updated or candidate_updated > current_updated):
+        return True
+    if current_updated and candidate_updated and current_updated > candidate_updated:
+        return False
+    current_participant_id = current.get("participant_id")
+    candidate_participant_id = candidate.get("participant_id")
+    if current_participant_id is None and candidate_participant_id is not None:
+        return True
+    current_participant_type = current.get("participant_type")
+    candidate_participant_type = candidate.get("participant_type")
+    if not current_participant_type and candidate_participant_type:
+        return True
+    return False
+
+
+def dedupe_outcome_rows(rows: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    deduped: Dict[Tuple[int, int, str, str, Optional[float]], Dict[str, object]] = {}
+    for row in rows:
+        key = outcome_write_key(row)
+        current = deduped.get(key)
+        if current is None or should_replace_outcome_row(current, row):
+            deduped[key] = row
+    collapsed = len(rows) - len(deduped)
+    if collapsed > 0:
+        log.warning(
+            "Collapsed %s duplicate odds_outcomes rows before SQLite upsert for fixture=%s bookmaker=%s",
+            collapsed,
+            rows[0].get("fixture_id"),
+            rows[0].get("bookmaker_id"),
+        )
+    return list(deduped.values())
 
 
 def delete_fixture_market_rows(
