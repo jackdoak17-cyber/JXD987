@@ -30,6 +30,8 @@ DB_PATH = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
 REST_PATH = "/rest/v1"
+ODDS_MIN_PRICE = float(os.environ.get("ODDS_MIN_PRICE", "1.0"))
+ODDS_MAX_PRICE = float(os.environ.get("ODDS_MAX_PRICE", "500"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -47,6 +49,33 @@ REQUIRED_TABLES = [
     "odds_snapshots",
     "odds_outcomes",
 ]
+
+
+def _valid_odds_price(value: object) -> bool:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return False
+    return ODDS_MIN_PRICE < price <= ODDS_MAX_PRICE
+
+
+def _odds_outcome_identity(row: Dict[str, object]) -> Tuple[object, ...]:
+    return (
+        row.get("fixture_id"),
+        row.get("market_key"),
+        row.get("bookmaker_id"),
+        row.get("participant_type") or "",
+        row.get("participant_id") if row.get("participant_id") is not None else -1,
+        row.get("selection_key") or "",
+        row.get("line") if row.get("line") is not None else -9999,
+    )
+
+
+def _odds_outcome_rank(row: Dict[str, object]) -> Tuple[str, int]:
+    last_updated_at = row.get("last_updated_at")
+    rank_time = str(last_updated_at or "")
+    rank_rowid = int(row.get("_rowid") or 0)
+    return (rank_time, rank_rowid)
 
 
 def require_env(dry_run: bool) -> None:
@@ -392,7 +421,7 @@ def fetch_odds_outcomes(conn: sqlite3.Connection, fixture_ids: Sequence[int]) ->
     q = ",".join("?" for _ in fixture_ids)
     cur.execute(
         f"""
-        select fixture_id, bookmaker_id, market_key, selection_key,
+        select rowid, fixture_id, bookmaker_id, market_key, selection_key,
                participant_type, participant_id, line,
                price_decimal, price_american, last_updated_at
         from odds_outcomes
@@ -400,20 +429,55 @@ def fetch_odds_outcomes(conn: sqlite3.Connection, fixture_ids: Sequence[int]) ->
         """,
         fixture_ids,
     )
-    return [
-        {
-            "fixture_id": r[0],
-            "bookmaker_id": r[1],
-            "market_key": r[2],
-            "selection_key": r[3],
-            "participant_type": r[4],
-            "participant_id": r[5],
-            "line": r[6],
-            "price_decimal": r[7],
-            "price_american": r[8],
-            "last_updated_at": r[9],
+    deduped_rows: Dict[Tuple[object, ...], Dict] = {}
+    skipped_invalid = 0
+    skipped_duplicates = 0
+    skipped_samples: List[str] = []
+    for r in cur.fetchall():
+        if not _valid_odds_price(r[8]):
+            skipped_invalid += 1
+            if len(skipped_samples) < 5:
+                skipped_samples.append(
+                    f"fixture_id={r[1]} market_key={r[3]} selection_key={r[4]} price_decimal={r[8]}"
+                )
+            continue
+        row = {
+            "_rowid": r[0],
+            "fixture_id": r[1],
+            "bookmaker_id": r[2],
+            "market_key": r[3],
+            "selection_key": r[4],
+            "participant_type": r[5],
+            "participant_id": r[6],
+            "line": r[7],
+            "price_decimal": r[8],
+            "price_american": r[9],
+            "last_updated_at": r[10],
         }
-        for r in cur.fetchall()
+        identity = _odds_outcome_identity(row)
+        existing = deduped_rows.get(identity)
+        if existing is not None:
+            skipped_duplicates += 1
+            if _odds_outcome_rank(row) <= _odds_outcome_rank(existing):
+                continue
+        deduped_rows[identity] = row
+    if skipped_invalid:
+        sample_text = "; ".join(skipped_samples)
+        log.warning(
+            "Skipped %s odds_outcomes rows outside allowed price range [%s, %s]. Samples: %s",
+            skipped_invalid,
+            ODDS_MIN_PRICE,
+            ODDS_MAX_PRICE,
+            sample_text,
+        )
+    if skipped_duplicates:
+        log.warning(
+            "Collapsed %s duplicate odds_outcomes rows to the latest row per natural key.",
+            skipped_duplicates,
+        )
+    return [
+        {key: value for key, value in row.items() if key != "_rowid"}
+        for row in deduped_rows.values()
     ]
 
 
@@ -706,10 +770,12 @@ def main():
         deleted_fixture_player_stats = delete_fixture_rows(
             "fixture_player_statistics", fixture_ids, args.dry_run
         )
+        deleted_odds_outcomes = delete_fixture_rows("odds_outcomes", fixture_ids, args.dry_run)
         log.info(
-            "Deleted rows: fixture_players=%s fixture_player_statistics=%s",
+            "Deleted rows: fixture_players=%s fixture_player_statistics=%s odds_outcomes=%s",
             deleted_fixture_players,
             deleted_fixture_player_stats,
+            deleted_odds_outcomes,
         )
 
     exported: Dict[str, int] = {}
