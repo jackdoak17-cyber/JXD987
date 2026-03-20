@@ -78,6 +78,10 @@ MATCH_MARKETS = {
     "goals_over_under_first_half",
     "btts",
 }
+BET365_SINGLE_SIDED_POSITIVE_PLAYER_MARKETS = {
+    "player_fouls_committed",
+    "player_fouls_drawn",
+}
 
 TEAM_NAME_ALIAS = {
     "manutd": "manchesterunited",
@@ -408,6 +412,27 @@ def parse_float(value: Optional[object]) -> Optional[float]:
             return num if math.isfinite(num) else None
         except Exception:
             return None
+
+
+def extract_player_market_price(
+    market_key: str,
+    bookmaker_id: int,
+    odd: Dict[str, object],
+) -> Tuple[Optional[float], Optional[str]]:
+    for key in ("over", "yes", "home"):
+        price = parse_float(odd.get(key))
+        if price is not None:
+            side_key = "over" if key == "over" else key
+            return price, side_key
+
+    # Odds-API encodes Bet365 foul props as one-sided `under` prices on 0.5 lines.
+    # Those prices represent the positive 1+ side we surface alongside the other books.
+    if bookmaker_id == 2 and market_key in BET365_SINGLE_SIDED_POSITIVE_PLAYER_MARKETS:
+        price = parse_float(odd.get("under"))
+        if price is not None:
+            return price, "over"
+
+    return None, None
 
 
 ORDINAL_SUFFIX_RE = re.compile(r"(\d)(st|nd|rd|th)\b", re.IGNORECASE)
@@ -1496,13 +1521,7 @@ def parse_markets_for_fixture(
                 if not player_name:
                     continue
                 line = parse_float(odd.get("hdp"))
-                price = None
-                side_key = None
-                for key in ("over", "yes", "home"):
-                    price = parse_float(odd.get(key))
-                    if price is not None:
-                        side_key = "over" if key == "over" else key
-                        break
+                price, side_key = extract_player_market_price(normalized_key, bookmaker_id, odd)
                 if price is None:
                     continue
                 player_id = resolve_player_id(
@@ -1836,13 +1855,7 @@ def parse_player_market_rows(
         if not player_name:
             continue
         line = parse_float(odd.get("hdp"))
-        price = None
-        side_key = None
-        for key in ("over", "yes", "home"):
-            price = parse_float(odd.get(key))
-            if price is not None:
-                side_key = "over" if key == "over" else key
-                break
+        price, side_key = extract_player_market_price(market_key, bookmaker_id, odd)
         if price is None:
             continue
         player_id = resolve_player_id(
