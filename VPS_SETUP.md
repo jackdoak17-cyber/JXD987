@@ -61,11 +61,12 @@ Use one cron entry equivalent to existing cadence:
 2. sync per league (`sync_odds.py` + refresh-upcoming)
 3. ingest per league (`export_odds_to_supabase_psql.py`, retention skipped)
 4. retention once (`odds_retention_psql.py`)
+5. best-effort recent fixture refresh + lightweight fixture-core Supabase export
 
 ## 5) Phase 2 schedule (Path B)
 Path B is enforced:
 - P1/P2: fetch-only
-- P3: SportMonks refresh + fetch + ingest + retention
+- P3: SportMonks refresh + fetch + ingest + retention + best-effort lightweight recent fixture refresh/export
 
 Cron entries:
 ```cron

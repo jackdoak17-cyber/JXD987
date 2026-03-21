@@ -986,17 +986,22 @@ class SyncService:
         end = today + timedelta(days=1)
         return self.sync_fixtures_between(start, end, league_ids=league_ids)
 
-    def reconcile_fixtures(self, fixture_ids: Sequence[int]) -> int:
-        includes = [
-            "participants",
-            "scores",
-            "statistics",
-            "statistics.type",
-            "lineups.details",
-            "lineups.position",
-            "lineups.detailedposition",
-            "lineups.player",
-        ]
+    def reconcile_fixtures(
+        self,
+        fixture_ids: Sequence[int],
+        includes: Optional[Sequence[str]] = None,
+    ) -> int:
+        if includes is None:
+            includes = [
+                "participants",
+                "scores",
+                "statistics",
+                "statistics.type",
+                "lineups.details",
+                "lineups.position",
+                "lineups.detailedposition",
+                "lineups.player",
+            ]
         count = 0
         for fixture_id in fixture_ids:
             endpoint = f"fixtures/{fixture_id}"

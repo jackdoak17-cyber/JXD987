@@ -12,6 +12,10 @@ export INGEST_MAX_RUNTIME_MINUTES="${ODDS_INGEST_MAX_RUNTIME_MINUTES:-25}"
 export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-1}"
 export RETENTION_DAYS_FORWARD="${RETENTION_DAYS_FORWARD:-14}"
 export RETENTION_SNAPSHOT_DAYS="${RETENTION_SNAPSHOT_DAYS:-30}"
+export FIXTURE_REFRESH_DAYS_BACK="${FIXTURE_REFRESH_DAYS_BACK:-2}"
+export FIXTURE_REFRESH_DAYS_FORWARD="${FIXTURE_REFRESH_DAYS_FORWARD:-3}"
+export FIXTURE_EXPORT_DAYS_BACK="${FIXTURE_EXPORT_DAYS_BACK:-2}"
+export FIXTURE_EXPORT_DAYS_FORWARD="${FIXTURE_EXPORT_DAYS_FORWARD:-3}"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Kambi,Paddy Power}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 
@@ -76,6 +80,28 @@ python scripts/odds_retention_psql.py \
   --days-forward "${RETENTION_DAYS_FORWARD}" \
   --snapshot-days "${RETENTION_SNAPSHOT_DAYS}" \
   --report-out "/tmp/odds_retention_report.json"
+
+# Best-effort recent fixture refresh/export. Do not fail the odds chain on transient fixture sync issues.
+if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
+  if python scripts/reconcile_recent_fixtures.py \
+    --leagues "${LEAGUES}" \
+    --days-back "${FIXTURE_REFRESH_DAYS_BACK}" \
+    --days-forward "${FIXTURE_REFRESH_DAYS_FORWARD}"; then
+    if ! python scripts/export_to_supabase.py \
+      --strict \
+      --leagues "${LEAGUES}" \
+      --days-back "${FIXTURE_EXPORT_DAYS_BACK}" \
+      --upcoming-days "${FIXTURE_EXPORT_DAYS_FORWARD}" \
+      --fixture-core-only \
+      --skip-prune; then
+      echo "Recent fixture export failed; continuing odds pipeline" >&2
+    fi
+  else
+    echo "Recent fixture refresh failed; continuing odds pipeline" >&2
+  fi
+else
+  echo "Skipping recent fixture refresh/export; missing SportMonks or Supabase REST env" >&2
+fi
 CHAIN
 )
 

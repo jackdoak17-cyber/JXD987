@@ -3,7 +3,7 @@
 Export a pruned subset of SQLite data to Supabase via REST.
 - seasons: current + previous per league
 - teams: only those referenced by exported fixtures
-- fixtures: finished fixtures plus upcoming scheduled fixtures (next 14 days)
+- fixtures: finished fixtures plus upcoming scheduled fixtures (next 45 days)
 - players: only players referenced by exported fixture player stats/lineups
 - player_team_history: player team timeline from squad syncs
 - fixture_players: only for exported fixtures
@@ -48,6 +48,12 @@ REQUIRED_TABLES = [
     "fixture_player_statistics",
     "odds_snapshots",
     "odds_outcomes",
+]
+FIXTURE_CORE_TABLES = [
+    "seasons",
+    "rounds",
+    "teams",
+    "fixtures",
 ]
 
 
@@ -226,12 +232,19 @@ def extract_half_time_scores(extra_raw: object) -> Tuple[Optional[int], Optional
     return home_ht, away_ht
 
 
-def fetch_fixtures(conn: sqlite3.Connection, keep_ids: Sequence[int], upcoming_days: int = 14) -> List[Dict]:
+def fetch_fixtures(
+    conn: sqlite3.Connection,
+    keep_ids: Sequence[int],
+    upcoming_days: int = 45,
+    days_back: Optional[int] = None,
+) -> List[Dict]:
     cur = conn.cursor()
     q = ",".join("?" for _ in keep_ids)
     now = datetime.utcnow()
-    upcoming_end = now + timedelta(days=upcoming_days)
-    days_back = int(os.environ.get("EXPORT_DAYS_BACK", "0") or "0")
+    upcoming_end = now + timedelta(days=max(upcoming_days, 0))
+    if days_back is None:
+        days_back = int(os.environ.get("EXPORT_DAYS_BACK", "0") or "0")
+    days_back = max(days_back, 0)
     finished_start = now - timedelta(days=days_back) if days_back > 0 else None
     now_iso = now.isoformat(sep=" ")
     upcoming_iso = upcoming_end.isoformat(sep=" ")
@@ -700,17 +713,47 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Compute payload sizes without sending to Supabase")
     parser.add_argument("--leagues", default=os.environ.get("LEAGUE_IDS", ""), help="Comma-separated league IDs")
     parser.add_argument(
+        "--days-back",
+        type=int,
+        default=None,
+        help="Override the finished-fixture export lookback window in days.",
+    )
+    parser.add_argument(
+        "--upcoming-days",
+        type=int,
+        default=int(os.environ.get("EXPORT_DAYS_FORWARD", "45") or "45"),
+        help="Number of upcoming days to export for scheduled fixtures.",
+    )
+    parser.add_argument(
+        "--fixture-core-only",
+        action="store_true",
+        default=False,
+        help="Export only seasons, rounds, teams, and fixtures for lightweight refresh runs.",
+    )
+    parser.add_argument(
         "--skip-odds-snapshots",
         action="store_true",
         default=False,
         help="Skip exporting odds_snapshots (reduces Supabase load)",
+    )
+    parser.add_argument(
+        "--skip-odds-outcomes",
+        action="store_true",
+        default=False,
+        help="Skip exporting odds_outcomes (useful for fixture-only refresh runs)",
+    )
+    parser.add_argument(
+        "--skip-prune",
+        action="store_true",
+        default=False,
+        help="Skip pruning fixtures outside kept seasons.",
     )
     args = parser.parse_args()
 
     require_env(args.dry_run)
 
     conn = get_conn()
-    ensure_tables_exist(conn, REQUIRED_TABLES)
+    ensure_tables_exist(conn, FIXTURE_CORE_TABLES if args.fixture_core_only else REQUIRED_TABLES)
 
     league_ids = [int(x) for x in args.leagues.split(",") if x.strip()] if args.leagues else []
     keep_ids = choose_keep_seasons(conn, league_ids if league_ids else None)
@@ -719,7 +762,12 @@ def main():
 
     seasons = fetch_seasons(conn, list(keep_ids))
     rounds = fetch_rounds(conn, list(keep_ids))
-    fixtures = fetch_fixtures(conn, list(keep_ids))
+    fixtures = fetch_fixtures(
+        conn,
+        list(keep_ids),
+        upcoming_days=args.upcoming_days,
+        days_back=args.days_back,
+    )
     team_ids = {f["home_team_id"] for f in fixtures} | {f["away_team_id"] for f in fixtures}
     teams = fetch_teams(conn, list(team_ids))
     known_team_ids = {t["id"] for t in teams}
@@ -731,23 +779,33 @@ def main():
 
     fixture_ids: Set[int] = {f["id"] for f in fixtures}
 
-    fixture_players = fetch_fixture_players(conn, list(fixture_ids))
-    fixture_stats = fetch_fixture_statistics(conn, list(fixture_ids))
-    fixture_player_stats = fetch_fixture_player_statistics(conn, list(fixture_ids))
-    odds_snapshots = [] if args.skip_odds_snapshots else fetch_odds_snapshots(conn, list(fixture_ids))
-    odds_outcomes = fetch_odds_outcomes(conn, list(fixture_ids))
+    if args.fixture_core_only:
+        fixture_players = []
+        fixture_stats = []
+        fixture_player_stats = []
+        odds_snapshots = []
+        odds_outcomes = []
+        players = []
+        player_team_history = []
+        sidelined_players = []
+    else:
+        fixture_players = fetch_fixture_players(conn, list(fixture_ids))
+        fixture_stats = fetch_fixture_statistics(conn, list(fixture_ids))
+        fixture_player_stats = fetch_fixture_player_statistics(conn, list(fixture_ids))
+        odds_snapshots = [] if args.skip_odds_snapshots else fetch_odds_snapshots(conn, list(fixture_ids))
+        odds_outcomes = [] if args.skip_odds_outcomes else fetch_odds_outcomes(conn, list(fixture_ids))
 
-    player_ids: Set[int] = set()
-    for fp in fixture_players:
-        if fp.get("player_id"):
-            player_ids.add(fp["player_id"])
-    for fps in fixture_player_stats:
-        if fps.get("player_id"):
-            player_ids.add(fps["player_id"])
+        player_ids: Set[int] = set()
+        for fp in fixture_players:
+            if fp.get("player_id"):
+                player_ids.add(fp["player_id"])
+        for fps in fixture_player_stats:
+            if fps.get("player_id"):
+                player_ids.add(fps["player_id"])
 
-    players = fetch_players(conn, list(player_ids))
-    player_team_history = fetch_player_team_history(conn, list(player_ids))
-    sidelined_players = fetch_sidelined_players(conn, list(team_ids))
+        players = fetch_players(conn, list(player_ids))
+        player_team_history = fetch_player_team_history(conn, list(player_ids))
+        sidelined_players = fetch_sidelined_players(conn, list(team_ids))
 
     log.info("Payload counts: seasons=%s teams=%s fixtures=%s players=%s", len(seasons), len(teams), len(fixtures), len(players))
     log.info("Payload counts: rounds=%s", len(rounds))
@@ -764,13 +822,15 @@ def main():
     )
     log.info("Payload counts: odds_snapshots=%s odds_outcomes=%s", len(odds_snapshots), len(odds_outcomes))
 
-    if fixture_ids:
+    if fixture_ids and not args.fixture_core_only:
         log.info("Deleting existing fixture-scoped rows before upsert")
         deleted_fixture_players = delete_fixture_rows("fixture_players", fixture_ids, args.dry_run)
         deleted_fixture_player_stats = delete_fixture_rows(
             "fixture_player_statistics", fixture_ids, args.dry_run
         )
-        deleted_odds_outcomes = delete_fixture_rows("odds_outcomes", fixture_ids, args.dry_run)
+        deleted_odds_outcomes = (
+            0 if args.skip_odds_outcomes else delete_fixture_rows("odds_outcomes", fixture_ids, args.dry_run)
+        )
         log.info(
             "Deleted rows: fixture_players=%s fixture_player_statistics=%s odds_outcomes=%s",
             deleted_fixture_players,
@@ -784,45 +844,54 @@ def main():
         ("rounds", rounds, "id"),
         ("teams", teams, "id"),
         ("fixtures", fixtures, "id"),
-        ("players", players, "id"),
-        ("sidelined_players", sidelined_players, "id"),
-        ("player_team_history", player_team_history, "id"),
-        ("fixture_players", fixture_players, "fixture_id,player_id"),
-        ("fixture_statistics", fixture_stats, "fixture_id,team_id,type_id"),
-        ("fixture_player_statistics", fixture_player_stats, "fixture_id,player_id,type_id"),
     ]
+    if not args.fixture_core_only:
+        exports.extend(
+            [
+                ("players", players, "id"),
+                ("sidelined_players", sidelined_players, "id"),
+                ("player_team_history", player_team_history, "id"),
+                ("fixture_players", fixture_players, "fixture_id,player_id"),
+                ("fixture_statistics", fixture_stats, "fixture_id,team_id,type_id"),
+                ("fixture_player_statistics", fixture_player_stats, "fixture_id,player_id,type_id"),
+            ]
+        )
 
     for table, rows, on_conflict in exports:
         log.info("Exporting %s (%s rows)", table, len(rows))
         exported[table] = upsert_table(table, rows, on_conflict, args.dry_run)
 
-    if args.skip_odds_snapshots:
+    if args.fixture_core_only or args.skip_odds_snapshots:
         exported["odds_snapshots"] = 0
     else:
         log.info("Exporting odds_snapshots (%s rows)", len(odds_snapshots))
         exported["odds_snapshots"] = upsert_table("odds_snapshots", odds_snapshots, "id", args.dry_run)
 
-    log.info("Exporting odds_outcomes (%s rows)", len(odds_outcomes))
-    exported["odds_outcomes"] = upsert_table(
-        "odds_outcomes",
-        odds_outcomes,
-        "fixture_id,bookmaker_id,market_key,selection_key,line",
-        args.dry_run,
-    )
-    pruned = prune_fixtures(list(keep_ids), args.dry_run)
+    if args.fixture_core_only or args.skip_odds_outcomes:
+        exported["odds_outcomes"] = 0
+    else:
+        log.info("Exporting odds_outcomes (%s rows)", len(odds_outcomes))
+        exported["odds_outcomes"] = upsert_table(
+            "odds_outcomes",
+            odds_outcomes,
+            "fixture_id,bookmaker_id,market_key,selection_key,line",
+            args.dry_run,
+        )
+    pruned = 0 if args.skip_prune else prune_fixtures(list(keep_ids), args.dry_run)
 
     summary = {
         "dry_run": args.dry_run,
+        "fixture_core_only": args.fixture_core_only,
         "keep_season_ids": list(keep_ids),
         "fixtures_exported": exported["fixtures"],
         "teams_exported": exported["teams"],
         "seasons_exported": exported["seasons"],
         "rounds_exported": exported["rounds"],
-        "players_exported": exported["players"],
-        "player_team_history_exported": exported["player_team_history"],
-        "fixture_players_exported": exported["fixture_players"],
-        "fixture_statistics_exported": exported["fixture_statistics"],
-        "fixture_player_statistics_exported": exported["fixture_player_statistics"],
+        "players_exported": exported.get("players", 0),
+        "player_team_history_exported": exported.get("player_team_history", 0),
+        "fixture_players_exported": exported.get("fixture_players", 0),
+        "fixture_statistics_exported": exported.get("fixture_statistics", 0),
+        "fixture_player_statistics_exported": exported.get("fixture_player_statistics", 0),
         "odds_snapshots_exported": exported["odds_snapshots"],
         "odds_outcomes_exported": exported["odds_outcomes"],
         "fixtures_dropped_missing_teams": dropped,
