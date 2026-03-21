@@ -2,7 +2,7 @@ name: Referee Sync
 
 on:
   schedule:
-    - cron: "10 2 * * *"
+    - cron: "15 2 * * *"
   workflow_dispatch:
     inputs:
       mode:
@@ -81,10 +81,10 @@ jobs:
             echo "HISTORY_DAYS_BACK=${{ inputs.history_days_back }}" >> "$GITHUB_ENV"
           else
             echo "RUN_MODE=daily" >> "$GITHUB_ENV"
-            echo "DAYS_BACK=30" >> "$GITHUB_ENV"
-            echo "DAYS_FORWARD=14" >> "$GITHUB_ENV"
+            echo "DAYS_BACK=2" >> "$GITHUB_ENV"
+            echo "DAYS_FORWARD=7" >> "$GITHUB_ENV"
             echo "LIMIT_FIXTURES=0" >> "$GITHUB_ENV"
-            echo "SLEEP_SECONDS=0.3" >> "$GITHUB_ENV"
+            echo "SLEEP_SECONDS=0.2" >> "$GITHUB_ENV"
             echo "MAX_REFEREE_PAGES=0" >> "$GITHUB_ENV"
             echo "HISTORY_DAYS_BACK=700" >> "$GITHUB_ENV"
           fi
@@ -146,7 +146,7 @@ jobs:
       - name: Hydrate historical referee assignments (main referee)
         run: |
           python3 scripts/hydrate_referee_history.py \
-            --seed-days-back "$DAYS_BACK" \
+            --seed-days-back 0 \
             --seed-days-forward "$DAYS_FORWARD" \
             --history-days-back "$HISTORY_DAYS_BACK" \
             --history-days-forward "$DAYS_FORWARD" \

@@ -23,7 +23,8 @@ on:
         default: "0"
         type: string
   schedule:
-    - cron: "20 3 * * *"
+    # Weekly low-cost metadata refresh. Scheduled runs skip player-nationality backfills.
+    - cron: "35 1 * * 0"
 
 concurrency:
   group: metadata-sync
@@ -57,7 +58,7 @@ jobs:
             echo "PLAYER_ID_LIMIT=${{ inputs.player_id_limit }}" >> "$GITHUB_ENV"
             echo "MAX_PLAYER_PAGES=${{ inputs.max_player_pages }}" >> "$GITHUB_ENV"
           else
-            echo "PLAYER_MODE=squads" >> "$GITHUB_ENV"
+            echo "PLAYER_MODE=off" >> "$GITHUB_ENV"
             echo "PLAYER_ID_LIMIT=0" >> "$GITHUB_ENV"
             echo "MAX_PLAYER_PAGES=0" >> "$GITHUB_ENV"
           fi
