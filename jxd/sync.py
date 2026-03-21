@@ -72,6 +72,38 @@ def _fixture_status_values(raw: Dict) -> Tuple[Optional[str], Optional[str]]:
     )
 
 
+def _fixture_lineup_confirmed(raw: Dict) -> Tuple[bool, Optional[bool]]:
+    metadata = raw.get("metadata")
+    if not isinstance(metadata, list):
+        return False, None
+    for item in metadata:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type_id") != 572:
+            continue
+        values = item.get("values")
+        if not isinstance(values, dict):
+            return True, None
+        confirmed = values.get("confirmed")
+        if isinstance(confirmed, bool):
+            return True, confirmed
+        return True, None
+    return True, None
+
+
+def _ensure_fixture_columns(engine) -> None:
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(fixtures)").fetchall()}
+        desired = {
+            "lineup_confirmed": "INTEGER",
+        }
+        for name, ddl_type in desired.items():
+            if name not in cols:
+                conn.exec_driver_sql(f"ALTER TABLE fixtures ADD COLUMN {name} {ddl_type}")
+
+
 def _ensure_fixture_player_columns(engine) -> None:
     if engine.dialect.name != "sqlite":
         return
@@ -273,6 +305,7 @@ class SyncService:
 
     def ensure_schema(self) -> None:
         Base.metadata.create_all(self.session.get_bind())
+        _ensure_fixture_columns(self.session.get_bind())
         _ensure_fixture_player_columns(self.session.get_bind())
         _ensure_team_player_columns(self.session.get_bind())
 
@@ -502,7 +535,8 @@ class SyncService:
     def _map_fixture(self, raw: Dict) -> Dict:
         home_score, away_score = self._extract_scores(raw.get("scores") or raw.get("score"))
         status, status_code = _fixture_status_values(raw)
-        return {
+        has_lineup_confirmed, lineup_confirmed = _fixture_lineup_confirmed(raw)
+        payload = {
             "id": raw.get("id"),
             "league_id": raw.get("league_id"),
             "season_id": raw.get("season_id"),
@@ -515,6 +549,9 @@ class SyncService:
             "away_score": away_score,
             "extra": raw,
         }
+        if has_lineup_confirmed:
+            payload["lineup_confirmed"] = lineup_confirmed
+        return payload
 
     def _extract_scores(self, scores_raw) -> Tuple[Optional[int], Optional[int]]:
         """

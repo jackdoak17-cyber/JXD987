@@ -16,6 +16,9 @@ export FIXTURE_REFRESH_DAYS_BACK="${FIXTURE_REFRESH_DAYS_BACK:-2}"
 export FIXTURE_REFRESH_DAYS_FORWARD="${FIXTURE_REFRESH_DAYS_FORWARD:-3}"
 export FIXTURE_EXPORT_DAYS_BACK="${FIXTURE_EXPORT_DAYS_BACK:-2}"
 export FIXTURE_EXPORT_DAYS_FORWARD="${FIXTURE_EXPORT_DAYS_FORWARD:-3}"
+export LINEUP_SYNC_HOURS_BACK="${LINEUP_SYNC_HOURS_BACK:-2}"
+export LINEUP_SYNC_HOURS_FORWARD="${LINEUP_SYNC_HOURS_FORWARD:-3}"
+export LINEUP_SYNC_LIMIT="${LINEUP_SYNC_LIMIT:-40}"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Kambi,Paddy Power}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 
@@ -101,6 +104,19 @@ if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE
   fi
 else
   echo "Skipping recent fixture refresh/export; missing SportMonks or Supabase REST env" >&2
+fi
+
+# Best-effort confirmed-lineup refresh for imminent fixtures.
+if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
+  if ! python scripts/sync_confirmed_lineups.py \
+    --leagues "${LEAGUES}" \
+    --hours-back "${LINEUP_SYNC_HOURS_BACK}" \
+    --hours-forward "${LINEUP_SYNC_HOURS_FORWARD}" \
+    --limit "${LINEUP_SYNC_LIMIT}"; then
+    echo "Confirmed lineup refresh failed; continuing odds pipeline" >&2
+  fi
+else
+  echo "Skipping confirmed lineup refresh; missing SportMonks or Supabase REST env" >&2
 fi
 CHAIN
 )

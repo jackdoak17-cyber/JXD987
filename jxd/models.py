@@ -113,6 +113,7 @@ class Fixture(Base):
     away_team_id = Column(Integer, nullable=True)
     home_score = Column(Integer, nullable=True)
     away_score = Column(Integer, nullable=True)
+    lineup_confirmed = Column(Boolean, nullable=True)
     extra = Column(JSON, nullable=True)
 
 

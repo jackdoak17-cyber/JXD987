@@ -111,6 +111,19 @@ def ensure_tables_exist(conn: sqlite3.Connection, tables: Sequence[str]) -> None
         raise SystemExit(f"Missing required tables in SQLite: {', '.join(missing)}")
 
 
+def ensure_fixture_columns(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute("PRAGMA table_info(fixtures)")
+    existing = {row[1] for row in cur.fetchall()}
+    desired = {
+        "lineup_confirmed": "INTEGER",
+    }
+    for name, ddl_type in desired.items():
+        if name not in existing:
+            cur.execute(f"ALTER TABLE fixtures ADD COLUMN {name} {ddl_type}")
+    conn.commit()
+
+
 def choose_keep_seasons(conn: sqlite3.Connection, league_ids: Sequence[int] | None = None) -> Set[int]:
     cur = conn.cursor()
     keep: Set[int] = set()
@@ -255,7 +268,7 @@ def fetch_fixtures(
     cur.execute(
         f"""
         select id, league_id, season_id, starting_at, status, status_code,
-               home_team_id, away_team_id, home_score, away_score, extra
+               home_team_id, away_team_id, home_score, away_score, lineup_confirmed, extra
         from fixtures
         where season_id in ({q})
           and home_team_id is not null
@@ -282,6 +295,7 @@ def fetch_fixtures(
                 "away_team_id": row[7],
                 "home_score": row[8],
                 "away_score": row[9],
+                "lineup_confirmed": bool(row[10]) if row[10] is not None else None,
                 "home_ht_score": home_ht_score,
                 "away_ht_score": away_ht_score,
             }
@@ -310,7 +324,8 @@ def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) 
     q = ",".join("?" for _ in fixture_ids)
     cur.execute(
         f"""
-        select fixture_id, player_id, team_id, is_starter, minutes_played, position_name,
+        select fixture_id, player_id, team_id, name, position, lineup_type, jersey_number,
+               is_starter, minutes_played, position_name,
                detailed_position_id, detailed_position_name, detailed_position_code,
                formation_field, formation_position,
                lineup_detailed_position_id, lineup_detailed_position_name, lineup_detailed_position_code,
@@ -325,18 +340,22 @@ def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) 
             "fixture_id": r[0],
             "player_id": r[1],
             "team_id": r[2],
-            "is_starter": r[3],
-            "minutes_played": r[4],
-            "position_name": r[5],
-            "detailed_position_id": r[6],
-            "detailed_position_name": r[7],
-            "detailed_position_code": r[8],
-            "formation_field": r[9],
-            "formation_position": r[10],
-            "lineup_detailed_position_id": r[11],
-            "lineup_detailed_position_name": r[12],
-            "lineup_detailed_position_code": r[13],
-            "position_abbr": r[14],
+            "name": r[3],
+            "position": r[4],
+            "lineup_type": r[5],
+            "jersey_number": r[6],
+            "is_starter": r[7],
+            "minutes_played": r[8],
+            "position_name": r[9],
+            "detailed_position_id": r[10],
+            "detailed_position_name": r[11],
+            "detailed_position_code": r[12],
+            "formation_field": r[13],
+            "formation_position": r[14],
+            "lineup_detailed_position_id": r[15],
+            "lineup_detailed_position_name": r[16],
+            "lineup_detailed_position_code": r[17],
+            "position_abbr": r[18],
         }
         for r in cur.fetchall()
     ]
@@ -754,6 +773,7 @@ def main():
 
     conn = get_conn()
     ensure_tables_exist(conn, FIXTURE_CORE_TABLES if args.fixture_core_only else REQUIRED_TABLES)
+    ensure_fixture_columns(conn)
 
     league_ids = [int(x) for x in args.leagues.split(",") if x.strip()] if args.leagues else []
     keep_ids = choose_keep_seasons(conn, league_ids if league_ids else None)

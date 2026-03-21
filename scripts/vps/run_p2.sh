@@ -9,6 +9,9 @@ export REPO_ROOT
 export LEAGUES="${LEAGUE_IDS:-$(default_league_csv)}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Kambi,Paddy Power}"
+export LINEUP_SYNC_HOURS_BACK="${LINEUP_SYNC_HOURS_BACK:-2}"
+export LINEUP_SYNC_HOURS_FORWARD="${LINEUP_SYNC_HOURS_FORWARD:-3}"
+export LINEUP_SYNC_LIMIT="${LINEUP_SYNC_LIMIT:-40}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
@@ -30,6 +33,19 @@ python scripts/sync_odds.py \
   --bookmakers "${ODDS_BOOKMAKERS}" \
   --report-out "/tmp/odds_sync_report_p2.json" \
   --unmatched-out "/tmp/unmatched_players_p2.json"
+
+# Best-effort confirmed-lineup refresh for imminent fixtures.
+if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
+  if ! python scripts/sync_confirmed_lineups.py \
+    --leagues "${LEAGUES}" \
+    --hours-back "${LINEUP_SYNC_HOURS_BACK}" \
+    --hours-forward "${LINEUP_SYNC_HOURS_FORWARD}" \
+    --limit "${LINEUP_SYNC_LIMIT}"; then
+    echo "Confirmed lineup refresh failed; continuing odds pipeline" >&2
+  fi
+else
+  echo "Skipping confirmed lineup refresh; missing SportMonks or Supabase REST env" >&2
+fi
 CHAIN
 )
 
