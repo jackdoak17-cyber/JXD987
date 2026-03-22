@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"
+verify_runtime_manifest_or_exit "$0"
 
 export REPO_ROOT
 export LEAGUES="${LEAGUE_IDS:-$(default_league_csv)}"

@@ -1,0 +1,9 @@
+457c54c44856d5bc91b7e32d247228ea6741d8fa  jxd/sync.py
+34746272e65461cf78ab75685edb619b36d5ab1a  scripts/export_to_supabase.py
+0aeb2ece3abb146f740989bc0b6e21aa017dc3cc  scripts/reconcile_recent_fixtures.py
+3f27116bb8a553f444a63c20bdb3f3beac390cee  scripts/sync_confirmed_lineups.py
+8bf2487e7823dd1addbcc2e48cd1ad55a972affe  scripts/vps/common.sh
+adac1f4a35900fe8e888485f8bf94f07858ce258  scripts/vps/run_p1.sh
+cdc2aca4e9fdef86534887ef7b2038090885fcf6  scripts/vps/run_p2.sh
+0481edb4bae94621cd090f4433645abb468b0b22  scripts/vps/run_p3.sh
+0bf0f47f0aeeb8e6e37c01298bcb8d9525bd4eef  scripts/vps/run_sync.sh

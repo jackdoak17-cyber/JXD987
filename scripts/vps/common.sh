@@ -3,6 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+RUNTIME_MANIFEST_PATH="${REPO_ROOT}/scripts/vps/runtime_manifest.sha1"
 
 log_info() {
   printf '%s [INFO] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*"
@@ -10,6 +11,83 @@ log_info() {
 
 log_error() {
   printf '%s [ERROR] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*" >&2
+}
+
+hash_file() {
+  local path="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum "${path}" | awk '{print $1}'
+    return 0
+  fi
+  if command -v sha1sum >/dev/null 2>&1; then
+    sha1sum "${path}" | awk '{print $1}'
+    return 0
+  fi
+  return 1
+}
+
+runtime_release_id() {
+  if [[ ! -f "${RUNTIME_MANIFEST_PATH}" ]]; then
+    printf 'manifest-missing'
+    return 0
+  fi
+  local digest
+  digest="$(hash_file "${RUNTIME_MANIFEST_PATH}" 2>/dev/null || true)"
+  if [[ -z "${digest}" ]]; then
+    printf 'manifest-unhashed'
+    return 0
+  fi
+  printf '%s' "${digest:0:12}"
+}
+
+verify_runtime_manifest() {
+  if [[ ! -f "${RUNTIME_MANIFEST_PATH}" ]]; then
+    log_error "runtime manifest missing: ${RUNTIME_MANIFEST_PATH}"
+    return 1
+  fi
+
+  if ! command -v shasum >/dev/null 2>&1 && ! command -v sha1sum >/dev/null 2>&1; then
+    log_error "runtime verification requires shasum or sha1sum"
+    return 1
+  fi
+
+  local expected relpath abs actual mismatches=0
+  while read -r expected relpath; do
+    [[ -n "${expected}" ]] || continue
+    [[ "${expected}" == \#* ]] && continue
+    if [[ -z "${relpath}" ]]; then
+      log_error "invalid runtime manifest row: ${expected}"
+      mismatches=1
+      continue
+    fi
+    abs="${REPO_ROOT}/${relpath}"
+    if [[ ! -f "${abs}" ]]; then
+      log_error "runtime file missing: ${relpath}"
+      mismatches=1
+      continue
+    fi
+    actual="$(hash_file "${abs}" 2>/dev/null || true)"
+    if [[ -z "${actual}" ]]; then
+      log_error "unable to hash runtime file: ${relpath}"
+      mismatches=1
+      continue
+    fi
+    if [[ "${actual}" != "${expected}" ]]; then
+      log_error "runtime drift detected for ${relpath}: expected=${expected} actual=${actual}"
+      mismatches=1
+    fi
+  done < "${RUNTIME_MANIFEST_PATH}"
+
+  [[ "${mismatches}" -eq 0 ]]
+}
+
+verify_runtime_manifest_or_exit() {
+  local entrypoint="${1:-unknown}"
+  if ! verify_runtime_manifest; then
+    log_error "runtime manifest verification failed for $(basename "${entrypoint}")"
+    exit 1
+  fi
+  log_info "runtime manifest verified release=$(runtime_release_id) entrypoint=$(basename "${entrypoint}")"
 }
 
 default_league_csv() {

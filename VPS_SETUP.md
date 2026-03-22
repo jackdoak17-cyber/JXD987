@@ -34,6 +34,10 @@ New operational vars:
 ## 3) Wrapper scripts
 Location:
 - `scripts/vps/common.sh`
+- `scripts/vps/runtime_files.txt`
+- `scripts/vps/runtime_manifest.sha1`
+- `scripts/vps/update_runtime_manifest.sh`
+- `scripts/vps/deploy_runtime.sh`
 - `scripts/vps/run_sync.sh`
 - `scripts/vps/run_p1.sh`
 - `scripts/vps/run_p2.sh`
@@ -49,6 +53,12 @@ Lock/timeout behavior:
 - Non-blocking lock (`flock --nonblock`) -> immediate skip on contention
 - `timeout` enforces kill-on-overrun
 - **The full chain is wrapped as one subshell command**, so timeout covers every step (not only the first command)
+
+Runtime drift protection:
+- wrappers verify `scripts/vps/runtime_manifest.sha1` before doing any work
+- if a critical runtime file on the VPS drifts from the committed manifest, the wrapper fails loudly instead of silently running stale logic
+- refresh the manifest locally with `scripts/vps/update_runtime_manifest.sh`
+- deploy the runtime file set with `scripts/vps/deploy_runtime.sh <host> [remote_repo_root]`
 
 ## 4) Phase 1 schedule (parity mode)
 Use one cron entry equivalent to existing cadence:
@@ -106,21 +116,28 @@ P1 is best-effort every 2 minutes, but can skip while P3 holds the lock.
 3. Run manually once:
    ```bash
    cd /opt/odds-sync/JXD987
+   scripts/vps/update_runtime_manifest.sh
    scripts/vps/run_sync.sh
    ```
    - Pass: exit `0`, retention report present, healthcheck pinged (if configured)
-4. Spot-check Supabase writes
+4. Deploy runtime file set explicitly after any VPS-affecting change:
+   ```bash
+   cd /opt/odds-sync/JXD987
+   scripts/vps/deploy_runtime.sh <host>
+   ```
+   - Pass: remote `shasum -c scripts/vps/runtime_manifest.sha1` returns `OK` for every file
+5. Spot-check Supabase writes
    - Pass: verify at least 5 rows across 2 leagues are updated
-5. Disable GitHub Actions workflow **via GitHub UI only**
+6. Disable GitHub Actions workflow **via GitHub UI only**
    - Actions tab -> `Sync Odds` workflow -> `Disable workflow`
    - Pass: workflow status shows disabled
-6. Wait one full cycle
+7. Wait one full cycle
    - Pass: no scheduled GitHub run fires
-7. Enable VPS crontab entries
+8. Enable VPS crontab entries
    - Pass: `crontab -l` shows expected entries
-8. Monitor 2 full P3 cycles (40 min)
+9. Monitor 2 full P3 cycles (40 min)
    - Pass: freshness within expected windows, no repeated failures
-9. Rollback if needed
+10. Rollback if needed
    - Re-enable workflow in GitHub UI
    - Disable VPS cron (`crontab -e` remove entries)
 
