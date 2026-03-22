@@ -93,13 +93,15 @@ if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE
   if python scripts/reconcile_recent_fixtures.py \
     --leagues "${LEAGUES}" \
     --days-back "${FIXTURE_REFRESH_DAYS_BACK}" \
-    --days-forward "${FIXTURE_REFRESH_DAYS_FORWARD}"; then
+    --days-forward "${FIXTURE_REFRESH_DAYS_FORWARD}" \
+    --with-details; then
     if ! python scripts/export_to_supabase.py \
       --strict \
       --leagues "${LEAGUES}" \
       --days-back "${FIXTURE_EXPORT_DAYS_BACK}" \
       --upcoming-days "${FIXTURE_EXPORT_DAYS_FORWARD}" \
-      --fixture-core-only \
+      --skip-odds-snapshots \
+      --skip-odds-outcomes \
       --skip-prune; then
       echo "Recent fixture export failed; continuing odds pipeline" >&2
     fi
