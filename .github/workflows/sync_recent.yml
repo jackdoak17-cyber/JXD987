@@ -10,8 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
-      RECENT_DAYS: "30"
-      EXPORT_DAYS_BACK: "30"
+      RECENT_DAYS: "240"
+      EXPORT_DAYS_BACK: "240"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,7 +51,7 @@ jobs:
           SUPABASE_EXPORT_CHUNK: "1000"
           SUPABASE_EXPORT_SLEEP: "0"
           SUPABASE_EXPORT_RETRIES: "5"
-          EXPORT_DAYS_BACK: "30"
+          EXPORT_DAYS_BACK: "240"
         run: python3 scripts/export_to_supabase.py --strict --leagues "$LEAGUE_IDS"
 
       - name: Refresh likely players

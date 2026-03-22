@@ -7,8 +7,10 @@ source "${SCRIPT_DIR}/common.sh"
 
 export REPO_ROOT
 export LEAGUES="${LEAGUE_IDS:-$(default_league_csv)}"
+export ODDS_SYNC_DAYS_BACK="${ODDS_SYNC_DAYS_BACK:-2}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
 export INGEST_MAX_RUNTIME_MINUTES="${ODDS_INGEST_MAX_RUNTIME_MINUTES:-25}"
+export ODDS_EXPORT_DAYS_BACK="${ODDS_EXPORT_DAYS_BACK:-2}"
 export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-1}"
 export RETENTION_DAYS_FORWARD="${RETENTION_DAYS_FORWARD:-14}"
 export RETENTION_SNAPSHOT_DAYS="${RETENTION_SNAPSHOT_DAYS:-30}"
@@ -58,6 +60,7 @@ for league_id in ${LEAGUES//,/ }; do
 
   python scripts/sync_odds.py \
     --leagues "${league_id}" \
+    --days-back "${ODDS_SYNC_DAYS_BACK}" \
     --days-forward "${DAYS_FORWARD}" \
     --refresh-upcoming \
     --bookmakers "${ODDS_BOOKMAKERS}" \
@@ -66,6 +69,7 @@ for league_id in ${LEAGUES//,/ }; do
 
   python scripts/export_odds_to_supabase_psql.py \
     --leagues "${league_id}" \
+    --days-back "${ODDS_EXPORT_DAYS_BACK}" \
     --days-forward "${DAYS_FORWARD}" \
     --csv-out "/tmp/odds_outcomes_export_${league_id}.csv" \
     --no-include-fixture-leagues \

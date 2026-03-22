@@ -45,6 +45,19 @@ BOOKMAKER_CANONICAL = {
     "kambi": "Kambi",
     "paddypower": "Paddy Power",
 }
+HISTORICAL_ODDS_BASE_URL = os.environ.get("ODDS_API_HISTORICAL_BASE") or "https://api.odds-api.io/v3"
+SETTLED_EVENT_STATUSES = {"settled", "finished", "final", "ended", "completed"}
+MONEYLINE_MARKET_KEYS = {
+    "moneyline",
+    "match_result",
+    "match_winner",
+    "match_winner_90",
+    "match_winner_90_min",
+    "full_time_result",
+    "full_time_result_90",
+    "1x2",
+    "home_draw_away",
+}
 
 DEFAULT_MARKET_ALLOWLIST = {
     "moneyline",
@@ -99,6 +112,40 @@ TEAM_NAME_ALIAS = {
     "cologne": "koln",
     "inter": "internazionale",
     "acmilan": "milan",
+    "athleticbilbao": "athleticclub",
+    "realbetisseville": "realbetis",
+    "realsociedadsansebastian": "realsociedad",
+    "realsociedadsansebastianb": "realsociedadii",
+    "albacetebalompie": "albacete",
+    "adceuta": "ceuta",
+    "rcdeportivodelacoruna": "deportivolacoruna",
+    "malagacf": "malaga",
+    "cadizcf": "cadiz",
+    "cdleganes": "leganes",
+    "cordobacf": "cordoba",
+    "sdeibar": "eibar",
+    "sdhuesca": "huesca",
+    "udlaspalmas": "laspalmas",
+    "elchecf": "elche",
+    "rcdmallorca": "mallorca",
+    "glasgowrangers": "rangers",
+    "celticglasgow": "celtic",
+    "heartofmidlothian": "hearts",
+    "ikstart": "start",
+    "aalesunds": "aalesund",
+    "vaalerenga": "valerenga",
+    "vaalerengaif": "valerenga",
+    "bodoeglimt": "bodoglimt",
+    "lillestroemsk": "lillestrom",
+    "kristiansundbk": "kristiansund",
+    "skbrann": "brann",
+    "sandefjordfotball": "sandefjord",
+    "tromsoeil": "tromso",
+    "fredrikstadfk": "fredrikstad",
+    "rcceltavigo": "celtavigo",
+    "staderennais": "rennes",
+    "staderennaisfc": "rennes",
+    "fcmetz": "metz",
 }
 
 TEAM_TOKEN_DROP = {
@@ -302,8 +349,10 @@ def team_aliases(value: str, short_code: Optional[str] = None) -> List[str]:
     if value:
         aliases.update(normalize_team_variants(value))
         aliases.add(normalize_team_name(value))
+        aliases.add(normalize_name(value))
     if short_code:
         aliases.add(normalize_team_name(short_code))
+        aliases.add(normalize_name(short_code))
     for item in list(aliases):
         if item in TEAM_NAME_ALIAS:
             aliases.add(TEAM_NAME_ALIAS[item])
@@ -594,16 +643,39 @@ def sqlite_utc_timestamp(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def fixture_window_bounds(days_forward: int) -> Tuple[datetime, datetime]:
-    start_dt = utc_now_naive()
-    end_dt = start_dt + timedelta(days=days_forward)
+def fixture_window_bounds(days_back: int, days_forward: int) -> Tuple[datetime, datetime]:
+    now_utc = utc_now_naive()
+    start_dt = now_utc - timedelta(days=max(0, days_back))
+    end_dt = now_utc + timedelta(days=days_forward)
     return start_dt, end_dt
 
 
-def load_fixtures(session, league_ids: List[int], days_forward: int) -> List[Dict[str, object]]:
+def load_fixture_moneyline_presence(session, fixture_ids: List[int]) -> Set[int]:
+    if not fixture_ids:
+        return set()
+    stmt = (
+        text(
+            """
+            select distinct fixture_id
+            from odds_outcomes
+            where fixture_id in :fixture_ids
+              and market_key in :market_keys
+            """
+        )
+        .bindparams(bindparam("fixture_ids", expanding=True))
+        .bindparams(bindparam("market_keys", expanding=True))
+    )
+    rows = session.execute(
+        stmt,
+        {"fixture_ids": fixture_ids, "market_keys": sorted(MONEYLINE_MARKET_KEYS)},
+    ).fetchall()
+    return {int(row[0]) for row in rows}
+
+
+def load_fixtures(session, league_ids: List[int], days_back: int, days_forward: int) -> List[Dict[str, object]]:
     if not league_ids:
         return []
-    start_dt, end_dt = fixture_window_bounds(days_forward)
+    start_dt, end_dt = fixture_window_bounds(days_back, days_forward)
     start_dt_sql = sqlite_utc_timestamp(start_dt)
     end_dt_sql = sqlite_utc_timestamp(end_dt)
     stmt = text(
@@ -633,6 +705,10 @@ def load_fixtures(session, league_ids: List[int], days_forward: int) -> List[Dic
             "end_dt": end_dt_sql,
         },
     ).fetchall()
+    moneyline_fixture_ids = load_fixture_moneyline_presence(
+        session,
+        [int(row.id) for row in rows if row.id],
+    )
 
     fixtures = []
     for row in rows:
@@ -655,6 +731,7 @@ def load_fixtures(session, league_ids: List[int], days_forward: int) -> List[Dic
                 "away_team_id": row.away_team_id,
                 "home_alias": home_alias,
                 "away_alias": away_alias,
+                "has_moneyline_odds": int(row.id) in moneyline_fixture_ids,
             }
         )
     return fixtures
@@ -705,12 +782,14 @@ def fetch_league_odds_payload(
     odds_league: str,
     league_fixtures: List[Dict[str, object]],
     sport: str,
+    days_back: int,
     days_forward: int,
     bookmakers: List[str],
     per_league_limit: int,
 ) -> LeagueResult:
     started = time.time()
     client = OddsApiClient()
+    historical_client: Optional[OddsApiClient] = None
     result = LeagueResult(
         league_id=league_id,
         league_name=odds_league,
@@ -722,14 +801,15 @@ def fetch_league_odds_payload(
     )
 
     try:
-        start_dt, end_dt = fixture_window_bounds(days_forward)
+        start_dt, end_dt = fixture_window_bounds(days_back, days_forward)
         params = {
             "sport": sport,
             "league": odds_league,
-            "status": "pending,live",
             "from": start_dt.isoformat() + "Z",
             "to": end_dt.isoformat() + "Z",
         }
+        if days_back <= 0:
+            params["status"] = "pending,live"
         events = client.request("events", params=params)
         if not isinstance(events, list):
             raise OddsApiError(f"Unexpected events response for league {odds_league}")
@@ -738,6 +818,7 @@ def fetch_league_odds_payload(
         result.events_returned = len(events)
 
         event_to_fixture: Dict[int, int] = {}
+        historical_backfill: List[Tuple[int, int]] = []
         for event in events:
             fixture = match_event_to_fixture(event, league_fixtures)
             if not fixture:
@@ -755,35 +836,64 @@ def fetch_league_odds_payload(
             event_id = event.get("id")
             if event_id is None:
                 continue
+            event_status = str(event.get("status") or "").strip().lower()
+            if event_status in SETTLED_EVENT_STATUSES:
+                if not bool(fixture.get("has_moneyline_odds")):
+                    historical_backfill.append((int(event_id), int(fixture["fixture_id"])))
+                continue
             event_to_fixture[int(event_id)] = int(fixture["fixture_id"])
 
-        result.events_matched = len(event_to_fixture)
-        if not event_to_fixture:
-            return result
+        result.events_matched = len(event_to_fixture) + len(historical_backfill)
+        if event_to_fixture:
+            event_ids = list(event_to_fixture.keys())
+            if per_league_limit > 0:
+                event_ids = event_ids[:per_league_limit]
+            batches = [event_ids[i : i + 10] for i in range(0, len(event_ids), 10)]
 
-        event_ids = list(event_to_fixture.keys())
-        if per_league_limit > 0:
-            event_ids = event_ids[:per_league_limit]
-        batches = [event_ids[i : i + 10] for i in range(0, len(event_ids), 10)]
+            for batch in batches:
+                odds_batch = client.request(
+                    "odds/multi",
+                    params={
+                        "eventIds": ",".join(str(event_id) for event_id in batch),
+                        "bookmakers": ",".join(bookmakers),
+                    },
+                )
+                if not isinstance(odds_batch, list):
+                    continue
+                for odds_event in odds_batch:
+                    event_id = odds_event.get("id")
+                    if event_id is None:
+                        continue
+                    fixture_id = event_to_fixture.get(int(event_id))
+                    if not fixture_id:
+                        continue
+                    bookmakers_payload = odds_event.get("bookmakers") or {}
+                    result.raw_odds_payloads[int(event_id)] = bookmakers_payload
+                    result.odds_records.append(
+                        {
+                            "event_id": int(event_id),
+                            "fixture_id": int(fixture_id),
+                            "bookmakers_payload": bookmakers_payload,
+                        }
+                    )
 
-        for batch in batches:
-            odds_batch = client.request(
-                "odds/multi",
-                params={
-                    "eventIds": ",".join(str(event_id) for event_id in batch),
-                    "bookmakers": ",".join(bookmakers),
-                },
-            )
-            if not isinstance(odds_batch, list):
-                continue
-            for odds_event in odds_batch:
-                event_id = odds_event.get("id")
-                if event_id is None:
+        if historical_backfill:
+            historical_client = OddsApiClient(base_url=HISTORICAL_ODDS_BASE_URL)
+            if per_league_limit > 0:
+                historical_backfill = historical_backfill[:per_league_limit]
+            for event_id, fixture_id in historical_backfill:
+                historical_payload = historical_client.request(
+                    "historical/odds",
+                    params={
+                        "eventId": str(event_id),
+                        "bookmakers": ",".join(bookmakers),
+                    },
+                )
+                if not isinstance(historical_payload, dict):
                     continue
-                fixture_id = event_to_fixture.get(int(event_id))
-                if not fixture_id:
+                bookmakers_payload = historical_payload.get("bookmakers") or {}
+                if not bookmakers_payload:
                     continue
-                bookmakers_payload = odds_event.get("bookmakers") or {}
                 result.raw_odds_payloads[int(event_id)] = bookmakers_payload
                 result.odds_records.append(
                     {
@@ -795,13 +905,22 @@ def fetch_league_odds_payload(
     except Exception as exc:
         result.error = exc
     finally:
+        stats_clients = [client]
+        if historical_client is not None:
+            stats_clients.append(historical_client)
         result.fetch_duration_seconds = round(time.time() - started, 2)
-        result.api_calls_made = client.stats.total_calls
-        result.api_calls_by_endpoint = dict(client.stats.calls_by_endpoint)
-        result.api_time_seconds = round(client.stats.api_time_seconds, 2)
-        result.rate_limit_hits = client.stats.rate_limit_hits
-        result.rate_limit_sleeps = client.stats.rate_limit_sleeps
-        result.last_rate_limit = client.stats.last_rate_limit
+        result.api_calls_made = sum(stats.stats.total_calls for stats in stats_clients)
+        result.api_calls_by_endpoint = {}
+        for api_client in stats_clients:
+            for endpoint, count in api_client.stats.calls_by_endpoint.items():
+                result.api_calls_by_endpoint[endpoint] = result.api_calls_by_endpoint.get(endpoint, 0) + int(count)
+        result.api_time_seconds = round(sum(stats.stats.api_time_seconds for stats in stats_clients), 2)
+        result.rate_limit_hits = sum(stats.stats.rate_limit_hits for stats in stats_clients)
+        result.rate_limit_sleeps = sum(stats.stats.rate_limit_sleeps for stats in stats_clients)
+        result.last_rate_limit = next(
+            (stats.stats.last_rate_limit for stats in reversed(stats_clients) if stats.stats.last_rate_limit),
+            None,
+        )
 
     return result
 
@@ -1214,12 +1333,13 @@ def delete_fixture_market_rows(
 def delete_invalid_goals_over_under(
     session,
     league_ids: Iterable[int],
+    days_back: int,
     days_forward: int,
 ) -> int:
     league_list = [int(value) for value in league_ids if value]
     if not league_list:
         return 0
-    start_dt, end_dt = fixture_window_bounds(days_forward)
+    start_dt, end_dt = fixture_window_bounds(days_back, days_forward)
     start_dt_sql = sqlite_utc_timestamp(start_dt)
     end_dt_sql = sqlite_utc_timestamp(end_dt)
     stmt = (
@@ -1907,6 +2027,7 @@ def parse_player_market_rows(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
+    parser.add_argument("--days-back", type=int, default=int(os.environ.get("ODDS_SYNC_DAYS_BACK", "0")))
     parser.add_argument("--days-forward", type=int, default=14)
     parser.add_argument(
         "--bookmakers",
@@ -2025,7 +2146,7 @@ def main() -> None:
                 log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
                 svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
 
-    fixtures = load_fixtures(session, league_ids, args.days_forward)
+    fixtures = load_fixtures(session, league_ids, args.days_back, args.days_forward)
     if args.priority:
         before = len(fixtures)
         fixtures = filter_fixtures_by_priority(fixtures, args.priority)
@@ -2160,6 +2281,7 @@ def main() -> None:
                     odds_league,
                     league_fixtures,
                     args.sport,
+                    args.days_back,
                     args.days_forward,
                     bookmakers,
                     args.limit,
@@ -2272,7 +2394,7 @@ def main() -> None:
 
     removed_invalid = 0
     if args.priority is None:
-        removed_invalid = delete_invalid_goals_over_under(session, league_ids, args.days_forward)
+        removed_invalid = delete_invalid_goals_over_under(session, league_ids, args.days_back, args.days_forward)
     if removed_invalid:
         log.warning("Removed %s invalid goals_over_under rows after sync.", removed_invalid)
         session.commit()
@@ -2321,6 +2443,8 @@ def main() -> None:
             "teams_sidelined_refreshed": len(sidelined_refreshed_team_ids),
             "priority": args.priority,
             "refresh_only": False,
+            "days_back": args.days_back,
+            "days_forward": args.days_forward,
             "fixtures_in_scope": len(fixtures),
             "leagues_in_scope": len(scoped_league_ids),
             "predicted_api_calls": predicted_calls,

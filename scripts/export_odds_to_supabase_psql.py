@@ -135,15 +135,24 @@ def market_clause_and_params(market_allowlist: Optional[Iterable[str]]) -> Tuple
     return f"and o.market_key in ({placeholders})", market_list
 
 
-def sqlite_window_bounds(days_forward: int) -> Tuple[str, str]:
-    start_dt = datetime.utcnow()
-    end_dt = start_dt + timedelta(days=days_forward)
+def sqlite_window_bounds(days_back: int, days_forward: int) -> Tuple[str, str]:
+    now_utc = datetime.utcnow()
+    start_dt = now_utc - timedelta(days=max(0, days_back))
+    end_dt = now_utc + timedelta(days=days_forward)
     fmt = "%Y-%m-%d %H:%M:%S"
     return start_dt.strftime(fmt), end_dt.strftime(fmt)
 
 
-def fetch_fixture_league_ids(conn: sqlite3.Connection, days_forward: int) -> List[int]:
-    start_dt, end_dt = sqlite_window_bounds(days_forward)
+def postgres_window_predicate(days_back: int, days_forward: int, table_alias: str = "f") -> str:
+    prefix = f"{table_alias}." if table_alias else ""
+    return (
+        f"{prefix}starting_at >= (now() at time zone 'utc') - interval '{days_back} days'\n"
+        f"    and {prefix}starting_at < (now() at time zone 'utc') + interval '{days_forward} days'"
+    )
+
+
+def fetch_fixture_league_ids(conn: sqlite3.Connection, days_back: int, days_forward: int) -> List[int]:
+    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward)
     cur = conn.cursor()
     cur.execute(
         """
@@ -295,6 +304,7 @@ def build_outcomes_csv(
     conn: sqlite3.Connection,
     league_ids: Iterable[int],
     market_allowlist: Optional[Iterable[str]],
+    days_back: int,
     days_forward: int,
     out_path: Path,
     progress_every: int,
@@ -304,7 +314,7 @@ def build_outcomes_csv(
     max_runtime_seconds: int,
     line_market_keys: Iterable[str],
 ) -> Tuple[int, bool, Optional[int]]:
-    start_dt, end_dt = sqlite_window_bounds(days_forward)
+    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward)
     params: List[object] = [start_dt, end_dt]
     league_clause = ""
     if league_ids:
@@ -496,9 +506,10 @@ def write_csv_summary(csv_path: Path, out_path: Path, top_n: int = 50) -> None:
 def count_invalid_goals_over_under(
     conn: sqlite3.Connection,
     league_ids: Iterable[int],
+    days_back: int,
     days_forward: int,
 ) -> int:
-    start_dt, end_dt = sqlite_window_bounds(days_forward)
+    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward)
     params: List[object] = [start_dt, end_dt]
     league_clause = ""
     if league_ids:
@@ -525,10 +536,11 @@ def count_invalid_goals_over_under(
 def fetch_sqlite_bookmaker_counts(
     conn: sqlite3.Connection,
     league_ids: Iterable[int],
+    days_back: int,
     days_forward: int,
     market_allowlist: Optional[Iterable[str]],
 ) -> Dict[str, int]:
-    start_dt, end_dt = sqlite_window_bounds(days_forward)
+    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward)
     params: List[object] = [start_dt, end_dt]
     league_clause = ""
     if league_ids:
@@ -559,6 +571,7 @@ def stage_and_upsert(
     csv_path: Path,
     league_label: str,
     league_ids: List[int],
+    days_back: int,
     days_forward: int,
     market_allowlist: Optional[Iterable[str]],
     keep_sql: bool,
@@ -597,8 +610,7 @@ def stage_and_upsert(
         f"with fixture_window as (\n"
         f"  select f.id, f.home_team_id, f.away_team_id\n"
         f"  from public.fixtures f\n"
-        f"  where f.starting_at >= (now() at time zone 'utc')\n"
-        f"    and f.starting_at < (now() at time zone 'utc') + interval '{days_forward} days'\n"
+        f"  where {postgres_window_predicate(days_back, days_forward, 'f')}\n"
         f"    {league_filter}\n"
         f")"
     )
@@ -1154,7 +1166,7 @@ select count(*)::bigint from deleted;
     return counts
 
 
-def coverage_query(days_forward: int, league_ids: List[int]) -> str:
+def coverage_query(days_back: int, days_forward: int, league_ids: List[int]) -> str:
     league_filter = ""
     if league_ids:
         league_filter = f"league_id = any({sql_array(league_ids)}) and"
@@ -1163,8 +1175,7 @@ with fixtures_in_range as (
   select id
   from public.fixtures
   where {league_filter}
-    starting_at >= (now() at time zone 'utc')
-    and starting_at < (now() at time zone 'utc') + interval '{days_forward} days'
+    {postgres_window_predicate(days_back, days_forward, '')}
 ), scoped as (
   select o.participant_id
   from public.odds_outcomes o
@@ -1179,7 +1190,7 @@ from scoped;
 """
 
 
-def bookmaker_counts_query(days_forward: int, league_ids: List[int]) -> str:
+def bookmaker_counts_query(days_back: int, days_forward: int, league_ids: List[int]) -> str:
     league_filter = ""
     if league_ids:
         league_filter = f"league_id = any({sql_array(league_ids)}) and"
@@ -1190,8 +1201,7 @@ select
 from public.odds_outcomes o
 join public.fixtures f on f.id = o.fixture_id
 where {league_filter}
-  f.starting_at >= (now() at time zone 'utc')
-  and f.starting_at < (now() at time zone 'utc') + interval '{days_forward} days'
+  {postgres_window_predicate(days_back, days_forward, 'f')}
 group by o.bookmaker_id
 order by o.bookmaker_id;
 """
@@ -1280,7 +1290,7 @@ def _hours_bucket(hours: float) -> str:
     return "168h+"
 
 
-def verification_queries(days_forward: int) -> List[str]:
+def verification_queries(days_back: int, days_forward: int) -> List[str]:
     queries = []
     queries.append(
         f"""
@@ -1289,8 +1299,7 @@ select
   count(*) filter (where participant_type='player' and participant_id is not null) as mapped_players
 from public.odds_outcomes o
 join public.fixtures f on f.id=o.fixture_id
-where f.starting_at >= (now() at time zone 'utc')
-  and f.starting_at < (now() at time zone 'utc') + interval '{days_forward} days';
+where {postgres_window_predicate(days_back, days_forward, 'f')};
 """
     )
     queries.append(
@@ -1300,8 +1309,7 @@ select market_key, line,
 from public.odds_outcomes o
 join public.fixtures f on f.id=o.fixture_id
 where market_key in ('player_shots','player_shots_on_target')
-  and f.starting_at >= (now() at time zone 'utc')
-  and f.starting_at < (now() at time zone 'utc') + interval '{days_forward} days'
+  and {postgres_window_predicate(days_back, days_forward, 'f')}
 group by market_key, line
 order by market_key, distinct_players desc
 limit 20;
@@ -1349,6 +1357,7 @@ select count(*)::bigint from deleted;
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
+    parser.add_argument("--days-back", type=int, default=int(os.environ.get("ODDS_EXPORT_DAYS_BACK", "2")))
     parser.add_argument("--days-forward", type=int, default=14)
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--csv-out", default="/tmp/odds_outcomes_export.csv")
@@ -1400,7 +1409,11 @@ def main() -> None:
     else:
         print(f"Market allowlist bypassed (ODDS_MARKET_ALLOWLIST={raw_allowlist or 'unset'})", flush=True)
     league_ids = parse_league_ids(args.leagues)
-    fixture_league_ids = fetch_fixture_league_ids(conn, args.days_forward) if args.include_fixture_leagues else []
+    fixture_league_ids = (
+        fetch_fixture_league_ids(conn, args.days_back, args.days_forward)
+        if args.include_fixture_leagues
+        else []
+    )
     effective_leagues = sorted({*league_ids, *fixture_league_ids})
 
     fixture_count = 0
@@ -1408,7 +1421,7 @@ def main() -> None:
     shot_market_keys = ("team_shots", "team_shots_on_target", "match_shots", "match_shots_on_target")
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
-        start_dt, end_dt = sqlite_window_bounds(args.days_forward)
+        start_dt, end_dt = sqlite_window_bounds(args.days_back, args.days_forward)
         fixture_count = conn.execute(
             f"""
             select count(*)
@@ -1424,7 +1437,7 @@ def main() -> None:
     sqlite_bookmaker_counts: Dict[str, int] = {}
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
-        start_dt, end_dt = sqlite_window_bounds(args.days_forward)
+        start_dt, end_dt = sqlite_window_bounds(args.days_back, args.days_forward)
         total_rows_all = conn.execute(
             f"""
             select count(*)
@@ -1450,6 +1463,7 @@ def main() -> None:
         sqlite_bookmaker_counts = fetch_sqlite_bookmaker_counts(
             conn,
             effective_leagues,
+            args.days_back,
             args.days_forward,
             market_allowlist,
         )
@@ -1463,7 +1477,7 @@ def main() -> None:
     warnings: List[str] = []
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
-        start_dt, end_dt = sqlite_window_bounds(args.days_forward)
+        start_dt, end_dt = sqlite_window_bounds(args.days_back, args.days_forward)
         market_clause, market_params = market_clause_and_params(market_allowlist)
         rows = conn.execute(
             f"""
@@ -1635,6 +1649,7 @@ def main() -> None:
         conn,
         effective_leagues,
         market_allowlist,
+        args.days_back,
         args.days_forward,
         Path(args.csv_out),
         args.progress_rows,
@@ -1660,6 +1675,7 @@ def main() -> None:
             invalid_goals_over_under = count_invalid_goals_over_under(
                 validation_conn,
                 effective_leagues,
+                args.days_back,
                 args.days_forward,
             )
         finally:
@@ -1709,6 +1725,7 @@ def main() -> None:
             Path(args.csv_out),
             league_label,
             effective_leagues,
+            args.days_back,
             args.days_forward,
             market_allowlist,
             args.keep_sql,
@@ -1774,7 +1791,7 @@ def main() -> None:
         try:
             bookmaker_out = run_psql(
                 DB_URL,
-                bookmaker_counts_query(args.days_forward, effective_leagues),
+                bookmaker_counts_query(args.days_back, args.days_forward, effective_leagues),
                 label="bookmaker_counts",
                 err_path=err_path,
                 out_path=out_path,
@@ -1787,7 +1804,7 @@ def main() -> None:
     coverage_mapped = 0
     coverage_pct = 0.0
     if ingest_ok and not args.skip_coverage:
-        coverage_sql = coverage_query(args.days_forward, effective_leagues)
+        coverage_sql = coverage_query(args.days_back, args.days_forward, effective_leagues)
         try:
             coverage_out = run_psql(
                 DB_URL,
@@ -1837,7 +1854,7 @@ def main() -> None:
 
     verification_outputs: List[str] = []
     if ingest_ok and not args.skip_verification:
-        for idx, query in enumerate(verification_queries(args.days_forward), start=1):
+        for idx, query in enumerate(verification_queries(args.days_back, args.days_forward), start=1):
             print(f"Verification query {idx} output:", flush=True)
             try:
                 out = run_psql(
@@ -1885,6 +1902,7 @@ def main() -> None:
         "start_time": start_iso,
         "end_time": end_iso,
         "runtime_seconds": round(end_time - start_time, 2),
+        "days_back": args.days_back,
         "window_days": args.days_forward,
         "fixture_count": fixture_count,
         "fixtures_in_window": fixture_count,
