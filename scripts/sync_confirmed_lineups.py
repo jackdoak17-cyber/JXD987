@@ -27,7 +27,7 @@ from export_to_supabase import (
 )
 from jxd import SportMonksClient, SyncService
 from jxd.db import get_engine, get_session
-from jxd.models import Fixture
+from jxd.models import Fixture, FixturePlayer, FixturePlayerStatistic
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -100,7 +100,6 @@ def fetch_candidate_fixture_ids(
         where starting_at >= :window_start
           and starting_at <= :window_end
           and coalesce(status, '') not in ('FT', 'AET', 'PEN', 'FT_PEN')
-          and coalesce(lineup_confirmed, 0) = 0
           {league_clause}
         order by starting_at asc
         limit :limit
@@ -143,6 +142,12 @@ def sync_confirmed_lineups(fixture_ids: Sequence[int]) -> tuple[List[int], List[
             if fixture:
                 fixture.lineup_confirmed = False
             continue
+        session.query(FixturePlayerStatistic).filter(
+            FixturePlayerStatistic.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
+        session.query(FixturePlayer).filter(
+            FixturePlayer.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
         svc._store_fixture_raw(data, log_changes=True)
         confirmed_ids.append(fixture_id)
 

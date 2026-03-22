@@ -26,9 +26,15 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import requests
 
+try:
+    import psycopg2
+except Exception:  # pragma: no cover - optional runtime dependency on some hosts
+    psycopg2 = None
+
 DB_PATH = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_DB_URL = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
 REST_PATH = "/rest/v1"
 ODDS_MIN_PRICE = float(os.environ.get("ODDS_MIN_PRICE", "1.0"))
 ODDS_MAX_PRICE = float(os.environ.get("ODDS_MAX_PRICE", "500"))
@@ -55,6 +61,27 @@ FIXTURE_CORE_TABLES = [
     "teams",
     "fixtures",
 ]
+FALLBACK_REMOTE_COLUMNS: Dict[str, Set[str]] = {
+    "fixture_players": {
+        "fixture_id",
+        "player_id",
+        "team_id",
+        "is_starter",
+        "minutes_played",
+        "position_name",
+        "detailed_position_id",
+        "detailed_position_name",
+        "detailed_position_code",
+        "formation_field",
+        "formation_position",
+        "lineup_detailed_position_id",
+        "lineup_detailed_position_name",
+        "lineup_detailed_position_code",
+        "position_abbr",
+    },
+}
+REMOTE_TABLE_COLUMNS_CACHE: Dict[str, Optional[Set[str]]] = {}
+REMOTE_TABLE_FILTER_LOGGED: Set[str] = set()
 
 
 def _valid_odds_price(value: object) -> bool:
@@ -94,6 +121,61 @@ def require_env(dry_run: bool) -> None:
         missing.append("SUPABASE_SERVICE_ROLE_KEY")
     if missing:
         raise SystemExit(f"Missing env vars: {', '.join(missing)}")
+
+
+def get_remote_table_columns(table: str) -> Optional[Set[str]]:
+    if table in REMOTE_TABLE_COLUMNS_CACHE:
+        return REMOTE_TABLE_COLUMNS_CACHE[table]
+
+    columns: Optional[Set[str]] = None
+    if SUPABASE_DB_URL and psycopg2 is not None:
+        conn = None
+        try:
+            conn = psycopg2.connect(SUPABASE_DB_URL)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                select column_name
+                from information_schema.columns
+                where table_schema = 'public'
+                  and table_name = %s
+                """,
+                (table,),
+            )
+            fetched = {str(row[0]) for row in cur.fetchall() if row and row[0]}
+            if fetched:
+                columns = fetched
+        except Exception as exc:  # pragma: no cover - best-effort schema discovery
+            log.warning("Remote schema discovery failed for %s: %s", table, exc)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    if not columns:
+        fallback = FALLBACK_REMOTE_COLUMNS.get(table)
+        if fallback:
+            columns = set(fallback)
+
+    REMOTE_TABLE_COLUMNS_CACHE[table] = columns
+    return columns
+
+
+def filter_rows_for_remote_schema(table: str, rows: List[Dict]) -> List[Dict]:
+    columns = get_remote_table_columns(table)
+    if not columns:
+        return rows
+
+    unsupported = sorted({key for row in rows for key in row.keys() if key not in columns})
+    if unsupported and table not in REMOTE_TABLE_FILTER_LOGGED:
+        log.info(
+            "Filtering unsupported %s columns for Supabase export: %s",
+            table,
+            ",".join(unsupported),
+        )
+        REMOTE_TABLE_FILTER_LOGGED.add(table)
+
+    filtered = [{key: value for key, value in row.items() if key in columns} for row in rows]
+    return [row for row in filtered if row]
 
 
 def get_conn() -> sqlite3.Connection:
@@ -664,6 +746,9 @@ def delete_fixture_rows(table: str, fixture_ids: Sequence[int], dry_run: bool) -
 
 
 def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) -> int:
+    if not rows:
+        return 0
+    rows = filter_rows_for_remote_schema(table, rows)
     if not rows:
         return 0
     if dry_run:
