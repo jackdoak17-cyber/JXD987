@@ -5,6 +5,22 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
+require_runtime_manifest_entries_or_exit "$0" \
+  "config/league_ids.txt" \
+  "jxd/__init__.py" \
+  "jxd/db.py" \
+  "jxd/models.py" \
+  "jxd/odds_api_client.py" \
+  "jxd/sportmonks_client.py" \
+  "jxd/sync.py" \
+  "scripts/preflight_supabase_psql.py" \
+  "scripts/rest_preflight.py" \
+  "scripts/sync_odds.py" \
+  "scripts/export_odds_to_supabase_psql.py" \
+  "scripts/odds_retention_psql.py" \
+  "scripts/reconcile_recent_fixtures.py" \
+  "scripts/export_to_supabase.py" \
+  "scripts/sync_confirmed_lineups.py"
 
 export REPO_ROOT
 export LEAGUES="${LEAGUE_IDS:-$(default_league_csv)}"

@@ -90,6 +90,36 @@ verify_runtime_manifest_or_exit() {
   log_info "runtime manifest verified release=$(runtime_release_id) entrypoint=$(basename "${entrypoint}")"
 }
 
+require_runtime_manifest_entries_or_exit() {
+  local entrypoint="${1:-unknown}"
+  shift || true
+
+  if [[ ! -f "${RUNTIME_MANIFEST_PATH}" ]]; then
+    log_error "runtime manifest missing while checking required entries for $(basename "${entrypoint}")"
+    exit 1
+  fi
+
+  local manifest_paths=""
+  manifest_paths="$(awk '{print $2}' "${RUNTIME_MANIFEST_PATH}" 2>/dev/null || true)"
+  if [[ -z "${manifest_paths}" ]]; then
+    log_error "runtime manifest unreadable while checking required entries for $(basename "${entrypoint}")"
+    exit 1
+  fi
+
+  local missing=0
+  local relpath
+  for relpath in "$@"; do
+    if ! printf '%s\n' "${manifest_paths}" | grep -Fxq "${relpath}"; then
+      log_error "runtime manifest missing required file for $(basename "${entrypoint}"): ${relpath}"
+      missing=1
+    fi
+  done
+
+  if [[ "${missing}" -ne 0 ]]; then
+    exit 1
+  fi
+}
+
 default_league_csv() {
   paste -sd, "${REPO_ROOT}/config/league_ids.txt"
 }
