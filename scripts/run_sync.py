@@ -94,8 +94,6 @@ def _check_eze_stats(session, league_ids: List[int]) -> None:
             max_stat_dt,
             max_fixture_dt,
         )
-
-
 @app.command()
 def main(
     leagues: str = typer.Option(
