@@ -207,6 +207,155 @@ GOAL_CONTRIBUTIONS_TYPE_ID = 200001
 GOAL_CONTRIBUTIONS_CODE = "goal_contributions"
 GOAL_CONTRIBUTIONS_NAME = "Goal Contributions"
 
+SHOTS_TOTAL_TYPE_ID = 42
+SHOTS_ON_TARGET_TYPE_ID = 86
+SHOTS_INSIDEBOX_TYPE_ID = 49
+TOTAL_CROSSES_TYPE_ID = 98
+ACCURATE_CROSSES_TYPE_ID = 99
+TACKLES_TYPE_ID = 78
+INTERCEPTIONS_TYPE_ID = 100
+CLEARANCES_TYPE_ID = 101
+BLOCKED_SHOTS_TYPE_ID = 97
+BALL_RECOVERY_TYPE_ID = 27271
+
+SHOT_ACCURACY_PERCENT_TYPE_ID = 200010
+SHOT_ACCURACY_PERCENT_CODE = "shot_accuracy_percent"
+SHOT_ACCURACY_PERCENT_NAME = "Shot Accuracy %"
+
+INSIDE_BOX_SHOT_SHARE_PERCENT_TYPE_ID = 200011
+INSIDE_BOX_SHOT_SHARE_PERCENT_CODE = "inside_box_shot_share_percent"
+INSIDE_BOX_SHOT_SHARE_PERCENT_NAME = "Inside Box Shot Share %"
+
+CROSS_ACCURACY_PERCENT_TYPE_ID = 200012
+CROSS_ACCURACY_PERCENT_CODE = "cross_accuracy_percent"
+CROSS_ACCURACY_PERCENT_NAME = "Cross Accuracy %"
+
+DEFENSIVE_INVOLVEMENT_TYPE_ID = 200013
+DEFENSIVE_INVOLVEMENT_CODE = "defensive_involvement"
+DEFENSIVE_INVOLVEMENT_NAME = "Defensive Involvement"
+
+DERIVED_PLAYER_RATIO_STATS = (
+    {
+        "type_id": SHOT_ACCURACY_PERCENT_TYPE_ID,
+        "code": SHOT_ACCURACY_PERCENT_CODE,
+        "name": SHOT_ACCURACY_PERCENT_NAME,
+        "numerator_type_id": SHOTS_ON_TARGET_TYPE_ID,
+        "denominator_type_id": SHOTS_TOTAL_TYPE_ID,
+    },
+    {
+        "type_id": CROSS_ACCURACY_PERCENT_TYPE_ID,
+        "code": CROSS_ACCURACY_PERCENT_CODE,
+        "name": CROSS_ACCURACY_PERCENT_NAME,
+        "numerator_type_id": ACCURATE_CROSSES_TYPE_ID,
+        "denominator_type_id": TOTAL_CROSSES_TYPE_ID,
+    },
+)
+
+DERIVED_TEAM_RATIO_STATS = (
+    {
+        "type_id": SHOT_ACCURACY_PERCENT_TYPE_ID,
+        "code": SHOT_ACCURACY_PERCENT_CODE,
+        "name": SHOT_ACCURACY_PERCENT_NAME,
+        "numerator_type_id": SHOTS_ON_TARGET_TYPE_ID,
+        "denominator_type_id": SHOTS_TOTAL_TYPE_ID,
+    },
+    {
+        "type_id": INSIDE_BOX_SHOT_SHARE_PERCENT_TYPE_ID,
+        "code": INSIDE_BOX_SHOT_SHARE_PERCENT_CODE,
+        "name": INSIDE_BOX_SHOT_SHARE_PERCENT_NAME,
+        "numerator_type_id": SHOTS_INSIDEBOX_TYPE_ID,
+        "denominator_type_id": SHOTS_TOTAL_TYPE_ID,
+    },
+    {
+        "type_id": CROSS_ACCURACY_PERCENT_TYPE_ID,
+        "code": CROSS_ACCURACY_PERCENT_CODE,
+        "name": CROSS_ACCURACY_PERCENT_NAME,
+        "numerator_type_id": ACCURATE_CROSSES_TYPE_ID,
+        "denominator_type_id": TOTAL_CROSSES_TYPE_ID,
+    },
+)
+
+DEFENSIVE_INVOLVEMENT_COMPONENT_TYPE_IDS = (
+    TACKLES_TYPE_ID,
+    INTERCEPTIONS_TYPE_ID,
+    CLEARANCES_TYPE_ID,
+    BALL_RECOVERY_TYPE_ID,
+    BLOCKED_SHOTS_TYPE_ID,
+)
+
+
+def _safe_ratio_percent(numerator: Optional[float], denominator: Optional[float]) -> Optional[float]:
+    if denominator is None or denominator <= 0:
+        return None
+    numerator_value = float(numerator or 0)
+    return round((numerator_value / float(denominator)) * 100.0, 4)
+
+
+def _upsert_fixture_player_derived_stat(
+    session: Session,
+    fixture_id: int,
+    player_id: int,
+    team_id: Optional[int],
+    type_id: int,
+    code: str,
+    name: str,
+    value: Optional[float],
+    extra: Dict,
+) -> None:
+    pk = (fixture_id, player_id, type_id, code)
+    obj = session.get(FixturePlayerStatistic, pk)
+    if value is None:
+        if obj:
+            session.delete(obj)
+        return
+    payload = {
+        "fixture_id": fixture_id,
+        "player_id": player_id,
+        "team_id": team_id,
+        "type_id": type_id,
+        "code": code,
+        "name": name,
+        "value": value,
+        "extra": extra,
+    }
+    if obj:
+        for k, v in payload.items():
+            setattr(obj, k, v)
+    else:
+        session.add(FixturePlayerStatistic(**payload))
+
+
+def _upsert_fixture_team_derived_stat(
+    session: Session,
+    fixture_id: int,
+    team_id: int,
+    type_id: int,
+    code: str,
+    name: str,
+    value: Optional[float],
+    extra: Dict,
+) -> None:
+    pk = (fixture_id, team_id, type_id, code, None)
+    obj = session.get(FixtureStatistic, pk)
+    if value is None:
+        if obj:
+            session.delete(obj)
+        return
+    payload = {
+        "fixture_id": fixture_id,
+        "team_id": team_id,
+        "type_id": type_id,
+        "code": code,
+        "name": name,
+        "location": None,
+        "value": value,
+        "extra": extra,
+    }
+    if obj:
+        for k, v in payload.items():
+            setattr(obj, k, v)
+    else:
+        session.add(FixtureStatistic(**payload))
 
 
 POSITION_ABBR_MAP = {
@@ -641,6 +790,7 @@ class SyncService:
         stats: Iterable[Dict],
         log_changes: bool = False,
     ) -> None:
+        team_stat_values: Dict[int, Dict[int, float]] = {}
         for s in stats or []:
             type_info = s.get("type") or {}
             type_id = s.get("type_id") or type_info.get("id")
@@ -653,6 +803,12 @@ class SyncService:
 
             if not team_id:
                 continue
+            if type_id is not None and value is not None:
+                bucket = team_stat_values.setdefault(team_id, {})
+                numeric_value = float(value)
+                current = bucket.get(type_id)
+                if current is None or numeric_value > current:
+                    bucket[type_id] = numeric_value
             pk = (fixture_id, team_id, type_id, code, location)
             obj = self.session.get(FixtureStatistic, pk)
             payload = {
@@ -706,6 +862,28 @@ class SyncService:
                     setattr(obj, k, v)
             else:
                 self.session.add(FixtureStatistic(**payload))
+
+        for team_id, stat_values in team_stat_values.items():
+            for meta in DERIVED_TEAM_RATIO_STATS:
+                numerator = stat_values.get(meta["numerator_type_id"])
+                denominator = stat_values.get(meta["denominator_type_id"])
+                _upsert_fixture_team_derived_stat(
+                    self.session,
+                    fixture_id,
+                    team_id,
+                    meta["type_id"],
+                    meta["code"],
+                    meta["name"],
+                    _safe_ratio_percent(numerator, denominator),
+                    {
+                        "source": "derived",
+                        "formula": "ratio_percent",
+                        "numerator_type_id": meta["numerator_type_id"],
+                        "denominator_type_id": meta["denominator_type_id"],
+                        "numerator_value": numerator,
+                        "denominator_value": denominator,
+                    },
+                )
 
     def _store_lineups(
         self,
@@ -844,28 +1022,68 @@ class SyncService:
             assists = _sum_stat_values(details, ASSISTS_TYPE_ID)
             if goals is not None or assists is not None:
                 derived_value = (goals or 0) + (assists or 0)
-                pk = (
+                _upsert_fixture_player_derived_stat(
+                    self.session,
                     fixture_id,
                     player_id,
+                    team_id,
                     GOAL_CONTRIBUTIONS_TYPE_ID,
                     GOAL_CONTRIBUTIONS_CODE,
+                    GOAL_CONTRIBUTIONS_NAME,
+                    derived_value,
+                    {"source": "derived", "goals": goals or 0, "assists": assists or 0},
                 )
-                obj_stat = self.session.get(FixturePlayerStatistic, pk)
-                payload_stat = {
-                    "fixture_id": fixture_id,
-                    "player_id": player_id,
-                    "team_id": team_id,
-                    "type_id": GOAL_CONTRIBUTIONS_TYPE_ID,
-                    "code": GOAL_CONTRIBUTIONS_CODE,
-                    "name": GOAL_CONTRIBUTIONS_NAME,
-                    "value": derived_value,
-                    "extra": {"source": "derived", "goals": goals or 0, "assists": assists or 0},
-                }
-                if obj_stat:
-                    for k, v in payload_stat.items():
-                        setattr(obj_stat, k, v)
-                else:
-                    self.session.add(FixturePlayerStatistic(**payload_stat))
+
+            for meta in DERIVED_PLAYER_RATIO_STATS:
+                numerator = _sum_stat_values(details, meta["numerator_type_id"])
+                denominator = _sum_stat_values(details, meta["denominator_type_id"])
+                _upsert_fixture_player_derived_stat(
+                    self.session,
+                    fixture_id,
+                    player_id,
+                    team_id,
+                    meta["type_id"],
+                    meta["code"],
+                    meta["name"],
+                    _safe_ratio_percent(numerator, denominator),
+                    {
+                        "source": "derived",
+                        "formula": "ratio_percent",
+                        "numerator_type_id": meta["numerator_type_id"],
+                        "denominator_type_id": meta["denominator_type_id"],
+                        "numerator_value": numerator,
+                        "denominator_value": denominator,
+                    },
+                )
+
+            defensive_components = []
+            for component_type_id in DEFENSIVE_INVOLVEMENT_COMPONENT_TYPE_IDS:
+                component_value = _sum_stat_values(details, component_type_id)
+                if component_value is not None:
+                    defensive_components.append((component_type_id, component_value))
+            defensive_total = (
+                float(sum(component_value for _, component_value in defensive_components))
+                if defensive_components
+                else None
+            )
+            _upsert_fixture_player_derived_stat(
+                self.session,
+                fixture_id,
+                player_id,
+                team_id,
+                DEFENSIVE_INVOLVEMENT_TYPE_ID,
+                DEFENSIVE_INVOLVEMENT_CODE,
+                DEFENSIVE_INVOLVEMENT_NAME,
+                defensive_total,
+                {
+                    "source": "derived",
+                    "formula": "sum",
+                    "component_type_ids": [type_id for type_id, _ in defensive_components],
+                    "component_values": {
+                        str(type_id): value for type_id, value in defensive_components
+                    },
+                },
+            )
 
     def _store_lineup_details_stats(
         self,
