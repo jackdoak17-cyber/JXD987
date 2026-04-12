@@ -1,4 +1,5 @@
 510f6bfec3d01f8accd957d5af037035752037a4  config/league_ids.txt
+a38668feb41cc566cfb9bc045b16ca078e0baf47  config/odds_api_leagues.json
 3fa4b803b0a2f65652e072debf1f1f11a20b8474  jxd/__init__.py
 ab454f2d7d5bf19375c139e5cfbdceb0fbf3268e  jxd/db.py
 fcdcb578db601c5d18ed75fe3ddc4dca41957ed1  jxd/models.py

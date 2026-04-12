@@ -1,4 +1,5 @@
 config/league_ids.txt
+config/odds_api_leagues.json
 jxd/__init__.py
 jxd/db.py
 jxd/models.py
