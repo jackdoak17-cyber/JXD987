@@ -34,6 +34,8 @@ export FIXTURE_REFRESH_DAYS_FORWARD="${FIXTURE_REFRESH_DAYS_FORWARD:-3}"
 export FIXTURE_EXPORT_DAYS_BACK="${FIXTURE_EXPORT_DAYS_BACK:-2}"
 export FIXTURE_EXPORT_DAYS_FORWARD="${FIXTURE_EXPORT_DAYS_FORWARD:-3}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
+export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
+export MONEYLINE_COVERAGE_MIN_PCT="${MONEYLINE_COVERAGE_MIN_PCT:-100}"
 
 if [[ "${RUN_COVERAGE}" == "true" || "${RUN_COVERAGE}" == "1" ]]; then
   export COVERAGE_ARGS=""
@@ -121,6 +123,14 @@ if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE
 else
   echo "Skipping recent fixture refresh/export; missing SportMonks or Supabase REST env" >&2
 fi
+
+# Step 6: Hard guard for the user-facing fixtures window.
+python scripts/validate_moneyline_coverage.py \
+  --leagues "${LEAGUES}" \
+  --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
+  --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
+  --out-json "/tmp/moneyline_coverage_report_p3.json" \
+  --out-md "/tmp/moneyline_coverage_report_p3.md"
 CHAIN
 )
 

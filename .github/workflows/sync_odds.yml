@@ -81,6 +81,12 @@ jobs:
             scripts/odds_retention_psql.py \
             scripts/patch_odds_participants_psql.py
 
+      - name: Run odds matcher regression tests
+        run: python -m unittest tests.test_sync_odds_matcher
+
+      - name: Run moneyline coverage validator unit tests
+        run: python -m unittest tests.test_validate_moneyline_coverage
+
       - name: Supabase DB preflight (psql)
         id: preflight
         continue-on-error: true
@@ -238,6 +244,30 @@ jobs:
         with:
           name: odds_ingest_report_${{ matrix.league_id }}
           path: /tmp/odds_ingest_report_${{ matrix.league_id }}.json
+          if-no-files-found: ignore
+
+      - name: Validate 7-day moneyline coverage
+        if: env.INGEST_OK == 'true'
+        env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          PGSSLMODE: require
+        run: |
+          python3 scripts/validate_moneyline_coverage.py \
+            --leagues "${{ matrix.league_id }}" \
+            --days-forward 7 \
+            --fail-below-pct 100 \
+            --out-json /tmp/moneyline_coverage_${{ matrix.league_id }}.json \
+            --out-md /tmp/moneyline_coverage_${{ matrix.league_id }}.md
+
+      - name: Upload moneyline coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moneyline_coverage_${{ matrix.league_id }}
+          path: |
+            /tmp/moneyline_coverage_${{ matrix.league_id }}.json
+            /tmp/moneyline_coverage_${{ matrix.league_id }}.md
           if-no-files-found: ignore
 
       - name: Upload odds ingest error

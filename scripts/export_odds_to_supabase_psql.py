@@ -1155,6 +1155,11 @@ select count(*)::bigint from deleted;
     }
     for line in output.splitlines():
         parts = line.split("\t")
+        if len(parts) >= 3 and all(part.strip().isdigit() for part in parts[:3]):
+            counts["upserted_total"] = int(parts[0])
+            counts["inserted"] = int(parts[1])
+            counts["updated"] = int(parts[2])
+            continue
         if len(parts) >= 2 and parts[0] in counts:
             try:
                 counts[parts[0]] = int(parts[1])

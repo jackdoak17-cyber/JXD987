@@ -102,6 +102,26 @@ jobs:
             --out-json /tmp/core_markets_report.json \
             --out-md /tmp/core_markets_report.md
 
+      - name: Moneyline coverage validation (next 7 days)
+        if: env.LEAGUE_IDS != ''
+        run: |
+          python3 scripts/validate_moneyline_coverage.py \
+            --leagues "$LEAGUE_IDS" \
+            --days-forward 7 \
+            --fail-below-pct 100 \
+            --out-json /tmp/moneyline_coverage_7d.json \
+            --out-md /tmp/moneyline_coverage_7d.md
+
+      - name: Moneyline coverage report (next 14 days)
+        if: env.LEAGUE_IDS != ''
+        run: |
+          python3 scripts/validate_moneyline_coverage.py \
+            --leagues "$LEAGUE_IDS" \
+            --days-forward 14 \
+            --fail-below-pct 0 \
+            --out-json /tmp/moneyline_coverage_14d.json \
+            --out-md /tmp/moneyline_coverage_14d.md
+
       - name: Build healthcheck report
         run: |
           python3 - <<'PY'
@@ -193,4 +213,16 @@ jobs:
           path: |
             /tmp/odds_health_report.json
             /tmp/odds_health_report.md
+          if-no-files-found: ignore
+
+      - name: Upload moneyline coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: moneyline_coverage_reports
+          path: |
+            /tmp/moneyline_coverage_7d.json
+            /tmp/moneyline_coverage_7d.md
+            /tmp/moneyline_coverage_14d.json
+            /tmp/moneyline_coverage_14d.md
           if-no-files-found: ignore

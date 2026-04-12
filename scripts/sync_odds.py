@@ -47,6 +47,8 @@ BOOKMAKER_CANONICAL = {
 }
 HISTORICAL_ODDS_BASE_URL = os.environ.get("ODDS_API_HISTORICAL_BASE") or "https://api.odds-api.io/v3"
 SETTLED_EVENT_STATUSES = {"settled", "finished", "final", "ended", "completed"}
+UPSTREAM_EVENT_WINDOW_PAD_HOURS = 72
+EXACT_NAME_KICKOFF_DRIFT_HOURS = 72
 MONEYLINE_MARKET_KEYS = {
     "moneyline",
     "match_result",
@@ -142,6 +144,8 @@ TEAM_NAME_ALIAS = {
     "sandefjordfotball": "sandefjord",
     "tromsoeil": "tromso",
     "fredrikstadfk": "fredrikstad",
+    "kasimpasa": "kasmpasa",
+    "kasimpasaistanbul": "kasmpasa",
     "rcceltavigo": "celtavigo",
     "staderennais": "rennes",
     "staderennaisfc": "rennes",
@@ -802,11 +806,13 @@ def fetch_league_odds_payload(
 
     try:
         start_dt, end_dt = fixture_window_bounds(days_back, days_forward)
+        event_start_dt = start_dt - timedelta(hours=UPSTREAM_EVENT_WINDOW_PAD_HOURS)
+        event_end_dt = end_dt + timedelta(hours=UPSTREAM_EVENT_WINDOW_PAD_HOURS)
         params = {
             "sport": sport,
             "league": odds_league,
-            "from": start_dt.isoformat() + "Z",
-            "to": end_dt.isoformat() + "Z",
+            "from": event_start_dt.isoformat() + "Z",
+            "to": event_end_dt.isoformat() + "Z",
         }
         if days_back <= 0:
             params["status"] = "pending,live"
@@ -945,6 +951,42 @@ def score_name_match(event_name: str, aliases: Iterable[str]) -> float:
     return best
 
 
+def fixture_has_placeholder_kickoff(value: Optional[datetime]) -> bool:
+    if value is None:
+        return False
+    return value.hour == 0 and value.minute == 0 and value.second == 0
+
+
+def kickoff_match_rank(
+    event_dt: Optional[datetime],
+    fixture_dt: Optional[datetime],
+    home_score: float,
+    away_score: float,
+) -> Optional[Tuple[int, float]]:
+    if event_dt is None or fixture_dt is None:
+        return 0, 0.0
+    delta_hours = abs((fixture_dt - event_dt).total_seconds()) / 3600.0
+    if delta_hours <= 3:
+        return 0, delta_hours
+    # SportMonks sometimes leaves upcoming kickoffs at 00:00:00 until a later refresh.
+    # When both team names are effectively exact, allow a wider window so those fixtures
+    # still ingest odds instead of being dropped on date mismatch alone.
+    if (
+        fixture_has_placeholder_kickoff(fixture_dt)
+        and home_score >= 0.95
+        and away_score >= 0.95
+        and delta_hours <= 36
+    ):
+        return 1, delta_hours
+    if (
+        home_score >= 0.95
+        and away_score >= 0.95
+        and delta_hours <= EXACT_NAME_KICKOFF_DRIFT_HOURS
+    ):
+        return 2, delta_hours
+    return None
+
+
 def match_event_to_fixture(event: Dict[str, object], fixtures: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
     if not fixtures:
         return None
@@ -960,20 +1002,36 @@ def match_event_to_fixture(event: Dict[str, object], fixtures: List[Dict[str, ob
     best = None
     best_score = 0.0
     best_min = 0.0
+    best_time_rank = 99
+    best_delta_hours = float("inf")
     second_best = 0.0
     for fixture in fixtures:
         fixture_dt = fixture.get("starting_at")
-        if event_dt and fixture_dt:
-            delta = abs((fixture_dt - event_dt).total_seconds())
-            if delta > 3 * 3600:
-                continue
         home_score = score_name_match(event_home, fixture.get("home_alias") or [])
         away_score = score_name_match(event_away, fixture.get("away_alias") or [])
+        time_match = kickoff_match_rank(event_dt, fixture_dt, home_score, away_score)
+        if time_match is None:
+            continue
+        time_rank, delta_hours = time_match
         combined = home_score + away_score
-        if combined > best_score:
+        if (
+            combined > best_score
+            or (
+                math.isclose(combined, best_score)
+                and (
+                    time_rank < best_time_rank
+                    or (
+                        time_rank == best_time_rank
+                        and delta_hours < best_delta_hours
+                    )
+                )
+            )
+        ):
             second_best = best_score
             best_score = combined
             best_min = min(home_score, away_score)
+            best_time_rank = time_rank
+            best_delta_hours = delta_hours
             best = fixture
 
     if not best:
