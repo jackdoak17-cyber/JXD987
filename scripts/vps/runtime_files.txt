@@ -1,4 +1,5 @@
 config/league_ids.txt
+# Keep Odds API league mappings in every VPS deploy so new league IDs do not get skipped.
 config/odds_api_leagues.json
 jxd/__init__.py
 jxd/db.py
