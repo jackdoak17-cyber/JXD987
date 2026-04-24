@@ -48,3 +48,4 @@ Rules:
 ### 2026-04-24
 - Layer 4 direction confirmed: opponent adjustment defaults to **shots conceded strength** (Option B).
 - Added DB migration to support storing separate multipliers per opponent metric (`league_position`, `conceded_rank`, `possession_rank`) via `opponent_metric` column and updated PK.
+- Upgraded multipliers to be **line-based** (1+/2+/3+) so the adjustment matches the betting market, not raw per-game averages.
