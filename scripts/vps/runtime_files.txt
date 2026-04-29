@@ -19,4 +19,5 @@ scripts/vps/common.sh
 scripts/vps/run_p1.sh
 scripts/vps/run_p2.sh
 scripts/vps/run_p3.sh
+scripts/vps/run_models.sh
 scripts/vps/run_sync.sh

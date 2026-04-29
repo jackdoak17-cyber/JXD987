@@ -43,6 +43,15 @@ else
   export COVERAGE_ARGS="--skip-coverage --skip-verification"
 fi
 
+# Opportunistic publish of betting picks (Models -> Supabase).
+# This ensures picks are refreshed after the heaviest ingestion step completes,
+# even if the standalone `run_models.sh` cron tick was skipped due to the lock.
+export RUN_MODELS_PUBLISH="${RUN_MODELS_PUBLISH:-true}"
+export MODELS_PUBLISH_AFTER_P3="${MODELS_PUBLISH_AFTER_P3:-true}"
+export MODELS_REPO_ROOT="${MODELS_REPO_ROOT:-/opt/odds-sync/Models}"
+export MODELS_ENV_PATH="${MODELS_ENV_PATH:-${REPO_ROOT}/.env}"
+export MODELS_TOP="${MODELS_TOP:-50}"
+
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
 
@@ -131,6 +140,23 @@ python scripts/validate_moneyline_coverage.py \
   --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
   --out-json "/tmp/moneyline_coverage_report_p3.json" \
   --out-md "/tmp/moneyline_coverage_report_p3.md"
+
+# Step 7: Best-effort betting picks publish (uses odds already ingested into Supabase).
+if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; then
+  if [[ "${MODELS_PUBLISH_AFTER_P3}" == "true" || "${MODELS_PUBLISH_AFTER_P3}" == "1" ]]; then
+    if [[ -d "${MODELS_REPO_ROOT}" ]]; then
+      cd "${MODELS_REPO_ROOT}"
+      if [[ -f .venv/bin/activate ]]; then
+        # shellcheck disable=SC1091
+        source .venv/bin/activate
+      fi
+      node scripts/create_betting_picks_tables.mjs --env "${MODELS_ENV_PATH}"
+      python3 ml/publish_betting_picks_to_supabase.py --env "${MODELS_ENV_PATH}" --top "${MODELS_TOP}"
+    else
+      echo "Skipping models publish; Models repo missing at ${MODELS_REPO_ROOT}" >&2
+    fi
+  fi
+fi
 CHAIN
 )
 

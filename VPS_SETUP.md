@@ -30,6 +30,14 @@ New operational vars:
 - `HEALTHCHECK_PING_URL_P1=` (optional)
 - `HEALTHCHECK_PING_URL_P2=` (optional)
 - `HEALTHCHECK_PING_URL_P3=` (optional)
+- `HEALTHCHECK_PING_URL_MODELS=` (optional)
+
+Models publish vars (betting picks):
+- `MODELS_REPO_ROOT=/opt/odds-sync/Models` (default)
+- `MODELS_ENV_PATH=/opt/odds-sync/JXD987/.env` (default)
+- `MODELS_MAX_DURATION_SECONDS=900` (default)
+- `MODELS_TOP=50` (default)
+- `MODELS_PUBLISH_R2=true|false` (default true; requires `CLOUDFLARE_R2_*` when enabled)
 
 ## 3) Wrapper scripts
 Location:
@@ -85,6 +93,10 @@ Cron entries:
 */2 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
 */5 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
 */20 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
+
+# Betting picks publish (Models -> Supabase, optional R2 fallback).
+# Shares the same global lock as P3 and will skip while ingestion is running.
+*/15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models.sh >> /var/log/models-publish.log 2>&1
 ```
 
 Important:

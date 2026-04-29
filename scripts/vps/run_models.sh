@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=./common.sh
+source "${SCRIPT_DIR}/common.sh"
+verify_runtime_manifest_or_exit "$0"
+require_runtime_manifest_entries_or_exit "$0" \
+  "scripts/vps/common.sh" \
+  "scripts/vps/run_models.sh"
+
+# This wrapper publishes betting picks into Supabase (and optionally R2) by running the
+# publisher inside the Models repo. It intentionally shares the same global lock as the
+# odds sync pipeline, so it never overlaps with P3 ingestion.
+#
+# Expected VPS layout (defaults):
+# - JXD987 repo:  /opt/odds-sync/JXD987
+# - Models repo: /opt/odds-sync/Models
+#
+# Override paths via env:
+# - MODELS_REPO_ROOT
+# - MODELS_ENV_PATH
+#
+# Runtime knobs:
+# - MODELS_MAX_DURATION_SECONDS (defaults to 900)
+# - MODELS_TOP (defaults to 50)
+# - MODELS_PUBLISH_R2 (true/false, defaults to true)
+
+export MODELS_REPO_ROOT="${MODELS_REPO_ROOT:-/opt/odds-sync/Models}"
+export MODELS_ENV_PATH="${MODELS_ENV_PATH:-${REPO_ROOT}/.env}"
+export MODELS_TOP="${MODELS_TOP:-50}"
+export MODELS_PUBLISH_R2="${MODELS_PUBLISH_R2:-true}"
+
+# Reuse the global lock helper, but allow a separate timeout for model publishing.
+export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${MODELS_MAX_DURATION_SECONDS:-900}"
+
+CHAIN_COMMAND=$(cat <<'CHAIN'
+set -euo pipefail
+
+if [[ ! -d "${MODELS_REPO_ROOT}" ]]; then
+  echo "Models repo not found at ${MODELS_REPO_ROOT}. Set MODELS_REPO_ROOT." >&2
+  exit 1
+fi
+
+cd "${MODELS_REPO_ROOT}"
+
+# Optional venv (recommended on VPS).
+if [[ -f .venv/bin/activate ]]; then
+  # shellcheck disable=SC1091
+  source .venv/bin/activate
+fi
+
+python3 -V >/dev/null
+node -v >/dev/null
+
+if [[ -f ./.env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source ./.env
+  set +a
+fi
+
+# Ensure the publisher tables exist and grants are applied.
+node scripts/create_betting_picks_tables.mjs --env "${MODELS_ENV_PATH}"
+
+# Publish the latest picks into Supabase (primary feed).
+python3 ml/publish_betting_picks_to_supabase.py \
+  --env "${MODELS_ENV_PATH}" \
+  --top "${MODELS_TOP}"
+
+# Optional: publish to R2 as a fallback/archive if credentials are present.
+if [[ "${MODELS_PUBLISH_R2}" == "true" || "${MODELS_PUBLISH_R2}" == "1" ]]; then
+  if [[ -n "${CLOUDFLARE_R2_BUCKET:-}" && -n "${CLOUDFLARE_R2_ACCOUNT_ID:-}" && -n "${CLOUDFLARE_R2_ACCESS_KEY_ID:-}" && -n "${CLOUDFLARE_R2_SECRET_ACCESS_KEY:-}" ]]; then
+    python3 ml/publish_betting_picks_to_r2.py \
+      --bucket "${CLOUDFLARE_R2_BUCKET}" \
+      --prefix betting-picks \
+      --top "${MODELS_TOP}"
+  else
+    echo "Skipping R2 publish; missing CLOUDFLARE_R2_* env vars." >&2
+  fi
+fi
+CHAIN
+)
+
+status=0
+run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_MODELS:-${HEALTHCHECK_PING_URL:-}}"
+
