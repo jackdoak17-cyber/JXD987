@@ -36,6 +36,8 @@ Models publish vars (betting picks):
 - `MODELS_REPO_ROOT=/opt/odds-sync/Models` (default)
 - `MODELS_ENV_PATH=/opt/odds-sync/JXD987/.env` (default)
 - `MODELS_MAX_DURATION_SECONDS=900` (default)
+- `MODELS_TRAIN_TIMEOUT_SECONDS=14400` (default)
+- `MODELS_SNAPSHOT_TIMEOUT_SECONDS=1200` (default)
 - `MODELS_TOP=50` (default)
 - `MODELS_PUBLISH_R2=true|false` (default true; requires `CLOUDFLARE_R2_*` when enabled)
 
@@ -88,7 +90,31 @@ Path B is enforced:
 - P2: fetch-only + best-effort confirmed-lineup refresh for imminent fixtures
 - P3: SportMonks refresh + fetch + ingest + retention + best-effort lightweight recent fixture refresh/export
 
-Cron entries:
+### Conservative production schedule for Supabase Micro
+
+Use this schedule while the production Supabase project is on Micro compute or while `odds_outcomes` / `fixture_player_statistics` have high dead-row counts. It prioritizes site stability over near-real-time odds freshness.
+
+```cron
+*/10 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
+*/15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
+7,37 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
+
+# Betting picks publish (Models -> Supabase, optional R2 fallback).
+# Shares the same global lock as P3 and will skip while ingestion is running.
+22 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models.sh >> /var/log/models-publish.log 2>&1
+
+# Odds snapshots for ML enrichment (R2).
+15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models_snapshots_open.sh >> /var/log/models-snapshot-open.log 2>&1
+5,35 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models_snapshots_close.sh >> /var/log/models-snapshot-close.log 2>&1
+
+# Weekly full retrain + publish (Tuesday 01:15 UTC).
+15 1 * * 2 cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models_train_weekly.sh >> /var/log/models-train-weekly.log 2>&1
+```
+
+### Aggressive schedule for larger Supabase compute
+
+Only use this after Supabase has enough IO/CPU headroom and the hot tables have been vacuumed/reindexed.
+
 ```cron
 */2 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
 */5 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
@@ -97,6 +123,13 @@ Cron entries:
 # Betting picks publish (Models -> Supabase, optional R2 fallback).
 # Shares the same global lock as P3 and will skip while ingestion is running.
 */15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models.sh >> /var/log/models-publish.log 2>&1
+
+# Odds snapshots for ML enrichment (R2).
+15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models_snapshots_open.sh >> /var/log/models-snapshot-open.log 2>&1
+*/10 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models_snapshots_close.sh >> /var/log/models-snapshot-close.log 2>&1
+
+# Weekly full retrain + publish (Tuesday 01:15 UTC).
+15 1 * * 2 cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models_train_weekly.sh >> /var/log/models-train-weekly.log 2>&1
 ```
 
 Important:
