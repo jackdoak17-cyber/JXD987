@@ -46,11 +46,18 @@ fi
 # Opportunistic publish of betting picks (Models -> Supabase).
 # This ensures picks are refreshed after the heaviest ingestion step completes,
 # even if the standalone `run_models.sh` cron tick was skipped due to the lock.
-export RUN_MODELS_PUBLISH="${RUN_MODELS_PUBLISH:-true}"
-export MODELS_PUBLISH_AFTER_P3="${MODELS_PUBLISH_AFTER_P3:-true}"
+export RUN_MODELS_PUBLISH="${RUN_MODELS_PUBLISH:-false}"
+export MODELS_PUBLISH_AFTER_P3="${MODELS_PUBLISH_AFTER_P3:-false}"
 export MODELS_REPO_ROOT="${MODELS_REPO_ROOT:-/opt/odds-sync/Models}"
 export MODELS_ENV_PATH="${MODELS_ENV_PATH:-${REPO_ROOT}/.env}"
 export MODELS_TOP="${MODELS_TOP:-50}"
+export MODELS_FIXTURE_LIMIT="${MODELS_FIXTURE_LIMIT:-20}"
+export MODELS_PLAYERS_LIMIT="${MODELS_PLAYERS_LIMIT:-20}"
+export MODELS_PLAYER_REQUIRE_POSITIVE_EV="${MODELS_PLAYER_REQUIRE_POSITIVE_EV:-false}"
+export MODELS_PLAYER_VALUE_ODDS_MIN="${MODELS_PLAYER_VALUE_ODDS_MIN:-1.0}"
+export MODELS_PLAYER_HIGH_ODDS_MIN="${MODELS_PLAYER_HIGH_ODDS_MIN:-1.0}"
+export MODELS_PLAYER_HIGH_PROB_MIN="${MODELS_PLAYER_HIGH_PROB_MIN:-0.55}"
+export MODELS_PLAYER_HIGH_HIT_RATE_MIN="${MODELS_PLAYER_HIGH_HIT_RATE_MIN:-0.5}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
@@ -151,7 +158,16 @@ if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; th
         source .venv/bin/activate
       fi
       node scripts/create_betting_picks_tables.mjs --env "${MODELS_ENV_PATH}"
-      python3 ml/publish_betting_picks_to_supabase.py --env "${MODELS_ENV_PATH}" --top "${MODELS_TOP}"
+      python3 ml/publish_betting_picks_to_supabase.py \
+        --env "${MODELS_ENV_PATH}" \
+        --top "${MODELS_TOP}" \
+        --fixtureLimit "${MODELS_FIXTURE_LIMIT}" \
+        --playersLimit "${MODELS_PLAYERS_LIMIT}" \
+        --playerRequirePositiveEv "${MODELS_PLAYER_REQUIRE_POSITIVE_EV}" \
+        --playerValueOddsMin "${MODELS_PLAYER_VALUE_ODDS_MIN}" \
+        --playerHighOddsMin "${MODELS_PLAYER_HIGH_ODDS_MIN}" \
+        --playerHighProbMin "${MODELS_PLAYER_HIGH_PROB_MIN}" \
+        --playerHighHitRateMin "${MODELS_PLAYER_HIGH_HIT_RATE_MIN}"
     else
       echo "Skipping models publish; Models repo missing at ${MODELS_REPO_ROOT}" >&2
     fi
