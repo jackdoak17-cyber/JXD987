@@ -29,6 +29,10 @@ require_runtime_manifest_entries_or_exit "$0" \
 export MODELS_REPO_ROOT="${MODELS_REPO_ROOT:-/opt/odds-sync/Models}"
 export MODELS_ENV_PATH="${MODELS_ENV_PATH:-${REPO_ROOT}/.env}"
 export MODELS_TOP="${MODELS_TOP:-50}"
+export MODELS_FIXTURE_LIMIT="${MODELS_FIXTURE_LIMIT:-2}"
+export MODELS_PLAYERS_LIMIT="${MODELS_PLAYERS_LIMIT:-20}"
+export MODELS_SKIP_PLAYER_AI="${MODELS_SKIP_PLAYER_AI:-true}"
+export MODELS_SKIP_TEAM_AI="${MODELS_SKIP_TEAM_AI:-true}"
 export MODELS_PUBLISH_R2="${MODELS_PUBLISH_R2:-true}"
 
 # Reuse the global lock helper, but allow a separate timeout for model publishing.
@@ -66,7 +70,9 @@ node scripts/create_betting_picks_tables.mjs --env "${MODELS_ENV_PATH}"
 # Publish the latest picks into Supabase (primary feed).
 python3 ml/publish_betting_picks_to_supabase.py \
   --env "${MODELS_ENV_PATH}" \
-  --top "${MODELS_TOP}"
+  --top "${MODELS_TOP}" \
+  --fixtureLimit "${MODELS_FIXTURE_LIMIT}" \
+  --playersLimit "${MODELS_PLAYERS_LIMIT}"
 
 # Optional: publish to R2 as a fallback/archive if credentials are present.
 if [[ "${MODELS_PUBLISH_R2}" == "true" || "${MODELS_PUBLISH_R2}" == "1" ]]; then
@@ -74,7 +80,9 @@ if [[ "${MODELS_PUBLISH_R2}" == "true" || "${MODELS_PUBLISH_R2}" == "1" ]]; then
     python3 ml/publish_betting_picks_to_r2.py \
       --bucket "${CLOUDFLARE_R2_BUCKET}" \
       --prefix betting-picks \
-      --top "${MODELS_TOP}"
+      --top "${MODELS_TOP}" \
+      --fixtureLimit "${MODELS_FIXTURE_LIMIT}" \
+      --playersLimit "${MODELS_PLAYERS_LIMIT}"
   else
     echo "Skipping R2 publish; missing CLOUDFLARE_R2_* env vars." >&2
   fi
@@ -85,4 +93,3 @@ CHAIN
 status=0
 run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
 finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_MODELS:-${HEALTHCHECK_PING_URL:-}}"
-
