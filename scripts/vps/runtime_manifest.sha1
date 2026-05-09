@@ -17,6 +17,6 @@ a1b2e580c78cc5cbc26705c9144fd6b4d2d2b05b  scripts/rest_preflight.py
 b52ac8c0d3eef0864e91e8d4172203f7e498aff9  scripts/vps/common.sh
 9fc2659d5b08332596aea15b9be48e9873cf9a98  scripts/vps/run_p1.sh
 e28b38c4e9512833a204fabb15e8a9ba57092576  scripts/vps/run_p2.sh
-c5485cb88ab99cd7069b7d9cceda5c04f0bc9557  scripts/vps/run_p3.sh
-e483a64c315dbf4ac27568e38ce16d433b6c11a4  scripts/vps/run_models.sh
+f675b7a8c269093eb5e7e52025bf299b2436835c  scripts/vps/run_p3.sh
+c1e2db2eb593edf8e11a2a8a62b7a149d4b3b59c  scripts/vps/run_models.sh
 27f37f6efa5ceaf33779ff4dc40238b3b9a3db5e  scripts/vps/run_sync.sh
