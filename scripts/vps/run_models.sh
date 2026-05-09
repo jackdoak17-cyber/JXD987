@@ -31,6 +31,11 @@ export MODELS_ENV_PATH="${MODELS_ENV_PATH:-${REPO_ROOT}/.env}"
 export MODELS_TOP="${MODELS_TOP:-50}"
 export MODELS_FIXTURE_LIMIT="${MODELS_FIXTURE_LIMIT:-20}"
 export MODELS_PLAYERS_LIMIT="${MODELS_PLAYERS_LIMIT:-20}"
+export MODELS_PLAYER_REQUIRE_POSITIVE_EV="${MODELS_PLAYER_REQUIRE_POSITIVE_EV:-true}"
+export MODELS_PLAYER_VALUE_ODDS_MIN="${MODELS_PLAYER_VALUE_ODDS_MIN:-1.0}"
+export MODELS_PLAYER_HIGH_ODDS_MIN="${MODELS_PLAYER_HIGH_ODDS_MIN:-1.0}"
+export MODELS_PLAYER_HIGH_PROB_MIN="${MODELS_PLAYER_HIGH_PROB_MIN:-0.8}"
+export MODELS_PLAYER_HIGH_HIT_RATE_MIN="${MODELS_PLAYER_HIGH_HIT_RATE_MIN:-0.8}"
 export MODELS_SKIP_PLAYER_AI="${MODELS_SKIP_PLAYER_AI:-true}"
 export MODELS_SKIP_TEAM_AI="${MODELS_SKIP_TEAM_AI:-true}"
 export MODELS_PUBLISH_R2="${MODELS_PUBLISH_R2:-true}"
@@ -72,7 +77,12 @@ python3 ml/publish_betting_picks_to_supabase.py \
   --env "${MODELS_ENV_PATH}" \
   --top "${MODELS_TOP}" \
   --fixtureLimit "${MODELS_FIXTURE_LIMIT}" \
-  --playersLimit "${MODELS_PLAYERS_LIMIT}"
+  --playersLimit "${MODELS_PLAYERS_LIMIT}" \
+  --playerRequirePositiveEv "${MODELS_PLAYER_REQUIRE_POSITIVE_EV}" \
+  --playerValueOddsMin "${MODELS_PLAYER_VALUE_ODDS_MIN}" \
+  --playerHighOddsMin "${MODELS_PLAYER_HIGH_ODDS_MIN}" \
+  --playerHighProbMin "${MODELS_PLAYER_HIGH_PROB_MIN}" \
+  --playerHighHitRateMin "${MODELS_PLAYER_HIGH_HIT_RATE_MIN}"
 
 # Optional: publish to R2 as a fallback/archive if credentials are present.
 if [[ "${MODELS_PUBLISH_R2}" == "true" || "${MODELS_PUBLISH_R2}" == "1" ]]; then
