@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
 require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
+  "config/odds_api_leagues.json" \
   "jxd/__init__.py" \
   "jxd/db.py" \
   "jxd/models.py" \
@@ -17,9 +18,10 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/sync_confirmed_lineups.py"
 
 export REPO_ROOT
-export LEAGUES="${LEAGUE_IDS:-$(default_league_csv)}"
+export STATS_LEAGUES="${STATS_LEAGUE_IDS:-${LEAGUE_IDS:-$(default_league_csv)}}"
+export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
-export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Kambi,Paddy Power}"
+export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
 export LINEUP_SYNC_HOURS_BACK="${LINEUP_SYNC_HOURS_BACK:-2}"
 export LINEUP_SYNC_HOURS_FORWARD="${LINEUP_SYNC_HOURS_FORWARD:-3}"
 export LINEUP_SYNC_LIMIT="${LINEUP_SYNC_LIMIT:-40}"
@@ -38,7 +40,7 @@ if [[ -f ./.env ]]; then
 fi
 
 python scripts/sync_odds.py \
-  --leagues "${LEAGUES}" \
+  --leagues "${ODDS_LEAGUES}" \
   --days-forward "${DAYS_FORWARD}" \
   --priority p2 \
   --bookmakers "${ODDS_BOOKMAKERS}" \
@@ -48,7 +50,7 @@ python scripts/sync_odds.py \
 # Best-effort confirmed-lineup refresh for imminent fixtures.
 if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   if ! python scripts/sync_confirmed_lineups.py \
-    --leagues "${LEAGUES}" \
+    --leagues "${STATS_LEAGUES}" \
     --hours-back "${LINEUP_SYNC_HOURS_BACK}" \
     --hours-forward "${LINEUP_SYNC_HOURS_FORWARD}" \
     --limit "${LINEUP_SYNC_LIMIT}"; then

@@ -13,6 +13,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/odds_api_client.py" \
   "jxd/sportmonks_client.py" \
   "jxd/sync.py" \
+  "config/odds_api_leagues.json" \
   "scripts/preflight_supabase_psql.py" \
   "scripts/rest_preflight.py" \
   "scripts/sync_odds.py" \
@@ -23,7 +24,8 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/sync_confirmed_lineups.py"
 
 export REPO_ROOT
-export LEAGUES="${LEAGUE_IDS:-$(default_league_csv)}"
+export STATS_LEAGUES="${STATS_LEAGUE_IDS:-${LEAGUE_IDS:-$(default_league_csv)}}"
+export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export ODDS_SYNC_DAYS_BACK="${ODDS_SYNC_DAYS_BACK:-2}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
 export INGEST_MAX_RUNTIME_MINUTES="${ODDS_INGEST_MAX_RUNTIME_MINUTES:-25}"
@@ -38,7 +40,7 @@ export FIXTURE_EXPORT_DAYS_FORWARD="${FIXTURE_EXPORT_DAYS_FORWARD:-3}"
 export LINEUP_SYNC_HOURS_BACK="${LINEUP_SYNC_HOURS_BACK:-2}"
 export LINEUP_SYNC_HOURS_FORWARD="${LINEUP_SYNC_HOURS_FORWARD:-3}"
 export LINEUP_SYNC_LIMIT="${LINEUP_SYNC_LIMIT:-40}"
-export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Kambi,Paddy Power}"
+export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 
 if [[ "${RUN_COVERAGE}" == "true" || "${RUN_COVERAGE}" == "1" ]]; then
@@ -63,7 +65,7 @@ fi
 export SUPABASE_DB_URL_SESSION="${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}"
 export PGSSLMODE="${PGSSLMODE:-require}"
 
-for league_id in ${LEAGUES//,/ }; do
+for league_id in ${ODDS_LEAGUES//,/ }; do
   python scripts/preflight_supabase_psql.py \
     --league-id "${league_id}" \
     --report-out "/tmp/odds_preflight_${league_id}.json" \
@@ -108,13 +110,13 @@ python scripts/odds_retention_psql.py \
 # Best-effort recent fixture refresh/export. Do not fail the odds chain on transient fixture sync issues.
 if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   if python scripts/reconcile_recent_fixtures.py \
-    --leagues "${LEAGUES}" \
+    --leagues "${STATS_LEAGUES}" \
     --days-back "${FIXTURE_REFRESH_DAYS_BACK}" \
     --days-forward "${FIXTURE_REFRESH_DAYS_FORWARD}" \
     --with-details; then
     if ! python scripts/export_to_supabase.py \
       --strict \
-      --leagues "${LEAGUES}" \
+      --leagues "${STATS_LEAGUES}" \
       --days-back "${FIXTURE_EXPORT_DAYS_BACK}" \
       --upcoming-days "${FIXTURE_EXPORT_DAYS_FORWARD}" \
       --skip-odds-snapshots \
@@ -132,7 +134,7 @@ fi
 # Best-effort confirmed-lineup refresh for imminent fixtures.
 if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   if ! python scripts/sync_confirmed_lineups.py \
-    --leagues "${LEAGUES}" \
+    --leagues "${STATS_LEAGUES}" \
     --hours-back "${LINEUP_SYNC_HOURS_BACK}" \
     --hours-forward "${LINEUP_SYNC_HOURS_FORWARD}" \
     --limit "${LINEUP_SYNC_LIMIT}"; then

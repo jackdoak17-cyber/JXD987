@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
 require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
+  "config/odds_api_leagues.json" \
   "jxd/__init__.py" \
   "jxd/db.py" \
   "jxd/models.py" \
@@ -16,9 +17,9 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/sync_odds.py"
 
 export REPO_ROOT
-export LEAGUES="${LEAGUE_IDS:-$(default_league_csv)}"
+export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
-export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Kambi,Paddy Power}"
+export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
@@ -34,7 +35,7 @@ if [[ -f ./.env ]]; then
 fi
 
 python scripts/sync_odds.py \
-  --leagues "${LEAGUES}" \
+  --leagues "${ODDS_LEAGUES}" \
   --days-forward "${DAYS_FORWARD}" \
   --priority p1 \
   --bookmakers "${ODDS_BOOKMAKERS}" \

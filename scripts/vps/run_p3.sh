@@ -13,6 +13,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/odds_api_client.py" \
   "jxd/sportmonks_client.py" \
   "jxd/sync.py" \
+  "config/odds_api_leagues.json" \
   "scripts/sync_odds.py" \
   "scripts/export_odds_to_supabase_psql.py" \
   "scripts/odds_retention_psql.py" \
@@ -20,10 +21,11 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/export_to_supabase.py"
 
 export REPO_ROOT
-export LEAGUES="${LEAGUE_IDS:-$(default_league_csv)}"
+export STATS_LEAGUES="${STATS_LEAGUE_IDS:-${LEAGUE_IDS:-$(default_league_csv)}}"
+export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export ODDS_SYNC_DAYS_BACK="${ODDS_SYNC_DAYS_BACK:-2}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
-export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Kambi,Paddy Power}"
+export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
 export INGEST_MAX_RUNTIME_MINUTES="${ODDS_INGEST_MAX_RUNTIME_MINUTES:-25}"
 export ODDS_EXPORT_DAYS_BACK="${ODDS_EXPORT_DAYS_BACK:-2}"
 export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-1}"
@@ -79,7 +81,7 @@ export PGSSLMODE="${PGSSLMODE:-require}"
 
 # Step 1: SportMonks refresh (inside P3 chain, no separate cron)
 python scripts/sync_odds.py \
-  --leagues "${LEAGUES}" \
+  --leagues "${STATS_LEAGUES}" \
   --days-back "${ODDS_SYNC_DAYS_BACK}" \
   --days-forward "${DAYS_FORWARD}" \
   --refresh-upcoming \
@@ -88,7 +90,7 @@ python scripts/sync_odds.py \
 
 # Step 2: Odds fetch scoped to P3 fixtures only
 python scripts/sync_odds.py \
-  --leagues "${LEAGUES}" \
+  --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_SYNC_DAYS_BACK}" \
   --days-forward "${DAYS_FORWARD}" \
   --priority p3 \
@@ -98,7 +100,7 @@ python scripts/sync_odds.py \
 
 # Step 3: Ingest full window (Path B)
 python scripts/export_odds_to_supabase_psql.py \
-  --leagues "${LEAGUES}" \
+  --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_EXPORT_DAYS_BACK}" \
   --days-forward "${DAYS_FORWARD}" \
   --csv-out "/tmp/odds_outcomes_export_p3.csv" \
@@ -121,13 +123,13 @@ python scripts/odds_retention_psql.py \
 # Step 5: Best-effort recent fixture refresh/export.
 if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   if python scripts/reconcile_recent_fixtures.py \
-    --leagues "${LEAGUES}" \
+    --leagues "${STATS_LEAGUES}" \
     --days-back "${FIXTURE_REFRESH_DAYS_BACK}" \
     --days-forward "${FIXTURE_REFRESH_DAYS_FORWARD}" \
     --with-details; then
     if ! python scripts/export_to_supabase.py \
       --strict \
-      --leagues "${LEAGUES}" \
+      --leagues "${STATS_LEAGUES}" \
       --days-back "${FIXTURE_EXPORT_DAYS_BACK}" \
       --upcoming-days "${FIXTURE_EXPORT_DAYS_FORWARD}" \
       --skip-odds-snapshots \
@@ -144,7 +146,7 @@ fi
 
 # Step 6: Hard guard for the user-facing fixtures window.
 python scripts/validate_moneyline_coverage.py \
-  --leagues "${LEAGUES}" \
+  --leagues "${ODDS_LEAGUES}" \
   --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
   --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
   --out-json "/tmp/moneyline_coverage_report_p3.json" \

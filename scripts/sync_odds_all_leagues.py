@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Sync odds for configured leagues (plus leagues with fixtures in the odds window).
+Sync odds for odds-enabled leagues (plus leagues with fixtures in the odds window).
 
-- Reads config/league_ids.txt
+- Reads config/odds_api_leagues.json and preserves config/league_ids.txt order
 - Uses Odds-API.io events + odds endpoints
 - Stores allowlisted markets in odds_outcomes (SQLite)
 """
@@ -10,6 +10,7 @@ Sync odds for configured leagues (plus leagues with fixtures in the odds window)
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import subprocess
@@ -31,6 +32,16 @@ def load_league_ids(path: Path) -> list[int]:
         except ValueError as exc:
             raise SystemExit(f"Invalid league id in {path}: {line}") from exc
     return ids
+
+
+def load_odds_league_ids(repo_root: Path) -> list[int]:
+    config_ids = load_league_ids(repo_root / "config" / "league_ids.txt")
+    odds_map_path = repo_root / "config" / "odds_api_leagues.json"
+    raw = json.loads(odds_map_path.read_text(encoding="utf-8"))
+    odds_ids = {int(value) for value in raw}
+    ordered_ids = [league_id for league_id in config_ids if league_id in odds_ids]
+    extra_ids = sorted(odds_ids.difference(ordered_ids))
+    return [*ordered_ids, *extra_ids]
 
 
 def window_bounds(days_forward: int) -> tuple[str, str]:
@@ -72,21 +83,20 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
         "--bookmakers",
-        default=os.environ.get("ODDS_BOOKMAKERS", "Bet365,Kambi,Paddy Power"),
+        default=os.environ.get("ODDS_BOOKMAKERS", "Bet365,Paddy Power"),
         help="Comma-separated bookmaker names",
     )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
-    leagues_file = repo_root / "config" / "league_ids.txt"
     db_path = Path(os.environ.get("JXD_DB_PATH", str(repo_root / "data" / "jxd.sqlite")))
     start_dt, end_dt = window_bounds(args.days_forward)
 
-    config_ids = load_league_ids(leagues_file)
+    config_ids = load_odds_league_ids(repo_root)
     fixture_ids = load_fixture_league_ids(db_path, start_dt, end_dt)
     league_ids = sorted({*config_ids, *fixture_ids})
     if not league_ids:
-        raise SystemExit(f"No league ids found (config={leagues_file}, db={db_path})")
+        raise SystemExit(f"No odds-enabled league ids found (config={repo_root / 'config' / 'odds_api_leagues.json'}, db={db_path})")
 
     league_ids_csv = ",".join(str(x) for x in league_ids)
 

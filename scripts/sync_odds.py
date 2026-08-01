@@ -34,7 +34,7 @@ from jxd.odds_api_client import OddsApiClient, OddsApiError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
-DEFAULT_BOOKMAKERS = ["Bet365", "Kambi", "Paddy Power"]
+DEFAULT_BOOKMAKERS = ["Bet365", "Paddy Power"]
 BOOKMAKER_NAME_TO_ID = {
     "bet365": 2,
     "kambi": 3,

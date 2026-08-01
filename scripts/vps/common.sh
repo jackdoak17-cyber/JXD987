@@ -124,6 +124,28 @@ default_league_csv() {
   paste -sd, "${REPO_ROOT}/config/league_ids.txt"
 }
 
+odds_league_csv() {
+  python3 - "${REPO_ROOT}/config/league_ids.txt" "${REPO_ROOT}/config/odds_api_leagues.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+league_ids_path = Path(sys.argv[1])
+odds_map_path = Path(sys.argv[2])
+
+configured_ids = []
+for line in league_ids_path.read_text(encoding="utf-8").splitlines():
+    value = line.strip()
+    if not value or value.startswith("#"):
+        continue
+    configured_ids.append(int(value))
+
+odds_map = json.loads(odds_map_path.read_text(encoding="utf-8"))
+odds_ids = {int(value) for value in odds_map}
+print(",".join(str(league_id) for league_id in configured_ids if league_id in odds_ids))
+PY
+}
+
 healthcheck_ping() {
   local url="${1:-}"
   if [[ -z "${url}" ]]; then
