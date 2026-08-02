@@ -1,6 +1,8 @@
 name: Sync History
 
 on:
+  schedule:
+    - cron: "15 3 * * 0"
   workflow_dispatch:
 
 jobs:
@@ -8,8 +10,8 @@ jobs:
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
-      RECENT_DAYS: "180"
-      EXPORT_DAYS_BACK: "180"
+      RECENT_DAYS: "800"
+      EXPORT_DAYS_BACK: "800"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,7 +39,7 @@ jobs:
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
-          python3 scripts/run_sync.py --mode recent --recent-days "$RECENT_DAYS" --leagues "$LEAGUE_IDS"
+          python3 scripts/run_sync.py --mode full --recent-days "$RECENT_DAYS" --leagues "$LEAGUE_IDS"
 
       - name: Freshness report
         run: python3 scripts/sqlite_freshness_report.py

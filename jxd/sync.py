@@ -796,7 +796,7 @@ class SyncService:
             type_id = s.get("type_id") or type_info.get("id")
             code = type_info.get("code") or (type_id and str(type_id))
             name = type_info.get("name")
-            location = (s.get("location") or "").lower() or None
+            location = (s.get("location") or "").lower() or "unknown"
             data = s.get("data") or {}
             value = _extract_stat_value(data)
             team_id = s.get("participant_id") or s.get("team_id")
