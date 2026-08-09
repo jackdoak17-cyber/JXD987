@@ -153,6 +153,16 @@ TEAM_NAME_ALIAS = {
     "yellowredkvmechelen": "mechelen",
     "royalcharleroi": "charleroi",
     "oudheverleeleuven": "ohleuven",
+    "athleticsjdrmg": "athleticclub",
+    "criciumaec": "criciuma",
+    "gremionovorizontinosp": "gremionovorizontino",
+    "juventuders": "juventude",
+    "nauticope": "nautico",
+    "goianienego": "goianiense",
+    "cuiabaecmt": "cuiaba",
+    "fortalezaecce": "fortaleza",
+    "avaisc": "avai",
+    "crbrasilal": "crb",
 }
 
 TEAM_TOKEN_DROP = {
