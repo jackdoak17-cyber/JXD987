@@ -13,7 +13,7 @@ fcdcb578db601c5d18ed75fe3ddc4dca41957ed1  jxd/models.py
 0aeb2ece3abb146f740989bc0b6e21aa017dc3cc  scripts/reconcile_recent_fixtures.py
 a1b2e580c78cc5cbc26705c9144fd6b4d2d2b05b  scripts/rest_preflight.py
 3f27116bb8a553f444a63c20bdb3f3beac390cee  scripts/sync_confirmed_lineups.py
-908fd48c6b47cf6a144a1ad91b6cfa3aeb3b7657  scripts/sync_odds.py
+90fdeebdcf3efd9e67bd5de221620acad664cfb7  scripts/sync_odds.py
 b52ac8c0d3eef0864e91e8d4172203f7e498aff9  scripts/vps/common.sh
 9fc2659d5b08332596aea15b9be48e9873cf9a98  scripts/vps/run_p1.sh
 e28b38c4e9512833a204fabb15e8a9ba57092576  scripts/vps/run_p2.sh

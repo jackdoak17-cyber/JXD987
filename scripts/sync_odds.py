@@ -150,6 +150,9 @@ TEAM_NAME_ALIAS = {
     "staderennais": "rennes",
     "staderennaisfc": "rennes",
     "fcmetz": "metz",
+    "yellowredkvmechelen": "mechelen",
+    "royalcharleroi": "charleroi",
+    "oudheverleeleuven": "ohleuven",
 }
 
 TEAM_TOKEN_DROP = {
