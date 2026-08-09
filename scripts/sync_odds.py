@@ -163,6 +163,7 @@ TEAM_NAME_ALIAS = {
     "fortalezaecce": "fortaleza",
     "avaisc": "avai",
     "crbrasilal": "crb",
+    "henansongshanlongmen": "henan",
 }
 
 TEAM_TOKEN_DROP = {
