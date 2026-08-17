@@ -142,15 +142,15 @@ else
   echo "Skipping fixture-core refresh/export; missing SportMonks or Supabase REST env" >&2
 fi
 
-# Step 2: Refresh/export sparse current-season squads.
+# Step 2: Reconcile/export current-season squads.
 if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   run_isolated_pipeline_job \
     "run_p3_sparse_squad_refresh" \
-    "P3 sparse squad refresh" \
-    "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/sync_sparse_squads.py --leagues \"${STATS_LEAGUES}\" --minimum-players \"${SQUAD_REFRESH_MIN_PLAYERS}\" --report-json \"/tmp/sparse_squad_refresh_report_p3.json\"" \
+    "P3 current squad reconciliation" \
+    "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/sync_sparse_squads.py --leagues \"${STATS_LEAGUES}\" --refresh-all --report-json \"/tmp/sparse_squad_refresh_report_p3.json\"" \
     "${P3_SPARSE_SQUAD_REFRESH_TIMEOUT_SECONDS:-900}"
 else
-  echo "Skipping sparse squad refresh; missing SportMonks or Supabase REST env" >&2
+  echo "Skipping squad reconciliation; missing SportMonks or Supabase REST env" >&2
 fi
 
 # Step 3: Odds fetch scoped to P3 fixtures only
