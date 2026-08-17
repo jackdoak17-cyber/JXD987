@@ -49,11 +49,31 @@ def _chunks(values: Sequence[int], size: int = 100) -> Iterable[Sequence[int]]:
 
 def _remote_rows(table: str, team_ids: Sequence[int], select_columns: str, extra: Dict[str, str] | None = None) -> List[Dict]:
     rows: List[Dict] = []
+    order_by = {
+        "players": "id.asc",
+        "team_squad_memberships": "team_id.asc,player_id.asc",
+        "team_squad_snapshots": "team_id.asc,id.asc",
+    }.get(table, "team_id.asc")
     for chunk in _chunks(team_ids):
-        params = {"select": select_columns, "team_id": f"in.({','.join(str(value) for value in chunk)})", "limit": "10000"}
-        if extra:
-            params.update(extra)
-        rows.extend(_fetch_remote(table, params))
+        offset = 0
+        while True:
+            # Supabase commonly caps REST responses at 1,000 rows even when a
+            # higher limit is requested.  Paginate so fleet verification never
+            # drops memberships from larger leagues and reports a false alarm.
+            params = {
+                "select": select_columns,
+                "team_id": f"in.({','.join(str(value) for value in chunk)})",
+                "limit": "1000",
+                "offset": str(offset),
+                "order": order_by,
+            }
+            if extra:
+                params.update(extra)
+            page = _fetch_remote(table, params)
+            rows.extend(page)
+            if len(page) < 1000:
+                break
+            offset += len(page)
     return rows
 
 

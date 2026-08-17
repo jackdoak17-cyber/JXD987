@@ -358,7 +358,14 @@ def main() -> None:
 
     candidate_team_ids = unique_ordered(
         [
-            *current_season_team_ids(session, league_ids, args.skip_large_leagues_threshold),
+            # A full reconciliation must never inherit the sparse-refresh guard.
+            # Otherwise the largest leagues are silently omitted precisely when
+            # we are trying to establish a complete current-squad baseline.
+            *current_season_team_ids(
+                session,
+                league_ids,
+                0 if args.refresh_all else args.skip_large_leagues_threshold,
+            ),
             *explicit_team_ids,
         ]
     )
