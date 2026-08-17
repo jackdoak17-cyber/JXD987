@@ -483,6 +483,18 @@ class SyncService:
         )
         self.session.add(entry)
 
+    def _end_player_team_assignment(self, player_id: int, team_id: int, sync_run_at: datetime) -> None:
+        """Close a current squad assignment when the provider no longer lists it."""
+        latest = (
+            self.session.query(PlayerTeamHistory)
+            .filter(PlayerTeamHistory.player_id == player_id)
+            .order_by(PlayerTeamHistory.effective_from.desc(), PlayerTeamHistory.id.desc())
+            .first()
+        )
+        if latest and latest.team_id == team_id and latest.effective_to is None:
+            latest.effective_to = sync_run_at
+            latest.updated_at = sync_run_at
+
     # --- seasons & teams ---
     def sync_seasons(self, league_ids: Sequence[int]) -> int:
         count = 0
@@ -572,11 +584,13 @@ class SyncService:
             seen.add(team_id)
             endpoint = f"squads/teams/{team_id}"
             try:
+                squad_player_ids: Set[int] = set()
                 for item in self.client.fetch_collection(endpoint, includes=["player"], per_page=200):
                     player = item.get("player") or {}
                     player_id = player.get("id") or item.get("player_id")
                     if not player_id:
                         continue
+                    squad_player_ids.add(int(player_id))
                     payload = {
                         "id": player_id,
                         "name": player.get("name") or player.get("display_name"),
@@ -602,6 +616,23 @@ class SyncService:
                     if track_history and payload.get("team_id"):
                         self._track_player_team_history(player_id, payload["team_id"], sync_run_at)
                     count += 1
+
+                # A successful squad response is an authoritative snapshot.
+                # Detach players absent from it so transfers and released
+                # players cannot remain in the current squad indefinitely.
+                if squad_player_ids:
+                    stale_players = (
+                        self.session.query(Player)
+                        .filter(Player.team_id == team_id)
+                        .filter(~Player.id.in_(squad_player_ids))
+                        .all()
+                    )
+                    for stale_player in stale_players:
+                        self._end_player_team_assignment(stale_player.id, team_id, sync_run_at)
+                        stale_player.team_id = None
+                        stale_player.team_updated_at = sync_run_at
+                else:
+                    log.warning("Squad lookup returned no players for team %s; preserving existing assignment", team_id)
             except SportMonksError as exc:
                 if exc.status_code in {404, 422}:
                     log.info("No squad data for team %s (status %s)", team_id, exc.status_code)

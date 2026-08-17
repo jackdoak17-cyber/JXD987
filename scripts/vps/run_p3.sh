@@ -14,6 +14,8 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/odds_api_client.py" \
   "jxd/sportmonks_client.py" \
   "jxd/sync.py" \
+  "scripts/sync_sparse_squads.py" \
+  "scripts/verify_squad_freshness.py" \
   "config/odds_api_leagues.json" \
   "scripts/sync_odds.py" \
   "scripts/export_odds_to_supabase_psql.py" \
@@ -43,6 +45,8 @@ export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
 export MONEYLINE_COVERAGE_MIN_PCT="${MONEYLINE_COVERAGE_MIN_PCT:-100}"
 export MONEYLINE_REPAIR_ATTEMPTS="${MONEYLINE_REPAIR_ATTEMPTS:-1}"
+export SQUAD_FRESHNESS_MAX_HOURS="${SQUAD_FRESHNESS_MAX_HOURS:-12}"
+export P3_SPARSE_SQUAD_REFRESH_TIMEOUT_SECONDS="${P3_SPARSE_SQUAD_REFRESH_TIMEOUT_SECONDS:-1800}"
 
 if [[ "${RUN_COVERAGE}" == "true" || "${RUN_COVERAGE}" == "1" ]]; then
   export COVERAGE_ARGS=""
@@ -93,7 +97,37 @@ python scripts/sync_odds.py \
   --refresh-only \
   --report-out "/tmp/odds_refresh_report_p3.json"
 
-# Step 2: Odds fetch scoped to P3 fixtures only
+# Step 2: Reconcile every current-season squad before user-facing exports.
+# A successful non-empty SportMonks snapshot is authoritative for current
+# membership; failed/empty responses preserve the last known assignment and
+# cause the freshness gate below to fail visibly.
+SQUAD_RECONCILIATION_STATUS=0
+SQUAD_FRESHNESS_STATUS=0
+if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
+  set +e
+  timeout "${P3_SPARSE_SQUAD_REFRESH_TIMEOUT_SECONDS}" \
+    python scripts/sync_sparse_squads.py \
+      --leagues "${STATS_LEAGUES}" \
+      --refresh-all \
+      --report-json "/tmp/sparse_squad_refresh_report_p3.json"
+  SQUAD_RECONCILIATION_STATUS=$?
+  if [[ "${SQUAD_RECONCILIATION_STATUS}" -eq 0 ]]; then
+    python scripts/verify_squad_freshness.py \
+      --leagues "${STATS_LEAGUES}" \
+      --max-age-hours "${SQUAD_FRESHNESS_MAX_HOURS}" \
+      --report-json "/tmp/squad_freshness_report_p3.json"
+    SQUAD_FRESHNESS_STATUS=$?
+  else
+    SQUAD_FRESHNESS_STATUS=1
+  fi
+  set -e
+else
+  echo "Skipping squad reconciliation; missing SportMonks or Supabase REST env" >&2
+  SQUAD_RECONCILIATION_STATUS=1
+  SQUAD_FRESHNESS_STATUS=1
+fi
+
+# Step 3: Odds fetch scoped to P3 fixtures only
 python scripts/sync_odds.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_SYNC_DAYS_BACK}" \
@@ -103,7 +137,7 @@ python scripts/sync_odds.py \
   --report-out "/tmp/odds_sync_report_p3.json" \
   --unmatched-out "/tmp/unmatched_players_p3.json"
 
-# Step 3: Ingest full window (Path B)
+# Step 4: Ingest full window (Path B)
 python scripts/export_odds_to_supabase_psql.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_EXPORT_DAYS_BACK}" \
@@ -118,14 +152,14 @@ python scripts/export_odds_to_supabase_psql.py \
   --skip-retention-snapshots \
   ${COVERAGE_ARGS}
 
-# Step 4: Retention only on P3
+# Step 5: Retention only on P3
 python scripts/odds_retention_psql.py \
   --days-back "${RETENTION_DAYS_BACK}" \
   --days-forward "${RETENTION_DAYS_FORWARD}" \
   --snapshot-days "${RETENTION_SNAPSHOT_DAYS}" \
   --report-out "/tmp/odds_retention_report_p3.json"
 
-# Step 5: Best-effort recent fixture refresh/export.
+# Step 6: Best-effort recent fixture refresh/export.
 if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   if python scripts/reconcile_recent_fixtures.py \
     --leagues "${STATS_LEAGUES}" \
@@ -149,7 +183,7 @@ else
   echo "Skipping recent fixture refresh/export; missing SportMonks or Supabase REST env" >&2
 fi
 
-# Step 6: Publish the persistent Fixtures Data Delivery v2 read models.
+# Step 7: Publish the persistent Fixtures Data Delivery v2 read models.
 # This is the only user-facing fixture delivery source after cutover. A failed
 # refresh fails P3 instead of hiding a stale or incomplete read model.
 FIXTURE_DELIVERY_STATUS=0
@@ -164,7 +198,7 @@ else
   FIXTURE_DELIVERY_STATUS=1
 fi
 
-# Step 7: Hard guard for the user-facing fixtures window.
+# Step 8: Hard guard for the user-facing fixtures window.
 set +e
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
@@ -228,7 +262,7 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
   fi
 fi
 
-# Step 8: Best-effort betting picks publish (uses odds already ingested into Supabase).
+# Step 9: Best-effort betting picks publish (uses odds already ingested into Supabase).
 if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; then
   if [[ "${MODELS_PUBLISH_AFTER_P3}" == "true" || "${MODELS_PUBLISH_AFTER_P3}" == "1" ]]; then
     if [[ -d "${MODELS_REPO_ROOT}" ]]; then
@@ -260,6 +294,10 @@ fi
 if [[ "${FIXTURE_DELIVERY_STATUS}" -ne 0 ]]; then
   echo "Fixtures Data Delivery v2 refresh failed; see /tmp/fixture_delivery_v2_report.json" >&2
   exit "${FIXTURE_DELIVERY_STATUS}"
+fi
+if [[ "${SQUAD_RECONCILIATION_STATUS}" -ne 0 || "${SQUAD_FRESHNESS_STATUS}" -ne 0 ]]; then
+  echo "Squad reconciliation/freshness failed; see /tmp/sparse_squad_refresh_report_p3.json and /tmp/squad_freshness_report_p3.json" >&2
+  exit 1
 fi
 CHAIN
 )
