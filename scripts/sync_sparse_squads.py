@@ -250,6 +250,75 @@ def fetch_player_team_history(player_ids: Sequence[int]) -> List[Dict]:
     ]
 
 
+def fetch_team_squad_snapshots(team_ids: Sequence[int]) -> List[Dict]:
+    if not team_ids:
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        q = ",".join("?" for _ in team_ids)
+        rows = conn.execute(
+            f"""
+            select id, team_id, source, status, observed_at, completed_at,
+                   player_count, payload_hash, error, created_at
+            from team_squad_snapshots
+            where team_id in ({q})
+            order by id
+            """,
+            list(team_ids),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "id": row[0],
+            "team_id": row[1],
+            "source": row[2],
+            "status": row[3],
+            "observed_at": row[4],
+            "completed_at": row[5],
+            "player_count": row[6],
+            "payload_hash": row[7],
+            "error": row[8],
+            "created_at": row[9],
+        }
+        for row in rows
+    ]
+
+
+def fetch_team_squad_memberships(team_ids: Sequence[int]) -> List[Dict]:
+    if not team_ids:
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        q = ",".join("?" for _ in team_ids)
+        rows = conn.execute(
+            f"""
+            select team_id, player_id, is_active, first_seen_at, last_seen_at, provider_started_at,
+                   last_snapshot_id, source, created_at, updated_at
+            from team_squad_memberships
+            where team_id in ({q})
+            """,
+            list(team_ids),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [
+        {
+            "team_id": row[0],
+            "player_id": row[1],
+            "is_active": bool(row[2]),
+            "first_seen_at": row[3],
+            "last_seen_at": row[4],
+            "provider_started_at": row[5],
+            "last_snapshot_id": row[6],
+            "source": row[7],
+            "created_at": row[8],
+            "updated_at": row[9],
+        }
+        for row in rows
+    ]
+
+
 def write_report(path: str | None, report: Dict) -> None:
     if not path:
         return
@@ -322,13 +391,23 @@ def main() -> None:
     )
     player_ids = [int(row["id"]) for row in players if row.get("id")]
     player_team_history = fetch_player_team_history(player_ids)
+    squad_snapshots = fetch_team_squad_snapshots(sparse_team_ids)
+    squad_memberships = fetch_team_squad_memberships(sparse_team_ids)
 
     players_exported = 0
     history_exported = 0
+    snapshots_exported = 0
+    memberships_exported = 0
     if players:
         players_exported, _ = upsert_table("players", players, "id", args.dry_run)
     if player_team_history:
         history_exported, _ = upsert_table("player_team_history", player_team_history, "id", args.dry_run)
+    if squad_snapshots:
+        snapshots_exported, _ = upsert_table("team_squad_snapshots", squad_snapshots, "id", args.dry_run)
+    if squad_memberships:
+        memberships_exported, _ = upsert_table(
+            "team_squad_memberships", squad_memberships, "team_id,player_id", args.dry_run
+        )
     remote_players_detached = detach_remote_players_missing_from_squads(
         sparse_team_ids,
         current_players,
@@ -348,6 +427,8 @@ def main() -> None:
         "after_counts": {str(team_id): after_counts.get(team_id, 0) for team_id in sparse_team_ids},
         "players_exported": players_exported,
         "player_team_history_exported": history_exported,
+        "squad_snapshots_exported": snapshots_exported,
+        "squad_memberships_exported": memberships_exported,
         "remote_players_detached": remote_players_detached,
     }
     write_report(args.report_json, report)

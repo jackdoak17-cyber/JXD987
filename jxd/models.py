@@ -100,6 +100,41 @@ class PlayerTeamHistory(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class TeamSquadSnapshot(Base):
+    """A provider response used to establish a team's current squad."""
+
+    __tablename__ = "team_squad_snapshots"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=False, index=True)
+    source = Column(String, nullable=False, default="sportmonks")
+    status = Column(String, nullable=False)  # success, empty, or failed
+    observed_at = Column(DateTime, nullable=False, index=True)
+    completed_at = Column(DateTime, nullable=True)
+    player_count = Column(Integer, nullable=False, default=0)
+    payload_hash = Column(String, nullable=True)
+    error = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class TeamSquadMembership(Base):
+    """Current squad membership derived only from successful snapshots."""
+
+    __tablename__ = "team_squad_memberships"
+    __table_args__ = (PrimaryKeyConstraint("team_id", "player_id"),)
+
+    team_id = Column(Integer, ForeignKey("teams.id"), nullable=False)
+    player_id = Column(Integer, ForeignKey("players.id"), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True, index=True)
+    first_seen_at = Column(DateTime, nullable=False)
+    last_seen_at = Column(DateTime, nullable=False, index=True)
+    provider_started_at = Column(DateTime, nullable=True, index=True)
+    last_snapshot_id = Column(Integer, ForeignKey("team_squad_snapshots.id"), nullable=True)
+    source = Column(String, nullable=False, default="sportmonks")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+
 class Fixture(Base):
     __tablename__ = "fixtures"
 
