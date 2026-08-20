@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from typing import Dict, Iterator, List, Optional
+from urllib.parse import parse_qsl, urlparse
 
 import requests
 
@@ -159,11 +160,19 @@ class SportMonksClient:
         if includes:
             base_params["include"] = ";".join(includes)
         base_params.setdefault("per_page", per_page)
+        current_endpoint = endpoint
         page = 1
+        request_params = dict(base_params)
+        seen_targets = set()
         while True:
-            page_params = dict(base_params)
-            page_params["page"] = page
-            payload = self.request("GET", endpoint, params=page_params)
+            if "cursor" not in request_params:
+                request_params.setdefault("page", page)
+            target_key = (current_endpoint, tuple(sorted((str(k), str(v)) for k, v in request_params.items())))
+            if target_key in seen_targets:
+                self.log.warning("Stopping repeated SportMonks pagination target %s", current_endpoint)
+                return
+            seen_targets.add(target_key)
+            payload = self.request("GET", current_endpoint, params=request_params)
             rows = []
             if isinstance(payload, dict):
                 if isinstance(payload.get("data"), list):
@@ -184,7 +193,35 @@ class SportMonksClient:
                 current_page = pagination.get("current_page") or pagination.get("page") or page
                 total_pages = pagination.get("total_pages")
                 has_more = pagination.get("has_more")
+                next_cursor = pagination.get("next_cursor")
                 next_page_val = pagination.get("next_page")
+
+                # SportMonks switches from page pagination to cursor pagination
+                # after 20,000 rows. Follow the provider cursor instead of
+                # incrementing page until the API returns a 400.
+                cursor_or_url = next_cursor or next_page_val
+                if cursor_or_url:
+                    if isinstance(cursor_or_url, str) and cursor_or_url.startswith(("http://", "https://")):
+                        parsed = urlparse(cursor_or_url)
+                        base_path = urlparse(self.base_url).path.rstrip("/")
+                        next_path = parsed.path
+                        if base_path and next_path.startswith(base_path):
+                            next_path = next_path[len(base_path) :]
+                        current_endpoint = next_path.lstrip("/") or current_endpoint
+                        request_params = {
+                            key: value
+                            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                            if key != "api_token"
+                        }
+                        page = int(request_params.get("page") or current_page)
+                        continue
+                    if next_cursor:
+                        current_endpoint = endpoint
+                        request_params = dict(base_params)
+                        request_params.pop("page", None)
+                        request_params["cursor"] = str(next_cursor)
+                        page = int(current_page)
+                        continue
                 try:
                     next_page_int = int(next_page_val) if next_page_val is not None else None
                 except Exception:
@@ -192,18 +229,26 @@ class SportMonksClient:
 
                 if next_page_int and next_page_int > current_page:
                     page = next_page_int
+                    request_params = dict(base_params)
+                    request_params["page"] = page
                     continue
                 if total_pages and current_page < total_pages:
                     page = current_page + 1
+                    request_params = dict(base_params)
+                    request_params["page"] = page
                     continue
                 if has_more:
                     page = current_page + 1
+                    request_params = dict(base_params)
+                    request_params["page"] = page
                     continue
                 return
 
             if len(rows) < per_page:
                 return
             page += 1
+            request_params = dict(base_params)
+            request_params["page"] = page
 
     def fetch_single(self, endpoint: str, params: Optional[Dict[str, object]] = None, includes: Optional[List[str]] = None) -> Dict:
         payload = self.request("GET", endpoint, params={**(params or {}), **({"include": ",".join(includes)} if includes else {})})
