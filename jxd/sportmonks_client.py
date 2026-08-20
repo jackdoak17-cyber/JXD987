@@ -164,6 +164,7 @@ class SportMonksClient:
         page = 1
         request_params = dict(base_params)
         seen_targets = set()
+        seen_unpaginated_ids: set[str] = set()
         while True:
             if "cursor" not in request_params:
                 request_params.setdefault("page", page)
@@ -182,12 +183,31 @@ class SportMonksClient:
             if not rows:
                 return
 
-            for row in rows:
-                yield row
-
             pagination = None
             if isinstance(payload, dict):
                 pagination = payload.get("pagination") or (payload.get("meta") or {}).get("pagination")
+
+            # A few SportMonks collection endpoints (notably teams/seasons)
+            # ignore `per_page` and return the complete collection without
+            # pagination metadata. Treat an oversized unpaginated response as
+            # complete instead of repeatedly incrementing `page` forever.
+            if not pagination:
+                row_ids = [
+                    str(row.get("id"))
+                    for row in rows
+                    if isinstance(row, dict) and row.get("id") is not None
+                ]
+                if row_ids and all(row_id in seen_unpaginated_ids for row_id in row_ids):
+                    self.log.warning("Stopping repeated unpaginated SportMonks response for %s", current_endpoint)
+                    return
+                for row in rows:
+                    yield row
+                seen_unpaginated_ids.update(row_ids)
+                if len(rows) > per_page:
+                    return
+            else:
+                for row in rows:
+                    yield row
 
             if pagination:
                 current_page = pagination.get("current_page") or pagination.get("page") or page

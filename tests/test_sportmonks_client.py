@@ -61,6 +61,33 @@ class SportMonksPaginationTests(unittest.TestCase):
         self.assertEqual(client.calls[1][1]["page"], 2)
         self.assertEqual(client.calls[1][1]["filters"], "fixtureLeagues:24")
 
+    def test_stops_when_endpoint_returns_complete_oversized_collection_without_pagination(self) -> None:
+        client = StubSportMonksClient(
+            [
+                {
+                    "data": [{"id": 1}, {"id": 2}, {"id": 3}],
+                },
+            ]
+        )
+
+        rows = list(client.fetch_collection("teams/seasons/123", per_page=2))
+
+        self.assertEqual([row["id"] for row in rows], [1, 2, 3])
+        self.assertEqual(len(client.calls), 1)
+
+    def test_stops_repeated_unpaginated_page_without_duplicate_rows(self) -> None:
+        client = StubSportMonksClient(
+            [
+                {"data": [{"id": 1}, {"id": 2}]},
+                {"data": [{"id": 1}, {"id": 2}]},
+            ]
+        )
+
+        rows = list(client.fetch_collection("teams", per_page=2))
+
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+        self.assertEqual(len(client.calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
