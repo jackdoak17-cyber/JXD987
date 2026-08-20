@@ -47,6 +47,7 @@ export SQUAD_REFRESH_MIN_PLAYERS="${SQUAD_REFRESH_MIN_PLAYERS:-15}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
 export MONEYLINE_COVERAGE_MIN_PCT="${MONEYLINE_COVERAGE_MIN_PCT:-100}"
+export MONEYLINE_REPAIR_ATTEMPTS="${MONEYLINE_REPAIR_ATTEMPTS:-1}"
 export PLAYER_PROP_VALIDATE="${PLAYER_PROP_VALIDATE:-true}"
 export PLAYER_PROP_VALIDATE_DAYS_BACK="${PLAYER_PROP_VALIDATE_DAYS_BACK:-${ODDS_EXPORT_DAYS_BACK}}"
 export PLAYER_PROP_VALIDATE_DAYS_FORWARD="${PLAYER_PROP_VALIDATE_DAYS_FORWARD:-${DAYS_FORWARD}}"
@@ -202,7 +203,58 @@ python scripts/validate_moneyline_coverage.py \
 MONEYLINE_VALIDATION_STATUS=$?
 set -e
 if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
-  echo "Moneyline fidelity report is red (exit=${MONEYLINE_VALIDATION_STATUS}); continuing P3 downstream work." >&2
+  echo "Moneyline fidelity report is red (exit=${MONEYLINE_VALIDATION_STATUS}); running bounded autonomous repair attempts before final alert." >&2
+  repair_attempt=0
+  while [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 && "${repair_attempt}" -lt "${MONEYLINE_REPAIR_ATTEMPTS}" ]]; do
+    repair_attempt=$((repair_attempt + 1))
+    echo "Moneyline repair attempt ${repair_attempt}/${MONEYLINE_REPAIR_ATTEMPTS}: refetching P3 events and exporting the complete odds window." >&2
+    set +e
+    python scripts/sync_odds.py \
+      --leagues "${ODDS_LEAGUES}" \
+      --days-back "${ODDS_SYNC_DAYS_BACK}" \
+      --days-forward "${DAYS_FORWARD}" \
+      --priority p3 \
+      --bookmakers "${ODDS_BOOKMAKERS}" \
+      --report-out "/tmp/odds_sync_report_p3_repair_${repair_attempt}.json" \
+      --unmatched-out "/tmp/unmatched_players_p3_repair_${repair_attempt}.json"
+    repair_sync_status=$?
+    if [[ "${repair_sync_status}" -eq 0 ]]; then
+      python scripts/export_odds_to_supabase_psql.py \
+        --leagues "${ODDS_LEAGUES}" \
+        --days-back "${ODDS_EXPORT_DAYS_BACK}" \
+        --days-forward "${DAYS_FORWARD}" \
+        --csv-out "/tmp/odds_outcomes_export_p3_repair_${repair_attempt}.csv" \
+        --no-include-fixture-leagues \
+        --progress-rows 10000 \
+        --progress-fixtures 100 \
+        --max-runtime-minutes "${INGEST_MAX_RUNTIME_MINUTES}" \
+        --report-out "/tmp/odds_ingest_report_p3_repair_${repair_attempt}.json" \
+        --skip-retention \
+        --skip-retention-snapshots \
+        ${COVERAGE_ARGS}
+      repair_export_status=$?
+    else
+      repair_export_status=${repair_sync_status}
+    fi
+    if [[ "${repair_sync_status}" -eq 0 && "${repair_export_status}" -eq 0 ]]; then
+      python scripts/validate_moneyline_coverage.py \
+        --leagues "${ODDS_LEAGUES}" \
+        --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
+        --priority p3 \
+        --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
+        --out-json "/tmp/moneyline_coverage_report_p3.json" \
+        --out-md "/tmp/moneyline_coverage_report_p3.md"
+      MONEYLINE_VALIDATION_STATUS=$?
+    else
+      MONEYLINE_VALIDATION_STATUS=1
+    fi
+    set -e
+  done
+  if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
+    echo "Moneyline fidelity remains red after ${repair_attempt} repair attempt(s); continuing P3 downstream work before final alert." >&2
+  else
+    echo "Moneyline fidelity passed after ${repair_attempt} autonomous repair attempt(s)." >&2
+  fi
 fi
 
 # Step 7: Best-effort recent fixture detail refresh/export.
