@@ -48,7 +48,10 @@ jobs:
       ODDS_IDLE_TX_TIMEOUT: "0"
       ODDS_ADVISORY_LOCK_KEY: "982374"
       ODDS_MARKET_ALLOWLIST: ${{ vars.ODDS_MARKET_ALLOWLIST }}
-      ODDS_BOOKMAKERS: ${{ vars.ODDS_BOOKMAKERS || 'Bet365,Kambi,Paddy Power' }}
+      # Keep this aligned with the bookmakers accepted by Odds-API.io.  Do
+      # not let a stale repository variable silently narrow coverage: several
+      # leagues publish moneyline markets only through Unibet or BetMGM.
+      ODDS_BOOKMAKERS: Unibet,BetMGM,Betfair Exchange,Paddy Power,Bet365
       ODDS_API_RETRIES: ${{ vars.ODDS_API_RETRIES || '3' }}
       ODDS_API_SLEEP_BASE: ${{ vars.ODDS_API_SLEEP_BASE || '1' }}
       ODDS_API_SLEEP_MAX: ${{ vars.ODDS_API_SLEEP_MAX || '10' }}
