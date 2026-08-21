@@ -108,6 +108,24 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
 
         self.assertIsNone(matched)
 
+    def test_matches_formal_provider_name_to_short_local_name(self) -> None:
+        event = build_event(
+            "Kocaelispor",
+            "Amed Sportif Faaliyetler",
+            "2026-08-24T18:30:00Z",
+        )
+        fixture = build_fixture(
+            19746638,
+            "Kocaelispor",
+            "Amed SK",
+            datetime(2026, 8, 24, 18, 30, 0),
+        )
+
+        matched = match_event_to_fixture(event, [fixture])
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["fixture_id"], 19746638)
+
 
 if __name__ == "__main__":
     unittest.main()

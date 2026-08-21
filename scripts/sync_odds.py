@@ -954,6 +954,16 @@ def score_name_match(event_name: str, aliases: Iterable[str]) -> float:
         for event_norm in event_variants:
             if event_norm == alias:
                 return 1.0
+            # Providers sometimes expand a short local name with a formal
+            # club name (for example, SportMonks "Amed SK" versus Odds API
+            # "Amed Sportif Faaliyetler"). Treat a distinctive four-character
+            # prefix/suffix as a strong match; kickoff and the opposite team
+            # are still checked by match_event_to_fixture, preventing broad
+            # names from matching unrelated fixtures.
+            if len(alias) >= 4 and (event_norm.startswith(alias) or event_norm.endswith(alias)):
+                best = max(best, 0.9)
+            elif len(event_norm) >= 4 and (alias.startswith(event_norm) or alias.endswith(event_norm)):
+                best = max(best, 0.9)
             score = difflib.SequenceMatcher(None, event_norm, alias).ratio()
             if score > best:
                 best = score

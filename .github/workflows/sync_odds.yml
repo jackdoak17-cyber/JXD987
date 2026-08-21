@@ -22,6 +22,11 @@ on:
         options:
           - "false"
           - "true"
+      league_ids:
+        description: "Optional comma-separated league IDs to run (blank runs the configured odds leagues)"
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: sync-odds
@@ -35,7 +40,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        league_id: [8, 9, 384, 387, 564, 567, 82, 301, 600, 501, 444, 72]
+        league_id: ${{ fromJSON(format('[{0}]', inputs.league_ids || '8,9,384,387,564,567,82,301,600,501,444,72')) }}
     env:
       PYTHONPATH: .
       PYTHONUNBUFFERED: "1"
@@ -440,7 +445,7 @@ jobs:
       RUN_COVERAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_coverage || 'false' }}
       PRICES_RESULT: ${{ needs.prices.result }}
       RETENTION_RESULT: ${{ needs.retention.result }}
-      EXPECTED_LEAGUES: "8,9,384,387,564,567,82,301,600,501,444,72"
+      EXPECTED_LEAGUES: ${{ inputs.league_ids || '8,9,384,387,564,567,82,301,600,501,444,72' }}
     steps:
       - name: Download ingest reports
         uses: actions/download-artifact@v4
