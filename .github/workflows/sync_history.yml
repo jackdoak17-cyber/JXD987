@@ -5,13 +5,42 @@ on:
     - cron: "15 3 * * 0"
   workflow_dispatch:
 
+# History is intentionally sharded by league. A single all-league run can
+# exceed GitHub's six-hour job limit before it reaches the Supabase export.
+# Each shard has its own SQLite workspace and exports only its league, so the
+# shards are independently resumable and cannot prune another league's data.
 jobs:
-  sync-history:
+  plan:
     runs-on: ubuntu-latest
+    outputs:
+      league_ids: ${{ steps.ids.outputs.league_ids }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Build league matrix
+        id: ids
+        shell: bash
+        run: |
+          league_ids="$(jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)' config/league_ids.txt)"
+          echo "league_ids=$league_ids" >> "$GITHUB_OUTPUT"
+
+  sync-history:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # Keep provider traffic bounded while ensuring every shard completes
+      # comfortably inside GitHub's per-job timeout.
+      max-parallel: 3
+      matrix:
+        league_id: ${{ fromJSON(needs.plan.outputs.league_ids) }}
     env:
       PYTHONPATH: .
-      RECENT_DAYS: "800"
-      EXPORT_DAYS_BACK: "800"
+      LEAGUE_ID: ${{ matrix.league_id }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,24 +60,23 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Load league ids
-        run: |
-          echo "LEAGUE_IDS=$(paste -sd, config/league_ids.txt)" >> $GITHUB_ENV
-
-      - name: Sync history (kept seasons)
+      - name: Sync kept history for league
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
-          python3 scripts/run_sync.py --mode full --recent-days "$RECENT_DAYS" --leagues "$LEAGUE_IDS"
+          python3 scripts/run_sync.py --mode history --leagues "$LEAGUE_ID"
 
       - name: Freshness report
         run: python3 scripts/sqlite_freshness_report.py
 
-      - name: Export to Supabase
+      - name: Export league history to Supabase
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SUPABASE_EXPORT_CHUNK: "1000"
           SUPABASE_EXPORT_SLEEP: "0"
           SUPABASE_EXPORT_RETRIES: "5"
-        run: python3 scripts/export_to_supabase.py --strict --leagues "$LEAGUE_IDS"
+        run: |
+          # Never run the global prune from a single-league shard: it would
+          # delete seasons belonging to the other matrix jobs.
+          python3 scripts/export_to_supabase.py --strict --skip-prune --leagues "$LEAGUE_ID"
