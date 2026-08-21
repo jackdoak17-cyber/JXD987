@@ -2119,7 +2119,10 @@ def parse_player_market_rows(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
-    parser.add_argument("--days-back", type=int, default=int(os.environ.get("ODDS_SYNC_DAYS_BACK", "0")))
+    # Keep a short settled window so callers that omit --days-back still
+    # retrieve historical pre-kickoff odds for fixtures that finished earlier
+    # on the same day.
+    parser.add_argument("--days-back", type=int, default=int(os.environ.get("ODDS_SYNC_DAYS_BACK", "1")))
     parser.add_argument("--days-forward", type=int, default=14)
     parser.add_argument(
         "--bookmakers",
