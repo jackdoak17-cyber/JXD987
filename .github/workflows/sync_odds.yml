@@ -33,14 +33,41 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      league_ids: ${{ steps.ids.outputs.league_ids }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build configured odds league matrix
+        id: ids
+        shell: bash
+        env:
+          REQUESTED_LEAGUE_IDS: ${{ inputs.league_ids || '' }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$REQUESTED_LEAGUE_IDS" ]]; then
+            league_ids="$(jq -cn --arg raw "$REQUESTED_LEAGUE_IDS" '$raw | split(",") | map(select(length > 0) | tonumber) | unique | sort')"
+          else
+            league_ids="$(jq -c 'keys | map(tonumber) | sort' config/odds_api_leagues.json)"
+          fi
+          [[ "$league_ids" != "[]" ]]
+          echo "league_ids=$league_ids" >> "$GITHUB_OUTPUT"
+          echo "Running odds sync for leagues: $league_ids"
+
   prices:
+    needs: plan
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode != 'patch') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 1
+      # The previous hard-coded 12-league matrix silently skipped every other
+      # configured league. Three shards keep the full 30-league refresh within
+      # the schedule interval without creating an unbounded provider burst.
+      max-parallel: 3
       matrix:
-        league_id: ${{ fromJSON(format('[{0}]', inputs.league_ids || '8,9,384,387,564,567,82,301,600,501,444,72')) }}
+        league_id: ${{ fromJSON(needs.plan.outputs.league_ids) }}
     env:
       PYTHONPATH: .
       PYTHONUNBUFFERED: "1"
@@ -443,7 +470,7 @@ jobs:
   summary:
     if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode != 'patch')) }}
     runs-on: ubuntu-latest
-    needs: [prices, retention]
+    needs: [plan, prices, retention]
     env:
       ODDS_MAX_RUNTIME_MINUTES: "25"
       ODDS_COVERAGE_MIN_PCT: "50"
@@ -452,7 +479,7 @@ jobs:
       RUN_COVERAGE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_coverage || 'false' }}
       PRICES_RESULT: ${{ needs.prices.result }}
       RETENTION_RESULT: ${{ needs.retention.result }}
-      EXPECTED_LEAGUES: ${{ inputs.league_ids || '8,9,384,387,564,567,82,301,600,501,444,72' }}
+      EXPECTED_LEAGUES: ${{ inputs.league_ids || join(fromJSON(needs.plan.outputs.league_ids), ',') }}
     steps:
       - name: Download ingest reports
         uses: actions/download-artifact@v4
