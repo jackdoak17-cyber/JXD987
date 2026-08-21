@@ -4,6 +4,19 @@ on:
   schedule:
     - cron: "45 8 * * *"
   workflow_dispatch:
+    inputs:
+      team_history_days:
+        description: "Provider history lookback for upcoming-team backfill"
+        required: false
+        default: "365"
+      team_history_batch_size:
+        description: "Maximum teams fetched in this run"
+        required: false
+        default: "25"
+      team_history_batch_index:
+        description: "Optional batch index; blank rotates by UTC day"
+        required: false
+        default: ""
 
 jobs:
   sync:
@@ -23,6 +36,11 @@ jobs:
       SM_RATE_LIMIT_RETRIES: "2"
       SM_RATE_LIMIT_SLEEP_BASE: "2"
       SM_RATE_LIMIT_SLEEP_MAX: "15"
+      TEAM_HISTORY_DAYS: ${{ github.event.inputs.team_history_days || '365' }}
+      TEAM_HISTORY_BATCH_SIZE: ${{ github.event.inputs.team_history_batch_size || '25' }}
+      TEAM_HISTORY_BATCH_INDEX: ${{ github.event.inputs.team_history_batch_index || '' }}
+      TEAM_HISTORY_MIN_MATCHES: "5"
+      TEAM_HISTORY_EXPORT_DAYS: "365"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,7 +68,18 @@ jobs:
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
-          python3 scripts/run_sync.py --mode recent --recent-days "$RECENT_DAYS" --leagues "$LEAGUE_IDS"
+          sync_args=(
+            --mode recent
+            --recent-days "$RECENT_DAYS"
+            --leagues "$LEAGUE_IDS"
+            --team-history-days "$TEAM_HISTORY_DAYS"
+            --team-history-min-matches "$TEAM_HISTORY_MIN_MATCHES"
+            --team-history-batch-size "$TEAM_HISTORY_BATCH_SIZE"
+          )
+          if [[ -n "$TEAM_HISTORY_BATCH_INDEX" ]]; then
+            sync_args+=(--team-history-batch-index "$TEAM_HISTORY_BATCH_INDEX")
+          fi
+          python3 scripts/run_sync.py "${sync_args[@]}"
 
       - name: Freshness report
         run: python3 scripts/sqlite_freshness_report.py
@@ -67,6 +96,34 @@ jobs:
           # workflow; reprocessing 240 days here defeats the runtime bound.
           EXPORT_DAYS_BACK: "30"
         run: python3 scripts/export_to_supabase.py --strict --leagues "$LEAGUE_IDS"
+
+      - name: Export provider-confirmed team history core
+        if: ${{ env.TEAM_HISTORY_DAYS != '0' }}
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_EXPORT_CHUNK: "1000"
+          SUPABASE_EXPORT_SLEEP: "0"
+          SUPABASE_EXPORT_RETRIES: "5"
+        run: |
+          # Team-scoped history can belong to a competition outside the menu
+          # allowlist. Export only confirmed core fixture rows and never prune
+          # unrelated seasons or detailed player/stat rows.
+          python3 scripts/export_to_supabase.py \
+            --fixture-core-only \
+            --days-back "$TEAM_HISTORY_EXPORT_DAYS" \
+            --upcoming-days 14 \
+            --skip-prune \
+            --leagues "" \
+            --report-json /tmp/team_history_export_report.json
+
+      - name: Upload team history export report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: team_history_export_report
+          path: /tmp/team_history_export_report.json
+          if-no-files-found: ignore
 
       - name: Refresh likely players
         env:

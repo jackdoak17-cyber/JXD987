@@ -102,6 +102,22 @@ def main(
     ),
     mode: str = typer.Option("recent", help="recent|history|full"),
     recent_days: int = typer.Option(120, help="Days back for recent window"),
+    team_history_days: int = typer.Option(
+        0,
+        help="Backfill provider-confirmed history for upcoming teams across competitions (0 disables)",
+    ),
+    team_history_min_matches: int = typer.Option(
+        5,
+        help="Only backfill teams with fewer than this many completed matches",
+    ),
+    team_history_batch_size: int = typer.Option(
+        25,
+        help="Maximum team-history API calls per run",
+    ),
+    team_history_batch_index: Optional[int] = typer.Option(
+        None,
+        help="Optional deterministic team-history batch index (defaults to UTC-day rotation)",
+    ),
 ):
     league_ids = _parse_leagues(leagues)
     engine = get_engine()
@@ -128,6 +144,16 @@ def main(
 
     log.info("Syncing upcoming fixtures (next 14 days)")
     svc.sync_upcoming_window(league_ids, days_forward=14)
+
+    if team_history_days > 0:
+        svc.sync_team_history_for_recent_fixtures(
+            league_ids,
+            history_days=team_history_days,
+            minimum_completed_matches=team_history_min_matches,
+            batch_size=team_history_batch_size,
+            batch_index=team_history_batch_index,
+            upcoming_days=14,
+        )
 
     _check_eze_stats(session, league_ids)
 

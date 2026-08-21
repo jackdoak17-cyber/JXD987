@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, timedelta, date
 from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .sportmonks_client import SportMonksClient, SportMonksError
@@ -681,6 +681,48 @@ class SyncService:
         return count
 
     # --- fixtures ---
+    def _store_fixture_season(self, raw: Dict) -> None:
+        """Persist season metadata discovered through a team fixture feed.
+
+        Team-scoped fixture history can cross competitions that are not part of
+        the menu's normal league allowlist.  Keeping the provider's season row
+        alongside the fixture lets the normal core exporter retain those
+        confirmed score records without inventing a league or season.
+        """
+        season_raw = raw.get("season") or {}
+        if isinstance(season_raw, dict) and isinstance(season_raw.get("data"), dict):
+            season_raw = season_raw["data"]
+        if not isinstance(season_raw, dict):
+            season_raw = {}
+        season_id = raw.get("season_id") or season_raw.get("id")
+        league_raw = raw.get("league") or {}
+        if isinstance(league_raw, dict) and isinstance(league_raw.get("data"), dict):
+            league_raw = league_raw["data"]
+        if not isinstance(league_raw, dict):
+            league_raw = {}
+        league_id = raw.get("league_id") or league_raw.get("id") or season_raw.get("league_id")
+        if season_id is None or league_id is None:
+            return
+
+        existing = self.session.get(Season, season_id)
+        payload = {
+            "id": season_id,
+            "league_id": league_id,
+            "name": season_raw.get("name"),
+            "start_date": parse_dt(season_raw.get("start_date") or season_raw.get("starting_at")),
+            "end_date": parse_dt(season_raw.get("end_date") or season_raw.get("ending_at")),
+            "is_current": bool(season_raw.get("is_current") or season_raw.get("current")),
+            "extra": season_raw or raw,
+        }
+        if existing is None:
+            self.session.add(Season(**payload))
+            return
+        # Do not erase richer metadata previously synced by the league feed
+        # when a team-scoped response omits one of the nested fields.
+        for key, value in payload.items():
+            if key in {"id", "league_id"} or value is not None:
+                setattr(existing, key, value)
+
     def _map_fixture(self, raw: Dict) -> Dict:
         home_score, away_score = self._extract_scores(raw.get("scores") or raw.get("score"))
         status, status_code = _fixture_status_values(raw)
@@ -1146,6 +1188,7 @@ class SyncService:
             fixture.away_score = _safe_int(away_part.get("score"))
 
     def _store_fixture_raw(self, raw: Dict, log_changes: bool = False) -> None:
+        self._store_fixture_season(raw)
         data = self._map_fixture(raw)
         fixture = self.session.get(Fixture, data["id"])
         if fixture:
@@ -1300,6 +1343,132 @@ class SyncService:
         end = today + timedelta(days=days_forward)
         includes = ["participants", "scores", "state"]
         return self.sync_fixtures_between(today, end, league_ids=league_ids, includes=includes)
+
+    def sync_team_history_for_recent_fixtures(
+        self,
+        league_ids: Sequence[int],
+        history_days: int = 365,
+        minimum_completed_matches: int = 5,
+        batch_size: int = 25,
+        batch_index: Optional[int] = None,
+        upcoming_days: int = 14,
+    ) -> Dict[str, int]:
+        """Backfill confirmed team history across competitions in bounded batches.
+
+        The fixture menu contains cup participants whose recent matches are in
+        a different domestic competition (or have not been synced at all). A
+        league-filtered refresh cannot discover those rows. This method uses
+        SportMonks' team-scoped date-range endpoint and stores only provider
+        responses; no derived or substituted values are written.
+
+        The local SQLite database is recreated by GitHub Actions on each run,
+        so the batch rotates deterministically by UTC day. Supabase retains
+        each exported batch, allowing the complete candidate set to converge
+        without making one scheduled run unbounded.
+        """
+        now = datetime.utcnow()
+        end = now + timedelta(days=max(upcoming_days, 0))
+        upcoming_query = (
+            self.session.query(Fixture.home_team_id, Fixture.away_team_id)
+            .filter(Fixture.starting_at >= now)
+            .filter(Fixture.starting_at <= end)
+        )
+        if league_ids:
+            upcoming_query = upcoming_query.filter(Fixture.league_id.in_(list(league_ids)))
+        upcoming_team_ids: Set[int] = set()
+        for home_id, away_id in upcoming_query.all():
+            if home_id:
+                upcoming_team_ids.add(int(home_id))
+            if away_id:
+                upcoming_team_ids.add(int(away_id))
+        if not upcoming_team_ids:
+            log.info("Team history backfill skipped: no upcoming fixture teams")
+            return {"teams_considered": 0, "teams_selected": 0, "fixtures_synced": 0, "teams_failed": 0}
+
+        team_id_list = sorted(upcoming_team_ids)
+        completed_base = (
+            self.session.query(Fixture.home_team_id, func.count(Fixture.id))
+            .filter(Fixture.home_team_id.in_(team_id_list))
+            .filter(Fixture.starting_at < now)
+            .filter(Fixture.home_score.isnot(None), Fixture.away_score.isnot(None))
+            .group_by(Fixture.home_team_id)
+            .all()
+        )
+        away_base = (
+            self.session.query(Fixture.away_team_id, func.count(Fixture.id))
+            .filter(Fixture.away_team_id.in_(team_id_list))
+            .filter(Fixture.starting_at < now)
+            .filter(Fixture.home_score.isnot(None), Fixture.away_score.isnot(None))
+            .group_by(Fixture.away_team_id)
+            .all()
+        )
+        completed_counts = {team_id: 0 for team_id in team_id_list}
+        for team_id, count in completed_base:
+            completed_counts[int(team_id)] += int(count or 0)
+        for team_id, count in away_base:
+            completed_counts[int(team_id)] += int(count or 0)
+
+        minimum = max(0, int(minimum_completed_matches))
+        candidates = [team_id for team_id in team_id_list if completed_counts[team_id] < minimum]
+        candidates.sort(key=lambda team_id: (completed_counts[team_id], team_id))
+        if not candidates:
+            log.info(
+                "Team history backfill skipped: all %s upcoming teams have at least %s completed matches",
+                len(team_id_list),
+                minimum,
+            )
+            return {
+                "teams_considered": len(team_id_list),
+                "teams_selected": 0,
+                "fixtures_synced": 0,
+                "teams_failed": 0,
+            }
+
+        size = max(1, int(batch_size))
+        batch_count = (len(candidates) + size - 1) // size
+        if batch_index is None:
+            batch_index = now.date().toordinal() % batch_count
+        selected = candidates[(int(batch_index) % batch_count) * size : (int(batch_index) % batch_count + 1) * size]
+        start = (now - timedelta(days=max(1, int(history_days)))).date()
+        end_date = now.date()
+        includes = ["participants", "scores", "state", "season", "league"]
+        synced = 0
+        failed = 0
+        for team_id in selected:
+            try:
+                endpoint = f"fixtures/between/{start.isoformat()}/{end_date.isoformat()}/{team_id}"
+                team_count = 0
+                for item in self.client.fetch_collection(endpoint, includes=includes, per_page=50):
+                    # The endpoint is authoritative, but keep the history pass
+                    # bounded to completed fixtures before the current UTC day.
+                    starting_at = parse_dt(item.get("starting_at"))
+                    if starting_at is not None and starting_at > now:
+                        continue
+                    self._store_fixture_raw(item)
+                    team_count += 1
+                self.session.commit()
+                synced += team_count
+                log.info("Team history backfill team=%s fixtures=%s", team_id, team_count)
+            except SportMonksError as exc:
+                self.session.rollback()
+                failed += 1
+                log.warning("Team history backfill failed team=%s: %s", team_id, exc)
+
+        log.info(
+            "Team history backfill complete: considered=%s selected=%s fixtures=%s failed=%s batch=%s/%s",
+            len(team_id_list),
+            len(selected),
+            synced,
+            failed,
+            int(batch_index) % batch_count,
+            batch_count,
+        )
+        return {
+            "teams_considered": len(team_id_list),
+            "teams_selected": len(selected),
+            "fixtures_synced": synced,
+            "teams_failed": failed,
+        }
 
     def sync_history_window(self, league_ids: Sequence[int], keep_season_ids: Set[int]) -> int:
         seasons = (
