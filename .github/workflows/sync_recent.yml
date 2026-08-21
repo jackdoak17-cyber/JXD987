@@ -12,7 +12,7 @@ on:
       team_history_batch_size:
         description: "Maximum teams fetched in this run"
         required: false
-        default: "25"
+        default: "100"
       team_history_batch_index:
         description: "Optional batch index; blank rotates by UTC day"
         required: false
@@ -41,7 +41,10 @@ jobs:
       # provider endpoint is still bounded per team and the batch keeps the
       # Actions job within its timeout.
       TEAM_HISTORY_DAYS: ${{ github.event.inputs.team_history_days || '1095' }}
-      TEAM_HISTORY_BATCH_SIZE: ${{ github.event.inputs.team_history_batch_size || '25' }}
+      # 25 teams/day left a large cup-team backlog unresolved for weeks. One
+      # hundred teams remains bounded below the proven 20-minute job limit and
+      # drains a full candidate backlog in days without manual dispatches.
+      TEAM_HISTORY_BATCH_SIZE: ${{ github.event.inputs.team_history_batch_size || '100' }}
       TEAM_HISTORY_BATCH_INDEX: ${{ github.event.inputs.team_history_batch_index || '' }}
       TEAM_HISTORY_MIN_MATCHES: "5"
       TEAM_HISTORY_EXPORT_DAYS: "1095"
