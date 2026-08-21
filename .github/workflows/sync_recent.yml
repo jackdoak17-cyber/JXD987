@@ -62,7 +62,10 @@ jobs:
           SUPABASE_EXPORT_CHUNK: "1000"
           SUPABASE_EXPORT_SLEEP: "0"
           SUPABASE_EXPORT_RETRIES: "5"
-          EXPORT_DAYS_BACK: "240"
+          # Keep the export bounded to the same recent window as the sync.
+          # Historical rows are retained in Supabase by the sharded history
+          # workflow; reprocessing 240 days here defeats the runtime bound.
+          EXPORT_DAYS_BACK: "30"
         run: python3 scripts/export_to_supabase.py --strict --leagues "$LEAGUE_IDS"
 
       - name: Refresh likely players
