@@ -67,6 +67,10 @@ jobs:
           python3 scripts/run_sync.py --mode history --leagues "$LEAGUE_ID"
 
       - name: Freshness report
+        # This report is global and can legitimately be stale for a single
+        # shard whose current season has not completed a fixture yet. It must
+        # not prevent the successfully synced league from being exported.
+        continue-on-error: true
         run: python3 scripts/sqlite_freshness_report.py
 
       - name: Export league history to Supabase
