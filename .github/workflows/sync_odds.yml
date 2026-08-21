@@ -255,6 +255,12 @@ jobs:
           if-no-files-found: ignore
 
       - name: Validate 7-day moneyline coverage
+        # Coverage can be below 100% when the upstream provider has not
+        # released a market yet or has no event for a competition. Preserve
+        # the report as an actionable warning without marking a successful
+        # odds ingest as a failed GitHub job; Operations audits the live card
+        # and records the exact missing fixture IDs separately.
+        continue-on-error: true
         if: env.INGEST_OK == 'true'
         env:
           SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
