@@ -1,6 +1,8 @@
 config/league_ids.txt
 # Keep Odds API league mappings in every VPS deploy so new league IDs do not get skipped.
 config/odds_api_leagues.json
+# Keep the default VPS odds list aligned with the no-cup-consumption policy.
+config/odds_api_sync_excluded_leagues.json
 jxd/__init__.py
 jxd/db.py
 jxd/models.py

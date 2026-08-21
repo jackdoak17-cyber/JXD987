@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
 require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
+  "config/odds_api_sync_excluded_leagues.json" \
   "jxd/__init__.py" \
   "jxd/db.py" \
   "jxd/models.py" \

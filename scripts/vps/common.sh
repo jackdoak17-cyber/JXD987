@@ -125,13 +125,14 @@ default_league_csv() {
 }
 
 odds_league_csv() {
-  python3 - "${REPO_ROOT}/config/league_ids.txt" "${REPO_ROOT}/config/odds_api_leagues.json" <<'PY'
+python3 - "${REPO_ROOT}/config/league_ids.txt" "${REPO_ROOT}/config/odds_api_leagues.json" "${REPO_ROOT}/config/odds_api_sync_excluded_leagues.json" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 league_ids_path = Path(sys.argv[1])
 odds_map_path = Path(sys.argv[2])
+excluded_path = Path(sys.argv[3])
 
 configured_ids = []
 for line in league_ids_path.read_text(encoding="utf-8").splitlines():
@@ -141,7 +142,11 @@ for line in league_ids_path.read_text(encoding="utf-8").splitlines():
     configured_ids.append(int(value))
 
 odds_map = json.loads(odds_map_path.read_text(encoding="utf-8"))
-odds_ids = {int(value) for value in odds_map}
+excluded_ids = {
+    int(value)
+    for value in json.loads(excluded_path.read_text(encoding="utf-8"))
+} if excluded_path.exists() else set()
+odds_ids = {int(value) for value in odds_map if int(value) not in excluded_ids}
 print(",".join(str(league_id) for league_id in configured_ids if league_id in odds_ids))
 PY
 }
