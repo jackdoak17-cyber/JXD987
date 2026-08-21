@@ -34,16 +34,22 @@ from jxd.odds_api_client import OddsApiClient, OddsApiError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
-DEFAULT_BOOKMAKERS = ["Bet365", "Paddy Power"]
+DEFAULT_BOOKMAKERS = ["Bet365", "Paddy Power", "Unibet", "BetMGM", "Betfair Exchange"]
 BOOKMAKER_NAME_TO_ID = {
     "bet365": 2,
     "kambi": 3,
     "paddypower": 4,
+    "unibet": 5,
+    "betmgm": 8,
+    "betfairexchange": 9,
 }
 BOOKMAKER_CANONICAL = {
     "bet365": "Bet365",
     "kambi": "Kambi",
     "paddypower": "Paddy Power",
+    "unibet": "Unibet",
+    "betmgm": "BetMGM",
+    "betfairexchange": "Betfair Exchange",
 }
 HISTORICAL_ODDS_BASE_URL = os.environ.get("ODDS_API_HISTORICAL_BASE") or "https://api.odds-api.io/v3"
 SETTLED_EVENT_STATUSES = {"settled", "finished", "final", "ended", "completed"}
@@ -432,6 +438,12 @@ def normalize_bookmaker_key(value: str) -> str:
         return "kambi"
     if "paddypower" in raw or ("paddy" in raw and "power" in raw):
         return "paddypower"
+    if "unibet" in raw:
+        return "unibet"
+    if "betmgm" in raw:
+        return "betmgm"
+    if "betfair" in raw and "exchange" in raw:
+        return "betfairexchange"
     return raw
 
 
