@@ -31,11 +31,17 @@ class SportMonksClient:
         if not self.api_token:
             raise SportMonksError("SPORTMONKS_API_TOKEN is required")
         self.base_url = base_url.rstrip("/") + "/"
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.rate_limit_retries = int(os.environ.get("SM_RATE_LIMIT_RETRIES", str(max_retries)))
-        self.rate_limit_sleep_base = float(os.environ.get("SM_RATE_LIMIT_SLEEP_BASE", "1"))
-        self.rate_limit_sleep_max = float(os.environ.get("SM_RATE_LIMIT_SLEEP_MAX", "60"))
+        self.timeout = max(1, int(os.environ.get("SPORTMONKS_TIMEOUT_SECONDS", str(timeout))))
+        self.max_retries = max(1, int(os.environ.get("SPORTMONKS_MAX_RETRIES", str(max_retries))))
+        self.rate_limit_retries = max(
+            1,
+            int(os.environ.get("SM_RATE_LIMIT_RETRIES", str(self.max_retries))),
+        )
+        self.rate_limit_sleep_base = max(0.0, float(os.environ.get("SM_RATE_LIMIT_SLEEP_BASE", "1")))
+        self.rate_limit_sleep_max = max(
+            self.rate_limit_sleep_base,
+            float(os.environ.get("SM_RATE_LIMIT_SLEEP_MAX", "60")),
+        )
         self.stats: Dict[str, object] = {
             "total_calls": 0,
             "total_time_seconds": 0.0,

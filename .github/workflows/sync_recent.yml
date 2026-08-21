@@ -8,10 +8,18 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # A provider stall must produce a visible failed run, never an unbounded
+    # Actions job that prevents the next scheduled refresh from starting.
+    timeout-minutes: 30
     env:
       PYTHONPATH: .
-      RECENT_DAYS: "240"
-      EXPORT_DAYS_BACK: "240"
+      RECENT_DAYS: "120"
+      EXPORT_DAYS_BACK: "120"
+      SPORTMONKS_TIMEOUT_SECONDS: "20"
+      SPORTMONKS_MAX_RETRIES: "3"
+      SM_RATE_LIMIT_RETRIES: "2"
+      SM_RATE_LIMIT_SLEEP_BASE: "2"
+      SM_RATE_LIMIT_SLEEP_MAX: "15"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
