@@ -165,6 +165,9 @@ TEAM_NAME_ALIAS = {
     "staderennais": "rennes",
     "staderennaisfc": "rennes",
     "fcmetz": "metz",
+    # SportMonks currently labels this Saudi club "Al Draih" while Odds-API
+    # uses its current name, "Diriyah Club".
+    "aldraih": "diriyah",
 }
 
 TEAM_TOKEN_DROP = {
