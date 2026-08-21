@@ -8,7 +8,7 @@ on:
       team_history_days:
         description: "Provider history lookback for upcoming-team backfill"
         required: false
-        default: "365"
+        default: "1095"
       team_history_batch_size:
         description: "Maximum teams fetched in this run"
         required: false
@@ -36,11 +36,15 @@ jobs:
       SM_RATE_LIMIT_RETRIES: "2"
       SM_RATE_LIMIT_SLEEP_BASE: "2"
       SM_RATE_LIMIT_SLEEP_MAX: "15"
-      TEAM_HISTORY_DAYS: ${{ github.event.inputs.team_history_days || '365' }}
+      # Three seasons are required for newly promoted/cup teams whose current
+      # competition only contains a handful of completed fixtures. The
+      # provider endpoint is still bounded per team and the batch keeps the
+      # Actions job within its timeout.
+      TEAM_HISTORY_DAYS: ${{ github.event.inputs.team_history_days || '1095' }}
       TEAM_HISTORY_BATCH_SIZE: ${{ github.event.inputs.team_history_batch_size || '25' }}
       TEAM_HISTORY_BATCH_INDEX: ${{ github.event.inputs.team_history_batch_index || '' }}
       TEAM_HISTORY_MIN_MATCHES: "5"
-      TEAM_HISTORY_EXPORT_DAYS: "365"
+      TEAM_HISTORY_EXPORT_DAYS: "1095"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -123,6 +127,7 @@ jobs:
             --upcoming-days 14 \
             --skip-prune \
             --leagues "" \
+            --keep-all-seasons \
             --report-json /tmp/team_history_export_report.json
 
       - name: Upload team history export report

@@ -206,8 +206,20 @@ def ensure_fixture_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def choose_keep_seasons(conn: sqlite3.Connection, league_ids: Sequence[int] | None = None) -> Set[int]:
+def choose_keep_seasons(
+    conn: sqlite3.Connection,
+    league_ids: Sequence[int] | None = None,
+    keep_all: bool = False,
+) -> Set[int]:
     cur = conn.cursor()
+    if keep_all:
+        if league_ids:
+            q = ",".join("?" for _ in league_ids)
+            cur.execute(f"select distinct id from seasons where league_id in ({q})", league_ids)
+        else:
+            cur.execute("select distinct id from seasons")
+        return {int(row[0]) for row in cur.fetchall()}
+
     keep: Set[int] = set()
     if league_ids:
         q = ",".join("?" for _ in league_ids)
@@ -853,6 +865,12 @@ def main():
         help="Skip pruning fixtures outside kept seasons.",
     )
     parser.add_argument(
+        "--keep-all-seasons",
+        action="store_true",
+        default=False,
+        help="Retain every season present in SQLite (for bounded team-history exports).",
+    )
+    parser.add_argument(
         "--report-json",
         default=None,
         help="Write the export summary JSON to this path as well as stdout.",
@@ -866,7 +884,11 @@ def main():
     ensure_fixture_columns(conn)
 
     league_ids = [int(x) for x in args.leagues.split(",") if x.strip()] if args.leagues else []
-    keep_ids = choose_keep_seasons(conn, league_ids if league_ids else None)
+    keep_ids = choose_keep_seasons(
+        conn,
+        league_ids if league_ids else None,
+        keep_all=args.keep_all_seasons,
+    )
     if not keep_ids:
         raise SystemExit("No seasons to export")
 
