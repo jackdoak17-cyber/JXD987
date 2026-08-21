@@ -47,10 +47,15 @@ jobs:
           REQUESTED_LEAGUE_IDS: ${{ inputs.league_ids || '' }}
         run: |
           set -euo pipefail
+          excluded_ids="$(jq -c '.' config/odds_api_sync_excluded_leagues.json)"
           if [[ -n "$REQUESTED_LEAGUE_IDS" ]]; then
             league_ids="$(jq -cn --arg raw "$REQUESTED_LEAGUE_IDS" '$raw | split(",") | map(select(length > 0) | tonumber) | unique | sort')"
+            if jq -e --argjson excluded "$excluded_ids" 'any(.[]; . as $id | ($excluded | index($id)) != null)' <<<"$league_ids" >/dev/null; then
+              echo "Requested odds leagues include competitions excluded by config/odds_api_sync_excluded_leagues.json" >&2
+              exit 1
+            fi
           else
-            league_ids="$(jq -c 'keys | map(tonumber) | sort' config/odds_api_leagues.json)"
+            league_ids="$(jq -c --argjson excluded "$excluded_ids" 'keys | map(tonumber) | map(select(. as $id | ($excluded | index($id)) == null)) | sort' config/odds_api_leagues.json)"
           fi
           [[ "$league_ids" != "[]" ]]
           echo "league_ids=$league_ids" >> "$GITHUB_OUTPUT"
