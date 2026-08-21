@@ -129,6 +129,8 @@ def main() -> None:
     ]
     if args.limit and args.limit > 0:
         cmd += ["--limit", str(args.limit)]
+    if args.include_excluded:
+        cmd.append("--include-excluded")
 
     raise SystemExit(subprocess.call(cmd))
 

@@ -477,6 +477,17 @@ def load_market_allowlist() -> Optional[set]:
     return set(DEFAULT_MARKET_ALLOWLIST)
 
 
+def load_excluded_league_ids() -> Set[int]:
+    """Return competitions that must not trigger paid Odds-API requests."""
+    path = Path(__file__).resolve().parent.parent / "config" / "odds_api_sync_excluded_leagues.json"
+    if not path.exists():
+        return set()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise SystemExit(f"Expected a JSON array in {path}")
+    return {int(value) for value in raw}
+
+
 def parse_float(value: Optional[object]) -> Optional[float]:
     if value is None:
         return None
@@ -2119,6 +2130,11 @@ def parse_player_market_rows(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
+    parser.add_argument(
+        "--include-excluded",
+        action="store_true",
+        help="Explicitly allow leagues listed in odds_api_sync_excluded_leagues.json.",
+    )
     # Keep a short settled window so callers that omit --days-back still
     # retrieve historical pre-kickoff odds for fixtures that finished earlier
     # on the same day.
@@ -2203,6 +2219,13 @@ def main() -> None:
     league_ids = [int(x) for x in raw_leagues.split(",") if x.strip()]
     if not league_ids:
         raise SystemExit("No league IDs provided")
+    excluded_ids = load_excluded_league_ids()
+    blocked_ids = sorted(set(league_ids).intersection(excluded_ids))
+    if blocked_ids and not args.include_excluded:
+        raise SystemExit(
+            "Refusing paid Odds-API sync for excluded cup league IDs "
+            f"{blocked_ids}; pass --include-excluded only for an intentional override."
+        )
 
     market_allowlist = load_market_allowlist()
     raw_bookmakers = [b.strip() for b in str(args.bookmakers).split(",") if b.strip()]
