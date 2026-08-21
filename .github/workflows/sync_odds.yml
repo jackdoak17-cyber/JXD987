@@ -60,6 +60,9 @@ jobs:
     needs: plan
     if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode != 'patch') }}
     runs-on: ubuntu-latest
+    # A provider/API stall must fail visibly instead of holding the matrix
+    # queue indefinitely and masking the next scheduled refresh.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       # The previous hard-coded 12-league matrix silently skipped every other
