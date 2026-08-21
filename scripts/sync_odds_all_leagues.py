@@ -34,11 +34,22 @@ def load_league_ids(path: Path) -> list[int]:
     return ids
 
 
-def load_odds_league_ids(repo_root: Path) -> list[int]:
+def load_excluded_league_ids(repo_root: Path) -> set[int]:
+    path = repo_root / "config" / "odds_api_sync_excluded_leagues.json"
+    if not path.exists():
+        return set()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise SystemExit(f"Expected a JSON array in {path}")
+    return {int(value) for value in raw}
+
+
+def load_odds_league_ids(repo_root: Path, include_excluded: bool = False) -> list[int]:
     config_ids = load_league_ids(repo_root / "config" / "league_ids.txt")
     odds_map_path = repo_root / "config" / "odds_api_leagues.json"
     raw = json.loads(odds_map_path.read_text(encoding="utf-8"))
-    odds_ids = {int(value) for value in raw}
+    excluded = set() if include_excluded else load_excluded_league_ids(repo_root)
+    odds_ids = {int(value) for value in raw if int(value) not in excluded}
     ordered_ids = [league_id for league_id in config_ids if league_id in odds_ids]
     extra_ids = sorted(odds_ids.difference(ordered_ids))
     return [*ordered_ids, *extra_ids]
@@ -82,6 +93,11 @@ def main() -> None:
     parser.add_argument("--days-forward", type=int, default=14)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument(
+        "--include-excluded",
+        action="store_true",
+        help="Explicitly include leagues listed in odds_api_sync_excluded_leagues.json.",
+    )
+    parser.add_argument(
         "--bookmakers",
         default=os.environ.get("ODDS_BOOKMAKERS", "Bet365,Paddy Power"),
         help="Comma-separated bookmaker names",
@@ -92,9 +108,10 @@ def main() -> None:
     db_path = Path(os.environ.get("JXD_DB_PATH", str(repo_root / "data" / "jxd.sqlite")))
     start_dt, end_dt = window_bounds(args.days_forward)
 
-    config_ids = load_odds_league_ids(repo_root)
+    excluded_ids = load_excluded_league_ids(repo_root) if not args.include_excluded else set()
+    config_ids = load_odds_league_ids(repo_root, include_excluded=args.include_excluded)
     fixture_ids = load_fixture_league_ids(db_path, start_dt, end_dt)
-    league_ids = sorted({*config_ids, *fixture_ids})
+    league_ids = sorted({*config_ids, *(league_id for league_id in fixture_ids if league_id not in excluded_ids)})
     if not league_ids:
         raise SystemExit(f"No odds-enabled league ids found (config={repo_root / 'config' / 'odds_api_leagues.json'}, db={db_path})")
 
