@@ -727,10 +727,26 @@ class SyncService:
         home_score, away_score = self._extract_scores(raw.get("scores") or raw.get("score"))
         status, status_code = _fixture_status_values(raw)
         has_lineup_confirmed, lineup_confirmed = _fixture_lineup_confirmed(raw)
+        # Team-scoped fixture feeds often provide season/league only through
+        # their included relation objects. Preserve those provider IDs so the
+        # core exporter can retain the cross-competition history rows instead
+        # of silently dropping them when it filters by season_id.
+        season_raw = raw.get("season") or {}
+        if isinstance(season_raw, dict) and isinstance(season_raw.get("data"), dict):
+            season_raw = season_raw["data"]
+        if not isinstance(season_raw, dict):
+            season_raw = {}
+        league_raw = raw.get("league") or {}
+        if isinstance(league_raw, dict) and isinstance(league_raw.get("data"), dict):
+            league_raw = league_raw["data"]
+        if not isinstance(league_raw, dict):
+            league_raw = {}
+        season_id = raw.get("season_id") or season_raw.get("id")
+        league_id = raw.get("league_id") or league_raw.get("id") or season_raw.get("league_id")
         payload = {
             "id": raw.get("id"),
-            "league_id": raw.get("league_id"),
-            "season_id": raw.get("season_id"),
+            "league_id": league_id,
+            "season_id": season_id,
             "starting_at": parse_dt(raw.get("starting_at")),
             "status": status,
             "status_code": status_code,

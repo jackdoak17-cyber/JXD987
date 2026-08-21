@@ -61,8 +61,6 @@ class TeamHistoryTests(unittest.TestCase):
         client.rows_by_endpoint[endpoint] = [
             {
                 "id": 901,
-                "league_id": 777,
-                "season_id": 400,
                 "starting_at": (now - timedelta(days=10)).isoformat(),
                 "status": "FT",
                 "participants": [
@@ -103,6 +101,8 @@ class TeamHistoryTests(unittest.TestCase):
         )
         self.assertEqual(session.get(Fixture, 901).home_score, 2)
         self.assertEqual(session.get(Fixture, 901).away_score, 1)
+        self.assertEqual(session.get(Fixture, 901).league_id, 777)
+        self.assertEqual(session.get(Fixture, 901).season_id, 400)
         self.assertEqual(session.get(Season, 400).league_id, 777)
 
     def test_backfill_does_not_call_provider_when_all_teams_are_complete(self):
