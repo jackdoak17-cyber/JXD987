@@ -852,6 +852,11 @@ def main():
         default=False,
         help="Skip pruning fixtures outside kept seasons.",
     )
+    parser.add_argument(
+        "--report-json",
+        default=None,
+        help="Write the export summary JSON to this path as well as stdout.",
+    )
     args = parser.parse_args()
 
     require_env(args.dry_run)
@@ -1015,7 +1020,17 @@ def main():
         "fixtures_dropped_missing_teams": dropped,
         "fixtures_pruned_other_seasons": pruned,
     }
-    print(json.dumps(summary))
+    summary_json = json.dumps(summary)
+    if args.report_json:
+        report_path = os.path.abspath(args.report_json)
+        report_dir = os.path.dirname(report_path)
+        if report_dir:
+            os.makedirs(report_dir, exist_ok=True)
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            report_file.write(summary_json)
+            report_file.write("\n")
+        log.info("Wrote export report: %s", report_path)
+    print(summary_json)
 
 
 if __name__ == "__main__":
