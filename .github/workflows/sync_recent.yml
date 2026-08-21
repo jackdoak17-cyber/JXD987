@@ -10,11 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     # A provider stall must produce a visible failed run, never an unbounded
     # Actions job that prevents the next scheduled refresh from starting.
-    timeout-minutes: 30
+    timeout-minutes: 20
     env:
       PYTHONPATH: .
-      RECENT_DAYS: "120"
-      EXPORT_DAYS_BACK: "120"
+      # Daily runs only need to refresh the recent form/stat window. Older
+      # rows remain in Supabase, so keeping this bounded prevents the export
+      # from repeatedly reprocessing an entire season.
+      RECENT_DAYS: "30"
+      EXPORT_DAYS_BACK: "30"
       SPORTMONKS_TIMEOUT_SECONDS: "20"
       SPORTMONKS_MAX_RETRIES: "3"
       SM_RATE_LIMIT_RETRIES: "2"
