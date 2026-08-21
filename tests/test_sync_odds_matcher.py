@@ -155,6 +155,42 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         self.assertIsNotNone(matched)
         self.assertEqual(matched["fixture_id"], 19777692)
 
+    def test_matches_brazilian_provider_state_qualifiers(self) -> None:
+        event = build_event(
+            "Botafogo FR RJ",
+            "CA Paranaense PR",
+            "2026-08-24T23:00:00Z",
+        )
+        fixture = build_fixture(
+            19621848,
+            "Botafogo",
+            "Athletico PR",
+            datetime(2026, 8, 24, 23, 0, 0),
+        )
+
+        matched = match_event_to_fixture(event, [fixture])
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["fixture_id"], 19621848)
+
+    def test_matches_brazilian_provider_long_names_to_short_names(self) -> None:
+        event = build_event(
+            "Athletic Club Sjdr MG",
+            "Gremio Novorizontino SP",
+            "2026-08-24T22:30:00Z",
+        )
+        fixture = build_fixture(
+            19667205,
+            "Athletic Club",
+            "Novorizontino",
+            datetime(2026, 8, 24, 22, 30, 0),
+        )
+
+        matched = match_event_to_fixture(event, [fixture])
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["fixture_id"], 19667205)
+
 
 if __name__ == "__main__":
     unittest.main()

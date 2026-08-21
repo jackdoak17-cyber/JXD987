@@ -128,6 +128,21 @@ TEAM_NAME_ALIAS = {
     "adceuta": "ceuta",
     "rcdeportivodelacoruna": "deportivolacoruna",
     "malagacf": "malaga",
+    # Brazilian provider names often append federation/state qualifiers that
+    # are absent from the SportMonks fixture names. Keep these explicit so
+    # kickoff matching does not discard otherwise valid markets.
+    "botafogofrrj": "botafogo",
+    "caparanaensepr": "athleticopr",
+    "athletic": "athleticclub",
+    "athleticclubsjdrmg": "athleticclub",
+    "athleticsjdrmg": "athleticclub",
+    "athleticsjdr": "athleticclub",
+    "gremionovorizontinosp": "novorizontino",
+    "ecjuventuders": "juventude",
+    "crbrasilal": "crb",
+    "nauticope": "nautico",
+    "goiasecgo": "goias",
+    "saobernardofc": "saobernardo",
     "cadizcf": "cadiz",
     "cdleganes": "leganes",
     "cordobacf": "cordoba",
