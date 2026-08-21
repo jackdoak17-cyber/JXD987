@@ -83,4 +83,9 @@ jobs:
         run: |
           # Never run the global prune from a single-league shard: it would
           # delete seasons belonging to the other matrix jobs.
-          python3 scripts/export_to_supabase.py --strict --skip-prune --leagues "$LEAGUE_ID"
+          python3 scripts/export_to_supabase.py \
+            --strict \
+            --skip-prune \
+            --skip-odds-snapshots \
+            --skip-odds-outcomes \
+            --leagues "$LEAGUE_ID"

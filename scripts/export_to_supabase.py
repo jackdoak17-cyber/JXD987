@@ -933,9 +933,22 @@ def main():
         deleted_fixture_player_stats = delete_fixture_rows(
             "fixture_player_statistics", fixture_ids, args.dry_run
         )
-        deleted_odds_outcomes = (
-            0 if args.skip_odds_outcomes else delete_fixture_rows("odds_outcomes", fixture_ids, args.dry_run)
-        )
+        # Odds are maintained by the dedicated odds-ingestion pipeline. A
+        # history/metadata export may not have any local odds rows at all;
+        # deleting the remote rows in that case silently wipes valid odds.
+        # Preserve them by default and require an explicit opt-in for a
+        # destructive replacement.
+        skip_odds_delete = os.environ.get("SUPABASE_SKIP_ODDS_OUTCOMES_DELETE", "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+        }
+        if args.skip_odds_outcomes or skip_odds_delete:
+            deleted_odds_outcomes = 0
+            if skip_odds_delete and not args.skip_odds_outcomes:
+                log.info("Skipping odds_outcomes fixture-scoped delete (SUPABASE_SKIP_ODDS_OUTCOMES_DELETE enabled).")
+        else:
+            deleted_odds_outcomes = delete_fixture_rows("odds_outcomes", fixture_ids, args.dry_run)
         log.info(
             "Deleted rows: fixture_players=%s fixture_player_statistics=%s odds_outcomes=%s",
             deleted_fixture_players,
