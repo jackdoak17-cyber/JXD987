@@ -101,6 +101,7 @@ jobs:
         env:
           SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          JXD_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
           PGSSLMODE: require
           LEAGUE_ID: ${{ matrix.league_id }}
           REPORT_PATH: /tmp/odds_preflight_${{ matrix.league_id }}.json
