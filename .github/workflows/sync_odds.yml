@@ -187,8 +187,12 @@ jobs:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
         run: |
           echo "LEAGUES_ARG=[${{ matrix.league_id }}]"
+          # Include the previous day so same-day fixtures that finish before
+          # their queued league shard runs still receive the provider's
+          # historical pre-kickoff odds.
           python3 scripts/sync_odds.py \
             --leagues "${{ matrix.league_id }}" \
+            --days-back 1 \
             --days-forward 14 \
             --refresh-upcoming \
             --bookmakers "${ODDS_BOOKMAKERS}" \
