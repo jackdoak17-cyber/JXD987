@@ -731,6 +731,7 @@ class SyncService:
                 for membership in stale_memberships:
                     membership.is_active = False
                     membership.updated_at = sync_run_at
+                    self._end_player_team_assignment(membership.player_id, team_id, sync_run_at)
 
                 # Maintain the legacy denormalised player.team_id for existing
                 # consumers, but treat snapshot membership as the source of truth.

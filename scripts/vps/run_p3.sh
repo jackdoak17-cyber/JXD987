@@ -127,6 +127,11 @@ else
   SQUAD_FRESHNESS_STATUS=1
 fi
 
+if [[ "${SQUAD_RECONCILIATION_STATUS}" -ne 0 || "${SQUAD_FRESHNESS_STATUS}" -ne 0 ]]; then
+  echo "Squad reconciliation/freshness failed; refusing to publish the remainder of P3" >&2
+  exit 1
+fi
+
 # Step 3: Odds fetch scoped to P3 fixtures only
 python scripts/sync_odds.py \
   --leagues "${ODDS_LEAGUES}" \
@@ -294,10 +299,6 @@ fi
 if [[ "${FIXTURE_DELIVERY_STATUS}" -ne 0 ]]; then
   echo "Fixtures Data Delivery v2 refresh failed; see /tmp/fixture_delivery_v2_report.json" >&2
   exit "${FIXTURE_DELIVERY_STATUS}"
-fi
-if [[ "${SQUAD_RECONCILIATION_STATUS}" -ne 0 || "${SQUAD_FRESHNESS_STATUS}" -ne 0 ]]; then
-  echo "Squad reconciliation/freshness failed; see /tmp/sparse_squad_refresh_report_p3.json and /tmp/squad_freshness_report_p3.json" >&2
-  exit 1
 fi
 CHAIN
 )

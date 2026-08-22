@@ -207,7 +207,14 @@ def detach_remote_players_missing_from_squads(
         patch = requests.patch(
             f"{SUPABASE_URL.rstrip()}{REST_PATH}/players",
             headers=rest_headers(),
-            params={"id": f"in.({','.join(str(player_id) for player_id in stale_ids)})"},
+            params={
+                # Keep the team predicate on the write as well as the lookup.
+                # This makes the detach idempotent and prevents a stale player
+                # ID from being cleared if another reconciliation moved it to
+                # a different team between these two requests.
+                "id": f"in.({','.join(str(player_id) for player_id in stale_ids)})",
+                "team_id": f"eq.{team_id}",
+            },
             json={"team_id": None},
             timeout=60,
         )
