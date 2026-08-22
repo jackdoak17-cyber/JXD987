@@ -50,6 +50,7 @@ MONEYLINE_MARKETS = {
     "home_draw_away",
     "h2h",
 }
+MIN_FORM_SAMPLE = 5
 
 
 def as_float(value: Any) -> float | None:
@@ -403,6 +404,20 @@ def empty_metrics() -> dict[str, Any]:
     }
 
 
+def sample_status(sample: int) -> str:
+    if sample <= 0:
+        return "none"
+    return "complete" if sample >= MIN_FORM_SAMPLE else "partial"
+
+
+def add_metrics_provenance(metrics: dict[str, Any], mode: str) -> dict[str, Any]:
+    """Persist the selected bucket and sample state alongside its values."""
+    sample = int(metrics.get("sample") or 0)
+    metrics["metricsSource"] = mode
+    metrics["sampleStatus"] = sample_status(sample)
+    return metrics
+
+
 def calculate_metrics(history: list[dict[str, Any]], team_id: int, window: int, venue: str | None) -> tuple[dict[str, Any], datetime | None]:
     selected: list[dict[str, Any]] = []
     for row in history:
@@ -465,7 +480,12 @@ def calculate_metrics(history: list[dict[str, Any]], team_id: int, window: int, 
     return metrics, max(row["starting_at"] for row in selected)
 
 
-def write_metrics(cur, schedule: list[dict[str, Any]], completed: list[dict[str, Any]], standings: dict[tuple[int, int], dict[int, dict[str, int]]]) -> int:
+def write_metrics(
+    cur,
+    schedule: list[dict[str, Any]],
+    completed: list[dict[str, Any]],
+    standings: dict[tuple[int, int], dict[int, dict[str, int]]],
+) -> tuple[int, dict[str, int]]:
     season_watermarks: dict[tuple[int, int], datetime] = {}
     for row in completed:
         key = (int(row["league_id"]), int(row["season_id"]))
@@ -503,19 +523,35 @@ def write_metrics(cur, schedule: list[dict[str, Any]], completed: list[dict[str,
         rows.sort(key=lambda row: (row["starting_at"], row["id"]), reverse=True)
 
     values = []
+    coverage = {
+        "overall_none": 0,
+        "overall_partial": 0,
+        "overall_complete": 0,
+        "venue_none": 0,
+        "venue_partial": 0,
+        "venue_complete": 0,
+        "venue_empty_overall_available": 0,
+    }
     for fixture in schedule:
         fixture_time = fixture["starting_at"]
         for side, team_id in (("home", int(fixture["home_team_id"])), ("away", int(fixture["away_team_id"]))):
             prior = [row for row in history_by_team.get(team_id, []) if row["starting_at"] < fixture_time]
             for window in range(5, 16):
+                samples: dict[str, int] = {}
                 for mode, venue in (("overall", None), ("venue", side)):
                     metrics, max_source = calculate_metrics(prior, team_id, window, venue)
+                    add_metrics_provenance(metrics, mode)
+                    status = str(metrics["sampleStatus"])
+                    coverage[f"{mode}_{status}"] += 1
+                    samples[mode] = int(metrics.get("sample") or 0)
                     values.append(
                         (
                             fixture["id"], team_id, side, window, mode, Json(metrics),
                             rank_for(int(fixture["league_id"]), int(fixture["season_id"] or 0), team_id), max_source,
                         )
                     )
+                if samples["venue"] == 0 and samples["overall"] > 0:
+                    coverage["venue_empty_overall_available"] += 1
     if values:
         execute_values(
             cur,
@@ -531,7 +567,7 @@ def write_metrics(cur, schedule: list[dict[str, Any]], completed: list[dict[str,
             values,
             page_size=1000,
         )
-    return len(values)
+    return len(values), coverage
 
 
 def source_odds(cur, fixture_ids: list[int]) -> list[dict[str, Any]]:
@@ -633,10 +669,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             report["components"]["standings"] = {"rows_read": len(completed), "rows_written": standings_written}
 
             metrics_run = start_run(cur, "metrics", start, end)
-            metrics_written = write_metrics(cur, valid_schedule, completed, standings)
-            finish_run(cur, metrics_run, "succeeded", {"rows_read": len(completed), "rows_written": metrics_written})
+            metrics_written, metrics_coverage = write_metrics(cur, valid_schedule, completed, standings)
+            finish_run(cur, metrics_run, "succeeded", {
+                "rows_read": len(completed),
+                "rows_written": metrics_written,
+                "rows_missing": metrics_coverage["venue_none"],
+                "coverage": metrics_coverage,
+            })
             conn.commit()
-            report["components"]["metrics"] = {"rows_read": len(completed), "rows_written": metrics_written}
+            report["components"]["metrics"] = {
+                "rows_read": len(completed),
+                "rows_written": metrics_written,
+                "coverage": metrics_coverage,
+            }
 
             odds_run = start_run(cur, "odds", start, end)
             odds_source = source_odds(cur, [int(row["id"]) for row in valid_schedule])
