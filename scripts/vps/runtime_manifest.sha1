@@ -9,6 +9,7 @@ fcdcb578db601c5d18ed75fe3ddc4dca41957ed1  jxd/models.py
 57a34e66f87f8613e7c43f0ed10c878edc819235  jxd/sync.py
 a035edb40cc5e12e1fdd5ccaa78d329b03ebf205  scripts/export_odds_to_supabase_psql.py
 c0cf37cd1db8d02365bf80ac325cfbe74044a98d  scripts/export_to_supabase.py
+cee2ad645616d5f6652f04b03d7a14a204e50dfd  scripts/refresh_fixture_delivery.py
 76e5168713ab879c274ec72d997e123f1cce7619  scripts/odds_retention_psql.py
 758f82520694091fde76fa861d36982db43c52e1  scripts/preflight_supabase_psql.py
 0aeb2ece3abb146f740989bc0b6e21aa017dc3cc  scripts/reconcile_recent_fixtures.py
@@ -18,6 +19,6 @@ a1b2e580c78cc5cbc26705c9144fd6b4d2d2b05b  scripts/rest_preflight.py
 e6075888af1dfe75bf2246a94492616434717f40  scripts/vps/common.sh
 aaf31d37d04da10279a562a2acfda4a74c387fc5  scripts/vps/run_p1.sh
 d2ca0710049ecfa058266b2157f066b83a2d1327  scripts/vps/run_p2.sh
-16520106e99cf8ee8bde47eccd2120cc82d7d8d5  scripts/vps/run_p3.sh
+0348125591b31bcda4d2214ab8d0606007a75ed2  scripts/vps/run_p3.sh
 c1e2db2eb593edf8e11a2a8a62b7a149d4b3b59c  scripts/vps/run_models.sh
 f3618767a4e726e24db85c465129ea255a3eaa79  scripts/vps/run_sync.sh
