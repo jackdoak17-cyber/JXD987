@@ -4,4 +4,3 @@
 
 alter table public.team_squad_snapshots enable row level security;
 alter table public.team_squad_memberships enable row level security;
-
