@@ -19,7 +19,8 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/export_odds_to_supabase_psql.py" \
   "scripts/odds_retention_psql.py" \
   "scripts/reconcile_recent_fixtures.py" \
-  "scripts/export_to_supabase.py"
+  "scripts/export_to_supabase.py" \
+  "scripts/refresh_fixture_delivery.py"
 
 export REPO_ROOT
 export STATS_LEAGUES="${STATS_LEAGUE_IDS:-${LEAGUE_IDS:-$(default_league_csv)}}"
@@ -36,6 +37,8 @@ export FIXTURE_REFRESH_DAYS_BACK="${FIXTURE_REFRESH_DAYS_BACK:-2}"
 export FIXTURE_REFRESH_DAYS_FORWARD="${FIXTURE_REFRESH_DAYS_FORWARD:-3}"
 export FIXTURE_EXPORT_DAYS_BACK="${FIXTURE_EXPORT_DAYS_BACK:-2}"
 export FIXTURE_EXPORT_DAYS_FORWARD="${FIXTURE_EXPORT_DAYS_FORWARD:-3}"
+export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-14}"
+export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-1800}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
 export MONEYLINE_COVERAGE_MIN_PCT="${MONEYLINE_COVERAGE_MIN_PCT:-100}"
@@ -146,7 +149,22 @@ else
   echo "Skipping recent fixture refresh/export; missing SportMonks or Supabase REST env" >&2
 fi
 
-# Step 6: Hard guard for the user-facing fixtures window.
+# Step 6: Publish the persistent Fixtures Data Delivery v2 read models.
+# This is the only user-facing fixture delivery source after cutover. A failed
+# refresh fails P3 instead of hiding a stale or incomplete read model.
+FIXTURE_DELIVERY_STATUS=0
+if [[ -n "${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}" ]]; then
+  python scripts/refresh_fixture_delivery.py \
+    --start-date "$(date -u +%F)" \
+    --end-date "$(date -u -d "+${FIXTURE_DELIVERY_DAYS_FORWARD} days" +%F)" \
+    --leagues "${STATS_LEAGUES}" \
+    --report-out /tmp/fixture_delivery_v2_report.json || FIXTURE_DELIVERY_STATUS=$?
+else
+  echo "Skipping Fixtures Data Delivery v2 refresh; missing Supabase DB URL" >&2
+  FIXTURE_DELIVERY_STATUS=1
+fi
+
+# Step 7: Hard guard for the user-facing fixtures window.
 set +e
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
@@ -210,7 +228,7 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
   fi
 fi
 
-# Step 7: Best-effort betting picks publish (uses odds already ingested into Supabase).
+# Step 8: Best-effort betting picks publish (uses odds already ingested into Supabase).
 if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; then
   if [[ "${MODELS_PUBLISH_AFTER_P3}" == "true" || "${MODELS_PUBLISH_AFTER_P3}" == "1" ]]; then
     if [[ -d "${MODELS_REPO_ROOT}" ]]; then
@@ -238,6 +256,10 @@ fi
 
 if [[ "${MONEYLINE_VALIDATION_STATUS:-0}" -ne 0 ]]; then
   exit "${MONEYLINE_VALIDATION_STATUS}"
+fi
+if [[ "${FIXTURE_DELIVERY_STATUS}" -ne 0 ]]; then
+  echo "Fixtures Data Delivery v2 refresh failed; see /tmp/fixture_delivery_v2_report.json" >&2
+  exit "${FIXTURE_DELIVERY_STATUS}"
 fi
 CHAIN
 )
