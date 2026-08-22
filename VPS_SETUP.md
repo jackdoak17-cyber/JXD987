@@ -52,6 +52,7 @@ Location:
 - `scripts/vps/run_p1.sh`
 - `scripts/vps/run_p2.sh`
 - `scripts/vps/run_p3.sh`
+- `scripts/vps/run_postmatch_settlement.sh`
 
 Exit codes:
 - `0`: success (healthcheck ping sent)
@@ -59,7 +60,8 @@ Exit codes:
 - `2`: skipped due to lock contention (no ping)
 
 Lock/timeout behavior:
-- Single global lock file across all wrappers
+- Odds wrappers share the global odds lock; fixture settlement uses its own lock
+  so a long odds ingest cannot suppress post-match result publication
 - Non-blocking lock (`flock --nonblock`) -> immediate skip on contention
 - `timeout` enforces kill-on-overrun
 - **The full chain is wrapped as one subshell command**, so timeout covers every step (not only the first command)
@@ -99,8 +101,11 @@ Use this schedule while the production Supabase project is on Micro compute or w
 */15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
 7,37 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
 
+# Post-match fixture settlement (independent of odds P1/P2/P3).
+*/15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_postmatch_settlement.sh >> /var/log/odds-sync-settlement.log 2>&1
+
 # Betting picks publish (Models -> Supabase, optional R2 fallback).
-# Shares the same global lock as P3 and will skip while ingestion is running.
+# Uses the Models lock and can run independently of fixture settlement.
 22 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models.sh >> /var/log/models-publish.log 2>&1
 
 # Odds snapshots for ML enrichment (R2).

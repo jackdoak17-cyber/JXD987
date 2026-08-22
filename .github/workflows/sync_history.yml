@@ -24,7 +24,8 @@ jobs:
         id: ids
         shell: bash
         run: |
-          league_ids="$(jq -R -s -c 'split("\n") | map(select(length > 0) | tonumber)' config/league_ids.txt)"
+          excluded_ids="$(jq -c '.' config/odds_api_sync_excluded_leagues.json)"
+          league_ids="$(jq -R -s -c --argjson excluded "$excluded_ids" 'split("\n") | map(select(length > 0) | tonumber) | map(select(. as $id | ($excluded | index($id)) == null))' config/league_ids.txt)"
           echo "league_ids=$league_ids" >> "$GITHUB_OUTPUT"
 
   sync-history:

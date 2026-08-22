@@ -67,9 +67,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Validate fixture settlement contract
+        run: python -m unittest tests.test_fixture_settlement_contract
+
       - name: Load league ids
         run: |
-          echo "LEAGUE_IDS=$(paste -sd, config/league_ids.txt)" >> $GITHUB_ENV
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          configured = [
+              int(line.strip())
+              for line in Path("config/league_ids.txt").read_text().splitlines()
+              if line.strip() and not line.lstrip().startswith("#")
+          ]
+          excluded = set(json.loads(Path("config/odds_api_sync_excluded_leagues.json").read_text()))
+          supported = [str(league_id) for league_id in configured if league_id not in excluded]
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"LEAGUE_IDS={','.join(supported)}\n")
+          print(f"Using supported leagues: {','.join(supported)}")
+          PY
 
       - name: Sync recent window
         env:

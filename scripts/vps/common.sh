@@ -124,6 +124,41 @@ default_league_csv() {
   paste -sd, "${REPO_ROOT}/config/league_ids.txt"
 }
 
+supported_league_csv() {
+  python3 - "${REPO_ROOT}/config/league_ids.txt" "${REPO_ROOT}/config/odds_api_sync_excluded_leagues.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+configured = []
+for raw in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    value = raw.strip()
+    if not value or value.startswith("#"):
+        continue
+    configured.append(int(value))
+
+excluded_path = Path(sys.argv[2])
+excluded = set(json.loads(excluded_path.read_text(encoding="utf-8"))) if excluded_path.exists() else set()
+print(",".join(str(value) for value in configured if value not in excluded))
+PY
+}
+
+validate_supported_leagues() {
+  python3 - "${REPO_ROOT}/config/odds_api_sync_excluded_leagues.json" "$1" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+excluded_path = Path(sys.argv[1])
+excluded = set(json.loads(excluded_path.read_text(encoding="utf-8"))) if excluded_path.exists() else set()
+requested = {int(value.strip()) for value in sys.argv[2].split(",") if value.strip()}
+blocked = sorted(requested.intersection(excluded))
+if blocked:
+    print(f"Unsupported cup league IDs in fixture pipeline: {blocked}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
 odds_league_csv() {
 python3 - "${REPO_ROOT}/config/league_ids.txt" "${REPO_ROOT}/config/odds_api_leagues.json" "${REPO_ROOT}/config/odds_api_sync_excluded_leagues.json" <<'PY'
 import json
@@ -149,6 +184,67 @@ excluded_ids = {
 odds_ids = {int(value) for value in odds_map if int(value) not in excluded_ids}
 print(",".join(str(league_id) for league_id in configured_ids if league_id in odds_ids))
 PY
+}
+
+pipeline_job_status_name() {
+  local status="$1"
+  case "${status}" in
+    0) printf 'success' ;;
+    2) printf 'skipped' ;;
+    *) printf 'failure' ;;
+  esac
+}
+
+record_pipeline_job_run() {
+  local job_id="$1"
+  local job_name="$2"
+  local status_code="$3"
+  local started_at="$4"
+  local finished_at="$5"
+  local duration_ms="$6"
+
+  if [[ -z "${OPERATIONS_CHECK_RUNNER_DATABASE_URL:-}" && -f "${REPO_ROOT}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${REPO_ROOT}/.env"
+    set +a
+  fi
+  if [[ -z "${OPERATIONS_CHECK_RUNNER_DATABASE_URL:-}" ]]; then
+    log_error "pipeline heartbeat skipped for ${job_id}; missing OPERATIONS_CHECK_RUNNER_DATABASE_URL"
+    return 0
+  fi
+  if ! command -v psql >/dev/null 2>&1; then
+    log_error "pipeline heartbeat skipped for ${job_id}; psql unavailable"
+    return 0
+  fi
+
+  local run_status release_id evidence
+  run_status="$(pipeline_job_status_name "${status_code}")"
+  release_id="$(runtime_release_id)"
+  evidence="exit status: ${status_code}; completion status: ${run_status}"
+
+  if ! psql "${OPERATIONS_CHECK_RUNNER_DATABASE_URL}" \
+    -v ON_ERROR_STOP=1 \
+    -v job_id="${job_id}" \
+    -v job_name="${job_name}" \
+    -v run_status="${run_status}" \
+    -v started_at="${started_at}" \
+    -v finished_at="${finished_at}" \
+    -v duration_ms="${duration_ms}" \
+    -v release_id="${release_id}" \
+    -v evidence="${evidence}" <<'SQL' >/dev/null
+insert into operations.pipeline_job_runs (
+  job_id, job_name, status, started_at, finished_at, duration_ms,
+  release_id, evidence_summary
+)
+values (
+  :'job_id', :'job_name', :'run_status', :'started_at'::timestamptz,
+  :'finished_at'::timestamptz, :'duration_ms'::integer, :'release_id', :'evidence'
+);
+SQL
+  then
+    log_error "pipeline heartbeat write failed for ${job_id}"
+  fi
 }
 
 healthcheck_ping() {

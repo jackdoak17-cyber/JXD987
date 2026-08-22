@@ -302,6 +302,41 @@ def upsert_schedule(cur, rows: list[dict[str, Any]], start: date, end: date) -> 
     return len(values)
 
 
+def validate_schedule_projection(cur, rows: list[dict[str, Any]]) -> None:
+    """Fail the publication if the delivery projection disagrees with source rows."""
+    if not rows:
+        return
+    fixture_ids = [int(row["id"]) for row in rows]
+    cur.execute(
+        """
+        select fixture_id, status, status_code, home_score, away_score
+          from public.fixture_delivery_schedule
+         where fixture_id = any(%s)
+        """,
+        (fixture_ids,),
+    )
+    projected = {int(row[0]): row[1:] for row in cur.fetchall()}
+    mismatches: list[str] = []
+    for source in rows:
+        fixture_id = int(source["id"])
+        actual = projected.get(fixture_id)
+        expected = (
+            source.get("status"),
+            source.get("status_code"),
+            source.get("home_score"),
+            source.get("away_score"),
+        )
+        if actual is None or tuple(actual) != expected:
+            mismatches.append(
+                f"{fixture_id}: expected={expected!r} actual={actual!r}"
+            )
+    if mismatches:
+        raise RuntimeError(
+            "fixture delivery projection mismatch after upsert: "
+            + "; ".join(mismatches[:20])
+        )
+
+
 def compute_standings(completed: list[dict[str, Any]]) -> dict[tuple[int, int], dict[int, dict[str, int]]]:
     grouped: dict[tuple[int, int], dict[int, dict[str, int]]] = defaultdict(dict)
     for row in completed:
@@ -652,6 +687,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             valid_schedule = [row for row in source if row["league_id"] not in EXCLUDED_CUPS and not is_hidden(row)]
             rejected_cups = sum(row["league_id"] in EXCLUDED_CUPS for row in source)
             schedule_written = upsert_schedule(cur, valid_schedule, start, end)
+            validate_schedule_projection(cur, valid_schedule)
             finish_run(cur, schedule_run, "succeeded", {
                 "rows_read": len(source), "rows_written": schedule_written,
                 "rows_rejected": len(source) - len(valid_schedule), "rejected_cup_rows": rejected_cups,
