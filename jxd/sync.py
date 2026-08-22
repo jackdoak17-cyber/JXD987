@@ -573,10 +573,17 @@ class SyncService:
         if not league_ids:
             return 0
         seasons = self.session.query(Season).filter(Season.league_id.in_(league_ids)).all()
+        team_ids = self.sync_teams_for_seasons([season.id for season in seasons])
+        log.info("Synced teams for leagues %s: %s", list(league_ids), len(team_ids))
+        return len(team_ids)
+
+    def sync_teams_for_seasons(self, season_ids: Sequence[int]) -> list[int]:
+        """Refresh teams for exactly the supplied seasons and return their IDs."""
+        if not season_ids:
+            return []
         seen_team_ids: Set[int] = set()
-        count = 0
-        for season in seasons:
-            endpoint = f"teams/seasons/{season.id}"
+        for season_id in season_ids:
+            endpoint = f"teams/seasons/{season_id}"
             for item in self.client.fetch_collection(endpoint, includes=["venue"], per_page=200):
                 team_id = item.get("id")
                 if team_id in seen_team_ids:
@@ -592,10 +599,9 @@ class SyncService:
                     data["image_path"] = image_path
                 _upsert(self.session, Team, data)
                 seen_team_ids.add(team_id)
-                count += 1
         self.session.commit()
-        log.info("Synced teams: %s", count)
-        return count
+        log.info("Synced teams for seasons %s: %s", list(season_ids), len(seen_team_ids))
+        return sorted(seen_team_ids)
 
     def sync_squads_for_teams(self, team_ids: Sequence[int]) -> int:
         if not team_ids:

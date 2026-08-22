@@ -17,9 +17,14 @@ from typing import Dict, Iterable, List, Sequence, Set
 import requests
 from sqlalchemy import bindparam, text
 
+from jxd import SportMonksClient, SyncService
 from jxd.db import get_engine, get_session
 from scripts.export_to_supabase import REST_PATH, SUPABASE_URL, require_env, rest_headers
-from scripts.sync_sparse_squads import current_season_team_ids, parse_ids
+from scripts.sync_sparse_squads import (
+    current_season_team_ids,
+    parse_ids,
+    refresh_current_provider_teams,
+)
 
 
 def _write_report(path: str, report: Dict) -> None:
@@ -113,8 +118,18 @@ def main() -> None:
     require_env(args.dry_run)
 
     session = get_session(get_engine())
-    team_ids = current_season_team_ids(session, parse_ids(args.leagues), 0)
+    league_ids = parse_ids(args.leagues)
+    if args.dry_run:
+        team_ids = current_season_team_ids(session, league_ids, 0)
+    else:
+        if not os.environ.get("SPORTMONKS_API_TOKEN"):
+            raise SystemExit("SPORTMONKS_API_TOKEN is required for provider-derived squad verification")
+        service = SyncService(SportMonksClient(), session)
+        _, provider_team_ids = refresh_current_provider_teams(session, service, league_ids)
+        team_ids = sorted(set(provider_team_ids) | set(current_season_team_ids(session, league_ids, 0)))
     team_ids = sorted(set(team_ids))
+    if not team_ids:
+        raise SystemExit("No current-season teams were discovered for squad verification")
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=args.max_age_hours)
 

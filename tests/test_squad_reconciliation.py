@@ -8,6 +8,7 @@ from jxd.models import (
     Base,
     Player,
     PlayerTeamHistory,
+    Season,
     Team,
     TeamSquadMembership,
     TeamSquadSnapshot,
@@ -51,6 +52,20 @@ class SquadReconciliationTests(unittest.TestCase):
     def test_exported_count_supports_deployed_exporter_return_shapes(self):
         self.assertEqual(sync_sparse_squads.exported_count(7), 7)
         self.assertEqual(sync_sparse_squads.exported_count((7, "ignored")), 7)
+
+    def test_current_provider_teams_are_based_on_current_seasons(self):
+        client = FakeSquadClient({"seasons": [], "teams/seasons/25583": []})
+        service, session = make_service(client)
+        session.add(Season(id=25583, league_id=8, is_current=True))
+        session.commit()
+
+        provider_seasons, provider_teams = sync_sparse_squads.refresh_current_provider_teams(
+            session, service, [8]
+        )
+
+        self.assertEqual(provider_seasons, [25583])
+        self.assertEqual(provider_teams, [])
+        self.assertEqual(client.calls, [("seasons", ["league"], 200), ("teams/seasons/25583", ["venue"], 200)])
 
     def test_transfer_reconciles_projection_memberships_and_history(self):
         client = FakeSquadClient(

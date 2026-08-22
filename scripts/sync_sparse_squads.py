@@ -16,9 +16,11 @@ from sqlalchemy import bindparam, text
 
 from jxd import SportMonksClient, SyncService
 from jxd.db import get_engine, get_session
+from jxd.models import Season
 from scripts.export_to_supabase import (
     REST_PATH,
     SUPABASE_URL,
+    fetch_teams,
     require_env,
     rest_headers,
     upsert_table,
@@ -85,6 +87,22 @@ def current_season_team_ids(
         if skip_large_leagues_threshold <= 0
         or league_team_counts.get(int(row.league_id), 0) < skip_large_leagues_threshold
     ]
+
+
+def current_season_ids(session, league_ids: Sequence[int]) -> List[int]:
+    query = session.query(Season.id).filter(Season.is_current.is_(True))
+    if league_ids:
+        query = query.filter(Season.league_id.in_(list(league_ids)))
+    return [int(row[0]) for row in query.order_by(Season.id).all()]
+
+
+def refresh_current_provider_teams(
+    session, service: SyncService, league_ids: Sequence[int]
+) -> tuple[List[int], List[int]]:
+    """Refresh season metadata and return current season/team IDs from SportMonks."""
+    service.sync_seasons(league_ids)
+    season_ids = current_season_ids(session, league_ids)
+    return season_ids, service.sync_teams_for_seasons(season_ids)
 
 
 def team_player_counts(session, team_ids: Sequence[int]) -> Dict[int, int]:
@@ -165,6 +183,16 @@ def fetch_players_by_ids(player_ids: Sequence[int]) -> List[Dict]:
         }
         for row in rows
     ]
+
+
+def fetch_teams_by_ids(team_ids: Sequence[int]) -> List[Dict]:
+    if not team_ids:
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        return fetch_teams(conn, list(team_ids))
+    finally:
+        conn.close()
 
 
 def detach_remote_players_missing_from_squads(
@@ -370,8 +398,16 @@ def main() -> None:
     service = SyncService(client, session)
     service.ensure_schema()
 
+    provider_season_ids: List[int] = []
+    provider_team_ids: List[int] = []
+    if not args.dry_run:
+        provider_season_ids, provider_team_ids = refresh_current_provider_teams(
+            session, service, league_ids
+        )
+
     candidate_team_ids = unique_ordered(
         [
+            *provider_team_ids,
             # A full reconciliation must never inherit the sparse-refresh guard.
             # Otherwise the largest leagues are silently omitted precisely when
             # we are trying to establish a complete current-squad baseline.
@@ -416,9 +452,13 @@ def main() -> None:
     squad_memberships = fetch_team_squad_memberships(sparse_team_ids)
 
     players_exported = 0
+    teams_exported = 0
     history_exported = 0
     snapshots_exported = 0
     memberships_exported = 0
+    teams = fetch_teams_by_ids(sparse_team_ids)
+    if teams:
+        teams_exported = exported_count(upsert_table("teams", teams, "id", args.dry_run))
     if players:
         players_exported = exported_count(upsert_table("players", players, "id", args.dry_run))
     if player_team_history:
@@ -447,11 +487,14 @@ def main() -> None:
         "minimum_players": args.minimum_players,
         "refresh_all": args.refresh_all,
         "skip_large_leagues_threshold": args.skip_large_leagues_threshold,
+        "current_season_ids": provider_season_ids,
+        "provider_current_team_count": len(provider_team_ids),
         "candidate_teams": len(candidate_team_ids),
         "teams_refreshed": len(sparse_team_ids),
         "team_ids_refreshed": sparse_team_ids,
         "before_counts": {str(team_id): before_counts.get(team_id, 0) for team_id in sparse_team_ids},
         "after_counts": {str(team_id): after_counts.get(team_id, 0) for team_id in sparse_team_ids},
+        "teams_exported": teams_exported,
         "players_exported": players_exported,
         "player_team_history_exported": history_exported,
         "squad_snapshots_exported": snapshots_exported,
