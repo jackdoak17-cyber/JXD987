@@ -332,6 +332,13 @@ def write_report(path: str | None, report: Dict) -> None:
     Path(path).write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def exported_count(result: object) -> int:
+    """Accept both exporter return shapes used by deployed JXD987 revisions."""
+    if isinstance(result, tuple):
+        result = result[0]
+    return int(result or 0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default=os.environ.get("LEAGUE_IDS", ""))
@@ -413,14 +420,20 @@ def main() -> None:
     snapshots_exported = 0
     memberships_exported = 0
     if players:
-        players_exported, _ = upsert_table("players", players, "id", args.dry_run)
+        players_exported = exported_count(upsert_table("players", players, "id", args.dry_run))
     if player_team_history:
-        history_exported, _ = upsert_table("player_team_history", player_team_history, "id", args.dry_run)
+        history_exported = exported_count(
+            upsert_table("player_team_history", player_team_history, "id", args.dry_run)
+        )
     if squad_snapshots:
-        snapshots_exported, _ = upsert_table("team_squad_snapshots", squad_snapshots, "id", args.dry_run)
+        snapshots_exported = exported_count(
+            upsert_table("team_squad_snapshots", squad_snapshots, "id", args.dry_run)
+        )
     if squad_memberships:
-        memberships_exported, _ = upsert_table(
-            "team_squad_memberships", squad_memberships, "team_id,player_id", args.dry_run
+        memberships_exported = exported_count(
+            upsert_table(
+                "team_squad_memberships", squad_memberships, "team_id,player_id", args.dry_run
+            )
         )
     remote_players_detached = detach_remote_players_missing_from_squads(
         sparse_team_ids,

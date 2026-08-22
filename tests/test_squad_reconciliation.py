@@ -48,6 +48,10 @@ def squad_row(player_id, name, start):
 
 
 class SquadReconciliationTests(unittest.TestCase):
+    def test_exported_count_supports_deployed_exporter_return_shapes(self):
+        self.assertEqual(sync_sparse_squads.exported_count(7), 7)
+        self.assertEqual(sync_sparse_squads.exported_count((7, "ignored")), 7)
+
     def test_transfer_reconciles_projection_memberships_and_history(self):
         client = FakeSquadClient(
             {
