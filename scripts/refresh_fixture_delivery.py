@@ -51,6 +51,7 @@ MONEYLINE_MARKETS = {
     "h2h",
 }
 MIN_FORM_SAMPLE = 5
+DEFAULT_DAYS_FORWARD = 31
 
 
 def as_float(value: Any) -> float | None:
@@ -109,7 +110,7 @@ def parse_leagues(raw: str | None) -> list[int]:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-date", default=None, help="London date, inclusive (default today)")
-    parser.add_argument("--end-date", default=None, help="London date, exclusive (default today + 14 days)")
+    parser.add_argument("--end-date", default=None, help="London date, exclusive (default today + 31 days)")
     parser.add_argument("--leagues", default=None, help="Comma-separated supported league IDs")
     parser.add_argument("--report-out", default=None)
     parser.add_argument("--dry-run", action="store_true")
@@ -118,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def get_dates(args: argparse.Namespace) -> tuple[date, date]:
     start = date.fromisoformat(args.start_date) if args.start_date else date.today()
-    end = date.fromisoformat(args.end_date) if args.end_date else start + timedelta(days=14)
+    end = date.fromisoformat(args.end_date) if args.end_date else start + timedelta(days=DEFAULT_DAYS_FORWARD)
     if end <= start:
         raise SystemExit("end date must be after start date")
     return start, end
@@ -185,9 +186,9 @@ def source_fixtures(cur, start: date, end: date, leagues: list[int]) -> list[dic
                at.name as away_team_name, at.short_code as away_team_short_code,
                at.image_path as away_team_image_path
           from public.fixtures f
-          join public.leagues l on l.id = f.league_id
-          join public.teams ht on ht.id = f.home_team_id
-          join public.teams at on at.id = f.away_team_id
+          left join public.leagues l on l.id = f.league_id
+          left join public.teams ht on ht.id = f.home_team_id
+          left join public.teams at on at.id = f.away_team_id
          where f.starting_at >= (%s::date at time zone 'Europe/London')
            and f.starting_at < (%s::date at time zone 'Europe/London')
            and f.league_id = any(%s)
@@ -198,6 +199,43 @@ def source_fixtures(cur, start: date, end: date, leagues: list[int]) -> list[dic
     )
     columns = [description[0] for description in cur.description]
     return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def missing_delivery_fields(row: dict[str, Any]) -> list[str]:
+    """Return fields that would make a source fixture unsafe to publish.
+
+    The delivery table intentionally has non-null identity/name columns.  A
+    source query must therefore report incomplete metadata explicitly instead
+    of silently dropping the fixture through an inner join.
+    """
+    missing: list[str] = []
+    for field in ("starting_at", "league_id", "home_team_id", "away_team_id", "league_name", "home_team_name", "away_team_name"):
+        if row.get(field) is None:
+            missing.append(field)
+    if row.get("home_team_id") is not None and row.get("home_team_id") == row.get("away_team_id"):
+        missing.append("distinct_teams")
+    return missing
+
+
+def classify_source_fixtures(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int, int, list[dict[str, Any]]]:
+    """Split source rows into publishable, hidden, Cup, and incomplete rows."""
+    valid: list[dict[str, Any]] = []
+    rejected_cups = 0
+    rejected_hidden = 0
+    incomplete: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("league_id") in EXCLUDED_CUPS:
+            rejected_cups += 1
+            continue
+        if is_hidden(row):
+            rejected_hidden += 1
+            continue
+        missing = missing_delivery_fields(row)
+        if missing:
+            incomplete.append({"fixture_id": int(row["id"]), "missing": missing})
+            continue
+        valid.append(row)
+    return valid, rejected_cups, rejected_hidden, incomplete
 
 
 def all_completed_fixtures(cur, leagues: list[int]) -> list[dict[str, Any]]:
@@ -335,6 +373,39 @@ def validate_schedule_projection(cur, rows: list[dict[str, Any]]) -> None:
             "fixture delivery projection mismatch after upsert: "
             + "; ".join(mismatches[:20])
         )
+
+
+def validate_schedule_completeness(
+    cur,
+    rows: list[dict[str, Any]],
+    start: date,
+    end: date,
+) -> None:
+    """Ensure every eligible source fixture is present, and nothing extra is.
+
+    This is deliberately checked after the delete/upsert inside the same
+    transaction.  A missing row aborts the transaction, leaving the previous
+    known-good read model intact rather than publishing a partial window.
+    """
+    expected_ids = {int(row["id"]) for row in rows}
+    cur.execute(
+        """
+        select fixture_id
+          from public.fixture_delivery_schedule
+         where fixture_date >= %s and fixture_date < %s
+        """,
+        (start, end),
+    )
+    actual_ids = {int(row[0]) for row in cur.fetchall()}
+    missing = sorted(expected_ids - actual_ids)
+    unexpected = sorted(actual_ids - expected_ids)
+    if missing or unexpected:
+        parts: list[str] = []
+        if missing:
+            parts.append(f"missing eligible fixtures={missing[:20]}")
+        if unexpected:
+            parts.append(f"unexpected published fixtures={unexpected[:20]}")
+        raise RuntimeError("fixture delivery completeness check failed: " + "; ".join(parts))
 
 
 def compute_standings(completed: list[dict[str, Any]]) -> dict[tuple[int, int], dict[int, dict[str, int]]]:
@@ -680,56 +751,97 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     conn = connection()
     conn.autocommit = False
+    active_component: str | None = None
+    active_stats: dict[str, Any] = {}
     try:
         with conn.cursor() as cur:
+            # Schedule, settlement, and P3 can overlap on the same VPS.  Hold
+            # one session-level lock across all component commits so a second
+            # refresh cannot delete a window using a different source snapshot.
+            cur.execute("select pg_advisory_lock(hashtextextended('oddssearch.fixture_delivery_v2', 0))")
+
+            active_component = "schedule"
             schedule_run = start_run(cur, "schedule", start, end)
             source = source_fixtures(cur, start, end, leagues)
-            valid_schedule = [row for row in source if row["league_id"] not in EXCLUDED_CUPS and not is_hidden(row)]
-            rejected_cups = sum(row["league_id"] in EXCLUDED_CUPS for row in source)
+            valid_schedule, rejected_cups, rejected_hidden, incomplete = classify_source_fixtures(source)
+            active_stats = {
+                "rows_read": len(source),
+                "rows_rejected": len(source) - len(valid_schedule),
+                "rows_missing": len(incomplete),
+                "rejected_cup_rows": rejected_cups,
+                "hidden_rows": rejected_hidden,
+                "incomplete_rows": incomplete[:100],
+                "source_watermark": max((row["starting_at"] for row in source), default=None),
+            }
+            if incomplete:
+                error = (
+                    "eligible fixture metadata incomplete; refusing partial publication: "
+                    + json.dumps(incomplete[:20], default=str)
+                )
+                finish_run(cur, schedule_run, "failed", active_stats, error)
+                conn.commit()
+                active_component = None
+                raise RuntimeError(error)
             schedule_written = upsert_schedule(cur, valid_schedule, start, end)
             validate_schedule_projection(cur, valid_schedule)
-            finish_run(cur, schedule_run, "succeeded", {
-                "rows_read": len(source), "rows_written": schedule_written,
-                "rows_rejected": len(source) - len(valid_schedule), "rejected_cup_rows": rejected_cups,
-                "source_watermark": max((row["starting_at"] for row in source), default=None),
-            })
+            validate_schedule_completeness(cur, valid_schedule, start, end)
+            active_stats["rows_written"] = schedule_written
+            finish_run(cur, schedule_run, "succeeded", active_stats)
             conn.commit()
-            report["components"]["schedule"] = {"rows_read": len(source), "rows_written": schedule_written, "rejected_cup_rows": rejected_cups}
+            active_component = None
+            report["components"]["schedule"] = active_stats
 
             completed = all_completed_fixtures(cur, leagues)
             standings = compute_standings(completed)
+            active_component = "standings"
             standings_run = start_run(cur, "standings", start, end)
+            active_stats = {"rows_read": len(completed)}
             standings_written = write_standings(cur, standings, completed)
-            finish_run(cur, standings_run, "succeeded", {"rows_read": len(completed), "rows_written": standings_written})
+            active_stats["rows_written"] = standings_written
+            finish_run(cur, standings_run, "succeeded", active_stats)
             conn.commit()
-            report["components"]["standings"] = {"rows_read": len(completed), "rows_written": standings_written}
+            active_component = None
+            report["components"]["standings"] = active_stats
 
+            active_component = "metrics"
             metrics_run = start_run(cur, "metrics", start, end)
+            active_stats = {"rows_read": len(completed)}
             metrics_written, metrics_coverage = write_metrics(cur, valid_schedule, completed, standings)
-            finish_run(cur, metrics_run, "succeeded", {
-                "rows_read": len(completed),
-                "rows_written": metrics_written,
-                "rows_missing": metrics_coverage["venue_none"],
-                "coverage": metrics_coverage,
-            })
+            active_stats.update({"rows_written": metrics_written, "rows_missing": metrics_coverage["venue_none"], "coverage": metrics_coverage})
+            finish_run(cur, metrics_run, "succeeded", active_stats)
             conn.commit()
-            report["components"]["metrics"] = {
-                "rows_read": len(completed),
-                "rows_written": metrics_written,
-                "coverage": metrics_coverage,
-            }
+            active_component = None
+            report["components"]["metrics"] = active_stats
 
+            active_component = "odds"
             odds_run = start_run(cur, "odds", start, end)
+            active_stats = {}
             odds_source = source_odds(cur, [int(row["id"]) for row in valid_schedule])
             odds_written = write_odds(cur, odds_source)
-            finish_run(cur, odds_run, "succeeded", {"rows_read": len(odds_source), "rows_written": odds_written})
+            active_stats.update({"rows_read": len(odds_source), "rows_written": odds_written})
+            finish_run(cur, odds_run, "succeeded", active_stats)
             conn.commit()
-            report["components"]["odds"] = {"rows_read": len(odds_source), "rows_written": odds_written}
-    except Exception:
+            active_component = None
+            report["components"]["odds"] = active_stats
+    except Exception as error:
         conn.rollback()
+        if active_component:
+            try:
+                with conn.cursor() as failure_cur:
+                    failed_run = start_run(failure_cur, active_component, start, end)
+                    finish_run(failure_cur, failed_run, "failed", active_stats, str(error))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                LOG.exception("unable to persist failed fixture delivery run")
         LOG.exception("fixtures delivery refresh failed")
         raise
     finally:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("select pg_advisory_unlock(hashtextextended('oddssearch.fixture_delivery_v2', 0))")
+        except Exception:
+            LOG.exception("unable to release fixture delivery advisory lock")
         conn.close()
     return report
 
