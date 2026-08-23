@@ -185,7 +185,7 @@ if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_DB_URL_SESSION:-${SUPABAS
   run_pipeline_job_with_heartbeat \
     "run_p3_referee_history" \
     "P3 referee history hydration" \
-    "python scripts/hydrate_referee_history.py --seed-days-back 0 --seed-days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --history-days-back \"${REFEREE_HISTORY_DAYS_BACK}\" --history-days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --main-only --report-json /tmp/referee_history_report_p3.json" \
+    "python scripts/hydrate_referee_history.py --seed-days-back \"${REFEREE_SYNC_DAYS_BACK}\" --seed-days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --history-days-back \"${REFEREE_HISTORY_DAYS_BACK}\" --history-days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --main-only --report-json /tmp/referee_history_report_p3.json" \
     "${REFEREE_HISTORY_TIMEOUT_SECONDS}"
   REFEREE_HISTORY_STATUS=$?
 

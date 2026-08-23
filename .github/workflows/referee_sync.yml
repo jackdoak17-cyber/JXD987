@@ -144,7 +144,7 @@ jobs:
       - name: Hydrate historical referee assignments (main referee)
         run: |
           python3 scripts/hydrate_referee_history.py \
-            --seed-days-back 0 \
+            --seed-days-back "$DAYS_BACK" \
             --seed-days-forward "$DAYS_FORWARD" \
             --history-days-back "$HISTORY_DAYS_BACK" \
             --history-days-forward "$DAYS_FORWARD" \
