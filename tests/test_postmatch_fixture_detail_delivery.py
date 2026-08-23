@@ -104,4 +104,3 @@ def test_lineup_only_storage_preserves_player_statistics(tmp_path) -> None:
     assert session.query(FixturePlayerStatistic).filter_by(fixture_id=9001, player_id=11, type_id=119).count() >= 1
     assert session.query(FixtureStatistic).filter_by(fixture_id=9001).count() == 1
     session.close()
-
