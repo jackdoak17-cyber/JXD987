@@ -247,6 +247,30 @@ SQL
   fi
 }
 
+run_pipeline_job_with_heartbeat() {
+  local job_id="$1"
+  local job_name="$2"
+  local command="$3"
+  local max_runtime="${4:-1800}"
+  local started_at finished_at started_epoch finished_epoch status
+
+  started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  started_epoch="$(date -u +"%s")"
+  set +e
+  timeout "${max_runtime}" bash -lc "${command}"
+  status=$?
+  finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  finished_epoch="$(date -u +"%s")"
+  record_pipeline_job_run \
+    "${job_id}" \
+    "${job_name}" \
+    "${status}" \
+    "${started_at}" \
+    "${finished_at}" \
+    "$(((finished_epoch - started_epoch) * 1000))"
+  return "${status}"
+}
+
 healthcheck_ping() {
   local url="${1:-}"
   if [[ -z "${url}" ]]; then

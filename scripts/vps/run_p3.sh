@@ -20,6 +20,10 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/odds_retention_psql.py" \
   "scripts/reconcile_recent_fixtures.py" \
   "scripts/export_to_supabase.py" \
+  "scripts/sync_fixture_referees.py" \
+  "scripts/hydrate_referee_history.py" \
+  "scripts/sync_fixture_referee_stats.py" \
+  "scripts/validate_referee_coverage.py" \
   "scripts/refresh_fixture_delivery.py"
 
 export REPO_ROOT
@@ -40,6 +44,16 @@ export FIXTURE_EXPORT_DAYS_BACK="${FIXTURE_EXPORT_DAYS_BACK:-2}"
 export FIXTURE_EXPORT_DAYS_FORWARD="${FIXTURE_EXPORT_DAYS_FORWARD:-3}"
 export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-14}"
 export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-1800}"
+export REFEREE_SYNC_DAYS_BACK="${REFEREE_SYNC_DAYS_BACK:-30}"
+export REFEREE_SYNC_DAYS_FORWARD="${REFEREE_SYNC_DAYS_FORWARD:-31}"
+export REFEREE_SYNC_RESYNC_HOURS="${REFEREE_SYNC_RESYNC_HOURS:-12}"
+export REFEREE_SYNC_TIMEOUT_SECONDS="${REFEREE_SYNC_TIMEOUT_SECONDS:-1800}"
+export REFEREE_HISTORY_DAYS_BACK="${REFEREE_HISTORY_DAYS_BACK:-700}"
+export REFEREE_HISTORY_TIMEOUT_SECONDS="${REFEREE_HISTORY_TIMEOUT_SECONDS:-1800}"
+export REFEREE_STATS_TIMEOUT_SECONDS="${REFEREE_STATS_TIMEOUT_SECONDS:-1200}"
+export REFEREE_COVERAGE_TIMEOUT_SECONDS="${REFEREE_COVERAGE_TIMEOUT_SECONDS:-300}"
+export REFEREE_COVERAGE_ASSIGNMENT_SLA_HOURS="${REFEREE_COVERAGE_ASSIGNMENT_SLA_HOURS:-24}"
+export REFEREE_COVERAGE_UNASSIGNED_GRACE_HOURS="${REFEREE_COVERAGE_UNASSIGNED_GRACE_HOURS:-12}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
 export MONEYLINE_COVERAGE_MIN_PCT="${MONEYLINE_COVERAGE_MIN_PCT:-100}"
@@ -150,7 +164,53 @@ else
   echo "Skipping recent fixture refresh/export; missing SportMonks or Supabase REST env" >&2
 fi
 
-# Step 6: Publish the persistent Fixtures Data Delivery v2 read models.
+# Step 6: Referee assignments, historical hydration, and card-rate snapshots.
+# These run inside P3's global lock and each job writes its own operations
+# heartbeat. A successful process with no useful coverage is caught by the
+# final coverage gate rather than being reported as healthy.
+REFEREE_ASSIGNMENT_STATUS=0
+REFEREE_HISTORY_STATUS=0
+REFEREE_STATS_STATUS=0
+REFEREE_COVERAGE_STATUS=0
+if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}" ]]; then
+  set +e
+  run_pipeline_job_with_heartbeat \
+    "run_p3_referee_assignments" \
+    "P3 referee assignment sync" \
+    "python scripts/sync_fixture_referees.py --days-back \"${REFEREE_SYNC_DAYS_BACK}\" --days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --resync-hours \"${REFEREE_SYNC_RESYNC_HOURS}\" --report-json /tmp/referee_assignments_report_p3.json" \
+    "${REFEREE_SYNC_TIMEOUT_SECONDS}"
+  REFEREE_ASSIGNMENT_STATUS=$?
+
+  run_pipeline_job_with_heartbeat \
+    "run_p3_referee_history" \
+    "P3 referee history hydration" \
+    "python scripts/hydrate_referee_history.py --seed-days-back 0 --seed-days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --history-days-back \"${REFEREE_HISTORY_DAYS_BACK}\" --history-days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --main-only --report-json /tmp/referee_history_report_p3.json" \
+    "${REFEREE_HISTORY_TIMEOUT_SECONDS}"
+  REFEREE_HISTORY_STATUS=$?
+
+  run_pipeline_job_with_heartbeat \
+    "run_p3_referee_stats" \
+    "P3 referee stats snapshot" \
+    "python scripts/sync_fixture_referee_stats.py --days-back \"${REFEREE_SYNC_DAYS_BACK}\" --days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --report-json /tmp/referee_stats_report_p3.json" \
+    "${REFEREE_STATS_TIMEOUT_SECONDS}"
+  REFEREE_STATS_STATUS=$?
+
+  run_pipeline_job_with_heartbeat \
+    "run_p3_referee_coverage" \
+    "P3 referee coverage validation" \
+    "python scripts/validate_referee_coverage.py --days-back 1 --days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --assignment-sla-hours \"${REFEREE_COVERAGE_ASSIGNMENT_SLA_HOURS}\" --unassigned-grace-hours \"${REFEREE_COVERAGE_UNASSIGNED_GRACE_HOURS}\" --report-json /tmp/referee_coverage_report_p3.json" \
+    "${REFEREE_COVERAGE_TIMEOUT_SECONDS}"
+  REFEREE_COVERAGE_STATUS=$?
+  set -e
+else
+  echo "Skipping referee pipeline; missing SportMonks or Supabase database environment" >&2
+  REFEREE_ASSIGNMENT_STATUS=1
+  REFEREE_HISTORY_STATUS=1
+  REFEREE_STATS_STATUS=1
+  REFEREE_COVERAGE_STATUS=1
+fi
+
+# Step 7: Publish the persistent Fixtures Data Delivery v2 read models.
 # This is the only user-facing fixture delivery source after cutover. A failed
 # refresh fails P3 instead of hiding a stale or incomplete read model.
 FIXTURE_DELIVERY_STATUS=0
@@ -165,7 +225,7 @@ else
   FIXTURE_DELIVERY_STATUS=1
 fi
 
-# Step 7: Hard guard for the user-facing fixtures window.
+# Step 8: Hard guard for the user-facing fixtures window.
 set +e
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
@@ -229,7 +289,7 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
   fi
 fi
 
-# Step 8: Best-effort betting picks publish (uses odds already ingested into Supabase).
+# Step 9: Best-effort betting picks publish (uses odds already ingested into Supabase).
 if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; then
   if [[ "${MODELS_PUBLISH_AFTER_P3}" == "true" || "${MODELS_PUBLISH_AFTER_P3}" == "1" ]]; then
     if [[ -d "${MODELS_REPO_ROOT}" ]]; then
@@ -257,6 +317,10 @@ fi
 
 if [[ "${MONEYLINE_VALIDATION_STATUS:-0}" -ne 0 ]]; then
   exit "${MONEYLINE_VALIDATION_STATUS}"
+fi
+if [[ "${REFEREE_ASSIGNMENT_STATUS}" -ne 0 || "${REFEREE_HISTORY_STATUS}" -ne 0 || "${REFEREE_STATS_STATUS}" -ne 0 || "${REFEREE_COVERAGE_STATUS}" -ne 0 ]]; then
+  echo "Referee pipeline failed; see /tmp/referee_assignments_report_p3.json, /tmp/referee_history_report_p3.json, /tmp/referee_stats_report_p3.json, and /tmp/referee_coverage_report_p3.json" >&2
+  exit 1
 fi
 if [[ "${FIXTURE_DELIVERY_STATUS}" -ne 0 ]]; then
   echo "Fixtures Data Delivery v2 refresh failed; see /tmp/fixture_delivery_v2_report.json" >&2

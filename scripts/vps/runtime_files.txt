@@ -15,6 +15,10 @@ scripts/refresh_fixture_delivery.py
 scripts/odds_retention_psql.py
 scripts/preflight_supabase_psql.py
 scripts/reconcile_recent_fixtures.py
+scripts/sync_fixture_referees.py
+scripts/hydrate_referee_history.py
+scripts/sync_fixture_referee_stats.py
+scripts/validate_referee_coverage.py
 scripts/rest_preflight.py
 scripts/sync_confirmed_lineups.py
 scripts/sync_odds.py

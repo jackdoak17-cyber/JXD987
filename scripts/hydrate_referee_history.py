@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed-days-forward", type=int, default=14, help="Window to discover active referees from DB fixtures")
     parser.add_argument("--history-days-back", type=int, default=700, help="History fixture window to persist")
     parser.add_argument("--history-days-forward", type=int, default=30, help="Future fixture window to persist")
+    parser.add_argument(
+        "--referee-id",
+        type=int,
+        default=0,
+        help="Restrict hydration to one referee (useful for controlled repair/backfill; 0 = all seeded referees)",
+    )
     parser.add_argument("--max-referees", type=int, default=0, help="Limit referees processed (0 = all)")
     parser.add_argument("--sleep-seconds", type=float, default=0.15, help="Delay between API calls")
     parser.add_argument("--timeout", type=int, default=30)
@@ -302,6 +308,8 @@ def main() -> int:
         conn.close()
 
     seed_referees = [rid for rid in seed_referees if rid in existing_referees]
+    if args.referee_id > 0:
+        seed_referees = [rid for rid in seed_referees if rid == args.referee_id]
     logger.info(
         "Referee history hydrate: referees=%s valid_fixtures=%s",
         len(seed_referees),

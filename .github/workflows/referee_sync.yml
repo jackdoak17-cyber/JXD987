@@ -1,8 +1,6 @@
-name: Referee Sync
+name: Referee Sync (manual/backfill)
 
 on:
-  schedule:
-    - cron: "15 2 * * *"
   workflow_dispatch:
     inputs:
       mode:

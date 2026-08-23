@@ -11,12 +11,13 @@ Sync fixture-referee assignments from SportMonks into Supabase.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import psycopg2
@@ -26,6 +27,8 @@ import requests
 DEFAULT_BASE_URL = "https://api.sportmonks.com/v3/football"
 
 logger = logging.getLogger("sync_fixture_referees")
+
+STATE_STATUSES = {"pending", "assigned", "no_assignment", "error"}
 
 REFEREE_TYPE_ROLE_MAP: Dict[int, Tuple[str, bool]] = {
     6: ("main", True),
@@ -40,12 +43,18 @@ REFEREE_TYPE_ROLE_MAP: Dict[int, Tuple[str, bool]] = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync SportMonks fixture-referee assignments into Supabase")
     parser.add_argument("--days-back", type=int, default=30)
-    parser.add_argument("--days-forward", type=int, default=14)
+    parser.add_argument("--days-forward", type=int, default=31)
     parser.add_argument(
         "--resync-hours",
         type=int,
         default=12,
         help="Only re-fetch fixtures whose referee assignments are missing or stale by this many hours",
+    )
+    parser.add_argument(
+        "--fixture-id",
+        type=int,
+        default=0,
+        help="Restrict the run to one fixture (useful for controlled repair/backfill; 0 = window)",
     )
     parser.add_argument("--limit-fixtures", type=int, default=0, help="Limit number of fixtures for testing")
     parser.add_argument("--sleep-seconds", type=float, default=0.3, help="Delay between fixture API calls")
@@ -164,27 +173,22 @@ def fetch_fixture_ids(
     days_back: int,
     days_forward: int,
     resync_hours: int,
+    fixture_id: int,
     limit_fixtures: int,
 ) -> List[int]:
     sql = """
         select id
         from public.fixtures
+        left join public.fixture_referee_sync_state state
+          on state.fixture_id = public.fixtures.id
         where starting_at >= (now() - make_interval(days => %s))
           and starting_at <= (now() + make_interval(days => %s))
+          and (%s = 0 or public.fixtures.id = %s)
+          and coalesce(state.next_attempt_at, now()) <= now()
           and (
-            not exists (
-              select 1
-              from public.fixture_referees fr
-              where fr.fixture_id = public.fixtures.id
-                and fr.source = 'sportmonks'
-            )
-            or exists (
-              select 1
-              from public.fixture_referees fr
-              where fr.fixture_id = public.fixtures.id
-                and fr.source = 'sportmonks'
-                and fr.last_synced_at < (now() - make_interval(hours => %s))
-            )
+            state.fixture_id is null
+            or state.status in ('pending', 'no_assignment', 'error')
+            or state.last_successful_at < (now() - make_interval(hours => %s))
           )
         order by starting_at asc
     """
@@ -192,11 +196,102 @@ def fetch_fixture_ids(
         sql += " limit %s"
     with conn.cursor() as cur:
         if limit_fixtures > 0:
-            cur.execute(sql, (max(0, days_back), max(0, days_forward), max(1, resync_hours), limit_fixtures))
+            cur.execute(
+                sql,
+                (
+                    max(0, days_back),
+                    max(0, days_forward),
+                    max(0, fixture_id),
+                    max(0, fixture_id),
+                    max(1, resync_hours),
+                    limit_fixtures,
+                ),
+            )
         else:
-            cur.execute(sql, (max(0, days_back), max(0, days_forward), max(1, resync_hours)))
+            cur.execute(
+                sql,
+                (max(0, days_back), max(0, days_forward), max(0, fixture_id), max(0, fixture_id), max(1, resync_hours)),
+            )
         rows = cur.fetchall()
     return [int(row[0]) for row in rows if row and row[0] is not None]
+
+
+def payload_hash(payload: Dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def mark_fixture_attempt(conn: psycopg2.extensions.connection, fixture_id: int) -> None:
+    """Persist an attempt before calling the provider so interrupted runs remain visible."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into public.fixture_referee_sync_state
+              (fixture_id, status, last_attempted_at, next_attempt_at, attempt_count, updated_at)
+            values (%s, 'pending', now(), now(), 1, now())
+            on conflict (fixture_id) do update
+            set status = case
+                  when public.fixture_referee_sync_state.status = 'assigned' then 'assigned'
+                  else 'pending'
+                end,
+                last_attempted_at = now(),
+                next_attempt_at = now(),
+                attempt_count = public.fixture_referee_sync_state.attempt_count + 1,
+                updated_at = now()
+            """,
+            (fixture_id,),
+        )
+    conn.commit()
+
+
+def record_fixture_state(
+    conn: psycopg2.extensions.connection,
+    fixture_id: int,
+    *,
+    status: str,
+    assignment_count: int = 0,
+    response_hash_value: Optional[str] = None,
+    error: Optional[str] = None,
+    retry_after: timedelta = timedelta(hours=12),
+) -> None:
+    if status not in STATE_STATUSES:
+        raise ValueError(f"Unsupported referee sync state: {status}")
+
+    if status == "error":
+        next_attempt_sql = "%s::interval + now()"
+        attempt_value = "1"
+        successful_value = "NULL"
+    else:
+        next_attempt_sql = "%s::interval + now()"
+        attempt_value = "0"
+        successful_value = "now()"
+
+    sql = f"""
+        insert into public.fixture_referee_sync_state
+          (fixture_id, status, last_successful_at, next_attempt_at, attempt_count,
+           assignment_count, response_hash, last_error, updated_at)
+        values (%s, %s, {successful_value}, {next_attempt_sql}, {attempt_value}, %s, %s, %s, now())
+        on conflict (fixture_id) do update
+        set status = excluded.status,
+            last_successful_at = coalesce(excluded.last_successful_at, public.fixture_referee_sync_state.last_successful_at),
+            next_attempt_at = excluded.next_attempt_at,
+            attempt_count = case
+              when excluded.status = 'error' then public.fixture_referee_sync_state.attempt_count
+              else excluded.attempt_count
+            end,
+            assignment_count = excluded.assignment_count,
+            response_hash = coalesce(excluded.response_hash, public.fixture_referee_sync_state.response_hash),
+            last_error = excluded.last_error,
+            updated_at = now()
+    """
+    params: Tuple[Any, ...]
+    if status == "error":
+        params = (fixture_id, status, retry_after, assignment_count, response_hash_value, error)
+    else:
+        params = (fixture_id, status, retry_after, assignment_count, response_hash_value, error)
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+    conn.commit()
 
 
 def load_country_ids(conn: psycopg2.extensions.connection) -> Optional[set[int]]:
@@ -392,6 +487,93 @@ def upsert_assignments(conn: psycopg2.extensions.connection, rows: Iterable[Dict
     return len(values)
 
 
+def insert_placeholder_referees(
+    conn: psycopg2.extensions.connection, referee_ids: Iterable[int]
+) -> int:
+    """Keep a valid FK for relation-only provider rows until profile sync supplies names."""
+    ids = sorted({int(value) for value in referee_ids if int(value) > 0})
+    if not ids:
+        return 0
+    values = [(referee_id, f"Referee {referee_id}", "sportmonks", Json({})) for referee_id in ids]
+    with conn.cursor() as cur:
+        execute_values(
+            cur,
+            """
+            insert into public.referees (id, name, source, extra)
+            values %s
+            on conflict (id) do nothing
+            """,
+            values,
+            page_size=500,
+        )
+    conn.commit()
+    return len(values)
+
+
+def reconcile_assignments(
+    conn: psycopg2.extensions.connection,
+    rows: Iterable[Dict[str, Any]],
+) -> Tuple[int, int]:
+    """Upsert current assignments and remove stale SportMonks rows per fixture."""
+    rows = list(rows)
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(int(row["fixture_id"]), []).append(row)
+    if not grouped:
+        return 0, 0
+
+    deleted = 0
+    inserted = 0
+    with conn.cursor() as cur:
+        for fixture_id, fixture_rows in grouped.items():
+            keys = {(int(row["referee_id"]), str(row["role"])) for row in fixture_rows}
+            placeholders = ",".join("(%s, %s)" for _ in keys)
+            params: List[Any] = [fixture_id]
+            for referee_id, role in sorted(keys):
+                params.extend([referee_id, role])
+            cur.execute(
+                f"""
+                delete from public.fixture_referees
+                where fixture_id = %s
+                  and source = 'sportmonks'
+                  and (referee_id, role) not in ({placeholders})
+                """,
+                params,
+            )
+            deleted += cur.rowcount
+
+        values = [
+            (
+                row["fixture_id"],
+                row["referee_id"],
+                row["role"],
+                bool(row.get("is_primary", False)),
+                row.get("source", "sportmonks"),
+                Json(row.get("extra") or {}),
+            )
+            for row in rows
+        ]
+        execute_values(
+            cur,
+            """
+            insert into public.fixture_referees
+              (fixture_id, referee_id, role, is_primary, source, extra)
+            values %s
+            on conflict (fixture_id, referee_id, role) do update
+            set is_primary = excluded.is_primary,
+                source = excluded.source,
+                extra = coalesce(excluded.extra, public.fixture_referees.extra),
+                updated_at = now(),
+                last_synced_at = now()
+            """,
+            values,
+            page_size=500,
+        )
+        inserted = len(values)
+    conn.commit()
+    return inserted, deleted
+
+
 def cleanup_legacy_assignment_ids(
     conn: psycopg2.extensions.connection, fixture_ids: Iterable[int]
 ) -> int:
@@ -458,6 +640,7 @@ def main() -> int:
             days_back=args.days_back,
             days_forward=args.days_forward,
             resync_hours=args.resync_hours,
+            fixture_id=args.fixture_id,
             limit_fixtures=args.limit_fixtures,
         )
     finally:
@@ -476,30 +659,47 @@ def main() -> int:
     fixtures_without_refs = 0
     fixture_errors = 0
     touched_fixtures = 0
+    state_updates = 0
     all_profiles: List[Dict[str, Any]] = []
     all_assignments: List[Dict[str, Any]] = []
+    successful_fixture_ids: List[int] = []
+    state_conn = None if args.dry_run else psycopg2.connect(db_url)
 
     session = requests.Session()
     try:
         for idx, fixture_id in enumerate(fixture_ids, start=1):
+            if state_conn is not None:
+                mark_fixture_attempt(state_conn, fixture_id)
             url = f"{base_url}/fixtures/{fixture_id}?api_token={token}&include=referees"
             try:
                 payload = fetch_json_with_retry(session=session, url=url, timeout=args.timeout)
             except Exception as exc:  # noqa: BLE001
                 fixture_errors += 1
                 logger.warning("fixture_id=%s failed: %s", fixture_id, exc)
+                if state_conn is not None:
+                    record_fixture_state(
+                        state_conn,
+                        fixture_id,
+                        status="error",
+                        error=str(exc)[:1000],
+                        retry_after=timedelta(minutes=15),
+                    )
+                    state_updates += 1
                 continue
 
             ref_items = extract_referee_items(payload)
             if not ref_items:
                 fixtures_without_refs += 1
-                logger.warning("fixture_id=%s has no referee payload; skipping", fixture_id)
-                if not args.dry_run:
-                    conn_touch = psycopg2.connect(db_url)
-                    try:
-                        touch_fixture_sync_timestamp(conn_touch, fixture_id)
-                    finally:
-                        conn_touch.close()
+                logger.info("fixture_id=%s has no referee payload; will retry", fixture_id)
+                if state_conn is not None:
+                    record_fixture_state(
+                        state_conn,
+                        fixture_id,
+                        status="no_assignment",
+                        response_hash_value=payload_hash(payload),
+                        retry_after=timedelta(hours=2),
+                    )
+                    state_updates += 1
                 continue
 
             fixtures_with_refs += 1
@@ -513,6 +713,7 @@ def main() -> int:
                     total_assignments += 1
 
             touched_fixtures += 1
+            successful_fixture_ids.append(fixture_id)
             if args.sleep_seconds > 0 and idx < len(fixture_ids):
                 time.sleep(args.sleep_seconds)
     finally:
@@ -533,20 +734,9 @@ def main() -> int:
         conn_meta.close()
 
     missing_referee_ids = sorted(set(assignment_referee_ids) - existing_referee_ids)
-    if missing_referee_ids:
-        logger.warning(
-            "Skipping %s assignment referee IDs not present in public.referees (run sync_referees first)",
-            len(missing_referee_ids),
-        )
-
-    dedup_assignments = {
-        key: row
-        for key, row in dedup_assignments.items()
-        if row["referee_id"] in existing_referee_ids
-    }
 
     report: Dict[str, Any] = {
-        "ok": True,
+        "ok": fixture_errors == 0,
         "dry_run": bool(args.dry_run),
         "fixtures_scanned": len(fixture_ids),
         "fixtures_with_referees": fixtures_with_refs,
@@ -570,20 +760,50 @@ def main() -> int:
     conn_write = psycopg2.connect(db_url)
     try:
         upserted_referees = upsert_referees(conn_write, dedup_profiles.values(), valid_country_ids=valid_country_ids)
-        upserted_assignments = upsert_assignments(conn_write, dedup_assignments.values())
+        placeholder_referees = insert_placeholder_referees(conn_write, missing_referee_ids)
+        upserted_assignments, deleted_stale_assignments = reconcile_assignments(
+            conn_write, dedup_assignments.values()
+        )
         cleaned_legacy_assignments = cleanup_legacy_assignment_ids(
             conn_write, {row["fixture_id"] for row in dedup_assignments.values()}
         )
     finally:
         conn_write.close()
 
+    if state_conn is not None:
+        try:
+            for fixture_id in successful_fixture_ids:
+                fixture_assignments = [
+                    row for row in dedup_assignments.values() if row["fixture_id"] == fixture_id
+                ]
+                response_hash_value = payload_hash(
+                    {
+                        "fixture_id": fixture_id,
+                        "assignments": fixture_assignments,
+                    }
+                )
+                record_fixture_state(
+                    state_conn,
+                    fixture_id,
+                    status="assigned",
+                    assignment_count=len(fixture_assignments),
+                    response_hash_value=response_hash_value,
+                    retry_after=timedelta(hours=max(1, args.resync_hours)),
+                )
+                state_updates += 1
+        finally:
+            state_conn.close()
+
     report["upserted_referees"] = upserted_referees
     report["upserted_assignments"] = upserted_assignments
+    report["placeholder_referees_inserted"] = placeholder_referees
+    report["deleted_stale_assignments"] = deleted_stale_assignments
     report["cleaned_legacy_assignments"] = cleaned_legacy_assignments
+    report["state_updates"] = state_updates
 
     print(json.dumps(report, indent=2, ensure_ascii=False))
     write_report(args.report_json, report)
-    return 0
+    return 1 if fixture_errors else 0
 
 
 if __name__ == "__main__":

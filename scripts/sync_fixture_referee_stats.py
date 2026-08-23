@@ -30,7 +30,13 @@ logger = logging.getLogger("sync_fixture_referee_stats")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync fixture_referee_stats from database card history")
     parser.add_argument("--days-back", type=int, default=30)
-    parser.add_argument("--days-forward", type=int, default=14)
+    parser.add_argument("--days-forward", type=int, default=31)
+    parser.add_argument(
+        "--fixture-id",
+        type=int,
+        default=0,
+        help="Restrict the run to one fixture (useful for controlled repair/backfill; 0 = window)",
+    )
     parser.add_argument("--limit-fixtures", type=int, default=0)
     # Kept for workflow CLI compatibility; no external API calls are made.
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
@@ -81,13 +87,15 @@ def fetch_fixture_referee_metrics(
     *,
     days_back: int,
     days_forward: int,
+    fixture_id: int,
     limit_fixtures: int,
 ) -> List[Dict[str, Any]]:
     limit_clause = ""
-    params: List[Any] = [max(0, days_back), max(0, days_forward), FINISHED_STATUSES]
+    params: List[Any] = [max(0, days_back), max(0, days_forward), max(0, fixture_id), max(0, fixture_id)]
     if limit_fixtures > 0:
         limit_clause = "\n          limit %s"
         params.append(limit_fixtures)
+    params.append(FINISHED_STATUSES)
 
     sql = f"""
       with target as (
@@ -111,6 +119,7 @@ def fetch_fixture_referee_metrics(
           on r.id = pick.referee_id
         where f.starting_at >= (now() - make_interval(days => %s))
           and f.starting_at <= (now() + make_interval(days => %s))
+          and (%s = 0 or f.id = %s)
         order by f.starting_at asc
         {limit_clause}
       ),
@@ -155,6 +164,7 @@ def fetch_fixture_referee_metrics(
           count(*) filter (where rn <= 5)::int as sample_5,
           count(*) filter (where rn <= 10)::int as sample_10,
           count(*) filter (where rn <= 20)::int as sample_20,
+          max(history_starting_at) filter (where rn <= 20) as history_through,
 
           avg(yellow_cards) filter (where rn <= 5)::float8 as avg_cards_5,
           avg(yellow_cards) filter (where rn <= 10)::float8 as avg_cards_10,
@@ -191,6 +201,7 @@ def fetch_fixture_referee_metrics(
         t.fixture_id,
         t.referee_id,
         t.referee_name,
+        a.history_through,
 
         coalesce(a.sample_5, 0) as sample_5,
         coalesce(a.sample_10, 0) as sample_10,
@@ -287,6 +298,15 @@ def upsert_fixture_referee_stats(conn: psycopg2.extensions.connection, rows: Ite
                 sample_5,
                 sample_10,
                 sample_20,
+                row.get("history_through"),
+                "referee-card-v2",
+                (
+                    "ready"
+                    if sample_20 > 0
+                    else "limited_history"
+                    if sample_5 > 0
+                    else "not_available"
+                ),
                 Json(windows_payload),
             )
         )
@@ -312,6 +332,9 @@ def upsert_fixture_referee_stats(conn: psycopg2.extensions.connection, rows: Ite
         sample_5,
         sample_10,
         sample_20,
+        history_through,
+        calculation_version,
+        data_status,
         windows
       )
       values %s
@@ -332,6 +355,9 @@ def upsert_fixture_referee_stats(conn: psycopg2.extensions.connection, rows: Ite
         sample_5 = excluded.sample_5,
         sample_10 = excluded.sample_10,
         sample_20 = excluded.sample_20,
+        history_through = excluded.history_through,
+        calculation_version = excluded.calculation_version,
+        data_status = excluded.data_status,
         windows = excluded.windows,
         updated_at = now()
     """
@@ -353,6 +379,7 @@ def main() -> int:
             conn,
             days_back=args.days_back,
             days_forward=args.days_forward,
+            fixture_id=args.fixture_id,
             limit_fixtures=args.limit_fixtures,
         )
     finally:
