@@ -22,9 +22,9 @@ on:
         default: "14"
         type: string
       limit_fixtures:
-        description: "Limit fixtures (0 = all in window)"
+        description: "Limit fixtures per run (0 = all in window)"
         required: true
-        default: "0"
+        default: "500"
         type: string
       sleep_seconds:
         description: "Throttle delay between fixture API calls"
@@ -81,7 +81,7 @@ jobs:
             echo "RUN_MODE=daily" >> "$GITHUB_ENV"
             echo "DAYS_BACK=2" >> "$GITHUB_ENV"
             echo "DAYS_FORWARD=7" >> "$GITHUB_ENV"
-            echo "LIMIT_FIXTURES=0" >> "$GITHUB_ENV"
+            echo "LIMIT_FIXTURES=500" >> "$GITHUB_ENV"
             echo "SLEEP_SECONDS=0.2" >> "$GITHUB_ENV"
             echo "MAX_REFEREE_PAGES=0" >> "$GITHUB_ENV"
             echo "HISTORY_DAYS_BACK=700" >> "$GITHUB_ENV"

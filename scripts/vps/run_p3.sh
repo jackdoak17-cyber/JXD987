@@ -47,6 +47,7 @@ export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-180
 export REFEREE_SYNC_DAYS_BACK="${REFEREE_SYNC_DAYS_BACK:-30}"
 export REFEREE_SYNC_DAYS_FORWARD="${REFEREE_SYNC_DAYS_FORWARD:-31}"
 export REFEREE_SYNC_RESYNC_HOURS="${REFEREE_SYNC_RESYNC_HOURS:-12}"
+export REFEREE_SYNC_MAX_FIXTURES="${REFEREE_SYNC_MAX_FIXTURES:-500}"
 export REFEREE_SYNC_TIMEOUT_SECONDS="${REFEREE_SYNC_TIMEOUT_SECONDS:-1800}"
 export REFEREE_HISTORY_DAYS_BACK="${REFEREE_HISTORY_DAYS_BACK:-700}"
 export REFEREE_HISTORY_TIMEOUT_SECONDS="${REFEREE_HISTORY_TIMEOUT_SECONDS:-1800}"
@@ -177,7 +178,7 @@ if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_DB_URL_SESSION:-${SUPABAS
   run_pipeline_job_with_heartbeat \
     "run_p3_referee_assignments" \
     "P3 referee assignment sync" \
-    "python scripts/sync_fixture_referees.py --days-back \"${REFEREE_SYNC_DAYS_BACK}\" --days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --resync-hours \"${REFEREE_SYNC_RESYNC_HOURS}\" --report-json /tmp/referee_assignments_report_p3.json" \
+    "python scripts/sync_fixture_referees.py --days-back \"${REFEREE_SYNC_DAYS_BACK}\" --days-forward \"${REFEREE_SYNC_DAYS_FORWARD}\" --resync-hours \"${REFEREE_SYNC_RESYNC_HOURS}\" --limit-fixtures \"${REFEREE_SYNC_MAX_FIXTURES}\" --report-json /tmp/referee_assignments_report_p3.json" \
     "${REFEREE_SYNC_TIMEOUT_SECONDS}"
   REFEREE_ASSIGNMENT_STATUS=$?
 
