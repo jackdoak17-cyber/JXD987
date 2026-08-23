@@ -27,6 +27,7 @@ require_runtime_manifest_entries_or_exit "$0" \
 export REPO_ROOT
 export STATS_LEAGUES="${STATS_LEAGUE_IDS:-${LEAGUE_IDS:-$(default_league_csv)}}"
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
+export SQUAD_LEAGUES="${SQUAD_LEAGUE_IDS:-${ODDS_LEAGUES}}"
 export ODDS_SYNC_DAYS_BACK="${ODDS_SYNC_DAYS_BACK:-2}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
@@ -107,13 +108,13 @@ if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE
   set +e
   timeout "${P3_SPARSE_SQUAD_REFRESH_TIMEOUT_SECONDS}" \
     python scripts/sync_sparse_squads.py \
-      --leagues "${STATS_LEAGUES}" \
+      --leagues "${SQUAD_LEAGUES}" \
       --refresh-all \
       --report-json "/tmp/sparse_squad_refresh_report_p3.json"
   SQUAD_RECONCILIATION_STATUS=$?
   if [[ "${SQUAD_RECONCILIATION_STATUS}" -eq 0 ]]; then
     python scripts/verify_squad_freshness.py \
-      --leagues "${STATS_LEAGUES}" \
+      --leagues "${SQUAD_LEAGUES}" \
       --max-age-hours "${SQUAD_FRESHNESS_MAX_HOURS}" \
       --report-json "/tmp/squad_freshness_report_p3.json"
     SQUAD_FRESHNESS_STATUS=$?

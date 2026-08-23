@@ -127,8 +127,13 @@ def main() -> None:
         if not os.environ.get("SPORTMONKS_API_TOKEN"):
             raise SystemExit("SPORTMONKS_API_TOKEN is required for provider-derived squad verification")
         service = SyncService(SportMonksClient(), session)
-        _, provider_team_ids = refresh_current_provider_teams(session, service, league_ids)
-        team_ids = sorted(set(provider_team_ids) | set(current_season_team_ids(session, league_ids, 0)))
+        refresh_current_provider_teams(session, service, league_ids)
+        # The public squad contract is scoped to teams with current-season
+        # fixtures in the configured product leagues.  Provider season
+        # metadata can contain aggregate/placeholder teams that have no
+        # fixture or searchable-team representation; including those would
+        # make a valid product refresh fail on an entity the site cannot show.
+        team_ids = current_season_team_ids(session, league_ids, 0)
     team_ids = sorted(set(team_ids))
     if not team_ids:
         raise SystemExit("No current-season teams were discovered for squad verification")
