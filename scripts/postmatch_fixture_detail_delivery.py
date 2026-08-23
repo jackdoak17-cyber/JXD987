@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 import psycopg2
+from psycopg2.extras import Json
 from sqlalchemy import create_engine
 
 from jxd import SportMonksClient, SyncService
@@ -48,6 +49,7 @@ REQUIRED_TEAM_STAT_TYPES = {42, 45, 56, 57, 78, 86, 100, 109, 581}
 PROVIDER_SPARSE_TEAM_STAT_TYPES = {581}
 
 LEDGER_TABLE = "fixture_detail_deliveries"
+TARGET_STATUS_TABLE = "fixture_detail_delivery_status"
 DEFAULT_HOURS_BACK = 72
 DEFAULT_LIMIT = 25
 DEFAULT_GRACE_MINUTES = 60
@@ -317,6 +319,115 @@ def update_ledger(
         ),
     )
     conn.commit()
+
+
+def _json_value(raw: object) -> Json | None:
+    if raw is None or raw == "":
+        return None
+    try:
+        return Json(json.loads(str(raw)))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return Json({"raw": str(raw)})
+
+
+def publish_delivery_status(
+    target_url: str,
+    source_conn: sqlite3.Connection,
+    fixture_id: int,
+) -> None:
+    """Mirror the durable source ledger into the serving database.
+
+    The source SQLite ledger remains authoritative for retries.  This small
+    serving-side projection lets the stats API explain whether a null metric
+    is still pending ingestion or was explicitly classified as provider-sparse.
+    """
+    row = source_conn.execute(
+        f"""
+        select d.fixture_id,
+               coalesce(d.league_id, f.league_id) as league_id,
+               coalesce(d.season_id, f.season_id) as season_id,
+               d.status, d.attempts, d.first_seen_at, d.last_attempted_at,
+               d.next_attempt_at, d.last_successful_at, d.provider_status,
+               d.provider_finished, d.provider_team_stat_count,
+               d.provider_player_stat_count, d.provider_lineup_count,
+               d.provider_team_stat_types, d.provider_missing_type_ids,
+               d.source_snapshot, d.target_snapshot, d.last_error,
+               d.release_id, d.updated_at
+          from {LEDGER_TABLE} d
+          left join fixtures f on f.id = d.fixture_id
+         where d.fixture_id = ?
+        """,
+        (fixture_id,),
+    ).fetchone()
+    if row is None:
+        return
+
+    values = (
+        int(row["fixture_id"]),
+        _int(row["league_id"]),
+        _int(row["season_id"]),
+        str(row["status"]),
+        int(row["attempts"] or 0),
+        row["first_seen_at"],
+        row["last_attempted_at"],
+        row["next_attempt_at"],
+        row["last_successful_at"],
+        row["provider_status"],
+        bool(row["provider_finished"]),
+        int(row["provider_team_stat_count"] or 0),
+        int(row["provider_player_stat_count"] or 0),
+        int(row["provider_lineup_count"] or 0),
+        _json_value(row["provider_team_stat_types"]),
+        _json_value(row["provider_missing_type_ids"]),
+        _json_value(row["source_snapshot"]),
+        _json_value(row["target_snapshot"]),
+        row["last_error"],
+        row["release_id"],
+        row["updated_at"],
+    )
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            cur.execute(
+                f"""
+                insert into public.{TARGET_STATUS_TABLE} (
+                  fixture_id, league_id, season_id, status, attempts,
+                  first_seen_at, last_attempted_at, next_attempt_at,
+                  last_successful_at, provider_status, provider_finished,
+                  provider_team_stat_count, provider_player_stat_count,
+                  provider_lineup_count, provider_team_stat_types,
+                  provider_missing_type_ids, source_snapshot, target_snapshot,
+                  last_error, release_id, updated_at
+                ) values (
+                  %s, %s, %s, %s, %s,
+                  %s::timestamptz, %s::timestamptz, %s::timestamptz,
+                  %s::timestamptz, %s, %s,
+                  %s, %s, %s, %s, %s, %s, %s,
+                  %s, %s, %s::timestamptz
+                )
+                on conflict (fixture_id) do update set
+                  league_id = excluded.league_id,
+                  season_id = excluded.season_id,
+                  status = excluded.status,
+                  attempts = excluded.attempts,
+                  first_seen_at = excluded.first_seen_at,
+                  last_attempted_at = excluded.last_attempted_at,
+                  next_attempt_at = excluded.next_attempt_at,
+                  last_successful_at = excluded.last_successful_at,
+                  provider_status = excluded.provider_status,
+                  provider_finished = excluded.provider_finished,
+                  provider_team_stat_count = excluded.provider_team_stat_count,
+                  provider_player_stat_count = excluded.provider_player_stat_count,
+                  provider_lineup_count = excluded.provider_lineup_count,
+                  provider_team_stat_types = excluded.provider_team_stat_types,
+                  provider_missing_type_ids = excluded.provider_missing_type_ids,
+                  source_snapshot = excluded.source_snapshot,
+                  target_snapshot = excluded.target_snapshot,
+                  last_error = excluded.last_error,
+                  release_id = excluded.release_id,
+                  updated_at = excluded.updated_at
+                """,
+                values,
+            )
 
 
 def _int(value: object) -> int | None:
@@ -720,6 +831,7 @@ def main() -> int:
         "provider_sparse": [],
         "provider_pending": [],
         "failed": [],
+        "status_sync_failures": [],
         "sla_breaches": [],
         "provider_calls": 0,
     }
@@ -813,6 +925,27 @@ def main() -> int:
             update_ledger(conn, fixture_id, "failed", attempt, assessment, error=message, next_attempt_at=backoff_time(attempt, utc_now()))
             report["failed"].append({"fixture_id": fixture_id, "stage": "fetch_or_store", "error": message})
             LOG.exception("Fixture detail delivery failed for %s", fixture_id)
+        finally:
+            try:
+                publish_delivery_status(target_url, conn, fixture_id)
+            except Exception as status_exc:
+                message = f"delivery status projection failed: {status_exc}"[-4000:]
+                report["status_sync_failures"].append({"fixture_id": fixture_id, "error": message})
+                if not any(item.get("fixture_id") == fixture_id for item in report["failed"]):
+                    report["failed"].append({"fixture_id": fixture_id, "stage": "status_projection", "error": message})
+                try:
+                    update_ledger(
+                        conn,
+                        fixture_id,
+                        "failed",
+                        attempt,
+                        assessment,
+                        error=message,
+                        next_attempt_at=backoff_time(attempt, utc_now()),
+                    )
+                except Exception:
+                    LOG.exception("Could not record status projection failure for %s", fixture_id)
+                LOG.exception("Delivery status projection failed for %s", fixture_id)
 
     report["status"] = "failed" if report["failed"] else "success"
     if report["sla_breaches"] and not args.no_fail_on_sla_breach:
