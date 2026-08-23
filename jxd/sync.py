@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 from datetime import datetime, timedelta, date
 from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 
@@ -15,6 +17,8 @@ from .models import (
     Team,
     Player,
     PlayerTeamHistory,
+    TeamSquadMembership,
+    TeamSquadSnapshot,
     Fixture,
     FixtureParticipant,
     FixtureStatistic,
@@ -138,6 +142,26 @@ def _ensure_team_player_columns(engine) -> None:
                     if col not in cols:
                         col_type = "TEXT" if col != "team_updated_at" else "DATETIME"
                         conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}")
+
+
+def _ensure_team_squad_columns(engine) -> None:
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        tables = {
+            row[0]
+            for row in conn.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if "team_squad_memberships" not in tables:
+            return
+        cols = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info(team_squad_memberships)").fetchall()
+        }
+        if "provider_started_at" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE team_squad_memberships ADD COLUMN provider_started_at DATETIME"
+            )
 
 
 def _extract_stat_value(data) -> Optional[int]:
@@ -335,7 +359,8 @@ def _upsert_fixture_team_derived_stat(
     value: Optional[float],
     extra: Dict,
 ) -> None:
-    pk = (fixture_id, team_id, type_id, code, None)
+    location = "all"
+    pk = (fixture_id, team_id, type_id, code, location)
     obj = session.get(FixtureStatistic, pk)
     if value is None:
         if obj:
@@ -347,7 +372,7 @@ def _upsert_fixture_team_derived_stat(
         "type_id": type_id,
         "code": code,
         "name": name,
-        "location": None,
+        "location": location,
         "value": value,
         "extra": extra,
     }
@@ -457,6 +482,7 @@ class SyncService:
         _ensure_fixture_columns(self.session.get_bind())
         _ensure_fixture_player_columns(self.session.get_bind())
         _ensure_team_player_columns(self.session.get_bind())
+        _ensure_team_squad_columns(self.session.get_bind())
 
     def _track_player_team_history(self, player_id: int, team_id: int, sync_run_at: datetime) -> None:
         if not player_id or not team_id:
@@ -482,6 +508,18 @@ class SyncService:
             updated_at=sync_run_at,
         )
         self.session.add(entry)
+
+    def _end_player_team_assignment(self, player_id: int, team_id: int, sync_run_at: datetime) -> None:
+        """Close a current squad assignment when the provider no longer lists it."""
+        latest = (
+            self.session.query(PlayerTeamHistory)
+            .filter(PlayerTeamHistory.player_id == player_id)
+            .order_by(PlayerTeamHistory.effective_from.desc(), PlayerTeamHistory.id.desc())
+            .first()
+        )
+        if latest and latest.team_id == team_id and latest.effective_to is None:
+            latest.effective_to = sync_run_at
+            latest.updated_at = sync_run_at
 
     # --- seasons & teams ---
     def sync_seasons(self, league_ids: Sequence[int]) -> int:
@@ -536,10 +574,17 @@ class SyncService:
         if not league_ids:
             return 0
         seasons = self.session.query(Season).filter(Season.league_id.in_(league_ids)).all()
+        team_ids = self.sync_teams_for_seasons([season.id for season in seasons])
+        log.info("Synced teams for leagues %s: %s", list(league_ids), len(team_ids))
+        return len(team_ids)
+
+    def sync_teams_for_seasons(self, season_ids: Sequence[int]) -> list[int]:
+        """Refresh teams for exactly the supplied seasons and return their IDs."""
+        if not season_ids:
+            return []
         seen_team_ids: Set[int] = set()
-        count = 0
-        for season in seasons:
-            endpoint = f"teams/seasons/{season.id}"
+        for season_id in season_ids:
+            endpoint = f"teams/seasons/{season_id}"
             for item in self.client.fetch_collection(endpoint, includes=["venue"], per_page=200):
                 team_id = item.get("id")
                 if team_id in seen_team_ids:
@@ -555,10 +600,9 @@ class SyncService:
                     data["image_path"] = image_path
                 _upsert(self.session, Team, data)
                 seen_team_ids.add(team_id)
-                count += 1
         self.session.commit()
-        log.info("Synced teams: %s", count)
-        return count
+        log.info("Synced teams for seasons %s: %s", list(season_ids), len(seen_team_ids))
+        return sorted(seen_team_ids)
 
     def sync_squads_for_teams(self, team_ids: Sequence[int]) -> int:
         if not team_ids:
@@ -572,11 +616,52 @@ class SyncService:
             seen.add(team_id)
             endpoint = f"squads/teams/{team_id}"
             try:
-                for item in self.client.fetch_collection(endpoint, includes=["player"], per_page=200):
+                # Do not mutate current membership while paging.  Only a fully
+                # successful, non-empty response is authoritative enough to remove
+                # somebody from a squad.
+                squad_rows = list(self.client.fetch_collection(endpoint, includes=["player"], per_page=200))
+                squad_player_ids: Set[int] = {
+                    int((item.get("player") or {}).get("id") or item.get("player_id"))
+                    for item in squad_rows
+                    if (item.get("player") or {}).get("id") or item.get("player_id")
+                }
+                if not squad_player_ids:
+                    snapshot = TeamSquadSnapshot(
+                        team_id=team_id,
+                        source="sportmonks",
+                        status="empty",
+                        observed_at=sync_run_at,
+                        completed_at=datetime.utcnow(),
+                        player_count=0,
+                        error="Provider returned no valid player IDs; existing membership preserved.",
+                        created_at=sync_run_at,
+                    )
+                    self.session.add(snapshot)
+                    self.session.commit()
+                    log.warning("Squad lookup returned no players for team %s; preserving existing assignment", team_id)
+                    continue
+
+                snapshot = TeamSquadSnapshot(
+                    team_id=team_id,
+                    source="sportmonks",
+                    status="success",
+                    observed_at=sync_run_at,
+                    completed_at=datetime.utcnow(),
+                    player_count=len(squad_player_ids),
+                    payload_hash=hashlib.sha256(
+                        json.dumps(sorted(squad_player_ids), separators=(",", ":")).encode("utf-8")
+                    ).hexdigest(),
+                    created_at=sync_run_at,
+                )
+                self.session.add(snapshot)
+                self.session.flush()
+
+                for item in squad_rows:
                     player = item.get("player") or {}
                     player_id = player.get("id") or item.get("player_id")
                     if not player_id:
                         continue
+                    player_id = int(player_id)
                     payload = {
                         "id": player_id,
                         "name": player.get("name") or player.get("display_name"),
@@ -586,30 +671,170 @@ class SyncService:
                         "image_path": player.get("image_path"),
                         "extra": player,
                     }
-                    next_team_id = item.get("team_id") or team_id
+                    provider_started_at = parse_dt(item.get("start") or item.get("joined_at")) or sync_run_at
+                    # Some provider records overlap while a transfer is being
+                    # processed.  The newer effective squad record wins; the
+                    # older membership is closed so one player cannot appear in
+                    # two current teams just because endpoint order changed.
+                    assignment_is_current = True
+                    other_memberships = (
+                        self.session.query(TeamSquadMembership)
+                        .filter(TeamSquadMembership.player_id == player_id)
+                        .filter(TeamSquadMembership.team_id != team_id)
+                        .filter(TeamSquadMembership.is_active.is_(True))
+                        .all()
+                    )
+                    for other_membership in other_memberships:
+                        other_started_at = other_membership.provider_started_at or other_membership.last_seen_at
+                        if other_started_at and other_started_at > provider_started_at:
+                            assignment_is_current = False
+                            continue
+                        other_membership.is_active = False
+                        other_membership.updated_at = sync_run_at
+                        self._end_player_team_assignment(other_membership.player_id, other_membership.team_id, sync_run_at)
+
+                    membership = self.session.get(TeamSquadMembership, (team_id, player_id))
+                    if membership:
+                        membership.is_active = assignment_is_current
+                        membership.last_seen_at = sync_run_at
+                        membership.provider_started_at = provider_started_at
+                        membership.last_snapshot_id = snapshot.id
+                        membership.source = "sportmonks"
+                        membership.updated_at = sync_run_at
+                    else:
+                        self.session.add(
+                            TeamSquadMembership(
+                                team_id=team_id,
+                                player_id=player_id,
+                                is_active=assignment_is_current,
+                                first_seen_at=sync_run_at,
+                                last_seen_at=sync_run_at,
+                                provider_started_at=provider_started_at,
+                                last_snapshot_id=snapshot.id,
+                                source="sportmonks",
+                                created_at=sync_run_at,
+                                updated_at=sync_run_at,
+                            )
+                        )
                     existing = self.session.get(Player, player_id)
-                    payload["team_id"] = next_team_id
-                    track_history = True
-                    if existing is not None:
-                        existing_updated_at = getattr(existing, "team_updated_at", None)
-                        if existing_updated_at and existing_updated_at >= sync_run_at:
-                            payload["team_id"] = existing.team_id
-                            payload["team_updated_at"] = existing_updated_at
-                            track_history = False
+                    payload["team_id"] = team_id if assignment_is_current else (existing.team_id if existing else None)
+                    track_history = assignment_is_current
                     if track_history:
                         payload["team_updated_at"] = sync_run_at
+                    elif existing is not None:
+                        payload["team_updated_at"] = existing.team_updated_at
                     _upsert(self.session, Player, payload)
                     if track_history and payload.get("team_id"):
                         self._track_player_team_history(player_id, payload["team_id"], sync_run_at)
                     count += 1
+
+                stale_memberships = (
+                    self.session.query(TeamSquadMembership)
+                    .filter(TeamSquadMembership.team_id == team_id)
+                    .filter(TeamSquadMembership.is_active.is_(True))
+                    .filter(~TeamSquadMembership.player_id.in_(squad_player_ids))
+                    .all()
+                )
+                for membership in stale_memberships:
+                    membership.is_active = False
+                    membership.updated_at = sync_run_at
+                    self._end_player_team_assignment(membership.player_id, team_id, sync_run_at)
+
+                # Maintain the legacy denormalised player.team_id for existing
+                # consumers, but treat snapshot membership as the source of truth.
+                stale_players = (
+                    self.session.query(Player)
+                    .filter(Player.team_id == team_id)
+                    .filter(~Player.id.in_(squad_player_ids))
+                    .all()
+                )
+                for stale_player in stale_players:
+                    self._end_player_team_assignment(stale_player.id, team_id, sync_run_at)
+                    stale_player.team_id = None
+                    stale_player.team_updated_at = sync_run_at
+                self.session.commit()
             except SportMonksError as exc:
+                self.session.rollback()
+                self.session.add(
+                    TeamSquadSnapshot(
+                        team_id=team_id,
+                        source="sportmonks",
+                        status="failed",
+                        observed_at=sync_run_at,
+                        completed_at=datetime.utcnow(),
+                        player_count=0,
+                        error=f"Provider response failed ({exc.status_code}): {exc}",
+                        created_at=sync_run_at,
+                    )
+                )
+                self.session.commit()
                 if exc.status_code in {404, 422}:
                     log.info("No squad data for team %s (status %s)", team_id, exc.status_code)
                     continue
                 raise
-        self.session.commit()
         log.info("Synced squads for %s teams (%s players)", len(seen), count)
         return count
+
+    def collapse_duplicate_active_memberships(
+        self,
+        player_ids: Optional[Sequence[int]] = None,
+    ) -> Tuple[List[int], List[int]]:
+        """Enforce one canonical active squad assignment per player.
+
+        A transfer can leave the old team unrefreshed, so the per-team sync
+        cannot always close the old membership in the same run.  The public
+        current-squad read model also applies this ordering, but cleaning the
+        source rows here keeps exports and legacy ``players.team_id`` aligned.
+        """
+        query = self.session.query(TeamSquadMembership).filter(
+            TeamSquadMembership.is_active.is_(True)
+        )
+        if player_ids:
+            query = query.filter(TeamSquadMembership.player_id.in_(list(player_ids)))
+
+        memberships_by_player: Dict[int, List[TeamSquadMembership]] = {}
+        for membership in query.all():
+            memberships_by_player.setdefault(int(membership.player_id), []).append(membership)
+
+        affected_players: Set[int] = set()
+        affected_teams: Set[int] = set()
+
+        def sort_key(membership: TeamSquadMembership) -> Tuple[datetime, datetime, int, int]:
+            return (
+                membership.provider_started_at or datetime.min,
+                membership.last_seen_at or datetime.min,
+                int(membership.last_snapshot_id or 0),
+                -int(membership.team_id),
+            )
+
+        for player_id, memberships in memberships_by_player.items():
+            if len(memberships) < 2:
+                continue
+            winner = max(memberships, key=sort_key)
+            now = datetime.utcnow()
+            for membership in memberships:
+                if membership is winner:
+                    continue
+                membership.is_active = False
+                membership.updated_at = now
+                self._end_player_team_assignment(player_id, membership.team_id, now)
+                affected_teams.add(int(membership.team_id))
+            player = self.session.get(Player, player_id)
+            if player is not None and player.team_id != winner.team_id:
+                player.team_id = winner.team_id
+                player.team_updated_at = now
+                self._track_player_team_history(player_id, winner.team_id, now)
+            affected_players.add(player_id)
+            affected_teams.add(int(winner.team_id))
+
+        if affected_players:
+            self.session.commit()
+            log.info(
+                "Collapsed duplicate active squad assignments for %s players across %s teams",
+                len(affected_players),
+                len(affected_teams),
+            )
+        return sorted(affected_players), sorted(affected_teams)
 
     def sync_sidelined_for_teams(self, team_ids: Sequence[int]) -> int:
         if not team_ids:
@@ -1190,6 +1415,24 @@ class SyncService:
             else:
                 self.session.add(FixturePlayerStatistic(**payload))
 
+    def _replace_fixture_lineup_rows(self, fixture_id: int) -> None:
+        """Replace lineup rows without deleting already-ingested player stats."""
+        self.session.query(FixturePlayer).filter(
+            FixturePlayer.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
+
+    def _replace_fixture_detail_rows(self, fixture_id: int) -> None:
+        """Replace provider-owned detail collections for an authoritative payload."""
+        self.session.query(FixtureStatistic).filter(
+            FixtureStatistic.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
+        self.session.query(FixturePlayerStatistic).filter(
+            FixturePlayerStatistic.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
+        self.session.query(FixturePlayer).filter(
+            FixturePlayer.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
+
     def _apply_participant_derivations(self, fixture: Fixture, loc_map: Dict[str, Dict]) -> None:
         if fixture.home_team_id is None and loc_map.get("home"):
             fixture.home_team_id = loc_map["home"].get("team_id")
@@ -1203,7 +1446,12 @@ class SyncService:
         if fixture.away_score is None and away_part:
             fixture.away_score = _safe_int(away_part.get("score"))
 
-    def _store_fixture_raw(self, raw: Dict, log_changes: bool = False) -> None:
+    def _store_fixture_raw(
+        self,
+        raw: Dict,
+        log_changes: bool = False,
+        full_detail: bool = False,
+    ) -> None:
         self._store_fixture_season(raw)
         data = self._map_fixture(raw)
         fixture = self.session.get(Fixture, data["id"])
@@ -1214,16 +1462,30 @@ class SyncService:
             fixture = Fixture(**data)
             self.session.add(fixture)
 
+        stats = raw.get("statistics")
+        lineups = raw.get("lineups")
+        authoritative_detail = (
+            full_detail
+            and isinstance(stats, list)
+            and bool(stats)
+            and isinstance(lineups, list)
+            and bool(lineups)
+        )
+        if authoritative_detail:
+            self._replace_fixture_detail_rows(fixture.id)
+        elif isinstance(lineups, list) and lineups:
+            self._replace_fixture_lineup_rows(fixture.id)
+
         loc_map = self._store_participants(fixture.id, raw.get("participants") or [])
         self._apply_participant_derivations(fixture, loc_map)
         self._store_statistics(
             fixture.id,
-            raw.get("statistics") or [],
+            stats or [],
             log_changes=log_changes,
         )
         self._store_lineups(
             fixture.id,
-            raw.get("lineups") or [],
+            lineups or [],
             log_changes=log_changes,
         )
 
@@ -1257,11 +1519,14 @@ class SyncService:
                 "lineups.player",
             ]
         count = 0
+        commit_every = 25
         for chunk_start, chunk_end in self._chunks_newest_first(start, end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
             for item in self.client.fetch_collection(endpoint, params=params, includes=includes, per_page=50):
-                self._store_fixture_raw(item)
+                self._store_fixture_raw(item, full_detail="statistics" in includes)
                 count += 1
+                if count % commit_every == 0:
+                    self.session.commit()
         self.session.commit()
         log.info("Synced fixtures between %s and %s: %s", start, end, count)
         return count
@@ -1288,7 +1553,7 @@ class SyncService:
         for chunk_start, chunk_end in self._chunks_newest_first(season_start, season_end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
             for item in self.client.fetch_collection(endpoint, params=params, includes=includes, per_page=50):
-                self._store_fixture_raw(item)
+                self._store_fixture_raw(item, full_detail=True)
                 count += 1
         self.session.commit()
         log.info("Synced fixtures for season %s (%s - %s): %s", season.id, season_start, season_end, count)
@@ -1317,6 +1582,7 @@ class SyncService:
                 "lineups.player",
             ]
         count = 0
+        commit_every = 10
         for fixture_id in fixture_ids:
             endpoint = f"fixtures/{fixture_id}"
             try:
@@ -1332,8 +1598,14 @@ class SyncService:
             if not data:
                 log.warning("Reconcile missing data for fixture %s", fixture_id)
                 continue
-            self._store_fixture_raw(data, log_changes=True)
+            self._store_fixture_raw(
+                data,
+                log_changes=True,
+                full_detail="statistics" in includes,
+            )
             count += 1
+            if count % commit_every == 0:
+                self.session.commit()
         self.session.commit()
         log.info("Reconciled %s fixtures by ID", count)
         return count

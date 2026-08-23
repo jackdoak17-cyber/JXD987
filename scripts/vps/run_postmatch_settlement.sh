@@ -15,7 +15,8 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/sync.py" \
   "scripts/reconcile_recent_fixtures.py" \
   "scripts/export_to_supabase.py" \
-  "scripts/refresh_fixture_delivery.py"
+  "scripts/refresh_fixture_delivery.py" \
+  "scripts/postmatch_fixture_detail_delivery.py"
 
 if [[ -f "${REPO_ROOT}/.env" ]]; then
   set -a
@@ -28,10 +29,14 @@ export REPO_ROOT
 export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_league_csv)}}"
 validate_supported_leagues "${STATS_LEAGUES}"
 export SETTLEMENT_HOURS_BACK="${SETTLEMENT_HOURS_BACK:-48}"
-export SETTLEMENT_MAX_RUNTIME_SECONDS="${SETTLEMENT_MAX_RUNTIME_SECONDS:-900}"
+export SETTLEMENT_MAX_RUNTIME_SECONDS="${SETTLEMENT_MAX_RUNTIME_SECONDS:-1200}"
 export SETTLEMENT_EXPORT_DAYS_BACK="${SETTLEMENT_EXPORT_DAYS_BACK:-2}"
 export SETTLEMENT_DELIVERY_DAYS_BACK="${SETTLEMENT_DELIVERY_DAYS_BACK:-2}"
 export SETTLEMENT_DELIVERY_DAYS_FORWARD="${SETTLEMENT_DELIVERY_DAYS_FORWARD:-2}"
+export POSTMATCH_DETAIL_HOURS_BACK="${POSTMATCH_DETAIL_HOURS_BACK:-72}"
+export POSTMATCH_DETAIL_LIMIT="${POSTMATCH_DETAIL_LIMIT:-25}"
+export POSTMATCH_DETAIL_GRACE_MINUTES="${POSTMATCH_DETAIL_GRACE_MINUTES:-60}"
+export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_fixture_detail_delivery_report.json}"
 export FIXTURE_SETTLEMENT_LOCK_FILE="${FIXTURE_SETTLEMENT_LOCK_FILE:-/var/lock/fixture-settlement.lock}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
@@ -60,6 +65,13 @@ python scripts/refresh_fixture_delivery.py \
   --end-date "$(date -u -d "+${SETTLEMENT_DELIVERY_DAYS_FORWARD} days" +%F)" \
   --leagues "${STATS_LEAGUES}" \
   --report-out "/tmp/postmatch_settlement_delivery.json"
+
+python scripts/postmatch_fixture_detail_delivery.py \
+  --leagues "${STATS_LEAGUES}" \
+  --hours-back "${POSTMATCH_DETAIL_HOURS_BACK}" \
+  --limit "${POSTMATCH_DETAIL_LIMIT}" \
+  --grace-minutes "${POSTMATCH_DETAIL_GRACE_MINUTES}" \
+  --report-json "/tmp/postmatch_fixture_detail_delivery_report.json"
 CHAIN
 )
 

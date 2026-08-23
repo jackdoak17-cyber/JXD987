@@ -21,6 +21,7 @@ import logging
 import os
 import sqlite3
 import time
+from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
@@ -82,6 +83,25 @@ FALLBACK_REMOTE_COLUMNS: Dict[str, Set[str]] = {
 }
 REMOTE_TABLE_COLUMNS_CACHE: Dict[str, Optional[Set[str]]] = {}
 REMOTE_TABLE_FILTER_LOGGED: Set[str] = set()
+
+
+def _is_timeout_error_message(text: str) -> bool:
+    msg = (text or "").lower()
+    return (
+        "statement timeout" in msg
+        or "canceling statement due to statement timeout" in msg
+        or '"code":"57014"' in msg
+        or '"code": "57014"' in msg
+        or "code=57014" in msg
+    )
+
+
+def _write_json_report(path_str: str, payload: Dict) -> None:
+    if not path_str:
+        return
+    path = Path(path_str)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _valid_odds_price(value: object) -> bool:
@@ -206,20 +226,8 @@ def ensure_fixture_columns(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def choose_keep_seasons(
-    conn: sqlite3.Connection,
-    league_ids: Sequence[int] | None = None,
-    keep_all: bool = False,
-) -> Set[int]:
+def choose_keep_seasons(conn: sqlite3.Connection, league_ids: Sequence[int] | None = None) -> Set[int]:
     cur = conn.cursor()
-    if keep_all:
-        if league_ids:
-            q = ",".join("?" for _ in league_ids)
-            cur.execute(f"select distinct id from seasons where league_id in ({q})", league_ids)
-        else:
-            cur.execute("select distinct id from seasons")
-        return {int(row[0]) for row in cur.fetchall()}
-
     keep: Set[int] = set()
     if league_ids:
         q = ",".join("?" for _ in league_ids)
@@ -352,7 +360,11 @@ def fetch_fixtures(
     if days_back is None:
         days_back = int(os.environ.get("EXPORT_DAYS_BACK", "0") or "0")
     days_back = max(days_back, 0)
-    finished_start = now - timedelta(days=days_back) if days_back > 0 else None
+    finished_start = (
+        datetime.combine((now - timedelta(days=days_back)).date(), datetime.min.time())
+        if days_back > 0
+        else None
+    )
     now_iso = now.isoformat(sep=" ")
     upcoming_iso = upcoming_end.isoformat(sep=" ")
     finished_iso = finished_start.isoformat(sep=" ") if finished_start else None
@@ -376,7 +388,7 @@ def fetch_fixtures(
     )
     fixtures = []
     for row in cur.fetchall():
-        home_ht_score, away_ht_score = extract_half_time_scores(row[10])
+        home_ht_score, away_ht_score = extract_half_time_scores(row[11])
         fixtures.append(
             {
                 "id": row[0],
@@ -395,6 +407,110 @@ def fetch_fixtures(
             }
         )
     return fixtures
+
+
+def fetch_fixtures_by_ids(conn: sqlite3.Connection, fixture_ids: Sequence[int]) -> List[Dict]:
+    """Read an explicit fixture manifest without applying the rolling date window."""
+    if not fixture_ids:
+        return []
+    cur = conn.cursor()
+    q = ",".join("?" for _ in fixture_ids)
+    cur.execute(
+        f"""
+        select id, league_id, season_id, starting_at, status, status_code,
+               home_team_id, away_team_id, home_score, away_score, lineup_confirmed, extra
+          from fixtures
+         where id in ({q})
+         order by starting_at desc, id desc
+        """,
+        list(fixture_ids),
+    )
+    fixtures: List[Dict] = []
+    for row in cur.fetchall():
+        home_ht_score, away_ht_score = extract_half_time_scores(row[11])
+        fixtures.append(
+            {
+                "id": row[0],
+                "league_id": row[1],
+                "season_id": row[2],
+                "starting_at": row[3],
+                "status": row[4],
+                "status_code": row[5],
+                "home_team_id": row[6],
+                "away_team_id": row[7],
+                "home_score": row[8],
+                "away_score": row[9],
+                "lineup_confirmed": bool(row[10]) if row[10] is not None else None,
+                "home_ht_score": home_ht_score,
+                "away_ht_score": away_ht_score,
+            }
+        )
+    found = {int(fixture["id"]) for fixture in fixtures}
+    missing = sorted(set(int(value) for value in fixture_ids).difference(found))
+    if missing:
+        raise SystemExit(f"Explicit fixture export could not find source fixture IDs: {missing[:20]}")
+    return fixtures
+
+
+def validate_detail_payload(
+    conn: sqlite3.Connection,
+    fixtures: Sequence[Dict],
+    require_player_stats: bool = False,
+) -> List[int]:
+    """Return completed fixtures whose source detail payload is unsafe to publish."""
+    completed = [
+        fixture
+        for fixture in fixtures
+        if fixture.get("home_score") is not None and fixture.get("away_score") is not None
+    ]
+    if not completed:
+        return []
+    fixture_ids = [int(fixture["id"]) for fixture in completed]
+    q = ",".join("?" for _ in fixture_ids)
+    lineup_rows = conn.execute(
+        f"""
+        select fixture_id, team_id, count(*) as row_count
+          from fixture_players
+         where fixture_id in ({q})
+         group by fixture_id, team_id
+        """,
+        fixture_ids,
+    ).fetchall()
+    player_rows = conn.execute(
+        f"""
+        select fixture_id, team_id, count(distinct player_id || ':' || type_id) as row_count
+          from fixture_player_statistics
+         where fixture_id in ({q})
+         group by fixture_id, team_id
+        """,
+        fixture_ids,
+    ).fetchall()
+    team_rows = conn.execute(
+        f"""
+        select fixture_id, team_id, count(distinct type_id) as row_count
+          from fixture_statistics
+         where fixture_id in ({q})
+         group by fixture_id, team_id
+        """,
+        fixture_ids,
+    ).fetchall()
+    lineup_counts = {(int(row[0]), int(row[1])): int(row[2] or 0) for row in lineup_rows}
+    player_counts = {(int(row[0]), int(row[1])): int(row[2] or 0) for row in player_rows}
+    team_counts = {(int(row[0]), int(row[1])): int(row[2] or 0) for row in team_rows}
+    unsafe: List[int] = []
+    for fixture in completed:
+        fixture_id = int(fixture["id"])
+        teams = (int(fixture["home_team_id"]), int(fixture["away_team_id"]))
+        if any(
+            lineup_counts.get((fixture_id, team_id), 0) <= 0
+            or team_counts.get((fixture_id, team_id), 0) <= 0
+            for team_id in teams
+        ):
+            unsafe.append(fixture_id)
+            continue
+        if any(player_counts.get((fixture_id, team_id), 0) <= 0 for team_id in teams):
+            unsafe.append(fixture_id)
+    return sorted(set(unsafe))
 
 
 def fetch_teams(conn: sqlite3.Connection, team_ids: Sequence[int]) -> List[Dict]:
@@ -705,9 +821,9 @@ def rest_headers() -> Dict[str, str]:
     }
 
 
-def delete_fixture_rows(table: str, fixture_ids: Sequence[int], dry_run: bool) -> int:
+def delete_fixture_rows(table: str, fixture_ids: Sequence[int], dry_run: bool) -> Tuple[int, List[int]]:
     if not fixture_ids or dry_run:
-        return 0
+        return 0, []
 
     url = SUPABASE_URL.rstrip("/") + REST_PATH + f"/{table}"
     chunk = max(int(os.environ.get("SUPABASE_DELETE_CHUNK", os.environ.get("SUPABASE_EXPORT_CHUNK", "50"))), 1)
@@ -717,10 +833,9 @@ def delete_fixture_rows(table: str, fixture_ids: Sequence[int], dry_run: bool) -
     fixture_ids = list(fixture_ids)
     total_batches = (len(fixture_ids) + chunk - 1) // chunk
     total = 0
-    for i in range(0, len(fixture_ids), chunk):
-        batch_ids = fixture_ids[i : i + chunk]
-        batch_index = i // chunk + 1
-        log.info("Deleting %s batch %s/%s (%s fixtures)", table, batch_index, total_batches, len(batch_ids))
+    missed_fixture_ids: List[int] = []
+
+    def run_delete_batch(batch_ids: List[int]) -> Tuple[bool, Optional[requests.Response], Optional[Exception]]:
         attempt = 0
         while True:
             try:
@@ -732,51 +847,91 @@ def delete_fixture_rows(table: str, fixture_ids: Sequence[int], dry_run: bool) -
                 )
             except requests.RequestException as exc:
                 if attempt >= max_retries:
-                    raise SystemExit(f"Supabase delete from {table} failed: {exc}") from exc
+                    return False, None, exc
                 attempt += 1
                 time.sleep(pause * (2**attempt))
                 continue
             if resp.ok:
-                break
+                return True, resp, None
             if attempt >= max_retries:
-                raise SystemExit(
-                    f"Supabase delete from {table} failed {resp.status_code}: {resp.text}"
-                )
+                return False, resp, None
             attempt += 1
             time.sleep(pause * (2**attempt))
-        content_range = resp.headers.get("Content-Range", "")
-        if "/" in content_range:
-            count = content_range.split("/")[-1]
-            if count and count != "*":
-                try:
-                    total += int(count)
-                except ValueError:
-                    pass
+
+    def delete_with_split(batch_ids: List[int]) -> None:
+        nonlocal total
+        ok, resp, exc = run_delete_batch(batch_ids)
+        if ok and resp is not None:
+            content_range = resp.headers.get("Content-Range", "")
+            if "/" in content_range:
+                count = content_range.split("/")[-1]
+                if count and count != "*":
+                    try:
+                        total += int(count)
+                    except ValueError:
+                        pass
+            return
+
+        error_text = str(exc) if exc is not None else f"{resp.status_code}: {resp.text}" if resp is not None else "unknown"
+        timeout_like = _is_timeout_error_message(error_text)
+
+        if timeout_like and len(batch_ids) > 1:
+            mid = len(batch_ids) // 2
+            left = batch_ids[:mid]
+            right = batch_ids[mid:]
+            log.warning(
+                "Delete timeout-like failure on %s (%s fixtures). Splitting into %s + %s.",
+                table,
+                len(batch_ids),
+                len(left),
+                len(right),
+            )
+            delete_with_split(left)
+            delete_with_split(right)
+            return
+
+        if timeout_like:
+            log.error("Delete failed after split to single fixture on %s fixture_id=%s: %s", table, batch_ids[0], error_text)
+            missed_fixture_ids.extend(batch_ids)
+            return
+
+        raise SystemExit(f"Supabase delete from {table} failed: {error_text}")
+
+    for i in range(0, len(fixture_ids), chunk):
+        batch_ids = fixture_ids[i : i + chunk]
+        batch_index = i // chunk + 1
+        log.info("Deleting %s batch %s/%s (%s fixtures)", table, batch_index, total_batches, len(batch_ids))
+        delete_with_split(batch_ids)
         if pause:
             time.sleep(pause)
-    return total
+    return total, sorted(set(missed_fixture_ids))
 
 
-def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) -> int:
+def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) -> Tuple[int, int]:
     if not rows:
-        return 0
+        return 0, 0
     rows = filter_rows_for_remote_schema(table, rows)
     if not rows:
-        return 0
+        return 0, 0
     if dry_run:
-        return len(rows)
+        return len(rows), 0
 
     url = SUPABASE_URL.rstrip("/") + REST_PATH + f"/{table}"
     total = 0
-    chunk = max(int(os.environ.get("SUPABASE_EXPORT_CHUNK", "50")), 1)
-    pause = max(float(os.environ.get("SUPABASE_EXPORT_SLEEP", "0.5")), 0.0)
+    # Keep the REST exporter within the P3 SLA without weakening correctness.
+    # The request is split recursively on a provider timeout, so a larger
+    # starting batch is safe while avoiding thousands of 50-row requests.
+    # Operators can still tune these explicitly for a constrained Supabase
+    # project, but the production defaults are sized for the largest detail
+    # table (fixture_player_statistics).
+    chunk = max(int(os.environ.get("SUPABASE_EXPORT_CHUNK", "500")), 1)
+    pause = max(float(os.environ.get("SUPABASE_EXPORT_SLEEP", "0.05")), 0.0)
     max_retries = max(int(os.environ.get("SUPABASE_EXPORT_RETRIES", "3")), 0)
     headers = rest_headers()
     total_batches = (len(rows) + chunk - 1) // chunk
-    for i in range(0, len(rows), chunk):
-        batch_index = i // chunk + 1
-        log.info("Upserting %s batch %s/%s (%s rows)", table, batch_index, total_batches, len(rows[i : i + chunk]))
-        batch = rows[i : i + chunk]
+    timeout_split_count = 0
+
+    def run_upsert_batch(batch_rows: List[Dict]) -> Tuple[bool, Optional[requests.Response], Optional[Exception]]:
         attempt = 0
         while True:
             try:
@@ -784,27 +939,55 @@ def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) 
                     url,
                     headers=headers,
                     params={"on_conflict": on_conflict},
-                    data=json.dumps(batch),
+                    data=json.dumps(batch_rows),
                     timeout=60,
                 )
             except requests.RequestException as exc:
                 if attempt >= max_retries:
-                    raise SystemExit(f"Supabase upsert to {table} failed: {exc}") from exc
+                    return False, None, exc
                 attempt += 1
                 time.sleep(pause * (2**attempt))
                 continue
             if resp.ok:
-                break
+                return True, resp, None
             if attempt >= max_retries:
-                raise SystemExit(
-                    f"Supabase upsert to {table} failed {resp.status_code}: {resp.text}"
-                )
+                return False, resp, None
             attempt += 1
             time.sleep(pause * (2**attempt))
-        total += len(batch)
+
+    def upsert_with_split(batch_rows: List[Dict]) -> int:
+        nonlocal timeout_split_count
+        ok, resp, exc = run_upsert_batch(batch_rows)
+        if ok:
+            return len(batch_rows)
+
+        error_text = str(exc) if exc is not None else f"{resp.status_code}: {resp.text}" if resp is not None else "unknown"
+        timeout_like = _is_timeout_error_message(error_text)
+        if timeout_like and len(batch_rows) > 1:
+            timeout_split_count += 1
+            mid = len(batch_rows) // 2
+            left = batch_rows[:mid]
+            right = batch_rows[mid:]
+            log.warning(
+                "Upsert timeout-like failure on %s (%s rows). Splitting into %s + %s.",
+                table,
+                len(batch_rows),
+                len(left),
+                len(right),
+            )
+            return upsert_with_split(left) + upsert_with_split(right)
+        if timeout_like:
+            raise SystemExit(f"Supabase upsert to {table} failed on single-row batch after timeout retries: {error_text}")
+        raise SystemExit(f"Supabase upsert to {table} failed: {error_text}")
+
+    for i in range(0, len(rows), chunk):
+        batch_index = i // chunk + 1
+        log.info("Upserting %s batch %s/%s (%s rows)", table, batch_index, total_batches, len(rows[i : i + chunk]))
+        batch = rows[i : i + chunk]
+        total += upsert_with_split(batch)
         if pause:
             time.sleep(pause)
-    return total
+    return total, timeout_split_count
 
 
 def prune_fixtures(keep_ids: Sequence[int], dry_run: bool) -> int:
@@ -833,6 +1016,21 @@ def main():
         type=int,
         default=None,
         help="Override the finished-fixture export lookback window in days.",
+    )
+    parser.add_argument(
+        "--fixture-ids",
+        default=None,
+        help="Optional comma-separated explicit fixture IDs; bypasses the rolling date window.",
+    )
+    parser.add_argument(
+        "--protect-empty-detail",
+        action="store_true",
+        help="Refuse to delete or publish completed fixture detail when either team has no source lineup rows.",
+    )
+    parser.add_argument(
+        "--require-detail",
+        action="store_true",
+        help="Require non-empty source player statistics for both teams as well as lineups.",
     )
     parser.add_argument(
         "--upcoming-days",
@@ -865,15 +1063,9 @@ def main():
         help="Skip pruning fixtures outside kept seasons.",
     )
     parser.add_argument(
-        "--keep-all-seasons",
-        action="store_true",
-        default=False,
-        help="Retain every season present in SQLite (for bounded team-history exports).",
-    )
-    parser.add_argument(
         "--report-json",
-        default=None,
-        help="Write the export summary JSON to this path as well as stdout.",
+        default=os.environ.get("SUPABASE_EXPORT_REPORT_JSON", ""),
+        help="Optional path to write detailed export report (including timeout splits/missed fixture deletes).",
     )
     args = parser.parse_args()
 
@@ -884,21 +1076,26 @@ def main():
     ensure_fixture_columns(conn)
 
     league_ids = [int(x) for x in args.leagues.split(",") if x.strip()] if args.leagues else []
-    keep_ids = choose_keep_seasons(
-        conn,
-        league_ids if league_ids else None,
-        keep_all=args.keep_all_seasons,
-    )
+    keep_ids = choose_keep_seasons(conn, league_ids if league_ids else None)
     if not keep_ids:
         raise SystemExit("No seasons to export")
 
     seasons = fetch_seasons(conn, list(keep_ids))
     rounds = fetch_rounds(conn, list(keep_ids))
-    fixtures = fetch_fixtures(
-        conn,
-        list(keep_ids),
-        upcoming_days=args.upcoming_days,
-        days_back=args.days_back,
+    explicit_fixture_ids = [
+        int(value.strip())
+        for value in (args.fixture_ids or "").split(",")
+        if value.strip()
+    ]
+    fixtures = (
+        fetch_fixtures_by_ids(conn, explicit_fixture_ids)
+        if explicit_fixture_ids
+        else fetch_fixtures(
+            conn,
+            list(keep_ids),
+            upcoming_days=args.upcoming_days,
+            days_back=args.days_back,
+        )
     )
     team_ids = {f["home_team_id"] for f in fixtures} | {f["away_team_id"] for f in fixtures}
     teams = fetch_teams(conn, list(team_ids))
@@ -908,6 +1105,26 @@ def main():
     if args.strict and dropped > 0:
         raise SystemExit(f"Strict export: dropping {dropped} fixtures with missing teams")
     fixtures = filtered_fixtures
+
+    if args.protect_empty_detail and not args.fixture_core_only:
+        unsafe_detail_ids = validate_detail_payload(
+            conn,
+            fixtures,
+            require_player_stats=args.require_detail,
+        )
+        if unsafe_detail_ids:
+            if explicit_fixture_ids or args.require_detail:
+                raise SystemExit(
+                    "Refusing fixture-detail export because source detail is empty for completed "
+                    f"fixture IDs: {unsafe_detail_ids[:50]}"
+                )
+            log.warning(
+                "Skipping %s completed fixtures with incomplete source detail during rolling export: %s",
+                len(unsafe_detail_ids),
+                unsafe_detail_ids[:50],
+            )
+            unsafe_set = set(unsafe_detail_ids)
+            fixtures = [fixture for fixture in fixtures if int(fixture["id"]) not in unsafe_set]
 
     fixture_ids: Set[int] = {f["id"] for f in fixtures}
 
@@ -954,31 +1171,54 @@ def main():
     )
     log.info("Payload counts: odds_snapshots=%s odds_outcomes=%s", len(odds_snapshots), len(odds_outcomes))
 
+    delete_stats: Dict[str, Dict[str, object]] = {}
     if fixture_ids and not args.fixture_core_only:
         log.info("Deleting existing fixture-scoped rows before upsert")
-        deleted_fixture_players = delete_fixture_rows("fixture_players", fixture_ids, args.dry_run)
-        deleted_fixture_player_stats = delete_fixture_rows(
+        deleted_fixture_players, missed_fixture_players = delete_fixture_rows("fixture_players", fixture_ids, args.dry_run)
+        deleted_fixture_player_stats, missed_fixture_player_stats = delete_fixture_rows(
             "fixture_player_statistics", fixture_ids, args.dry_run
         )
-        # Odds are maintained by the dedicated odds-ingestion pipeline. A
-        # history/metadata export may not have any local odds rows at all;
-        # deleting the remote rows in that case silently wipes valid odds.
-        # Preserve them by default and require an explicit opt-in for a
-        # destructive replacement.
-        skip_odds_delete = os.environ.get("SUPABASE_SKIP_ODDS_OUTCOMES_DELETE", "1").strip().lower() not in {
-            "0",
-            "false",
-            "no",
+        deleted_fixture_stats, missed_fixture_stats = delete_fixture_rows(
+            "fixture_statistics", fixture_ids, args.dry_run
+        )
+        delete_stats["fixture_players"] = {
+            "deleted": deleted_fixture_players,
+            "missed_fixture_ids": missed_fixture_players,
         }
-        if args.skip_odds_outcomes or skip_odds_delete:
-            deleted_odds_outcomes = 0
-            if skip_odds_delete and not args.skip_odds_outcomes:
-                log.info("Skipping odds_outcomes fixture-scoped delete (SUPABASE_SKIP_ODDS_OUTCOMES_DELETE enabled).")
-        else:
-            deleted_odds_outcomes = delete_fixture_rows("odds_outcomes", fixture_ids, args.dry_run)
+        delete_stats["fixture_player_statistics"] = {
+            "deleted": deleted_fixture_player_stats,
+            "missed_fixture_ids": missed_fixture_player_stats,
+        }
+        delete_stats["fixture_statistics"] = {
+            "deleted": deleted_fixture_stats,
+            "missed_fixture_ids": missed_fixture_stats,
+        }
+        deleted_odds_outcomes = 0
+        missed_odds_outcomes: List[int] = []
+        skip_odds_delete = os.environ.get("SUPABASE_SKIP_ODDS_OUTCOMES_DELETE", "1").strip().lower() not in {"0", "false", "no"}
+        if not args.skip_odds_outcomes and not skip_odds_delete:
+            deleted_odds_outcomes, missed_odds_outcomes = delete_fixture_rows("odds_outcomes", fixture_ids, args.dry_run)
+        elif not args.skip_odds_outcomes and skip_odds_delete:
+            log.info("Skipping odds_outcomes fixture-scoped delete (SUPABASE_SKIP_ODDS_OUTCOMES_DELETE enabled).")
+        delete_stats["odds_outcomes"] = {
+            "deleted": deleted_odds_outcomes,
+            "missed_fixture_ids": missed_odds_outcomes,
+            "delete_skipped": bool(skip_odds_delete),
+        }
+        missed_detail_deletes = sorted(
+            set(missed_fixture_players)
+            | set(missed_fixture_player_stats)
+            | set(missed_fixture_stats)
+        )
+        if missed_detail_deletes and (explicit_fixture_ids or args.protect_empty_detail):
+            raise SystemExit(
+                "Refusing to publish fixture detail after incomplete target cleanup; "
+                f"fixture IDs: {missed_detail_deletes[:50]}"
+            )
         log.info(
-            "Deleted rows: fixture_players=%s fixture_player_statistics=%s odds_outcomes=%s",
+            "Deleted rows: fixture_players=%s fixture_statistics=%s fixture_player_statistics=%s odds_outcomes=%s",
             deleted_fixture_players,
+            deleted_fixture_stats,
             deleted_fixture_player_stats,
             deleted_odds_outcomes,
         )
@@ -1004,19 +1244,22 @@ def main():
 
     for table, rows, on_conflict in exports:
         log.info("Exporting %s (%s rows)", table, len(rows))
-        exported[table] = upsert_table(table, rows, on_conflict, args.dry_run)
+        exported_count, timeout_splits = upsert_table(table, rows, on_conflict, args.dry_run)
+        exported[table] = exported_count
+        if timeout_splits:
+            log.warning("Timeout split recovery used for %s: %s split events", table, timeout_splits)
 
     if args.fixture_core_only or args.skip_odds_snapshots:
         exported["odds_snapshots"] = 0
     else:
         log.info("Exporting odds_snapshots (%s rows)", len(odds_snapshots))
-        exported["odds_snapshots"] = upsert_table("odds_snapshots", odds_snapshots, "id", args.dry_run)
+        exported["odds_snapshots"], _ = upsert_table("odds_snapshots", odds_snapshots, "id", args.dry_run)
 
     if args.fixture_core_only or args.skip_odds_outcomes:
         exported["odds_outcomes"] = 0
     else:
         log.info("Exporting odds_outcomes (%s rows)", len(odds_outcomes))
-        exported["odds_outcomes"] = upsert_table(
+        exported["odds_outcomes"], _ = upsert_table(
             "odds_outcomes",
             odds_outcomes,
             "fixture_id,bookmaker_id,market_key,selection_key,line",
@@ -1027,6 +1270,8 @@ def main():
     summary = {
         "dry_run": args.dry_run,
         "fixture_core_only": args.fixture_core_only,
+        "explicit_fixture_ids": explicit_fixture_ids,
+        "fixtures_selected": len(fixtures),
         "keep_season_ids": list(keep_ids),
         "fixtures_exported": exported["fixtures"],
         "teams_exported": exported["teams"],
@@ -1041,18 +1286,10 @@ def main():
         "odds_outcomes_exported": exported["odds_outcomes"],
         "fixtures_dropped_missing_teams": dropped,
         "fixtures_pruned_other_seasons": pruned,
+        "delete_stats": delete_stats,
     }
-    summary_json = json.dumps(summary)
-    if args.report_json:
-        report_path = os.path.abspath(args.report_json)
-        report_dir = os.path.dirname(report_path)
-        if report_dir:
-            os.makedirs(report_dir, exist_ok=True)
-        with open(report_path, "w", encoding="utf-8") as report_file:
-            report_file.write(summary_json)
-            report_file.write("\n")
-        log.info("Wrote export report: %s", report_path)
-    print(summary_json)
+    _write_json_report(args.report_json, summary)
+    print(json.dumps(summary))
 
 
 if __name__ == "__main__":

@@ -27,7 +27,7 @@ from export_to_supabase import (
 )
 from jxd import SportMonksClient, SyncService
 from jxd.db import get_engine, get_session
-from jxd.models import Fixture, FixturePlayer, FixturePlayerStatistic
+from jxd.models import Fixture, FixturePlayer
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -142,13 +142,12 @@ def sync_confirmed_lineups(fixture_ids: Sequence[int]) -> tuple[List[int], List[
             if fixture:
                 fixture.lineup_confirmed = False
             continue
-        session.query(FixturePlayerStatistic).filter(
-            FixturePlayerStatistic.fixture_id == fixture_id
-        ).delete(synchronize_session=False)
         session.query(FixturePlayer).filter(
             FixturePlayer.fixture_id == fixture_id
         ).delete(synchronize_session=False)
-        svc._store_fixture_raw(data, log_changes=True)
+        # This endpoint intentionally omits statistics. Preserve existing
+        # player-stat rows; the full-detail worker owns their replacement.
+        svc._store_fixture_raw(data, log_changes=True, full_detail=False)
         confirmed_ids.append(fixture_id)
 
     if checked_ids:

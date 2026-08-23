@@ -124,6 +124,12 @@ default_league_csv() {
   paste -sd, "${REPO_ROOT}/config/league_ids.txt"
 }
 
+# Return a stable, de-duplicated CSV union for wrappers that combine the
+# supported SportMonks and Odds API league sets.
+union_csv() {
+  python3 -c 'import sys; seen=set(); ordered=[]; [((lambda v: (None if not v or v in seen else (seen.add(v), ordered.append(v))))(v.strip())) for raw in sys.argv[1:] for v in str(raw).replace("\n", " ,").split(",")] ; print(",".join(ordered))' "$@"
+}
+
 supported_league_csv() {
   python3 - "${REPO_ROOT}/config/league_ids.txt" "${REPO_ROOT}/config/odds_api_sync_excluded_leagues.json" <<'PY'
 import json
@@ -218,10 +224,17 @@ record_pipeline_job_run() {
     return 0
   fi
 
-  local run_status release_id evidence
+  local run_status release_id evidence evidence_file evidence_payload
   run_status="$(pipeline_job_status_name "${status_code}")"
   release_id="$(runtime_release_id)"
   evidence="exit status: ${status_code}; completion status: ${run_status}"
+  evidence_file="${PIPELINE_EVIDENCE_FILE:-}"
+  if [[ -n "${evidence_file}" && -f "${evidence_file}" ]]; then
+    evidence_payload="$(tr '\n' ' ' < "${evidence_file}" | head -c 3500)"
+    if [[ -n "${evidence_payload}" ]]; then
+      evidence="${evidence}; report: ${evidence_payload}"
+    fi
+  fi
 
   if ! psql "${OPERATIONS_CHECK_RUNNER_DATABASE_URL}" \
     -v ON_ERROR_STOP=1 \
@@ -277,6 +290,10 @@ run_with_global_lock_and_timeout() {
     local status=$?
     if [[ ${status} -eq 124 || ${status} -eq 137 ]]; then
       log_error "process killed after ${max_runtime}s overrun"
+      exit 1
+    fi
+    if [[ ${status} -eq 2 ]]; then
+      log_error "process exited with usage/status code 2"
       exit 1
     fi
     exit ${status}

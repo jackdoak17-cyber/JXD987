@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+import sqlite3
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from jxd.models import Base, Fixture, FixturePlayer, FixturePlayerStatistic, FixtureStatistic
+from jxd.sync import SyncService
+from scripts.postmatch_fixture_detail_delivery import (
+    DetailSnapshot,
+    assess_provider_payload,
+    candidate_fixture_ids,
+    compare_snapshots,
+    ensure_ledger,
+)
+
+
+def provider_payload(*, include_big_chances: bool = True) -> dict:
+    stats = []
+    for team_id in (101, 202):
+        for type_id in (42, 45, 56, 57, 78, 86, 100, 109):
+            stats.append({"participant_id": team_id, "type_id": type_id, "data": {"value": 1}})
+        if include_big_chances:
+            stats.append({"participant_id": team_id, "type_id": 581, "data": {"value": 1}})
+    return {
+        "id": 9001,
+        "state": {"short_name": "FT"},
+        "participants": [{"id": 101}, {"id": 202}],
+        "statistics": stats,
+        "lineups": [
+            {"team_id": 101, "player_id": 11, "details": [{"type_id": 119, "data": {"value": 90}}]},
+            {"team_id": 202, "player_id": 22, "details": [{"type_id": 119, "data": {"value": 90}}]},
+        ],
+    }
+
+
+def test_provider_assessment_distinguishes_ready_sparse_and_pending() -> None:
+    assert assess_provider_payload(provider_payload()).status == "ready"
+    assert assess_provider_payload(provider_payload(include_big_chances=False)).status == "provider_sparse"
+    pending = provider_payload()
+    pending["state"] = {"short_name": "NS"}
+    assert assess_provider_payload(pending).status == "provider_pending"
+
+
+def test_candidate_selection_is_due_and_does_not_require_local_scores() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("create table fixtures (id integer, league_id integer, starting_at text)")
+    conn.execute("insert into fixtures values (1, 8, datetime('now', '-4 hours'))")
+    conn.execute("insert into fixtures values (2, 8, datetime('now', '-3 hours'))")
+    ensure_ledger(conn)
+    conn.execute(
+        "insert into fixture_detail_deliveries(fixture_id,league_id,status,first_seen_at,next_attempt_at,updated_at) "
+        "values (2,8,'verified','2020-01-01T00:00:00Z',null,'2020-01-01T00:00:00Z')"
+    )
+    conn.commit()
+    assert candidate_fixture_ids(conn, [8], 72, 10) == [1]
+
+
+def test_snapshot_comparison_reports_value_and_row_differences() -> None:
+    source = DetailSnapshot(
+        fixture_id=1,
+        team_stat_count=1,
+        player_stat_count=1,
+        lineup_count=1,
+        team_stat_types={"1": [42]},
+        team_stat_values={"1:42": 5},
+        player_stat_values={"10:1:119": 90},
+        lineup_values={"10:1": (True, 90)},
+    )
+    target = DetailSnapshot(
+        fixture_id=1,
+        team_stat_count=1,
+        player_stat_count=0,
+        lineup_count=0,
+        team_stat_types={"1": [42]},
+        team_stat_values={"1:42": 4},
+        player_stat_values={},
+        lineup_values={},
+    )
+    problems = compare_snapshots(source, target)
+    assert any("team-stat values differ" in problem for problem in problems)
+    assert any("player-stat parity differs" in problem for problem in problems)
+    assert any("lineup parity differs" in problem for problem in problems)
+
+
+def test_lineup_only_storage_preserves_player_statistics(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'source.sqlite'}", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    session = Session()
+    session.add(Fixture(id=9001, home_team_id=101, away_team_id=202))
+    session.add(FixturePlayerStatistic(fixture_id=9001, player_id=11, team_id=101, type_id=119, code="minutes", value=90))
+    session.add(FixturePlayer(fixture_id=9001, player_id=11, team_id=101, minutes_played=90))
+    session.add(FixtureStatistic(fixture_id=9001, team_id=101, type_id=42, code="shots", value=5, location="home"))
+    session.commit()
+
+    service = SyncService(client=object(), session=session)
+    lightweight = provider_payload()
+    lightweight.pop("statistics")
+    service._store_fixture_raw(lightweight, full_detail=False)
+    session.commit()
+
+    assert session.query(FixturePlayerStatistic).filter_by(fixture_id=9001, player_id=11, type_id=119).count() >= 1
+    assert session.query(FixtureStatistic).filter_by(fixture_id=9001).count() == 1
+    session.close()
+

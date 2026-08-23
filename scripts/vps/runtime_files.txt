@@ -12,6 +12,7 @@ jxd/sync.py
 scripts/export_odds_to_supabase_psql.py
 scripts/export_to_supabase.py
 scripts/refresh_fixture_delivery.py
+scripts/postmatch_fixture_detail_delivery.py
 scripts/odds_retention_psql.py
 scripts/preflight_supabase_psql.py
 scripts/reconcile_recent_fixtures.py
