@@ -52,14 +52,15 @@ def _chunks(values: Sequence[int], size: int = 100) -> Iterable[Sequence[int]]:
         yield values[start : start + size]
 
 
-def _remote_rows(table: str, team_ids: Sequence[int], select_columns: str, extra: Dict[str, str] | None = None) -> List[Dict]:
+def _remote_rows(table: str, team_ids: Sequence[int] | None, select_columns: str, extra: Dict[str, str] | None = None) -> List[Dict]:
     rows: List[Dict] = []
     order_by = {
         "players": "id.asc",
         "team_squad_memberships": "team_id.asc,player_id.asc",
         "team_squad_snapshots": "team_id.asc,id.asc",
     }.get(table, "team_id.asc")
-    for chunk in _chunks(team_ids):
+    chunks: Iterable[Sequence[int] | None] = _chunks(team_ids) if team_ids else [None]
+    for chunk in chunks:
         offset = 0
         while True:
             # Supabase commonly caps REST responses at 1,000 rows even when a
@@ -67,11 +68,12 @@ def _remote_rows(table: str, team_ids: Sequence[int], select_columns: str, extra
             # drops memberships from larger leagues and reports a false alarm.
             params = {
                 "select": select_columns,
-                "team_id": f"in.({','.join(str(value) for value in chunk)})",
                 "limit": "1000",
                 "offset": str(offset),
                 "order": order_by,
             }
+            if chunk:
+                params["team_id"] = f"in.({','.join(str(value) for value in chunk)})"
             if extra:
                 params.update(extra)
             page = _fetch_remote(table, params)
@@ -167,7 +169,7 @@ def main() -> None:
         )
         remote_players = _remote_rows("players", team_ids, "id,team_id")
         remote_latest = _latest_successful_snapshot(remote_snapshots, now)
-        failures.update({"missing_remote_snapshot": [], "stale_remote_snapshot": [], "snapshot_membership_count_mismatch": [], "player_assignment_mismatch": []})
+        failures.update({"missing_remote_snapshot": [], "stale_remote_snapshot": [], "snapshot_membership_count_mismatch": [], "player_assignment_mismatch": [], "duplicate_active_player_assignments": []})
         active_members_by_team: Dict[int, Set[int]] = {}
         members_by_snapshot: Dict[tuple[int, int], Set[int]] = {}
         for row in remote_memberships:
@@ -179,6 +181,24 @@ def main() -> None:
                     members_by_snapshot.setdefault((team_id, int(snapshot_id)), set()).add(player_id)
                 if row.get("is_active"):
                     active_members_by_team.setdefault(team_id, set()).add(player_id)
+        all_remote_memberships = _remote_rows(
+            "team_squad_memberships",
+            [],
+            "team_id,player_id,is_active,last_snapshot_id",
+        )
+        active_teams_by_player: Dict[int, Set[int]] = {}
+        for row in all_remote_memberships:
+            if not row.get("is_active") or row.get("player_id") is None or row.get("team_id") is None:
+                continue
+            active_teams_by_player.setdefault(int(row["player_id"]), set()).add(int(row["team_id"]))
+        failures["duplicate_active_player_assignments"].extend(
+            {
+                "player_id": player_id,
+                "team_ids": sorted(team_ids_for_player),
+            }
+            for player_id, team_ids_for_player in active_teams_by_player.items()
+            if len(team_ids_for_player) > 1
+        )
         players_by_team: Dict[int, Set[int]] = {}
         for row in remote_players:
             if row.get("team_id") is not None and row.get("id") is not None:

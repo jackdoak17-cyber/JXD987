@@ -435,28 +435,33 @@ def main() -> None:
         if row.get("id")
     ]
 
+    collapsed_player_ids: List[int] = []
+    collapsed_team_ids: List[int] = []
     if not args.dry_run:
         service.sync_squads_for_teams(sparse_team_ids)
-    after_counts = team_player_counts(session, sparse_team_ids)
+        collapsed_player_ids, collapsed_team_ids = service.collapse_duplicate_active_memberships()
+    export_team_ids = unique_ordered([*sparse_team_ids, *collapsed_team_ids])
+    after_counts = team_player_counts(session, export_team_ids)
 
-    current_players = fetch_players_for_teams(sparse_team_ids)
+    current_players = fetch_players_for_teams(export_team_ids)
     players = fetch_players_by_ids(
         unique_ordered([
             *previously_assigned_player_ids,
+            *collapsed_player_ids,
             *(int(row["id"]) for row in current_players if row.get("id")),
         ])
     )
     player_ids = [int(row["id"]) for row in players if row.get("id")]
     player_team_history = fetch_player_team_history(player_ids)
-    squad_snapshots = fetch_team_squad_snapshots(sparse_team_ids)
-    squad_memberships = fetch_team_squad_memberships(sparse_team_ids)
+    squad_snapshots = fetch_team_squad_snapshots(export_team_ids)
+    squad_memberships = fetch_team_squad_memberships(export_team_ids)
 
     players_exported = 0
     teams_exported = 0
     history_exported = 0
     snapshots_exported = 0
     memberships_exported = 0
-    teams = fetch_teams_by_ids(sparse_team_ids)
+    teams = fetch_teams_by_ids(export_team_ids)
     if teams:
         teams_exported = exported_count(upsert_table("teams", teams, "id", args.dry_run))
     if players:
@@ -492,8 +497,11 @@ def main() -> None:
         "candidate_teams": len(candidate_team_ids),
         "teams_refreshed": len(sparse_team_ids),
         "team_ids_refreshed": sparse_team_ids,
+        "export_team_ids": export_team_ids,
+        "collapsed_duplicate_players": collapsed_player_ids,
+        "collapsed_duplicate_teams": collapsed_team_ids,
         "before_counts": {str(team_id): before_counts.get(team_id, 0) for team_id in sparse_team_ids},
-        "after_counts": {str(team_id): after_counts.get(team_id, 0) for team_id in sparse_team_ids},
+        "after_counts": {str(team_id): after_counts.get(team_id, 0) for team_id in export_team_ids},
         "teams_exported": teams_exported,
         "players_exported": players_exported,
         "player_team_history_exported": history_exported,

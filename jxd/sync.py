@@ -774,6 +774,67 @@ class SyncService:
         log.info("Synced squads for %s teams (%s players)", len(seen), count)
         return count
 
+    def collapse_duplicate_active_memberships(
+        self,
+        player_ids: Optional[Sequence[int]] = None,
+    ) -> Tuple[List[int], List[int]]:
+        """Enforce one canonical active squad assignment per player.
+
+        A transfer can leave the old team unrefreshed, so the per-team sync
+        cannot always close the old membership in the same run.  The public
+        current-squad read model also applies this ordering, but cleaning the
+        source rows here keeps exports and legacy ``players.team_id`` aligned.
+        """
+        query = self.session.query(TeamSquadMembership).filter(
+            TeamSquadMembership.is_active.is_(True)
+        )
+        if player_ids:
+            query = query.filter(TeamSquadMembership.player_id.in_(list(player_ids)))
+
+        memberships_by_player: Dict[int, List[TeamSquadMembership]] = {}
+        for membership in query.all():
+            memberships_by_player.setdefault(int(membership.player_id), []).append(membership)
+
+        affected_players: Set[int] = set()
+        affected_teams: Set[int] = set()
+
+        def sort_key(membership: TeamSquadMembership) -> Tuple[datetime, datetime, int, int]:
+            return (
+                membership.provider_started_at or datetime.min,
+                membership.last_seen_at or datetime.min,
+                int(membership.last_snapshot_id or 0),
+                -int(membership.team_id),
+            )
+
+        for player_id, memberships in memberships_by_player.items():
+            if len(memberships) < 2:
+                continue
+            winner = max(memberships, key=sort_key)
+            now = datetime.utcnow()
+            for membership in memberships:
+                if membership is winner:
+                    continue
+                membership.is_active = False
+                membership.updated_at = now
+                self._end_player_team_assignment(player_id, membership.team_id, now)
+                affected_teams.add(int(membership.team_id))
+            player = self.session.get(Player, player_id)
+            if player is not None and player.team_id != winner.team_id:
+                player.team_id = winner.team_id
+                player.team_updated_at = now
+                self._track_player_team_history(player_id, winner.team_id, now)
+            affected_players.add(player_id)
+            affected_teams.add(int(winner.team_id))
+
+        if affected_players:
+            self.session.commit()
+            log.info(
+                "Collapsed duplicate active squad assignments for %s players across %s teams",
+                len(affected_players),
+                len(affected_teams),
+            )
+        return sorted(affected_players), sorted(affected_teams)
+
     def sync_sidelined_for_teams(self, team_ids: Sequence[int]) -> int:
         if not team_ids:
             return 0

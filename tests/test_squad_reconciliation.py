@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from unittest.mock import Mock, patch
 
 from sqlalchemy import create_engine
@@ -125,6 +126,39 @@ class SquadReconciliationTests(unittest.TestCase):
             session.query(TeamSquadSnapshot).order_by(TeamSquadSnapshot.id.desc()).first().status,
             "empty",
         )
+
+    def test_duplicate_active_memberships_are_collapsed_even_when_old_team_was_not_refreshed(self):
+        service, session = make_service(FakeSquadClient({}))
+        session.add(Player(id=7124, name="Ezri Konsa", team_id=15))
+        session.add_all(
+            [
+                TeamSquadMembership(
+                    team_id=15,
+                    player_id=7124,
+                    is_active=True,
+                    first_seen_at=datetime(2023, 7, 1),
+                    provider_started_at=datetime(2023, 7, 1),
+                    last_seen_at=datetime(2026, 8, 22),
+                ),
+                TeamSquadMembership(
+                    team_id=19,
+                    player_id=7124,
+                    is_active=True,
+                    first_seen_at=datetime(2026, 8, 21),
+                    provider_started_at=datetime(2026, 8, 21),
+                    last_seen_at=datetime(2026, 8, 22),
+                ),
+            ]
+        )
+        session.commit()
+
+        players, teams = service.collapse_duplicate_active_memberships()
+
+        self.assertEqual(players, [7124])
+        self.assertEqual(teams, [15, 19])
+        self.assertFalse(session.get(TeamSquadMembership, (15, 7124)).is_active)
+        self.assertTrue(session.get(TeamSquadMembership, (19, 7124)).is_active)
+        self.assertEqual(session.get(Player, 7124).team_id, 19)
 
     def test_remote_detach_is_scoped_to_the_team_at_write_time(self):
         get_response = Mock(ok=True)
