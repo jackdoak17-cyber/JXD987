@@ -33,6 +33,12 @@ logger = logging.getLogger("hydrate_referee_history")
 MAIN_REF_TYPE_IDS = {6}
 
 
+class ProviderRateLimited(RuntimeError):
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__("SportMonks rate limit reached")
+        self.retry_after_seconds = max(1, retry_after_seconds)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hydrate historical referee assignments via /referees/{id}?include=fixtures")
     parser.add_argument("--seed-days-back", type=int, default=30, help="Window to discover active referees from DB fixtures")
@@ -97,13 +103,12 @@ def fetch_json_with_retry(
             resp = session.get(url, timeout=timeout)
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
-                sleep_for = int(retry_after) if retry_after and retry_after.isdigit() else min(30, attempt * 3)
-                logger.warning("Rate limited (429) for %s; sleeping %ss", url, sleep_for)
-                time.sleep(max(1, sleep_for))
-                continue
+                retry_after_seconds = int(retry_after) if retry_after and retry_after.isdigit() else 60
+                logger.warning("SportMonks rate limit reached; retry_after=%ss", retry_after_seconds)
+                raise ProviderRateLimited(retry_after_seconds)
             if 500 <= resp.status_code < 600:
                 sleep_for = min(20, attempt * 2)
-                logger.warning("Server error %s for %s; sleeping %ss", resp.status_code, url, sleep_for)
+                logger.warning("SportMonks server error status=%s; sleeping %ss", resp.status_code, sleep_for)
                 time.sleep(sleep_for)
                 continue
             resp.raise_for_status()
@@ -111,12 +116,14 @@ def fetch_json_with_retry(
             if not isinstance(payload, dict):
                 raise RuntimeError(f"Unexpected JSON payload type: {type(payload)}")
             return payload
+        except ProviderRateLimited:
+            raise
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt >= max_attempts:
                 break
             time.sleep(min(10, attempt))
-    raise RuntimeError(f"Request failed after retries: {url}") from last_exc
+    raise RuntimeError("SportMonks request failed after retries") from last_exc
 
 
 def fetch_seed_referees(
@@ -318,13 +325,25 @@ def main() -> int:
 
     total_rows_raw = 0
     referees_failed = 0
-    all_rows: List[Dict[str, Any]] = []
+    upserted_assignments_total = 0
+    rate_limited = False
+    rate_limited_retry_after_seconds = 0
+    conn_write = None if args.dry_run else psycopg2.connect(db_url)
     session = requests.Session()
     try:
         for idx, referee_id in enumerate(seed_referees, start=1):
             url = f"{base_url}/referees/{referee_id}?api_token={token}&include=fixtures"
             try:
                 payload = fetch_json_with_retry(session=session, url=url, timeout=args.timeout)
+            except ProviderRateLimited as exc:
+                referees_failed += 1
+                rate_limited = True
+                rate_limited_retry_after_seconds = exc.retry_after_seconds
+                logger.warning(
+                    "referee_id=%s stopped at provider rate limit; retrying on the next scheduled run",
+                    referee_id,
+                )
+                break
             except Exception as exc:  # noqa: BLE001
                 referees_failed += 1
                 logger.warning("referee_id=%s failed: %s", referee_id, exc)
@@ -336,19 +355,18 @@ def main() -> int:
                 main_only=args.main_only,
             )
             total_rows_raw += len(links)
-            all_rows.extend(links)
+            if conn_write is not None:
+                upserted_assignments_total += upsert_assignments(conn_write, links)
 
             if args.sleep_seconds > 0 and idx < len(seed_referees):
                 time.sleep(args.sleep_seconds)
     finally:
         session.close()
-
-    dedup_rows = {
-        (row["fixture_id"], row["referee_id"], row["role"]): row for row in all_rows
-    }
+        if conn_write is not None:
+            conn_write.close()
 
     report: Dict[str, Any] = {
-        "ok": True,
+        "ok": referees_failed == 0 and not rate_limited,
         "dry_run": bool(args.dry_run),
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "seed_referees": len(seed_referees),
@@ -356,7 +374,9 @@ def main() -> int:
         "main_only": bool(args.main_only),
         "referees_failed": referees_failed,
         "rows_raw": total_rows_raw,
-        "rows_deduped": len(dedup_rows),
+        "upserted_assignments": upserted_assignments_total,
+        "rate_limited": rate_limited,
+        "rate_limited_retry_after_seconds": rate_limited_retry_after_seconds,
         "sample_referees": seed_referees[:10],
     }
 
@@ -365,16 +385,9 @@ def main() -> int:
         write_report(args.report_json, report)
         return 0
 
-    conn_write = psycopg2.connect(db_url)
-    try:
-        upserted = upsert_assignments(conn_write, dedup_rows.values())
-    finally:
-        conn_write.close()
-
-    report["upserted_assignments"] = upserted
     print(json.dumps(report, indent=2, ensure_ascii=False))
     write_report(args.report_json, report)
-    return 0
+    return 1 if referees_failed else 0
 
 
 if __name__ == "__main__":
