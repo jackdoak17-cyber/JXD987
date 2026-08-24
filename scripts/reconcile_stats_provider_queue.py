@@ -37,6 +37,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     persist_provider_snapshot,
     provider_payload_hash,
     ProviderDetailIncompleteError,
+    ProviderFixtureUnavailableError,
     publish_delivery_status,
     revalidation_time,
     source_connection,
@@ -45,6 +46,8 @@ from scripts.postmatch_fixture_detail_delivery import (
     target_snapshot,
     ledger_attempt_start,
     update_ledger,
+    mark_provider_unavailable,
+    clear_provider_unavailable_exclusion,
 )
 
 
@@ -127,6 +130,7 @@ def main() -> int:
         "fixtures_selected": 0,
         "fixtures_accepted": 0,
         "provider_pending": [],
+        "provider_unavailable": [],
         "provider_sparse": [],
         "failed": [],
         "projection_rows": {},
@@ -174,7 +178,10 @@ def main() -> int:
                     report["provider_calls"] += 1
                     data = payload.get("data") if isinstance(payload, dict) else None
                     if not isinstance(data, dict) or not data:
-                        raise RuntimeError("SportMonks returned no fixture data")
+                        message = "SportMonks returned no fixture data"
+                        if attempt >= 3:
+                            raise ProviderFixtureUnavailableError(message)
+                        raise RuntimeError(message)
                     assessment = assess_provider_payload(data)
                     payload_hash = provider_payload_hash(data)
                     normalized_hash = normalized_provider_hash(data)
@@ -214,9 +221,14 @@ def main() -> int:
                         report["provider_pending"].append({"fixture_id": fixture_id, "reason": message})
                         continue
                     source = store_provider_detail(engine, client, fixture_id, data, assessment)
+                    clear_provider_unavailable_exclusion(target_url, fixture_id)
                     if not meta:
                         meta = conn.execute("select league_id,season_id,starting_at from fixtures where id=?", (fixture_id,)).fetchone()
                     accepted.append({"fixture_id": fixture_id, "assessment": assessment, "source": source, "snapshot_id": snapshot_id, "payload_hash": payload_hash, "normalized_hash": normalized_hash, "stable_count": stable_count, "meta": meta})
+                except ProviderFixtureUnavailableError as exc:
+                    message = str(exc)[-4000:]
+                    review_at = mark_provider_unavailable(target_url, conn, fixture_id, attempt, message)
+                    report["provider_unavailable"].append({"fixture_id": fixture_id, "next_review_at": review_at, "reason": message})
                 except ProviderDetailIncompleteError as exc:
                     message = str(exc)[-4000:]
                     next_at = backoff_time(attempt, datetime.now(timezone.utc))

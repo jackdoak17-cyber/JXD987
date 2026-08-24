@@ -61,6 +61,7 @@ DEFAULT_SOURCE_BUSY_TIMEOUT_MS = 30_000
 DEFAULT_RECENT_REVALIDATION_HOURS = 6
 DEFAULT_DAILY_REVALIDATION_HOURS = 24
 DEFAULT_HISTORICAL_REVALIDATION_HOURS = 168
+DEFAULT_PROVIDER_UNAVAILABLE_REVIEW_DAYS = 7
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,10 @@ class DetailSnapshot:
 
 class ProviderDetailIncompleteError(RuntimeError):
     """SportMonks returned a finished fixture that cannot be safely published."""
+
+
+class ProviderFixtureUnavailableError(RuntimeError):
+    """SportMonks explicitly returned no fixture for a completed target ID."""
 
 
 def parse_csv_ints(raw: str | None) -> list[int]:
@@ -342,7 +347,7 @@ def candidate_target_fixture_ids(
     clauses = [
         "f.home_score is not null",
         "f.away_score is not null",
-        "not exists (select 1 from public.fixture_stats_quality_exclusions x where x.fixture_id = f.id)",
+        "not exists (select 1 from public.fixture_stats_quality_exclusions x where x.fixture_id = f.id and (x.exclusion_type = 'duplicate' or x.next_review_at is null or x.next_review_at > now()))",
     ]
     params: list[object] = []
     if league_ids:
@@ -387,7 +392,7 @@ def excluded_target_fixture_ids(target_url: str, fixture_ids: Sequence[int]) -> 
     with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
         with target_conn.cursor() as cur:
             cur.execute(
-                "select fixture_id from public.fixture_stats_quality_exclusions where fixture_id = any(%s)",
+                "select fixture_id from public.fixture_stats_quality_exclusions where fixture_id = any(%s) and (exclusion_type = 'duplicate' or next_review_at is null or next_review_at > now())",
                 (ids,),
             )
             return {int(row[0]) for row in cur.fetchall()}
@@ -511,6 +516,93 @@ def _json_value(raw: object) -> Json | None:
         return Json(json.loads(str(raw)))
     except (TypeError, ValueError, json.JSONDecodeError):
         return Json({"raw": str(raw)})
+
+
+def mark_provider_unavailable(
+    target_url: str,
+    conn: sqlite3.Connection,
+    fixture_id: int,
+    attempt: int,
+    error: str,
+) -> str:
+    """Quarantine a provider-absent target while retaining a scheduled review."""
+    review_at = iso(utc_now() + timedelta(days=DEFAULT_PROVIDER_UNAVAILABLE_REVIEW_DAYS))
+    meta = conn.execute(
+        "select league_id, season_id from fixtures where id = ?",
+        (fixture_id,),
+    ).fetchone()
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            if not meta:
+                cur.execute(
+                    "select league_id, season_id from public.fixtures where id = %s",
+                    (fixture_id,),
+                )
+                meta = cur.fetchone()
+            cur.execute(
+                """
+                insert into public.fixture_stats_quality_exclusions (
+                  fixture_id, league_id, season_id, exclusion_type,
+                  reason, next_review_at, evidence, last_checked_at, updated_at
+                ) values (
+                  %s, %s, %s, 'provider_unavailable', %s, %s::timestamptz,
+                  %s::jsonb, now(), now()
+                )
+                on conflict (fixture_id) do update set
+                  league_id = excluded.league_id,
+                  season_id = excluded.season_id,
+                  exclusion_type = case
+                    when public.fixture_stats_quality_exclusions.exclusion_type = 'duplicate'
+                    then public.fixture_stats_quality_exclusions.exclusion_type
+                    else excluded.exclusion_type
+                  end,
+                  reason = case
+                    when public.fixture_stats_quality_exclusions.exclusion_type = 'duplicate'
+                    then public.fixture_stats_quality_exclusions.reason
+                    else excluded.reason
+                  end,
+                  next_review_at = case
+                    when public.fixture_stats_quality_exclusions.exclusion_type = 'duplicate'
+                    then public.fixture_stats_quality_exclusions.next_review_at
+                    else excluded.next_review_at
+                  end,
+                  evidence = case
+                    when public.fixture_stats_quality_exclusions.exclusion_type = 'duplicate'
+                    then public.fixture_stats_quality_exclusions.evidence
+                    else excluded.evidence
+                  end,
+                  last_checked_at = now(),
+                  updated_at = now()
+                """,
+                (
+                    fixture_id,
+                    int(meta[0]) if meta and meta[0] is not None else None,
+                    int(meta[1]) if meta and meta[1] is not None else None,
+                    "SportMonks returned no fixture data for a completed target ID",
+                    review_at,
+                    json.dumps({"attempt": attempt, "error": error[:4000]}),
+                ),
+            )
+    update_ledger(
+        conn,
+        fixture_id,
+        "excluded",
+        attempt,
+        error=f"{error}; quarantined until {review_at}",
+        next_attempt_at=review_at,
+    )
+    publish_delivery_status(target_url, conn, fixture_id)
+    return review_at
+
+
+def clear_provider_unavailable_exclusion(target_url: str, fixture_id: int) -> None:
+    """Re-open a quarantined fixture only after a complete provider payload passes validation."""
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            cur.execute(
+                "delete from public.fixture_stats_quality_exclusions where fixture_id = %s and exclusion_type = 'provider_unavailable'",
+                (fixture_id,),
+            )
 
 
 def persist_provider_snapshot(
@@ -1157,6 +1249,7 @@ def main() -> int:
         "verified": [],
         "provider_sparse": [],
         "provider_pending": [],
+        "provider_unavailable": [],
         "failed": [],
         "status_sync_failures": [],
         "sla_breaches": [],
@@ -1218,7 +1311,10 @@ def main() -> int:
             report["provider_calls"] += 1
             data = payload.get("data") if isinstance(payload, dict) else None
             if not isinstance(data, dict) or not data:
-                raise RuntimeError("SportMonks returned no fixture data")
+                message = "SportMonks returned no fixture data"
+                if attempt >= 3:
+                    raise ProviderFixtureUnavailableError(message)
+                raise RuntimeError(message)
             assessment = assess_provider_payload(data)
             payload_hash = provider_payload_hash(data)
             normalized_hash = normalized_provider_hash(data)
@@ -1292,6 +1388,7 @@ def main() -> int:
                 continue
 
             source = store_provider_detail(engine, client, fixture_id, data, assessment)
+            clear_provider_unavailable_exclusion(target_url, fixture_id)
             export_result = export_fixture(fixture_id, leagues, export_report_path)
             if export_result.returncode != 0:
                 message = (export_result.stderr or export_result.stdout or "export failed")[-4000:]
@@ -1358,6 +1455,11 @@ def main() -> int:
                 report["provider_sparse"].append({"fixture_id": fixture_id, "assessment": asdict(assessment), "next_revalidation_at": next_revalidation_at})
             else:
                 report["verified"].append({"fixture_id": fixture_id, "assessment": asdict(assessment), "next_revalidation_at": next_revalidation_at})
+        except ProviderFixtureUnavailableError as exc:
+            message = str(exc)[-4000:]
+            review_at = mark_provider_unavailable(target_url, conn, fixture_id, attempt, message)
+            report["provider_unavailable"].append({"fixture_id": fixture_id, "next_review_at": review_at, "reason": message})
+            LOG.warning("Provider returned no fixture for %s; quarantined until %s", fixture_id, review_at)
         except ProviderDetailIncompleteError as exc:
             message = str(exc)[-4000:]
             next_at = backoff_time(attempt, utc_now())
