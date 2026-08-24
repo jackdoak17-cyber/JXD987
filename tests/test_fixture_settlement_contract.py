@@ -71,6 +71,7 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("--max-batches 1", source)
         self.assertIn("STATS_RECONCILE_SUPERVISOR_LOCK", source)
         self.assertIn("wait_for_live_window", source)
+        self.assertIn('timeout --signal=TERM --kill-after=5s "${STATS_RECONCILE_MAX_HOLD_SECONDS}"', source)
 
     def test_shared_lock_has_priority_aware_settlement_handoff(self) -> None:
         source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")
@@ -78,6 +79,10 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('job_priority="${ODDS_SYNC_JOB_PRIORITY:-normal}"', source)
         self.assertIn('lock_wait_seconds="${ODDS_SYNC_LOCK_WAIT_SECONDS:-0}"', source)
         self.assertIn("settlement lock unavailable after", source)
+        self.assertIn('effective_runtime="${max_runtime}"', source)
+        self.assertIn('available_runtime=$((seconds_to_tick - live_grace_seconds))', source)
+        self.assertIn('timeout --signal=TERM --kill-after=5s "${effective_runtime}"', source)
+        self.assertIn("normal-writer lease ended for settlement handoff", source)
 
     def test_stats_reconciliation_cron_installer_is_shell_valid_and_idempotent(self) -> None:
         installer = ROOT / "scripts/vps/install_stats_reconciliation_cron.sh"

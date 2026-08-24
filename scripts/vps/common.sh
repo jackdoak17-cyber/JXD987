@@ -330,10 +330,36 @@ run_with_global_lock_and_timeout() {
       sleep "${lock_poll_seconds}" 9>&-
     done
 
+    local effective_runtime="${max_runtime}"
+    if [[ "${job_priority}" != "settlement" ]]; then
+      # A normal writer may start outside the reservation window but still
+      # overrun the next settlement tick if it consumes its full timeout.
+      # Cap the in-flight lease so the canonical lock is released before the
+      # settlement grace period. Every normal chain is resumable/idempotent,
+      # so a planned handoff is safer than allowing a long writer to starve
+      # the critical settlement path.
+      now_epoch="$(date -u +%s)"
+      live_phase=$((now_epoch % live_tick_seconds))
+      seconds_to_tick=$((live_tick_seconds - live_phase))
+      available_runtime=$((seconds_to_tick - live_grace_seconds))
+      if (( available_runtime <= 0 )); then
+        log_info "[SKIPPED] no normal-writer lease before settlement grace window (phase=${live_phase}s)"
+        exit 2
+      fi
+      if (( available_runtime < effective_runtime )); then
+        effective_runtime="${available_runtime}"
+        log_info "normal-writer lease capped at ${effective_runtime}s before settlement grace window"
+      fi
+    fi
+
     # The full chain must execute as one subshell so timeout covers every step.
-    timeout "${max_runtime}" bash -lc "${chain_command}"
+    timeout --signal=TERM --kill-after=5s "${effective_runtime}" bash -lc "${chain_command}"
     local status=$?
     if [[ ${status} -eq 124 || ${status} -eq 137 ]]; then
+      if [[ "${job_priority}" != "settlement" && "${effective_runtime}" -lt "${max_runtime}" ]]; then
+        log_info "[SKIPPED] normal-writer lease ended for settlement handoff after ${effective_runtime}s"
+        exit 2
+      fi
       log_error "process killed after ${max_runtime}s overrun"
       exit 1
     fi

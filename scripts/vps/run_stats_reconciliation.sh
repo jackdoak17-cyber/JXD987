@@ -68,7 +68,8 @@ while true; do
   wait_for_live_window
   rm -f "${STATS_RECONCILE_REPORT}" "${STATS_RECONCILE_RUN_LOG}"
   set +e
-  "${REPO_ROOT}/.venv/bin/python" \
+  timeout --signal=TERM --kill-after=5s "${STATS_RECONCILE_MAX_HOLD_SECONDS}" \
+    "${REPO_ROOT}/.venv/bin/python" \
     "${REPO_ROOT}/scripts/reconcile_stats_provider_queue.py" \
     --leagues "${STATS_RECONCILE_LEAGUES}" \
     --batch-size "${STATS_RECONCILE_BATCH_SIZE}" \
