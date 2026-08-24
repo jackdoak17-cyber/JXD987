@@ -36,6 +36,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     normalized_provider_hash,
     persist_provider_snapshot,
     provider_payload_hash,
+    ProviderDetailIncompleteError,
     publish_delivery_status,
     revalidation_time,
     source_connection,
@@ -216,6 +217,12 @@ def main() -> int:
                     if not meta:
                         meta = conn.execute("select league_id,season_id,starting_at from fixtures where id=?", (fixture_id,)).fetchone()
                     accepted.append({"fixture_id": fixture_id, "assessment": assessment, "source": source, "snapshot_id": snapshot_id, "payload_hash": payload_hash, "normalized_hash": normalized_hash, "stable_count": stable_count, "meta": meta})
+                except ProviderDetailIncompleteError as exc:
+                    message = str(exc)[-4000:]
+                    next_at = backoff_time(attempt, datetime.now(timezone.utc))
+                    update_ledger(conn, fixture_id, "provider_pending", attempt, assessment, error=message, next_attempt_at=next_at, payload_hash=payload_hash, normalized_hash=normalized_hash, stable_fetch_count=stable_count)
+                    publish_delivery_status(target_url, conn, fixture_id)
+                    report["provider_pending"].append({"fixture_id": fixture_id, "reason": message})
                 except Exception as exc:
                     message = str(exc)[-4000:]
                     update_ledger(conn, fixture_id, "failed", attempt, error=message, next_attempt_at=backoff_time(attempt, datetime.now(timezone.utc)))

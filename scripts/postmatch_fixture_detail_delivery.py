@@ -92,6 +92,10 @@ class DetailSnapshot:
     lineup_values: dict[str, tuple[object, ...]]
 
 
+class ProviderDetailIncompleteError(RuntimeError):
+    """SportMonks returned a finished fixture that cannot be safely published."""
+
+
 def parse_csv_ints(raw: str | None) -> list[int]:
     values: list[int] = []
     for token in (raw or "").replace("\n", ",").split(","):
@@ -1003,7 +1007,7 @@ def store_provider_detail(
         # connection so the validation sees exactly the rows being committed.
         snapshot = source_snapshot_from_session(session, fixture_id)
         if not source_ready(snapshot, assessment):
-            raise RuntimeError("provider payload was accepted but source detail rows are incomplete")
+            raise ProviderDetailIncompleteError("provider payload was accepted but source detail rows are incomplete")
         session.commit()
         return snapshot
     except Exception:
@@ -1337,6 +1341,22 @@ def main() -> int:
                 report["provider_sparse"].append({"fixture_id": fixture_id, "assessment": asdict(assessment), "next_revalidation_at": next_revalidation_at})
             else:
                 report["verified"].append({"fixture_id": fixture_id, "assessment": asdict(assessment), "next_revalidation_at": next_revalidation_at})
+        except ProviderDetailIncompleteError as exc:
+            message = str(exc)[-4000:]
+            next_at = backoff_time(attempt, utc_now())
+            update_ledger(
+                conn,
+                fixture_id,
+                "provider_pending",
+                attempt,
+                assessment,
+                error=message,
+                next_attempt_at=next_at,
+                payload_hash=payload_hash,
+                normalized_hash=normalized_hash,
+            )
+            report["provider_pending"].append({"fixture_id": fixture_id, "next_attempt_at": next_at, "reason": message})
+            LOG.warning("Provider detail incomplete for %s; retaining it in pending state", fixture_id)
         except Exception as exc:  # provider and storage errors are retried by the ledger
             message = str(exc)[-4000:]
             update_ledger(conn, fixture_id, "failed", attempt, assessment, error=message, next_attempt_at=backoff_time(attempt, utc_now()))
