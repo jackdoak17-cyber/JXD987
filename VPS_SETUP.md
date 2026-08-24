@@ -93,8 +93,8 @@ Use one cron entry equivalent to existing cadence:
 Path B is enforced:
 - P1/P2: fetch-only
 - P2: fetch-only + best-effort confirmed-lineup refresh for imminent fixtures
-- P3: SportMonks refresh + fetch + ingest + retention + best-effort lightweight recent fixture refresh/export
-- Post-match settlement: every 15 minutes, refresh fixture cores and run the bounded full-detail delivery worker for recently started fixtures. The worker retries provider-pending fixtures and verifies source-to-Supabase parity before marking them delivered.
+- P3: SportMonks refresh + fetch + ingest + retention + best-effort recent fixture-core refresh/export
+- Post-match settlement: every 15 minutes, refresh fixture cores and run the bounded full-detail delivery worker for recently started fixtures. The worker retries provider-pending fixtures and verifies source-to-Supabase parity before marking them delivered. P3 deliberately uses `--fixture-core-only` so it cannot delete or overwrite fixture-player/statistics detail while the detail pipeline is reconciling it.
 
 ### Conservative production schedule for Supabase Micro
 
