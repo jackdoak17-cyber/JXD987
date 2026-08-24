@@ -60,7 +60,7 @@ wait_for_live_window() {
 
   if (( delay > 0 )); then
     log_info "waiting ${delay}s for the next live-safe reconciliation window"
-    sleep "${delay}"
+    sleep "${delay}" 9>&-
   fi
 }
 
@@ -81,7 +81,7 @@ while true; do
   if [[ ! -f "${STATS_RECONCILE_REPORT}" ]]; then
     # The Python worker exits without a report when another SQLite writer owns
     # the canonical lock. Wait and retry without contending or spinning.
-    sleep "${STATS_RECONCILE_SLEEP_SECONDS}"
+    sleep "${STATS_RECONCILE_SLEEP_SECONDS}" 9>&-
     continue
   fi
 
@@ -97,7 +97,7 @@ PY
 
   if [[ "${status}" -ne 0 ]]; then
     tail -n 20 "${STATS_RECONCILE_RUN_LOG}" >&2 || true
-    sleep "${STATS_RECONCILE_SLEEP_SECONDS}"
+    sleep "${STATS_RECONCILE_SLEEP_SECONDS}" 9>&-
     continue
   fi
 
