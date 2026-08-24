@@ -26,8 +26,8 @@ export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(supported_league_cs
 # plus the cohort cap keeps the larger batch within a bounded projection
 # fan-out. The global wrapper still refuses to start when the remaining lease
 # is too short.
-export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-100}"
-export STATS_RECONCILE_MAX_COHORTS="${STATS_RECONCILE_MAX_COHORTS:-8}"
+export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-50}"
+export STATS_RECONCILE_MAX_COHORTS="${STATS_RECONCILE_MAX_COHORTS:-5}"
 # Retry delay after a live writer owns the lock. The scheduler gate below
 # decides whether a new batch may begin; this delay is not the handoff policy.
 export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-60}"
