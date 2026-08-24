@@ -178,6 +178,16 @@ def main() -> int:
                     payload_hash = provider_payload_hash(data)
                     normalized_hash = normalized_provider_hash(data)
                     meta = conn.execute("select league_id,season_id,starting_at from fixtures where id=?", (fixture_id,)).fetchone()
+                    if not meta:
+                        # Historical fixtures may exist in the serving store
+                        # before the SQLite spool has ever seen them.
+                        with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+                            with target_conn.cursor() as target_cur:
+                                target_cur.execute(
+                                    "select league_id,season_id,starting_at from public.fixtures where id=%s",
+                                    (fixture_id,),
+                                )
+                                meta = target_cur.fetchone()
                     snapshot_id = persist_provider_snapshot(
                         target_url,
                         fixture_id,
@@ -203,6 +213,8 @@ def main() -> int:
                         report["provider_pending"].append({"fixture_id": fixture_id, "reason": message})
                         continue
                     source = store_provider_detail(engine, client, fixture_id, data, assessment)
+                    if not meta:
+                        meta = conn.execute("select league_id,season_id,starting_at from fixtures where id=?", (fixture_id,)).fetchone()
                     accepted.append({"fixture_id": fixture_id, "assessment": assessment, "source": source, "snapshot_id": snapshot_id, "payload_hash": payload_hash, "normalized_hash": normalized_hash, "stable_count": stable_count, "meta": meta})
                 except Exception as exc:
                     message = str(exc)[-4000:]
