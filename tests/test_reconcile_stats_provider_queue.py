@@ -16,7 +16,8 @@ class FakeSportMonksClient:
         self.calls.append(endpoint)
         ids = [int(value) for value in endpoint.rsplit("/", 1)[1].split(",")]
         returned = self.responses.get(endpoint, ids)
-        return {"data": [{"id": fixture_id, "statistics": [], "lineups": []} for fixture_id in returned]}
+        rows = [{"id": fixture_id, "statistics": [], "lineups": []} for fixture_id in returned]
+        return {"data": rows if "/multi/" in endpoint else rows[0]}
 
 
 def test_bulk_fetch_preserves_each_fixture_and_reports_one_http_call(monkeypatch) -> None:
@@ -60,3 +61,16 @@ def test_bulk_fetch_splits_batches_and_counts_http_requests(monkeypatch) -> None
         "fixtures/multi/3,4",
         "fixtures/multi/5",
     ]
+
+
+def test_bulk_omission_falls_back_to_single_fixture(monkeypatch) -> None:
+    FakeSportMonksClient.calls = []
+    FakeSportMonksClient.responses = {"fixtures/multi/101,202": [101]}
+    monkeypatch.setattr(queue, "SportMonksClient", FakeSportMonksClient)
+
+    fetched, errors, calls = queue.fetch_provider_fixtures([101, 202], 2, 50)
+
+    assert sorted(fetched) == [101, 202]
+    assert errors == {}
+    assert calls == 2
+    assert sorted(FakeSportMonksClient.calls) == ["fixtures/202", "fixtures/multi/101,202"]

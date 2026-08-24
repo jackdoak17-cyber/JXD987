@@ -73,6 +73,25 @@ DETAIL_INCLUDE = ";".join(
 MAX_BULK_FIXTURE_IDS = 50
 
 
+def fetch_provider_fixture(fixture_id: int) -> tuple[dict[str, Any] | None, Exception | None, int]:
+    """Fetch one fixture as the bounded fallback for a failed bulk request."""
+    try:
+        client = SportMonksClient()
+        payload = client.request(
+            "GET",
+            f"fixtures/{fixture_id}",
+            params={"include": DETAIL_INCLUDE},
+        )
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or not data:
+            return None, RuntimeError("SportMonks returned no fixture data"), 1
+        if int(data.get("id") or 0) != fixture_id:
+            return None, RuntimeError("SportMonks returned the wrong fixture ID"), 1
+        return data, None, 1
+    except Exception as exc:  # classified by the existing attempt/error policy
+        return None, exc, 1
+
+
 def fetch_provider_fixture_batch(
     fixture_ids: list[int],
 ) -> tuple[dict[int, dict[str, Any]], dict[int, Exception], int]:
@@ -129,9 +148,32 @@ def fetch_provider_fixtures(
                 batch_fetched, batch_errors, calls = future.result()
             except Exception as exc:  # defensive: worker function classifies normal errors
                 batch_fetched, batch_errors, calls = {}, {fixture_id: exc for fixture_id in chunk}, 1
+            http_calls += calls
+
+            # A failed or incomplete bulk response must not quarantine every
+            # requested fixture. Retry only affected IDs through the proven
+            # single-fixture endpoint, keeping the fallback bounded by the
+            # same worker concurrency.
+            fallback_ids = sorted(batch_errors)
+            if fallback_ids:
+                with ThreadPoolExecutor(max_workers=min(fetch_concurrency, len(fallback_ids))) as fallback_executor:
+                    fallback_futures = {
+                        fallback_executor.submit(fetch_provider_fixture, fixture_id): fixture_id
+                        for fixture_id in fallback_ids
+                    }
+                    for fallback_future in as_completed(fallback_futures):
+                        fixture_id = fallback_futures[fallback_future]
+                        data, error, fallback_calls = fallback_future.result()
+                        http_calls += fallback_calls
+                        if error is None and data is not None:
+                            batch_fetched[fixture_id] = data
+                            batch_errors.pop(fixture_id, None)
+                        else:
+                            batch_errors[fixture_id] = error or RuntimeError(
+                                "SportMonks single-fixture fallback returned no data"
+                            )
             fetched.update(batch_fetched)
             errors.update(batch_errors)
-            http_calls += calls
     return fetched, errors, http_calls
 
 
