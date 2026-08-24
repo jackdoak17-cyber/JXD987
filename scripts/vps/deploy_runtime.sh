@@ -32,7 +32,7 @@ if [[ -n "${SSH_KEY}" ]]; then
 fi
 ssh_cmd+=("${TARGET_USER}@${TARGET_HOST}")
 
-files_to_sync=("scripts/vps/runtime_manifest.sha1" "scripts/vps/runtime_files.txt")
+files_to_sync=("scripts/vps/runtime_files.txt")
 while IFS= read -r relpath || [[ -n "${relpath}" ]]; do
   [[ -n "${relpath}" ]] || continue
   [[ "${relpath}" == \#* ]] && continue
@@ -42,6 +42,15 @@ done < "${RUNTIME_FILE_LIST}"
 (
   cd "${REPO_ROOT}"
   rsync -avR -e "$(printf '%q ' "${rsync_rsh[@]}")" "${files_to_sync[@]}" "${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}/"
+)
+
+# Publish the manifest last. During a runtime update, wrappers either see the
+# previous complete release or fail closed on a manifest mismatch; they never
+# execute a partially copied release as valid.
+(
+  cd "${REPO_ROOT}"
+  rsync -avR -e "$(printf '%q ' "${rsync_rsh[@]}")" \
+    scripts/vps/runtime_manifest.sha1 "${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}/"
 )
 
 "${ssh_cmd[@]}" "cd '${TARGET_REPO_ROOT}' && shasum -c scripts/vps/runtime_manifest.sha1"

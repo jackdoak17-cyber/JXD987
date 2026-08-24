@@ -88,6 +88,14 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("grep -Fqx", source)
         self.assertIn("run_stats_reconciliation.sh", source)
 
+    def test_runtime_deploy_publishes_manifest_last(self) -> None:
+        deploy = ROOT / "scripts/vps/deploy_runtime.sh"
+        result = subprocess.run(["bash", "-n", str(deploy)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source = deploy.read_text(encoding="utf-8")
+        self.assertIn("Publish the manifest last", source)
+        self.assertIn("scripts/vps/runtime_manifest.sha1", source)
+
 
 if __name__ == "__main__":
     unittest.main()
