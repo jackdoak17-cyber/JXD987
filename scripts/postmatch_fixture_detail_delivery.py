@@ -1563,7 +1563,11 @@ def main() -> int:
     if explicit_ids:
         fixture_ids = explicit_ids
     else:
-        selected = candidate_fixture_ids(conn, leagues, args.hours_back, args.limit, args.force)
+        # A season-scoped run is an intentional historical drain. Do not let
+        # unrelated recent source fixtures consume the bounded batch before
+        # the requested target-season queue gets a turn. The normal live run
+        # (without --season-ids) continues to combine source and target lanes.
+        selected = [] if season_ids else candidate_fixture_ids(conn, leagues, args.hours_back, args.limit, args.force)
         if args.target_queue:
             selected.extend(candidate_target_fixture_ids(target_url, leagues, args.limit, args.force, season_ids or None))
         fixture_ids = list(dict.fromkeys(selected))
