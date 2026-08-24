@@ -38,6 +38,7 @@ export STATS_RECONCILE_MAX_HOLD_SECONDS="${STATS_RECONCILE_MAX_HOLD_SECONDS:-600
 export STATS_RECONCILE_REPORT="${STATS_RECONCILE_REPORT:-/tmp/stats_reconcile_provider_batch.json}"
 export STATS_RECONCILE_RUN_LOG="${STATS_RECONCILE_RUN_LOG:-/tmp/stats_reconcile_provider_batch.log}"
 export STATS_RECONCILE_SUPERVISOR_LOCK="${STATS_RECONCILE_SUPERVISOR_LOCK:-/var/lock/stats-reconciliation-supervisor.lock}"
+export RUNTIME_RELEASE_ID="${RUNTIME_RELEASE_ID:-$(runtime_release_id)}"
 
 mkdir -p "$(dirname "${STATS_RECONCILE_SUPERVISOR_LOCK}")"
 exec 9>"${STATS_RECONCILE_SUPERVISOR_LOCK}"
