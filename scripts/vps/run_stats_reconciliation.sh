@@ -18,7 +18,7 @@ fi
 
 export PYTHONPATH="${REPO_ROOT}"
 export REPO_ROOT
-export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(default_league_csv)}"
+export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(supported_league_csv)}"
 # Keep each historical lock hold below the live settlement cadence, then leave
 # a real handoff window for the scheduled writers. Operators can raise these
 # values for an isolated maintenance window, but the production defaults are

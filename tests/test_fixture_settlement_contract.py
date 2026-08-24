@@ -72,6 +72,7 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("STATS_RECONCILE_SUPERVISOR_LOCK", source)
         self.assertIn("wait_for_live_window", source)
         self.assertIn("STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS", source)
+        self.assertIn('$(supported_league_csv)', source)
         self.assertIn("run_with_global_lock_and_timeout", source)
         self.assertIn("STATS_RECONCILE_LOCK_HELD", source)
         self.assertIn("export REPO_ROOT", source)
