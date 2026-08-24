@@ -53,6 +53,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     update_ledger,
     mark_provider_unavailable,
     clear_provider_unavailable_exclusion,
+    recover_stale_running,
 )
 
 
@@ -303,6 +304,9 @@ def main() -> int:
 
     conn = source_connection()
     ensure_ledger(conn)
+    recovered_running = recover_stale_running(conn)
+    if recovered_running:
+        LOG.warning("Requeued %s stale running delivery rows after a prior worker handoff", recovered_running)
     source_path = str(Path(os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")).resolve())
     engine = create_engine(f"sqlite:///{source_path}", future=True)
     # This client is retained for the sequential source-store path.  Provider

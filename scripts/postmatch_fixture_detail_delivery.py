@@ -280,6 +280,39 @@ def ensure_ledger(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def recover_stale_running(
+    conn: sqlite3.Connection,
+    timeout_minutes: int = 30,
+    now: datetime | None = None,
+) -> int:
+    """Requeue attempts left running after a bounded worker handoff.
+
+    The worker checkpoints each fixture, but a lease timeout can occur between
+    the running marker and the final classification. Requeue stale markers
+    explicitly so the next attempt is observable and cannot remain an
+    unexplained in-flight row indefinitely.
+    """
+    current = now or utc_now()
+    current_text = iso(current)
+    cutoff_text = iso(current - timedelta(minutes=max(timeout_minutes, 1)))
+    cursor = conn.execute(
+        f"""
+        update {LEDGER_TABLE}
+           set status = 'provider_pending',
+               next_attempt_at = ?,
+               last_error = 'Previous reconciliation worker exited before final classification; fixture requeued',
+               updated_at = ?
+         where status = 'running'
+           and coalesce(last_attempted_at, updated_at) < ?
+        """,
+        (current_text, current_text, cutoff_text),
+    )
+    recovered = int(cursor.rowcount or 0)
+    if recovered:
+        conn.commit()
+    return recovered
+
+
 def release_id() -> str:
     explicit = os.environ.get("RUNTIME_RELEASE_ID") or os.environ.get("PIPELINE_RELEASE_ID")
     if explicit:
