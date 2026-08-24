@@ -14,7 +14,9 @@ from scripts.postmatch_fixture_detail_delivery import (
     compare_snapshots,
     DERIVED_STAT_TYPE_IDS,
     ensure_ledger,
+    is_non_competitive_provider_assessment,
     source_ready,
+    stable_provider_sparse_assessment,
     TRACKED_TEAM_STAT_TYPES,
 )
 from jxd.sync import _extract_stat_value
@@ -85,6 +87,27 @@ def test_provider_assessment_rejects_lineups_without_player_identity() -> None:
     assessment = assess_provider_payload(payload)
     assert assessment.status == "provider_pending"
     assert assessment.error == "provider lineup/player identity detail incomplete for team ids 101"
+
+
+def test_stable_incomplete_player_identity_becomes_provider_sparse() -> None:
+    payload = provider_payload()
+    payload["lineups"][0]["player_id"] = None
+    assessment = assess_provider_payload(payload)
+    assert stable_provider_sparse_assessment(assessment, 1) is None
+    terminal = stable_provider_sparse_assessment(assessment, 2)
+    assert terminal is not None
+    assert terminal.status == "provider_sparse"
+    assert "identical finished payloads" in (terminal.error or "")
+
+
+def test_only_explicit_non_competitive_provider_status_is_excluded() -> None:
+    abandoned = provider_payload()
+    abandoned["state"] = {"short_name": "ABAN"}
+    assert is_non_competitive_provider_assessment(assess_provider_payload(abandoned))
+
+    in_progress = provider_payload()
+    in_progress["state"] = {"short_name": "1ST"}
+    assert not is_non_competitive_provider_assessment(assess_provider_payload(in_progress))
 
 
 def test_provider_revision_hash_is_stable_for_collection_order() -> None:

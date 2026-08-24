@@ -23,7 +23,7 @@ import os
 import sqlite3
 import subprocess
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
@@ -40,6 +40,7 @@ LOG = logging.getLogger("postmatch_fixture_detail_delivery")
 UTC = timezone.utc
 SOURCE_DB = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
 FINISHED_STATUSES = {"FT", "AET", "PEN", "FT_PEN", "FINISHED", "ENDED"}
+NON_COMPETITIVE_STATUSES = {"ABAN", "ABANDONED", "CANCELLED", "CANCELED", "POSTPONED"}
 
 # These are the provider-backed metrics consumed by the Team Stats surface.
 # They describe metric coverage, not fixture validity. SportMonks legitimately
@@ -769,10 +770,17 @@ def mark_provider_unavailable(
     fixture_id: int,
     attempt: int,
     error: str,
+    exclusion_reason: str | None = None,
+    evidence: dict[str, Any] | None = None,
+    assessment: ProviderAssessment | None = None,
     target_conn: Any | None = None,
 ) -> str:
     """Quarantine a provider-absent target while retaining a scheduled review."""
     review_at = iso(utc_now() + timedelta(days=DEFAULT_PROVIDER_UNAVAILABLE_REVIEW_DAYS))
+    resolved_reason = exclusion_reason or "SportMonks returned no fixture data for a completed target ID"
+    resolved_evidence = {"attempt": attempt, "error": error[:4000]}
+    if evidence:
+        resolved_evidence.update(evidence)
     meta = conn.execute(
         "select league_id, season_id from fixtures where id = ?",
         (fixture_id,),
@@ -826,9 +834,9 @@ def mark_provider_unavailable(
                     fixture_id,
                     int(meta[0]) if meta and meta[0] is not None else None,
                     int(meta[1]) if meta and meta[1] is not None else None,
-                    "SportMonks returned no fixture data for a completed target ID",
+                    resolved_reason,
                     review_at,
-                    json.dumps({"attempt": attempt, "error": error[:4000]}),
+                    json.dumps(resolved_evidence),
                 ),
             )
         target.commit()
@@ -843,7 +851,8 @@ def mark_provider_unavailable(
         fixture_id,
         "excluded",
         attempt,
-        error=f"{error}; quarantined until {review_at}",
+        assessment=assessment,
+        error=f"{resolved_reason}; {error}; quarantined until {review_at}",
         next_attempt_at=review_at,
     )
     publish_delivery_status(target_url, conn, fixture_id, target_conn=target_conn)
@@ -1260,6 +1269,52 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
     )
 
 
+def stable_provider_sparse_assessment(
+    assessment: ProviderAssessment,
+    stable_fetch_count: int,
+) -> ProviderAssessment | None:
+    """Terminally classify a stable, structurally usable provider gap.
+
+    SportMonks sometimes returns a finished fixture with team statistics,
+    lineups, and player details, but omits identity/details for a subset of
+    lineup rows.  That is provider-sparse data, not an ingestion failure. Two
+    identical provider payloads are required before accepting the sparse
+    revision so a temporary post-match response cannot shrink the serving
+    facts.
+    """
+    if (
+        assessment.status != "provider_pending"
+        or not assessment.finished
+        or assessment.fixture_status not in FINISHED_STATUSES
+        or assessment.team_stat_count <= 0
+        or assessment.player_stat_count <= 0
+        or assessment.lineup_count <= 0
+        or stable_fetch_count < 2
+        or not (assessment.error or "").startswith(
+            "provider lineup/player identity detail incomplete"
+        )
+        or any(count <= 0 for count in assessment.lineup_counts.values())
+        or any(count <= 0 for count in assessment.player_stat_counts.values())
+    ):
+        return None
+    return replace(
+        assessment,
+        status="provider_sparse",
+        error=(
+            f"{assessment.error}; provider-sparse classification confirmed "
+            f"after {stable_fetch_count} identical finished payloads"
+        ),
+    )
+
+
+def is_non_competitive_provider_assessment(assessment: ProviderAssessment) -> bool:
+    """Return true only for explicit provider statuses that cannot be played."""
+    return (
+        assessment.status == "provider_pending"
+        and assessment.fixture_status in NON_COMPETITIVE_STATUSES
+    )
+
+
 def _numeric(value: object) -> int | float | None:
     if value is None:
         return None
@@ -1583,6 +1638,7 @@ def main() -> int:
         "provider_sparse": [],
         "provider_pending": [],
         "provider_unavailable": [],
+        "excluded": [],
         "failed": [],
         "status_sync_failures": [],
         "sla_breaches": [],
@@ -1677,6 +1733,31 @@ def main() -> int:
                 normalized_hash,
             )
             stable_fetch_count = prior_stable_count + 1 if prior_normalized_hash == normalized_hash else 1
+            if is_non_competitive_provider_assessment(assessment):
+                reason = (
+                    f"SportMonks marks fixture status {assessment.fixture_status}; "
+                    "fixture is excluded from stats as non-competitive"
+                )
+                review_at = mark_provider_unavailable(
+                    target_url,
+                    conn,
+                    fixture_id,
+                    attempt,
+                    reason,
+                    exclusion_reason=reason,
+                    evidence={"provider_status": assessment.fixture_status, "assessment": asdict(assessment)},
+                    assessment=assessment,
+                )
+                report["excluded"].append({"fixture_id": fixture_id, "next_review_at": review_at, "reason": reason})
+                try:
+                    report["projection_rows"] += refresh_player_projection(target_url, fixture_id)
+                except Exception as projection_exc:
+                    report["projection_failures"].append({"fixture_id": fixture_id, "error": str(projection_exc)[-4000:]})
+                    report["failed"].append({"fixture_id": fixture_id, "stage": "projection", "error": str(projection_exc)[-4000:]})
+                continue
+            terminal_sparse = stable_provider_sparse_assessment(assessment, stable_fetch_count)
+            if terminal_sparse is not None:
+                assessment = terminal_sparse
             if assessment.status == "provider_pending":
                 now = utc_now()
                 next_at = backoff_time(attempt, now)

@@ -20,6 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,8 @@ from scripts.postmatch_fixture_detail_delivery import (
     revalidation_time,
     source_connection,
     source_snapshot,
+    is_non_competitive_provider_assessment,
+    stable_provider_sparse_assessment,
     store_provider_detail,
     target_fixture_metadata,
     target_snapshot,
@@ -376,6 +379,7 @@ def main() -> int:
         "fixtures_accepted": 0,
         "provider_pending": [],
         "provider_unavailable": [],
+        "excluded": [],
         "provider_sparse": [],
         "failed": [],
         "projection_rows": {},
@@ -480,6 +484,7 @@ def main() -> int:
             report["provider_http_calls"] += http_calls
 
             accepted: list[dict[str, Any]] = []
+            excluded_seasons: set[tuple[int, int]] = set()
             for fixture_id in fixture_ids:
                 context = contexts[fixture_id]
                 meta = context["meta"]
@@ -516,6 +521,29 @@ def main() -> int:
                         target_conn=shared_target_connection(),
                     )
                     stable_count = prior_stable + 1 if prior_hash == normalized_hash else 1
+                    if is_non_competitive_provider_assessment(assessment):
+                        reason = (
+                            f"SportMonks marks fixture status {assessment.fixture_status}; "
+                            "fixture is excluded from stats as non-competitive"
+                        )
+                        review_at = mark_provider_unavailable(
+                            target_url,
+                            conn,
+                            fixture_id,
+                            attempt,
+                            reason,
+                            exclusion_reason=reason,
+                            evidence={"provider_status": assessment.fixture_status, "assessment": asdict(assessment)},
+                            assessment=assessment,
+                            target_conn=shared_target_connection(),
+                        )
+                        if meta:
+                            excluded_seasons.add((int(meta[0]), int(meta[1])))
+                        report["excluded"].append({"fixture_id": fixture_id, "next_review_at": review_at, "reason": reason})
+                        continue
+                    terminal_sparse = stable_provider_sparse_assessment(assessment, stable_count)
+                    if terminal_sparse is not None:
+                        assessment = terminal_sparse
                     if assessment.status == "provider_pending":
                         next_at = backoff_time(attempt, datetime.now(timezone.utc))
                         update_ledger(conn, fixture_id, assessment.status, attempt, assessment, error=assessment.error, next_attempt_at=next_at, payload_hash=payload_hash, normalized_hash=normalized_hash, stable_fetch_count=stable_count)
@@ -569,6 +597,13 @@ def main() -> int:
                     update_ledger(conn, fixture_id, "failed", attempt, error=message, next_attempt_at=backoff_time(attempt, datetime.now(timezone.utc)))
                     publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                     report["failed"].append({"fixture_id": fixture_id, "stage": "fetch_or_store", "error": message})
+
+            if excluded_seasons:
+                stage_started = time.perf_counter()
+                refreshed = refresh_seasons(target_url, excluded_seasons, target_conn=shared_target_connection())
+                report["stage_seconds"]["excluded_projection_refresh"] = round(time.perf_counter() - stage_started, 3)
+                for key, count in refreshed.items():
+                    report["projection_rows"][key] = report["projection_rows"].get(key, 0) + count
 
             if not accepted:
                 continue
