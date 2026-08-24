@@ -541,7 +541,7 @@ def candidate_target_fixture_ids(
             case when d.accepted_snapshot_id is null then 0 else 1 end,
             case
               when d.status = 'provider_pending'
-               and d.last_error like 'Legacy provider_pending record%'
+               and d.last_error like 'Legacy provider_pending record%%'
               then 0
               when d.status = 'provider_pending'
                and nullif(btrim(d.last_error), '') is null
