@@ -96,6 +96,11 @@ Path B is enforced:
 - P3: SportMonks refresh + fetch + ingest + retention + best-effort recent fixture-core refresh/export
 - Post-match settlement: every 15 minutes, refresh fixture cores and run the bounded full-detail delivery worker for recently started fixtures. The worker retries provider-pending fixtures and verifies source-to-Supabase parity before marking them delivered. P3 deliberately uses `--fixture-core-only` so it cannot delete or overwrite fixture-player/statistics detail while the detail pipeline is reconciling it.
 
+P3 is an odds/core-data job, not the stats-detail cadence. If the Odds API is
+in standby because its credential is unavailable, P3 may remain on the VPS's
+low-frequency standby schedule; live stats detail is still driven by settlement
+every 15 minutes and the historical reconciliation safety net every 5 minutes.
+
 ### Conservative production schedule for Supabase Micro
 
 Use this schedule while the production Supabase project is on Micro compute or while `odds_outcomes` / `fixture_player_statistics` have high dead-row counts. It prioritizes site stability over near-real-time odds freshness.
