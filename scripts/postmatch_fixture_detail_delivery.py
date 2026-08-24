@@ -360,8 +360,12 @@ def candidate_target_fixture_ids(
           from public.fixtures f
           left join public.fixture_detail_delivery_status d on d.fixture_id = f.id
          where {' and '.join(clauses)}
-         order by f.starting_at asc, f.id asc
-         limit %s
+        -- Resolve legacy/pending rows and customer-visible recent fixtures
+        -- before walking the oldest historical backlog. The cursor remains
+        -- resumable because every selected row is still governed by the
+        -- delivery/revalidation predicates above.
+        order by (d.fixture_id is not null) desc, f.starting_at desc, f.id desc
+        limit %s
     """
     params.append(max(int(limit), 0))
     with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
