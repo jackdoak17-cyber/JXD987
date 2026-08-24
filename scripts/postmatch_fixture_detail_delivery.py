@@ -521,7 +521,12 @@ def candidate_target_fixture_ids(
         new_candidates = fetch_candidates(
             target_conn,
             "d.fixture_id is null",
-            "f.starting_at desc, f.id desc",
+            # Keep one bounded batch within a small number of league-season
+            # cohorts. Projection refresh is keyed by this pair; clustering
+            # the queue avoids rebuilding 15-20 unrelated read models for a
+            # 50-fixture batch while the fair lane still advances every
+            # supported competition over time.
+            "f.season_id desc, f.league_id, f.starting_at asc, f.id asc",
         )
         retry_candidates = fetch_candidates(
             target_conn,
@@ -549,8 +554,10 @@ def candidate_target_fixture_ids(
               else 1
             end,
             coalesce(d.next_attempt_at, d.next_revalidation_at, d.updated_at, f.starting_at),
-            f.starting_at desc,
-            f.id desc
+            f.season_id desc,
+            f.league_id,
+            f.starting_at asc,
+            f.id asc
             """,
         )
 
