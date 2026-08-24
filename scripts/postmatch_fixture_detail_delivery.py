@@ -327,6 +327,47 @@ def candidate_fixture_ids(
     return selected
 
 
+def candidate_target_fixture_ids(
+    target_url: str,
+    league_ids: Sequence[int],
+    limit: int,
+    force: bool = False,
+    season_ids: Sequence[int] | None = None,
+) -> list[int]:
+    """Select completed target fixtures missing or due for provider detail."""
+    clauses = [
+        "f.home_score is not null",
+        "f.away_score is not null",
+    ]
+    params: list[object] = []
+    if league_ids:
+        clauses.append("f.league_id = any(%s)")
+        params.append(list(league_ids))
+    if season_ids:
+        clauses.append("f.season_id = any(%s)")
+        params.append(list(season_ids))
+    if not force:
+        clauses.append(
+            "(d.fixture_id is null or d.accepted_snapshot_id is null "
+            "or d.status in ('new','running','provider_pending','failed','export_failed','verification_failed','projection_failed') "
+            "or (d.next_revalidation_at is not null and d.next_revalidation_at <= now()) "
+            "or (d.status = 'verified' and d.next_revalidation_at is null))"
+        )
+    query = f"""
+        select f.id
+          from public.fixtures f
+          left join public.fixture_detail_delivery_status d on d.fixture_id = f.id
+         where {' and '.join(clauses)}
+         order by f.starting_at asc, f.id asc
+         limit %s
+    """
+    params.append(max(int(limit), 0))
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            cur.execute(query, params)
+            return [int(row[0]) for row in cur.fetchall()]
+
+
 def ledger_attempt_start(conn: sqlite3.Connection, fixture_id: int, now: datetime) -> int:
     timestamp = iso(now)
     conn.execute(
@@ -1026,10 +1067,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--leagues", default=None)
     parser.add_argument("--fixture-ids", default=None, help="Explicit fixture IDs for repair/certification.")
+    parser.add_argument(
+        "--season-ids",
+        default=None,
+        help="Restrict target-queue selection to comma-separated season IDs.",
+    )
     parser.add_argument("--hours-back", type=int, default=int(os.environ.get("POSTMATCH_DETAIL_HOURS_BACK", str(DEFAULT_HOURS_BACK))))
     parser.add_argument("--limit", type=int, default=int(os.environ.get("POSTMATCH_DETAIL_LIMIT", str(DEFAULT_LIMIT))))
     parser.add_argument("--grace-minutes", type=int, default=int(os.environ.get("POSTMATCH_DETAIL_GRACE_MINUTES", str(DEFAULT_GRACE_MINUTES))))
     parser.add_argument("--force", action="store_true", help="Reprocess fixtures even when the ledger says verified.")
+    parser.add_argument(
+        "--target-queue",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("POSTMATCH_DETAIL_TARGET_QUEUE", "1").lower() not in {"0", "false", "no"},
+        help="Select missing/due completed fixtures from the serving database as well as the source queue.",
+    )
     parser.add_argument("--no-fail-on-sla-breach", action="store_true")
     parser.add_argument("--report-json", default=None)
     return parser
@@ -1056,7 +1108,17 @@ def main() -> int:
 
     conn = source_connection()
     ensure_ledger(conn)
-    fixture_ids = explicit_ids or candidate_fixture_ids(conn, leagues, args.hours_back, args.limit, args.force)
+    target_url = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
+    if not target_url:
+        raise SystemExit("SUPABASE_DB_URL_SESSION or SUPABASE_DB_URL is required for delivery verification")
+    season_ids = parse_csv_ints(args.season_ids)
+    if explicit_ids:
+        fixture_ids = explicit_ids
+    else:
+        selected = candidate_fixture_ids(conn, leagues, args.hours_back, args.limit, args.force)
+        if args.target_queue:
+            selected.extend(candidate_target_fixture_ids(target_url, leagues, args.limit, args.force, season_ids or None))
+        fixture_ids = list(dict.fromkeys(selected))[: max(args.limit, 0)]
     report: dict[str, Any] = {
         "release_id": release_id(),
         "leagues": leagues,
@@ -1086,9 +1148,6 @@ def main() -> int:
     source_path = str(Path(SOURCE_DB).resolve())
     engine = create_engine(f"sqlite:///{source_path}", future=True)
     client = SportMonksClient()
-    target_url = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
-    if not target_url:
-        raise SystemExit("SUPABASE_DB_URL_SESSION or SUPABASE_DB_URL is required for delivery verification")
     export_report_path = "/tmp/postmatch_fixture_detail_export_report.json"
 
     for fixture_id in fixture_ids:

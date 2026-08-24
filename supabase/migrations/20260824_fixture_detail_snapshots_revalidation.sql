@@ -24,6 +24,8 @@ create index if not exists fixture_detail_snapshots_fixture_idx
   on public.fixture_detail_snapshots (fixture_id, fetched_at desc);
 create index if not exists fixture_detail_snapshots_quality_idx
   on public.fixture_detail_snapshots (quality_status, accepted_at);
+create index if not exists fixture_detail_delivery_revalidation_idx
+  on public.fixture_detail_delivery_status (next_revalidation_at, status);
 
 alter table public.fixture_detail_snapshots enable row level security;
 revoke all on table public.fixture_detail_snapshots from public, anon, authenticated;
