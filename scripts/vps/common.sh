@@ -235,6 +235,10 @@ record_pipeline_job_run() {
       evidence="${evidence}; report: ${evidence_payload}"
     fi
   fi
+  # operations.pipeline_job_runs.evidence_summary is intentionally bounded so
+  # a verbose JSON report can never make an otherwise completed run fail while
+  # recording its heartbeat.
+  evidence="${evidence:0:500}"
 
   if ! psql "${OPERATIONS_CHECK_RUNNER_DATABASE_URL}" \
     -v ON_ERROR_STOP=1 \

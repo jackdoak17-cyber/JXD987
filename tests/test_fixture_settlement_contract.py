@@ -29,7 +29,7 @@ class FixtureSettlementContractTests(unittest.TestCase):
         result = subprocess.run(["bash", "-n", str(wrapper)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         source = wrapper.read_text(encoding="utf-8")
-        self.assertIn("fixture-settlement.lock", source)
+        self.assertIn("odds-sync.lock", source)
         self.assertIn("refresh_fixture_delivery.py", source)
 
     def test_supported_league_helper_excludes_cups(self) -> None:

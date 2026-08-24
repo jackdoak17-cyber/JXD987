@@ -37,7 +37,9 @@ export POSTMATCH_DETAIL_HOURS_BACK="${POSTMATCH_DETAIL_HOURS_BACK:-72}"
 export POSTMATCH_DETAIL_LIMIT="${POSTMATCH_DETAIL_LIMIT:-25}"
 export POSTMATCH_DETAIL_GRACE_MINUTES="${POSTMATCH_DETAIL_GRACE_MINUTES:-60}"
 export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_fixture_detail_delivery_report.json}"
-export FIXTURE_SETTLEMENT_LOCK_FILE="${FIXTURE_SETTLEMENT_LOCK_FILE:-/var/lock/fixture-settlement.lock}"
+# This chain shares the SQLite spool with P1/P2/P3, models, and historical
+# reconciliation. Use the single canonical pipeline lock for every writer.
+export FIXTURE_SETTLEMENT_LOCK_FILE="${FIXTURE_SETTLEMENT_LOCK_FILE:-/var/lock/odds-sync.lock}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail

@@ -58,7 +58,10 @@ LOG = logging.getLogger("reconcile_stats_provider_queue")
 
 def acquire_process_lock() -> int | None:
     """Prevent concurrent workers from writing the shared SQLite spool."""
-    path = os.environ.get("STATS_RECONCILE_LOCK_PATH", "/var/lock/odds-stats-reconcile.lock")
+    # All production writers use the same lock because they share the SQLite
+    # spool. Keep an override for isolated/manual runs, but make the
+    # production default identical to the VPS wrappers.
+    path = os.environ.get("STATS_RECONCILE_LOCK_PATH", "/var/lock/odds-sync.lock")
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
