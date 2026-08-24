@@ -47,6 +47,10 @@ FINISHED_STATUSES = {"FT", "AET", "PEN", "FT_PEN", "FINISHED", "ENDED"}
 # recorded and are intentionally not delivery gates.
 REQUIRED_TEAM_STAT_TYPES = {42, 45, 56, 57, 78, 86, 100, 109, 581}
 PROVIDER_SPARSE_TEAM_STAT_TYPES = {581}
+TRACKED_PLAYER_STAT_TYPES = {
+    42, 52, 56, 57, 78, 79, 83, 84, 85, 86, 88, 96, 97, 100, 101,
+    109, 117, 118, 27267, 580, 9706,
+}
 
 LEDGER_TABLE = "fixture_detail_deliveries"
 TARGET_STATUS_TABLE = "fixture_detail_delivery_status"
@@ -63,6 +67,8 @@ class ProviderAssessment:
     finished: bool
     team_stat_types: dict[str, list[int]]
     missing_required_type_ids: dict[str, list[int]]
+    player_stat_types: dict[str, list[int]]
+    missing_player_stat_type_ids: dict[str, list[int]]
     lineup_counts: dict[str, int]
     player_stat_counts: dict[str, int]
     team_stat_count: int
@@ -158,6 +164,8 @@ def ensure_ledger(conn: sqlite3.Connection) -> None:
           provider_lineup_count integer not null default 0,
           provider_team_stat_types text,
           provider_missing_type_ids text,
+          provider_player_stat_types text,
+          provider_missing_player_type_ids text,
           source_snapshot text,
           target_snapshot text,
           last_error text,
@@ -166,6 +174,13 @@ def ensure_ledger(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    existing_columns = {
+        row[1]
+        for row in conn.execute(f"pragma table_info({LEDGER_TABLE})").fetchall()
+    }
+    for column in ("provider_player_stat_types", "provider_missing_player_type_ids"):
+        if column not in existing_columns:
+            conn.execute(f"alter table {LEDGER_TABLE} add column {column} text")
     conn.commit()
 
 
@@ -290,6 +305,8 @@ def update_ledger(
                provider_lineup_count = ?,
                provider_team_stat_types = ?,
                provider_missing_type_ids = ?,
+               provider_player_stat_types = ?,
+               provider_missing_player_type_ids = ?,
                source_snapshot = ?,
                target_snapshot = ?,
                last_error = ?,
@@ -310,6 +327,8 @@ def update_ledger(
             provider.lineup_count if provider else 0,
             json_text(provider.team_stat_types) if provider else None,
             json_text(provider.missing_required_type_ids) if provider else None,
+            json_text(provider.player_stat_types) if provider else None,
+            json_text(provider.missing_player_stat_type_ids) if provider else None,
             json_text(asdict(source)) if source else None,
             json_text(asdict(target)) if target else None,
             (error or (provider.error if provider else None) or "")[:4000] or None,
@@ -351,6 +370,7 @@ def publish_delivery_status(
                d.provider_finished, d.provider_team_stat_count,
                d.provider_player_stat_count, d.provider_lineup_count,
                d.provider_team_stat_types, d.provider_missing_type_ids,
+               d.provider_player_stat_types, d.provider_missing_player_type_ids,
                d.source_snapshot, d.target_snapshot, d.last_error,
                d.release_id, d.updated_at
           from {LEDGER_TABLE} d
@@ -379,6 +399,8 @@ def publish_delivery_status(
         int(row["provider_lineup_count"] or 0),
         _json_value(row["provider_team_stat_types"]),
         _json_value(row["provider_missing_type_ids"]),
+        _json_value(row["provider_player_stat_types"]),
+        _json_value(row["provider_missing_player_type_ids"]),
         _json_value(row["source_snapshot"]),
         _json_value(row["target_snapshot"]),
         row["last_error"],
@@ -395,13 +417,14 @@ def publish_delivery_status(
                   last_successful_at, provider_status, provider_finished,
                   provider_team_stat_count, provider_player_stat_count,
                   provider_lineup_count, provider_team_stat_types,
-                  provider_missing_type_ids, source_snapshot, target_snapshot,
+                  provider_missing_type_ids, provider_player_stat_types,
+                  provider_missing_player_type_ids, source_snapshot, target_snapshot,
                   last_error, release_id, updated_at
                 ) values (
                   %s, %s, %s, %s, %s,
                   %s::timestamptz, %s::timestamptz, %s::timestamptz,
                   %s::timestamptz, %s, %s,
-                  %s, %s, %s, %s, %s, %s, %s,
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s,
                   %s, %s, %s::timestamptz
                 )
                 on conflict (fixture_id) do update set
@@ -420,6 +443,8 @@ def publish_delivery_status(
                   provider_lineup_count = excluded.provider_lineup_count,
                   provider_team_stat_types = excluded.provider_team_stat_types,
                   provider_missing_type_ids = excluded.provider_missing_type_ids,
+                  provider_player_stat_types = excluded.provider_player_stat_types,
+                  provider_missing_player_type_ids = excluded.provider_missing_player_type_ids,
                   source_snapshot = excluded.source_snapshot,
                   target_snapshot = excluded.target_snapshot,
                   last_error = excluded.last_error,
@@ -435,6 +460,18 @@ def _int(value: object) -> int | None:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def refresh_player_projection(target_url: str, fixture_id: int) -> int:
+    """Refresh all affected player-season rows after verified fixture export."""
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            cur.execute(
+                "select public.refresh_player_stats_for_fixture(%s)",
+                (fixture_id,),
+            )
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
 
 
 def _provider_status(data: dict[str, Any]) -> str | None:
@@ -490,6 +527,7 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
 
     lineup_counts: dict[int, int] = {team_id: 0 for team_id in teams}
     player_stat_counts: dict[int, int] = {team_id: 0 for team_id in teams}
+    player_types: dict[int, set[int]] = {team_id: set() for team_id in teams}
     lineup_count = 0
     player_stat_count = 0
     for lineup in lineups_list:
@@ -506,12 +544,18 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
             type_id = _int(detail.get("type_id") or (detail.get("type") or {}).get("id"))
             if type_id:
                 player_stat_counts[team_id] = player_stat_counts.get(team_id, 0) + 1
+                player_types.setdefault(team_id, set()).add(type_id)
                 player_stat_count += 1
 
     type_output = {str(team_id): sorted(types) for team_id, types in team_types.items()}
     missing: dict[str, list[int]] = {}
     for team_id in teams:
         missing[str(team_id)] = sorted(REQUIRED_TEAM_STAT_TYPES.difference(team_types.get(team_id, set())))
+    player_type_output = {str(team_id): sorted(types) for team_id, types in player_types.items()}
+    missing_player_types = {
+        str(team_id): sorted(TRACKED_PLAYER_STAT_TYPES.difference(player_types.get(team_id, set())))
+        for team_id in teams
+    }
 
     if not finished or len(teams) < 2:
         assessment_status = "provider_pending"
@@ -534,6 +578,8 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
         finished=finished,
         team_stat_types=type_output,
         missing_required_type_ids=missing,
+        player_stat_types=player_type_output,
+        missing_player_stat_type_ids=missing_player_types,
         lineup_counts={str(team_id): count for team_id, count in lineup_counts.items()},
         player_stat_counts={str(team_id): count for team_id, count in player_stat_counts.items()},
         team_stat_count=team_stat_count,
@@ -834,6 +880,8 @@ def main() -> int:
         "status_sync_failures": [],
         "sla_breaches": [],
         "provider_calls": 0,
+        "projection_rows": 0,
+        "projection_failures": [],
     }
     if not fixture_ids:
         report["status"] = "idle"
@@ -911,6 +959,25 @@ def main() -> int:
                 message = "; ".join(problems)
                 update_ledger(conn, fixture_id, "verification_failed", attempt, assessment, source=source, target=target, error=message, next_attempt_at=backoff_time(attempt, utc_now()))
                 report["failed"].append({"fixture_id": fixture_id, "stage": "verification", "error": message})
+                continue
+
+            try:
+                report["projection_rows"] += refresh_player_projection(target_url, fixture_id)
+            except Exception as projection_exc:
+                message = str(projection_exc)[-4000:]
+                update_ledger(
+                    conn,
+                    fixture_id,
+                    "projection_failed",
+                    attempt,
+                    assessment,
+                    source=source,
+                    target=target,
+                    error=message,
+                    next_attempt_at=backoff_time(attempt, utc_now()),
+                )
+                report["projection_failures"].append({"fixture_id": fixture_id, "error": message})
+                report["failed"].append({"fixture_id": fixture_id, "stage": "projection", "error": message})
                 continue
 
             final_status = "provider_sparse" if assessment.status == "provider_sparse" else "verified"
