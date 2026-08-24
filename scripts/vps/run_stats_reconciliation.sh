@@ -22,10 +22,10 @@ export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(supported_league_cs
 # Keep each historical lock hold below the live settlement cadence, then leave
 # a real handoff window for the scheduled writers. Operators can raise these
 # values for an isolated maintenance window, but the production defaults are
-# deliberately live-safe. A 100-fixture batch is bounded to two provider bulk
-# requests and one export/projection pass; measured batches remain below the
-# 420-second live-safe lease while reducing historical drain time materially.
-export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-100}"
+# deliberately live-safe. The provider fetch is bulked, while the batch size
+# stays at 50 because projection time is data-dependent and must fit the
+# bounded 420-second lease in the worst case.
+export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-50}"
 # Retry delay after a live writer owns the lock. The scheduler gate below
 # decides whether a new batch may begin; this delay is not the handoff policy.
 export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-60}"
