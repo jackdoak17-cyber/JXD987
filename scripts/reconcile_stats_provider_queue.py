@@ -45,6 +45,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     source_connection,
     source_snapshot,
     store_provider_detail,
+    target_fixture_metadata,
     target_snapshot,
     ledger_attempt_start,
     update_ledger,
@@ -180,20 +181,37 @@ def main() -> int:
             )
             if not fixture_ids:
                 break
+            target_metadata = target_fixture_metadata(target_url, fixture_ids)
             report["batches"] += 1
             report["fixtures_selected"] += len(fixture_ids)
             LOG.info("Processing stats reconciliation batch %s: %s fixtures", report["batches"], len(fixture_ids))
 
             accepted: list[dict[str, Any]] = []
             for fixture_id in fixture_ids:
-                prior = conn.execute(
-                    "select provider_player_stat_count,last_normalized_hash,stable_fetch_count from fixture_detail_deliveries where fixture_id = ?",
+                source_meta_row = conn.execute(
+                    "select league_id,season_id,starting_at from fixtures where id=?",
                     (fixture_id,),
                 ).fetchone()
-                prior_count = int(prior[0] or 0) if prior else 0
-                prior_hash = str(prior[1]) if prior and prior[1] else None
-                prior_stable = int(prior[2] or 0) if prior else 0
-                attempt = ledger_attempt_start(conn, fixture_id, datetime.now(timezone.utc))
+                target_meta = target_metadata.get(fixture_id)
+                meta = source_meta_row or (target_meta[:3] if target_meta else None)
+                prior = conn.execute(
+                    "select provider_team_stat_count,provider_player_stat_count,last_normalized_hash,stable_fetch_count from fixture_detail_deliveries where fixture_id = ?",
+                    (fixture_id,),
+                ).fetchone()
+                prior_team_count = int(prior[0] or 0) if prior else 0
+                prior_player_count = int(prior[1] or 0) if prior else 0
+                prior_hash = str(prior[2]) if prior and prior[2] else None
+                prior_stable = int(prior[3] or 0) if prior else 0
+                if target_meta:
+                    prior_team_count = max(prior_team_count, target_meta[3])
+                    prior_player_count = max(prior_player_count, target_meta[4])
+                attempt = ledger_attempt_start(
+                    conn,
+                    fixture_id,
+                    datetime.now(timezone.utc),
+                    int(meta[0]) if meta and meta[0] is not None else None,
+                    int(meta[1]) if meta and meta[1] is not None else None,
+                )
                 try:
                     payload = client.request(
                         "GET",
@@ -215,17 +233,6 @@ def main() -> int:
                     assessment = assess_provider_payload(data)
                     payload_hash = provider_payload_hash(data)
                     normalized_hash = normalized_provider_hash(data)
-                    meta = conn.execute("select league_id,season_id,starting_at from fixtures where id=?", (fixture_id,)).fetchone()
-                    if not meta:
-                        # Historical fixtures may exist in the serving store
-                        # before the SQLite spool has ever seen them.
-                        with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
-                            with target_conn.cursor() as target_cur:
-                                target_cur.execute(
-                                    "select league_id,season_id,starting_at from public.fixtures where id=%s",
-                                    (fixture_id,),
-                                )
-                                meta = target_cur.fetchone()
                     snapshot_id = persist_provider_snapshot(
                         target_url,
                         fixture_id,
@@ -243,9 +250,18 @@ def main() -> int:
                         publish_delivery_status(target_url, conn, fixture_id)
                         report["provider_pending"].append({"fixture_id": fixture_id, "reason": assessment.error})
                         continue
-                    if not args.force and assessment.status == "ready" and prior_count > 0 and assessment.player_stat_count < prior_count and prior_hash != normalized_hash:
+                    candidate_shrank = (
+                        (prior_team_count > 0 and assessment.team_stat_count < prior_team_count)
+                        or (prior_player_count > 0 and assessment.player_stat_count < prior_player_count)
+                    )
+                    if not args.force and candidate_shrank and prior_hash != normalized_hash and stable_count < 2:
                         next_at = backoff_time(attempt, datetime.now(timezone.utc))
-                        message = f"provider player-detail collection shrank from {prior_count} to {assessment.player_stat_count}; awaiting confirmation"
+                        message = (
+                            "provider detail collection shrank "
+                            f"(team_stats {prior_team_count}->{assessment.team_stat_count}, "
+                            f"player_stats {prior_player_count}->{assessment.player_stat_count}); "
+                            "awaiting one identical confirmation fetch"
+                        )
                         update_ledger(conn, fixture_id, "provider_pending", attempt, assessment, error=message, next_attempt_at=next_at, payload_hash=payload_hash, normalized_hash=normalized_hash, stable_fetch_count=stable_count)
                         publish_delivery_status(target_url, conn, fixture_id)
                         report["provider_pending"].append({"fixture_id": fixture_id, "reason": message})
