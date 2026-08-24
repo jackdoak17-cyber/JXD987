@@ -96,6 +96,11 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("Publish the manifest last", source)
         self.assertIn("scripts/vps/runtime_manifest.sha1", source)
 
+    def test_heartbeat_report_truncation_cannot_abort_under_pipefail(self) -> None:
+        source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")
+        self.assertIn('pathlib.Path(sys.argv[1]).read_text', source)
+        self.assertNotIn("tr '\\n' ' ' < \"${evidence_file}\" | head -c", source)
+
 
 if __name__ == "__main__":
     unittest.main()

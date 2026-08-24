@@ -230,7 +230,17 @@ record_pipeline_job_run() {
   evidence="exit status: ${status_code}; completion status: ${run_status}"
   evidence_file="${PIPELINE_EVIDENCE_FILE:-}"
   if [[ -n "${evidence_file}" && -f "${evidence_file}" ]]; then
-    evidence_payload="$(tr '\n' ' ' < "${evidence_file}" | head -c 3500)"
+    # Do not use a truncating pipeline here. With pipefail enabled, `tr | head`
+    # can return 141 when the report is large, aborting the wrapper before it
+    # records the completion heartbeat. Read and truncate in one process.
+    evidence_payload="$(python3 - "${evidence_file}" <<'PY'
+import pathlib
+import sys
+
+payload = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+sys.stdout.write(payload.replace("\n", " ")[:3500])
+PY
+)"
     if [[ -n "${evidence_payload}" ]]; then
       evidence="${evidence}; report: ${evidence_payload}"
     fi
