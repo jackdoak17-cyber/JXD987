@@ -32,6 +32,14 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("odds-sync.lock", source)
         self.assertIn("refresh_fixture_delivery.py", source)
 
+    def test_p3_rolling_refresh_cannot_overwrite_fixture_detail(self) -> None:
+        wrapper = ROOT / "scripts/vps/run_p3.sh"
+        result = subprocess.run(["bash", "-n", str(wrapper)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source = wrapper.read_text(encoding="utf-8")
+        self.assertIn("--fixture-core-only", source)
+        self.assertNotIn("--with-details", source)
+
     def test_supported_league_helper_excludes_cups(self) -> None:
         excluded = set(json.loads((ROOT / "config/odds_api_sync_excluded_leagues.json").read_text()))
         result = subprocess.run(
