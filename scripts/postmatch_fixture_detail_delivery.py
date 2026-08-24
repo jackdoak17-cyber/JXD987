@@ -68,6 +68,13 @@ DERIVED_STAT_TYPE_IDS = frozenset({200001, 200010, 200011, 200012, 200013})
 
 LEDGER_TABLE = "fixture_detail_deliveries"
 TARGET_STATUS_TABLE = "fixture_detail_delivery_status"
+LEGACY_PENDING_REASON = (
+    "Legacy provider_pending record had no durable classification reason; "
+    "provider revalidation required"
+)
+HANDOFF_REQUEUE_REASON = (
+    "Controlled reconciliation worker handoff recovered; provider revalidation required"
+)
 DEFAULT_HOURS_BACK = 72
 DEFAULT_LIMIT = 25
 DEFAULT_GRACE_MINUTES = 60
@@ -313,6 +320,75 @@ def recover_stale_running(
     return recovered
 
 
+def repair_legacy_ledger(
+    conn: sqlite3.Connection,
+    now: datetime | None = None,
+) -> dict[str, list[int]]:
+    """Make pre-ledger classifications explicit and safely retryable.
+
+    Older workers could leave provider-pending rows without a reason, and the
+    bounded reconciliation handoff used to record controlled interruptions as
+    ``failed``.  Neither state describes a provider failure.  Repair them at
+    worker startup so the queue is self-healing, auditable, and cannot expose
+    an opaque pending row indefinitely.  No provider or serving data is
+    accepted by this migration; every repaired fixture still goes through the
+    normal fetch, snapshot, comparison, and activation gates.
+    """
+    current_text = iso(now or utc_now())
+    legacy_rows = [
+        int(row[0])
+        for row in conn.execute(
+            f"""
+            select fixture_id
+              from {LEDGER_TABLE}
+             where status = 'provider_pending'
+               and (last_error is null or trim(last_error) = '')
+            """
+        ).fetchall()
+    ]
+    handoff_rows = [
+        int(row[0])
+        for row in conn.execute(
+            f"""
+            select fixture_id
+              from {LEDGER_TABLE}
+             where status = 'failed'
+               and last_error = 'Controlled reconciliation worker handoff; fixture requeued'
+            """
+        ).fetchall()
+    ]
+    if legacy_rows:
+        conn.execute(
+            f"""
+            update {LEDGER_TABLE}
+               set last_error = ?,
+                   next_attempt_at = ?,
+                   release_id = ?,
+                   updated_at = ?
+             where status = 'provider_pending'
+               and (last_error is null or trim(last_error) = '')
+            """,
+            (LEGACY_PENDING_REASON, current_text, release_id(), current_text),
+        )
+    if handoff_rows:
+        conn.execute(
+            f"""
+            update {LEDGER_TABLE}
+               set status = 'provider_pending',
+                   next_attempt_at = ?,
+                   last_error = ?,
+                   release_id = ?,
+                   updated_at = ?
+             where status = 'failed'
+               and last_error = 'Controlled reconciliation worker handoff; fixture requeued'
+            """,
+            (current_text, HANDOFF_REQUEUE_REASON, release_id(), current_text),
+        )
+    if legacy_rows or handoff_rows:
+        conn.commit()
+    return {"legacy_pending": legacy_rows, "handoff_failed": handoff_rows}
+
+
 def release_id() -> str:
     explicit = os.environ.get("RUNTIME_RELEASE_ID") or os.environ.get("PIPELINE_RELEASE_ID")
     if explicit:
@@ -464,6 +540,9 @@ def candidate_target_fixture_ids(
             """
             case when d.accepted_snapshot_id is null then 0 else 1 end,
             case
+              when d.status = 'provider_pending'
+               and d.last_error like 'Legacy provider_pending record%'
+              then 0
               when d.status = 'provider_pending'
                and nullif(btrim(d.last_error), '') is null
               then 0

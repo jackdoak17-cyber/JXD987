@@ -54,6 +54,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     mark_provider_unavailable,
     clear_provider_unavailable_exclusion,
     recover_stale_running,
+    repair_legacy_ledger,
 )
 
 
@@ -307,6 +308,18 @@ def main() -> int:
     recovered_running = recover_stale_running(conn)
     if recovered_running:
         LOG.warning("Requeued %s stale running delivery rows after a prior worker handoff", recovered_running)
+    repaired_ledger = repair_legacy_ledger(conn)
+    repaired_ids = [
+        *repaired_ledger["legacy_pending"],
+        *repaired_ledger["handoff_failed"],
+    ]
+    if repaired_ids:
+        LOG.warning(
+            "Repaired %s legacy provider classifications (%s opaque pending, %s handoff failures)",
+            len(repaired_ids),
+            len(repaired_ledger["legacy_pending"]),
+            len(repaired_ledger["handoff_failed"]),
+        )
     source_path = str(Path(os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")).resolve())
     engine = create_engine(f"sqlite:///{source_path}", future=True)
     # This client is retained for the sequential source-store path.  Provider
@@ -339,6 +352,13 @@ def main() -> int:
         if target_conn is None or target_conn.closed:
             target_conn = psycopg2.connect(target_url, connect_timeout=20)
         return target_conn
+
+    # Mirror the self-healing ledger transition immediately.  This uses one
+    # target connection for the whole repair so the serving contract and the
+    # authoritative source ledger cannot diverge merely because a worker
+    # restarted before selecting the repaired fixture.
+    for fixture_id in repaired_ids:
+        publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
 
     try:
         while True:

@@ -4,7 +4,14 @@ import sqlite3
 from datetime import datetime, timezone
 
 from scripts import reconcile_stats_provider_queue as queue
-from scripts.postmatch_fixture_detail_delivery import ensure_ledger, recover_stale_running, target_candidate_quotas
+from scripts.postmatch_fixture_detail_delivery import (
+    HANDOFF_REQUEUE_REASON,
+    LEGACY_PENDING_REASON,
+    ensure_ledger,
+    recover_stale_running,
+    repair_legacy_ledger,
+    target_candidate_quotas,
+)
 
 
 class FakeSportMonksClient:
@@ -57,6 +64,38 @@ def test_stale_running_rows_are_requeued_with_a_reason() -> None:
     assert stale[1] == "2026-08-24T18:00:00Z"
     assert "requeued" in stale[2]
     assert fresh[0] == "running"
+
+
+def test_legacy_provider_pending_rows_are_repaired_and_due() -> None:
+    conn = sqlite3.connect(":memory:")
+    ensure_ledger(conn)
+    now = datetime(2026, 8, 24, 18, 0, tzinfo=timezone.utc)
+    conn.execute(
+        "insert into fixture_detail_deliveries(fixture_id,status,first_seen_at,updated_at) "
+        "values (1,'provider_pending',?,?)",
+        ("2026-08-24T17:00:00Z", "2026-08-24T17:00:00Z"),
+    )
+    conn.execute(
+        "insert into fixture_detail_deliveries(fixture_id,status,first_seen_at,last_error,updated_at) "
+        "values (2,'failed',?,?,?)",
+        (
+            "2026-08-24T17:00:00Z",
+            "Controlled reconciliation worker handoff; fixture requeued",
+            "2026-08-24T17:00:00Z",
+        ),
+    )
+    conn.commit()
+
+    repaired = repair_legacy_ledger(conn, now=now)
+
+    assert repaired == {"legacy_pending": [1], "handoff_failed": [2]}
+    rows = conn.execute(
+        "select fixture_id,status,next_attempt_at,last_error from fixture_detail_deliveries order by fixture_id"
+    ).fetchall()
+    assert rows == [
+        (1, "provider_pending", "2026-08-24T18:00:00Z", LEGACY_PENDING_REASON),
+        (2, "provider_pending", "2026-08-24T18:00:00Z", HANDOFF_REQUEUE_REASON),
+    ]
 
 
 def test_bulk_fetch_preserves_each_fixture_and_reports_one_http_call(monkeypatch) -> None:
