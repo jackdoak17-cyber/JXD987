@@ -349,7 +349,9 @@ def candidate_target_fixture_ids(
     if not force:
         clauses.append(
             "(d.fixture_id is null "
-            "or (d.accepted_snapshot_id is null and (d.next_attempt_at is null or d.next_attempt_at <= now())) "
+            "or (d.accepted_snapshot_id is null and ("
+            "d.status in ('verified', 'provider_sparse') "
+            "or d.next_attempt_at is null or d.next_attempt_at <= now())) "
             "or (d.next_revalidation_at is not null and d.next_revalidation_at <= now()) "
             "or (d.status = 'verified' and d.next_revalidation_at is null))"
         )
