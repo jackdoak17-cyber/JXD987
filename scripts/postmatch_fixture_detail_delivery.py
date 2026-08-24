@@ -430,6 +430,12 @@ def candidate_target_fixture_ids(
             """,
             """
             case when d.accepted_snapshot_id is null then 0 else 1 end,
+            case
+              when d.status = 'provider_pending'
+               and nullif(btrim(d.last_error), '') is null
+              then 0
+              else 1
+            end,
             coalesce(d.next_attempt_at, d.next_revalidation_at, d.updated_at, f.starting_at),
             f.starting_at desc,
             f.id desc
