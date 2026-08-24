@@ -12,6 +12,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     assess_provider_payload,
     candidate_fixture_ids,
     compare_snapshots,
+    DERIVED_STAT_TYPE_IDS,
     ensure_ledger,
     source_ready,
     TRACKED_TEAM_STAT_TYPES,
@@ -44,6 +45,10 @@ def test_provider_assessment_distinguishes_ready_sparse_and_pending() -> None:
     pending = provider_payload()
     pending["state"] = {"short_name": "NS"}
     assert assess_provider_payload(pending).status == "provider_pending"
+
+
+def test_derived_stat_types_are_excluded_from_provider_shrink_counts() -> None:
+    assert DERIVED_STAT_TYPE_IDS == {200001, 200010, 200011, 200012, 200013}
 
 
 def test_provider_assessment_accepts_valid_fixture_with_optional_metric_gaps() -> None:

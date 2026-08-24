@@ -59,6 +59,13 @@ TRACKED_PLAYER_STAT_TYPES = {
     109, 117, 118, 27267, 580, 9706,
 }
 
+# These rows are generated locally from provider-backed facts. They are part
+# of the serving read model and must be preserved, but they are not evidence
+# that SportMonks returned additional provider detail. Shrink protection must
+# compare provider-owned rows only, otherwise every revalidation sees these
+# derived rows as a false provider shrink.
+DERIVED_STAT_TYPE_IDS = frozenset({200001, 200010, 200011, 200012, 200013})
+
 LEDGER_TABLE = "fixture_detail_deliveries"
 TARGET_STATUS_TABLE = "fixture_detail_delivery_status"
 DEFAULT_HOURS_BACK = 72
@@ -480,14 +487,16 @@ def target_fixture_metadata(
                 select f.id, f.league_id, f.season_id, f.starting_at,
                        (select count(distinct (fs.team_id, fs.type_id))
                           from public.fixture_statistics fs
-                         where fs.fixture_id = f.id) as team_stat_count,
+                         where fs.fixture_id = f.id
+                           and fs.type_id <> all(%s)) as team_stat_count,
                        (select count(distinct (fps.player_id, fps.team_id, fps.type_id))
                           from public.fixture_player_statistics fps
-                         where fps.fixture_id = f.id) as player_stat_count
+                         where fps.fixture_id = f.id
+                           and fps.type_id <> all(%s)) as player_stat_count
                   from public.fixtures f
                  where f.id = any(%s)
                 """,
-                (ids,),
+                (list(DERIVED_STAT_TYPE_IDS), list(DERIVED_STAT_TYPE_IDS), ids),
             )
             return {
                 int(row[0]): (
