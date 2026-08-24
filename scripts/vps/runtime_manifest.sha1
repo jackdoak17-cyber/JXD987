@@ -19,7 +19,7 @@ b7ae861e9d9d3d6009d562da213ad892440f29cb  scripts/reconcile_recent_fixtures.py
 a1b2e580c78cc5cbc26705c9144fd6b4d2d2b05b  scripts/rest_preflight.py
 6795b7075659a7b45b2a7354e65a1f3f441d874f  scripts/sync_confirmed_lineups.py
 17f2cfe733ecd33826066d5292bece91c02831ee  scripts/sync_odds.py
-74f21c33beac378f45875ca1d70ca07635c86f1b  scripts/vps/common.sh
+88f1a24851a6a693c1ae39e50772d7922e8658c1  scripts/vps/common.sh
 aaf31d37d04da10279a562a2acfda4a74c387fc5  scripts/vps/run_p1.sh
 7e1353a52f73ddfa38b222eead01753c891fcd01  scripts/vps/run_p2.sh
 1dc9762f5ab12be2d642596991fc60d440f1b1f7  scripts/vps/run_p3.sh
