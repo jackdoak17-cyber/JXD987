@@ -70,30 +70,69 @@ DETAIL_INCLUDE = ";".join(
         "lineups.player",
     ]
 )
+MAX_BULK_FIXTURE_IDS = 50
 
 
-def fetch_provider_fixture(fixture_id: int) -> tuple[int, dict[str, Any] | None, Exception | None]:
-    """Fetch one fixture without sharing a requests client between threads.
+def fetch_provider_fixture_batch(
+    fixture_ids: list[int],
+) -> tuple[dict[int, dict[str, Any]], dict[int, Exception], int]:
+    """Fetch a bounded fixture batch using SportMonks' multi-ID endpoint.
 
-    Fetching is the only parallel part of reconciliation.  The caller still
-    performs all source-ledger writes, target snapshot writes, exports,
-    verification, and active-snapshot switches serially under the canonical
-    writer lock.  A fresh client per task also keeps its retry/stat counters
-    thread-local and avoids making the existing client stateful across workers.
+    The endpoint returns full fixture objects with the same nested statistics
+    and lineup includes as the single-fixture endpoint.  Missing IDs remain
+    per-fixture errors so the existing retry/unavailable policy is preserved.
+    The returned third value is the number of HTTP requests consumed (one).
     """
     try:
         client = SportMonksClient()
         payload = client.request(
             "GET",
-            f"fixtures/{fixture_id}",
+            f"fixtures/multi/{','.join(str(value) for value in fixture_ids)}",
             params={"include": DETAIL_INCLUDE},
         )
-        data = payload.get("data") if isinstance(payload, dict) else None
-        if not isinstance(data, dict) or not data:
-            return fixture_id, None, RuntimeError("SportMonks returned no fixture data")
-        return fixture_id, data, None
+        raw_data = payload.get("data") if isinstance(payload, dict) else None
+        rows = raw_data if isinstance(raw_data, list) else [raw_data] if isinstance(raw_data, dict) else []
+        fetched = {
+            int(row["id"]): row
+            for row in rows
+            if isinstance(row, dict) and row.get("id") is not None and int(row["id"]) in fixture_ids
+        }
+        errors = {
+            fixture_id: RuntimeError("SportMonks multi-fixture response omitted requested fixture")
+            for fixture_id in fixture_ids
+            if fixture_id not in fetched
+        }
+        return fetched, errors, 1
     except Exception as exc:  # classified by the existing attempt/error policy
-        return fixture_id, None, exc
+        return {}, {fixture_id: exc for fixture_id in fixture_ids}, 1
+
+
+def fetch_provider_fixtures(
+    fixture_ids: list[int],
+    fetch_concurrency: int,
+    bulk_size: int,
+) -> tuple[dict[int, dict[str, Any]], dict[int, Exception], int]:
+    """Fetch all requested fixtures in bounded multi-ID HTTP batches.
+
+    Only independent HTTP requests may run concurrently.  All persistence and
+    verification remains in the caller's serial writer section.
+    """
+    chunks = [fixture_ids[index : index + bulk_size] for index in range(0, len(fixture_ids), bulk_size)]
+    fetched: dict[int, dict[str, Any]] = {}
+    errors: dict[int, Exception] = {}
+    http_calls = 0
+    with ThreadPoolExecutor(max_workers=min(fetch_concurrency, len(chunks))) as executor:
+        futures = {executor.submit(fetch_provider_fixture_batch, chunk): chunk for chunk in chunks}
+        for future in as_completed(futures):
+            chunk = futures[future]
+            try:
+                batch_fetched, batch_errors, calls = future.result()
+            except Exception as exc:  # defensive: worker function classifies normal errors
+                batch_fetched, batch_errors, calls = {}, {fixture_id: exc for fixture_id in chunk}, 1
+            fetched.update(batch_fetched)
+            errors.update(batch_errors)
+            http_calls += calls
+    return fetched, errors, http_calls
 
 
 def acquire_process_lock() -> int | None:
@@ -172,6 +211,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="bounded concurrent SportMonks fetches (default: STATS_RECONCILE_FETCH_CONCURRENCY or 4)",
     )
+    parser.add_argument(
+        "--bulk-size",
+        type=int,
+        default=None,
+        help="fixture IDs per SportMonks multi-fixture request (default: STATS_RECONCILE_BULK_SIZE or 50)",
+    )
     parser.add_argument("--max-batches", type=int, default=0, help="0 means drain the queue.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--report-json", default="/tmp/reconcile_stats_provider_queue.json")
@@ -193,6 +238,10 @@ def main() -> int:
     if configured_fetch_concurrency is None:
         configured_fetch_concurrency = int(os.environ.get("STATS_RECONCILE_FETCH_CONCURRENCY", "4"))
     fetch_concurrency = max(1, min(configured_fetch_concurrency, 8))
+    configured_bulk_size = args.bulk_size
+    if configured_bulk_size is None:
+        configured_bulk_size = int(os.environ.get("STATS_RECONCILE_BULK_SIZE", str(MAX_BULK_FIXTURE_IDS)))
+    bulk_size = max(1, min(configured_bulk_size, MAX_BULK_FIXTURE_IDS))
 
     target_url = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
     if not target_url:
@@ -219,7 +268,10 @@ def main() -> int:
         "failed": [],
         "projection_rows": {},
         "provider_calls": 0,
+        "provider_fixture_attempts": 0,
+        "provider_http_calls": 0,
         "fetch_concurrency": fetch_concurrency,
+        "bulk_size": bulk_size,
     }
 
     try:
@@ -278,20 +330,14 @@ def main() -> int:
                     "prior_stable": prior_stable,
                 }
 
-            fetched: dict[int, dict[str, Any]] = {}
-            fetch_errors: dict[int, Exception] = {}
-            with ThreadPoolExecutor(max_workers=min(fetch_concurrency, len(fixture_ids))) as executor:
-                futures = {
-                    executor.submit(fetch_provider_fixture, fixture_id): fixture_id
-                    for fixture_id in fixture_ids
-                }
-                for future in as_completed(futures):
-                    fixture_id, data, error = future.result()
-                    if error is not None:
-                        fetch_errors[fixture_id] = error
-                    elif data is not None:
-                        fetched[fixture_id] = data
+            fetched, fetch_errors, http_calls = fetch_provider_fixtures(
+                fixture_ids,
+                fetch_concurrency,
+                bulk_size,
+            )
             report["provider_calls"] += len(fixture_ids)
+            report["provider_fixture_attempts"] += len(fixture_ids)
+            report["provider_http_calls"] += http_calls
 
             accepted: list[dict[str, Any]] = []
             for fixture_id in fixture_ids:
