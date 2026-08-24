@@ -58,6 +58,13 @@ LOG = logging.getLogger("reconcile_stats_provider_queue")
 
 def acquire_process_lock() -> int | None:
     """Prevent concurrent workers from writing the shared SQLite spool."""
+    # The VPS supervisor acquires the canonical lock around this worker so it
+    # can enforce a bounded lease and hand the lock back to settlement before
+    # the next tick. The inherited descriptor remains open in this process;
+    # do not acquire a second flock on the same path.
+    if os.environ.get("STATS_RECONCILE_LOCK_HELD") == "1":
+        LOG.info("Using canonical SQLite spool lock held by the VPS supervisor")
+        return 0
     # All production writers use the same lock because they share the SQLite
     # spool. Keep an override for isolated/manual runs, but make the
     # production default identical to the VPS wrappers.

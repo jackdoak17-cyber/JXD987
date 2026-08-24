@@ -22,11 +22,16 @@ export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(default_league_csv)
 # a real handoff window for the scheduled writers. Operators can raise these
 # values for an isolated maintenance window, but the production defaults are
 # deliberately live-safe.
-export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-50}"
+export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-20}"
 # Retry delay after a live writer owns the lock. The scheduler gate below
 # decides whether a new batch may begin; this delay is not the handoff policy.
 export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-60}"
 export STATS_RECONCILE_LIVE_TICK_SECONDS="${STATS_RECONCILE_LIVE_TICK_SECONDS:-900}"
+# The live settlement normally owns the spool for several minutes after the
+# quarter-hour tick. Do not race that work; begin historical reconciliation
+# after this guard and let the canonical lease cap the run before the next
+# tick.
+export STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS="${STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS:-420}"
 export STATS_RECONCILE_LIVE_GRACE_SECONDS="${STATS_RECONCILE_LIVE_GRACE_SECONDS:-60}"
 export STATS_RECONCILE_MAX_HOLD_SECONDS="${STATS_RECONCILE_MAX_HOLD_SECONDS:-600}"
 export STATS_RECONCILE_REPORT="${STATS_RECONCILE_REPORT:-/tmp/stats_reconcile_provider_batch.json}"
@@ -40,22 +45,43 @@ if ! flock --nonblock 9; then
   exit 0
 fi
 
+# Let the canonical wrapper own the shared spool lock. This gives the
+# provider worker the same deadline-aware lease as every other normal writer;
+# Python inherits descriptor 9 and therefore must not flock the path twice.
+export STATS_RECONCILE_LOCK_HELD=1
+export ODDS_SYNC_JOB_PRIORITY=normal
+export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${STATS_RECONCILE_MAX_HOLD_SECONDS}"
+export ODDS_SYNC_LIVE_TICK_SECONDS="${STATS_RECONCILE_LIVE_TICK_SECONDS}"
+export ODDS_SYNC_LIVE_GRACE_SECONDS="${STATS_RECONCILE_LIVE_GRACE_SECONDS}"
+
+RECONCILIATION_COMMAND=$(cat <<'CHAIN'
+exec "${REPO_ROOT}/.venv/bin/python" \
+  "${REPO_ROOT}/scripts/reconcile_stats_provider_queue.py" \
+  --leagues "${STATS_RECONCILE_LEAGUES}" \
+  --batch-size "${STATS_RECONCILE_BATCH_SIZE}" \
+  --max-batches 1 \
+  --report-json "${STATS_RECONCILE_REPORT}" \
+  >"${STATS_RECONCILE_RUN_LOG}" 2>&1
+CHAIN
+)
+
 wait_for_live_window() {
-  local now phase delay tick hold grace
+  local now phase delay tick guard grace
   tick="${STATS_RECONCILE_LIVE_TICK_SECONDS}"
-  hold="${STATS_RECONCILE_MAX_HOLD_SECONDS}"
+  guard="${STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS}"
   grace="${STATS_RECONCILE_LIVE_GRACE_SECONDS}"
   now="$(date -u +%s)"
   phase=$((now % tick))
   delay=0
 
-  # Do not start immediately before the quarter-hour settlement tick. Start
-  # only after the tick plus a grace period, leaving the live writer the first
-  # opportunity to acquire the canonical lock.
-  if (( phase < grace )); then
-    delay=$((grace - phase))
-  elif (( phase > tick - hold )); then
-    delay=$((tick - phase + grace))
+  # Do not start while the live settlement is expected to own the spool. Start
+  # only after the measured post-tick guard, and stop starting new batches once
+  # there is not enough time to hand the bounded lease back before the next
+  # tick. The canonical wrapper also caps an already-running lease.
+  if (( phase < guard )); then
+    delay=$((guard - phase))
+  elif (( phase >= tick - grace )); then
+    delay=$((tick - phase + guard))
   fi
 
   if (( delay > 0 )); then
@@ -68,14 +94,7 @@ while true; do
   wait_for_live_window
   rm -f "${STATS_RECONCILE_REPORT}" "${STATS_RECONCILE_RUN_LOG}"
   set +e
-  timeout --signal=TERM --kill-after=5s "${STATS_RECONCILE_MAX_HOLD_SECONDS}" \
-    "${REPO_ROOT}/.venv/bin/python" \
-    "${REPO_ROOT}/scripts/reconcile_stats_provider_queue.py" \
-    --leagues "${STATS_RECONCILE_LEAGUES}" \
-    --batch-size "${STATS_RECONCILE_BATCH_SIZE}" \
-    --max-batches 1 \
-    --report-json "${STATS_RECONCILE_REPORT}" \
-    >"${STATS_RECONCILE_RUN_LOG}" 2>&1
+  run_with_global_lock_and_timeout "${RECONCILIATION_COMMAND}"
   status=$?
   set -e
 
@@ -108,4 +127,17 @@ PY
   fi
 
   tail -n 8 "${STATS_RECONCILE_RUN_LOG}" || true
+
+  # One successful batch per live cycle keeps the provider backfill resumable
+  # and leaves the next settlement tick deterministic, even if a batch ends
+  # much faster than its maximum lease.
+  now="$(date -u +%s)"
+  phase=$((now % STATS_RECONCILE_LIVE_TICK_SECONDS))
+  if (( phase < STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS )); then
+    delay=$((STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS - phase))
+  else
+    delay=$((STATS_RECONCILE_LIVE_TICK_SECONDS - phase + STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS))
+  fi
+  log_info "waiting ${delay}s for the next live-safe reconciliation batch"
+  sleep "${delay}" 9>&-
 done
