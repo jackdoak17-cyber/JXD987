@@ -74,6 +74,35 @@ DETAIL_INCLUDE = ";".join(
     ]
 )
 MAX_BULK_FIXTURE_IDS = 50
+DEFAULT_MAX_COHORTS = 8
+
+
+def cohort_limited_fixture_ids(
+    fixture_ids: list[int],
+    target_metadata: dict[int, tuple[int | None, int | None, str | None, int, int]],
+    max_cohorts: int,
+) -> list[int]:
+    """Keep a batch within a bounded number of projection cohorts.
+
+    Candidate ordering already clusters fixtures by league/season. This
+    defensive cap keeps a larger throughput batch from accidentally turning
+    into a projection fan-out if the target queue later contains a different
+    mix. Unknown target metadata is left untouched so a metadata defect cannot
+    silently change queue fairness.
+    """
+    if max_cohorts <= 0 or not fixture_ids:
+        return fixture_ids
+    if any(fixture_id not in target_metadata for fixture_id in fixture_ids):
+        return fixture_ids
+
+    seen: set[tuple[int | None, int | None]] = set()
+    for index, fixture_id in enumerate(fixture_ids):
+        meta = target_metadata[fixture_id]
+        cohort = (meta[0], meta[1])
+        if cohort not in seen and len(seen) >= max_cohorts:
+            return fixture_ids[:index]
+        seen.add(cohort)
+    return fixture_ids
 
 
 def fetch_provider_fixture(fixture_id: int) -> tuple[dict[str, Any] | None, Exception | None, int]:
@@ -262,6 +291,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--season-ids", default=None)
     parser.add_argument("--batch-size", type=int, default=25)
     parser.add_argument(
+        "--max-cohorts",
+        type=int,
+        default=None,
+        help=f"maximum league-season projection cohorts per batch (default: STATS_RECONCILE_MAX_COHORTS or {DEFAULT_MAX_COHORTS})",
+    )
+    parser.add_argument(
         "--fetch-concurrency",
         type=int,
         default=None,
@@ -298,6 +333,12 @@ def main() -> int:
     if configured_bulk_size is None:
         configured_bulk_size = int(os.environ.get("STATS_RECONCILE_BULK_SIZE", str(MAX_BULK_FIXTURE_IDS)))
     bulk_size = max(1, min(configured_bulk_size, MAX_BULK_FIXTURE_IDS))
+    configured_max_cohorts = args.max_cohorts
+    if configured_max_cohorts is None:
+        configured_max_cohorts = int(
+            os.environ.get("STATS_RECONCILE_MAX_COHORTS", str(DEFAULT_MAX_COHORTS))
+        )
+    max_cohorts = max(0, configured_max_cohorts)
 
     target_url = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
     if not target_url:
@@ -343,6 +384,7 @@ def main() -> int:
         "provider_http_calls": 0,
         "fetch_concurrency": fetch_concurrency,
         "bulk_size": bulk_size,
+        "max_cohorts": max_cohorts,
         "stage_seconds": {},
     }
     target_conn: Any | None = None
@@ -374,6 +416,16 @@ def main() -> int:
             if not fixture_ids:
                 break
             target_metadata = target_fixture_metadata(target_url, fixture_ids)
+            original_fixture_count = len(fixture_ids)
+            fixture_ids = cohort_limited_fixture_ids(fixture_ids, target_metadata, max_cohorts)
+            if len(fixture_ids) < original_fixture_count:
+                LOG.info(
+                    "Capped batch from %s to %s fixtures to stay within %s projection cohorts",
+                    original_fixture_count,
+                    len(fixture_ids),
+                    max_cohorts,
+                )
+                target_metadata = {fixture_id: target_metadata[fixture_id] for fixture_id in fixture_ids}
             report["batches"] += 1
             report["fixtures_selected"] += len(fixture_ids)
             LOG.info("Processing stats reconciliation batch %s: %s fixtures", report["batches"], len(fixture_ids))

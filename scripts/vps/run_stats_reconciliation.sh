@@ -22,10 +22,12 @@ export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(supported_league_cs
 # Keep each historical lock hold below the live settlement cadence, then leave
 # a real handoff window for the scheduled writers. Operators can raise these
 # values for an isolated maintenance window, but the production defaults are
-# deliberately live-safe. The provider fetch is bulked, while the batch size
-# stays at 50 because projection time is data-dependent and must fit the
-# bounded 420-second lease in the worst case.
-export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-50}"
+# deliberately live-safe. Provider fetch is bulked, and candidate ordering
+# plus the cohort cap keeps the larger batch within a bounded projection
+# fan-out. The global wrapper still refuses to start when the remaining lease
+# is too short.
+export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-100}"
+export STATS_RECONCILE_MAX_COHORTS="${STATS_RECONCILE_MAX_COHORTS:-8}"
 # Retry delay after a live writer owns the lock. The scheduler gate below
 # decides whether a new batch may begin; this delay is not the handoff policy.
 export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-60}"
@@ -67,6 +69,7 @@ exec "${REPO_ROOT}/.venv/bin/python" \
   "${REPO_ROOT}/scripts/reconcile_stats_provider_queue.py" \
   --leagues "${STATS_RECONCILE_LEAGUES}" \
   --batch-size "${STATS_RECONCILE_BATCH_SIZE}" \
+  --max-cohorts "${STATS_RECONCILE_MAX_COHORTS}" \
   --max-batches 1 \
   --report-json "${STATS_RECONCILE_REPORT}" \
   >"${STATS_RECONCILE_RUN_LOG}" 2>&1

@@ -37,6 +37,18 @@ def test_target_candidate_quotas_reserve_historical_progress() -> None:
     assert target_candidate_quotas(0) == (0, 0)
 
 
+def test_cohort_limit_preserves_clustered_prefix() -> None:
+    metadata = {
+        1: (8, 25583, None, 0, 0),
+        2: (8, 25583, None, 0, 0),
+        3: (387, 26164, None, 0, 0),
+        4: (648, 23265, None, 0, 0),
+    }
+
+    assert queue.cohort_limited_fixture_ids([1, 2, 3, 4], metadata, 2) == [1, 2, 3]
+    assert queue.cohort_limited_fixture_ids([1, 2, 3, 4], metadata, 0) == [1, 2, 3, 4]
+
+
 def test_stale_running_rows_are_requeued_with_a_reason() -> None:
     conn = sqlite3.connect(":memory:")
     ensure_ledger(conn)
