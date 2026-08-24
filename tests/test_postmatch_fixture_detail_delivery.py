@@ -58,11 +58,17 @@ def test_provider_assessment_accepts_valid_fixture_with_optional_metric_gaps() -
     assert assessment.missing_team_stat_type_ids["202"] == [78, 100, 109, 581]
 
 
-def test_provider_assessment_rejects_fixture_without_team_stat_rows_for_a_team() -> None:
+def test_provider_assessment_accepts_fixture_without_team_stat_rows() -> None:
     payload = provider_payload()
     payload["statistics"] = [
-        row for row in payload["statistics"] if row["participant_id"] == 101
+        row for row in payload["statistics"] if row["participant_id"] == 101 and row["type_id"] == 45
     ]
+    assert assess_provider_payload(payload).status == "provider_sparse"
+
+
+def test_provider_assessment_requires_detail_structure() -> None:
+    payload = provider_payload()
+    payload["lineups"] = []
     assert assess_provider_payload(payload).status == "provider_pending"
 
 

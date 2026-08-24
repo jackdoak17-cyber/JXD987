@@ -407,7 +407,7 @@ def excluded_target_fixture_ids(target_url: str, fixture_ids: Sequence[int]) -> 
 def target_fixture_metadata(
     target_url: str,
     fixture_ids: Sequence[int],
-) -> dict[int, tuple[int | None, int | None, str | None]]:
+) -> dict[int, tuple[int | None, int | None, str | None, int, int]]:
     """Load serving identity metadata for target-queue fixtures.
 
     Historical target rows can be absent from the SQLite spool. Keeping their
@@ -420,11 +420,27 @@ def target_fixture_metadata(
     with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
         with target_conn.cursor() as cur:
             cur.execute(
-                "select id, league_id, season_id, starting_at from public.fixtures where id = any(%s)",
+                """
+                select f.id, f.league_id, f.season_id, f.starting_at,
+                       (select count(distinct (fs.team_id, fs.type_id))
+                          from public.fixture_statistics fs
+                         where fs.fixture_id = f.id) as team_stat_count,
+                       (select count(distinct (fps.player_id, fps.team_id, fps.type_id))
+                          from public.fixture_player_statistics fps
+                         where fps.fixture_id = f.id) as player_stat_count
+                  from public.fixtures f
+                 where f.id = any(%s)
+                """,
                 (ids,),
             )
             return {
-                int(row[0]): (_int(row[1]), _int(row[2]), str(row[3]) if row[3] is not None else None)
+                int(row[0]): (
+                    _int(row[1]),
+                    _int(row[2]),
+                    str(row[3]) if row[3] is not None else None,
+                    int(row[4] or 0),
+                    int(row[5] or 0),
+                )
                 for row in cur.fetchall()
             }
 
@@ -945,11 +961,9 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
 
     if not finished or len(teams) < 2:
         assessment_status = "provider_pending"
-    elif not stats_list or not lineups_list or any(
+    elif not lineups_list or any(
         lineup_counts.get(team_id, 0) <= 0 or player_stat_counts.get(team_id, 0) <= 0 for team_id in teams
     ):
-        assessment_status = "provider_pending"
-    elif any(not team_types.get(team_id) for team_id in teams):
         assessment_status = "provider_pending"
     elif any(missing.get(str(team_id)) for team_id in teams):
         assessment_status = "provider_sparse"
@@ -1037,13 +1051,14 @@ def source_snapshot(conn: sqlite3.Connection, fixture_id: int) -> DetailSnapshot
 
 def source_ready(snapshot: DetailSnapshot, assessment: ProviderAssessment) -> bool:
     for team_id in assessment.team_stat_types:
-        types = set(snapshot.team_stat_types.get(team_id, []))
-        # The provider assessment has already recorded per-metric gaps. The
-        # delivery gate only requires that each provider team has at least one
-        # authoritative team-stat row; nullable metric gaps are intentional.
-        if not types:
-            return False
-        if not any(key.startswith(f"{team_id}:") for key in snapshot.team_stat_values):
+        # Team-stat rows are per-metric optional. A finished provider payload
+        # can legitimately contain no team-stat rows at all, in which case
+        # every tracked team metric remains NULL and is inventoried as sparse.
+        # Lineups and player details remain mandatory because this delivery
+        # pipeline also owns the player-stat read model.
+        if snapshot.team_stat_types.get(team_id) and not any(
+            key.startswith(f"{team_id}:") for key in snapshot.team_stat_values
+        ):
             return False
     if snapshot.lineup_count <= 0 or snapshot.player_stat_count <= 0:
         return False
@@ -1329,6 +1344,13 @@ def main() -> int:
         ).fetchone()
         prior_team_count = int(prior[0] or 0) if prior else 0
         prior_player_count = int(prior[1] or 0) if prior else 0
+        if target_meta:
+            # A target-only fixture may have active facts from an earlier
+            # pipeline even when its SQLite delivery ledger has no row. Use
+            # the serving counts in the shrink guard so a sparse response
+            # cannot delete richer facts on its first observation.
+            prior_team_count = max(prior_team_count, target_meta[3])
+            prior_player_count = max(prior_player_count, target_meta[4])
         prior_normalized_hash = str(prior[2]) if prior and prior[2] else None
         prior_stable_count = int(prior[3] or 0) if prior else 0
         attempt = ledger_attempt_start(conn, fixture_id, utc_now(), league_id, season_id)
