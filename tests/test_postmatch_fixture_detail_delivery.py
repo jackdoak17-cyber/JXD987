@@ -13,6 +13,8 @@ from scripts.postmatch_fixture_detail_delivery import (
     candidate_fixture_ids,
     compare_snapshots,
     ensure_ledger,
+    source_ready,
+    REQUIRED_TEAM_STAT_TYPES,
 )
 from jxd.sync import _extract_stat_value
 
@@ -58,6 +60,28 @@ def test_provider_revision_hash_is_stable_for_collection_order() -> None:
 def test_player_stat_parser_preserves_decimal_ratings() -> None:
     assert str(_extract_stat_value({"value": "7.85"})) == "7.85"
     assert _extract_stat_value({"value": "7"}) == 7
+
+
+def test_source_ready_requires_player_detail_for_each_team() -> None:
+    assessment = assess_provider_payload(provider_payload())
+    team_types = {str(team_id): sorted(REQUIRED_TEAM_STAT_TYPES) for team_id in (101, 202)}
+    team_values = {f"{team_id}:{type_id}": 1 for team_id in (101, 202) for type_id in REQUIRED_TEAM_STAT_TYPES}
+    incomplete = DetailSnapshot(
+        fixture_id=9001,
+        team_stat_count=len(team_values),
+        player_stat_count=1,
+        lineup_count=2,
+        team_stat_types=team_types,
+        team_stat_values=team_values,
+        player_stat_values={"11:101:119": 90},
+        lineup_values={"11:101": (True, 90), "22:202": (True, 90)},
+    )
+    assert not source_ready(incomplete, assessment)
+
+    complete = DetailSnapshot(
+        **{**incomplete.__dict__, "player_stat_count": 2, "player_stat_values": {"11:101:119": 90, "22:202:119": 90}}
+    )
+    assert source_ready(complete, assessment)
 
 
 def test_candidate_selection_is_due_and_does_not_require_local_scores() -> None:
