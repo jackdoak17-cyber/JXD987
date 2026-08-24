@@ -40,6 +40,7 @@ export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_fixture_
 # This chain shares the SQLite spool with P1/P2/P3, models, and historical
 # reconciliation. Use the single canonical pipeline lock for every writer.
 export FIXTURE_SETTLEMENT_LOCK_FILE="${FIXTURE_SETTLEMENT_LOCK_FILE:-/var/lock/odds-sync.lock}"
+export SETTLEMENT_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS:-300}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
@@ -81,6 +82,8 @@ status=0
 RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RUN_STARTED_EPOCH="$(date -u +"%s")"
 ODDS_SYNC_LOCK_FILE="${FIXTURE_SETTLEMENT_LOCK_FILE}" \
+ODDS_SYNC_JOB_PRIORITY="settlement" \
+ODDS_SYNC_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS}" \
 ODDS_SYNC_P3_MAX_DURATION_SECONDS="${SETTLEMENT_MAX_RUNTIME_SECONDS}" \
   run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
 RUN_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"

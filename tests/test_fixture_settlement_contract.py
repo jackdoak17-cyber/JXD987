@@ -31,6 +31,8 @@ class FixtureSettlementContractTests(unittest.TestCase):
         source = wrapper.read_text(encoding="utf-8")
         self.assertIn("odds-sync.lock", source)
         self.assertIn("refresh_fixture_delivery.py", source)
+        self.assertIn('ODDS_SYNC_JOB_PRIORITY="settlement"', source)
+        self.assertIn('ODDS_SYNC_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS}"', source)
 
     def test_p3_rolling_refresh_cannot_overwrite_fixture_detail(self) -> None:
         wrapper = ROOT / "scripts/vps/run_p3.sh"
@@ -68,6 +70,13 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("--max-batches 1", source)
         self.assertIn("STATS_RECONCILE_SUPERVISOR_LOCK", source)
         self.assertIn("wait_for_live_window", source)
+
+    def test_shared_lock_has_priority_aware_settlement_handoff(self) -> None:
+        source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")
+        self.assertIn("live settlement reservation active", source)
+        self.assertIn('job_priority="${ODDS_SYNC_JOB_PRIORITY:-normal}"', source)
+        self.assertIn('lock_wait_seconds="${ODDS_SYNC_LOCK_WAIT_SECONDS:-0}"', source)
+        self.assertIn("settlement lock unavailable after", source)
 
     def test_stats_reconciliation_cron_installer_is_shell_valid_and_idempotent(self) -> None:
         installer = ROOT / "scripts/vps/install_stats_reconciliation_cron.sh"

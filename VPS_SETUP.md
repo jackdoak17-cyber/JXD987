@@ -65,7 +65,8 @@ Lock/timeout behavior:
   `ODDS_SYNC_LOCK_FILE`, including odds ingestion, settlement, models, and
   stats reconciliation. Historical reconciliation runs one bounded batch at a
   time so live settlement can acquire the lock between batches.
-- Non-blocking lock (`flock --nonblock`) -> immediate skip on contention
+- Normal writers honor a three-minute pre-tick/two-minute post-tick settlement reservation and skip before taking the lock
+- Settlement has priority and waits up to `SETTLEMENT_LOCK_WAIT_SECONDS` (default 300s) for an already-running writer, so one transient lock owner cannot silently lose a stats tick
 - `timeout` enforces kill-on-overrun
 - **The full chain is wrapped as one subshell command**, so timeout covers every step (not only the first command)
 
@@ -120,7 +121,7 @@ Use this schedule while the production Supabase project is on Micro compute or w
 */5 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_stats_reconciliation.sh >> /var/log/stats-reconciliation-supervisor.log 2>&1
 
 # Betting picks publish (Models -> Supabase, optional R2 fallback).
-# Uses the Models lock and can run independently of fixture settlement.
+# Uses the canonical lock and honors the settlement reservation window.
 22 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_models.sh >> /var/log/models-publish.log 2>&1
 
 # Odds snapshots for ML enrichment (R2).

@@ -280,14 +280,42 @@ run_with_global_lock_and_timeout() {
   local chain_command="$1"
   local lock_file="${ODDS_SYNC_LOCK_FILE:-/var/lock/odds-sync.lock}"
   local max_runtime="${ODDS_SYNC_P3_MAX_DURATION_SECONDS:-900}"
+  local job_priority="${ODDS_SYNC_JOB_PRIORITY:-normal}"
+  local lock_wait_seconds="${ODDS_SYNC_LOCK_WAIT_SECONDS:-0}"
+  local lock_poll_seconds="${ODDS_SYNC_LOCK_POLL_SECONDS:-5}"
+  local live_tick_seconds="${ODDS_SYNC_LIVE_TICK_SECONDS:-900}"
+  local live_reserve_seconds="${ODDS_SYNC_LIVE_RESERVE_SECONDS:-180}"
+  local live_grace_seconds="${ODDS_SYNC_LIVE_GRACE_SECONDS:-120}"
 
   mkdir -p "$(dirname "${lock_file}")"
 
   (
-    flock --nonblock 9 || {
-      log_info "[SKIPPED] lock unavailable, will retry next tick"
+    # The quarter-hour settlement is the critical stats writer. Keep normal
+    # writers from starting shortly before/after its tick, while allowing the
+    # settlement writer to wait for a writer that was already in flight.
+    now_epoch="$(date -u +%s)"
+    live_phase=$((now_epoch % live_tick_seconds))
+    if [[ "${job_priority}" != "settlement" ]] && {
+      (( live_phase >= live_tick_seconds - live_reserve_seconds )) ||
+      (( live_phase < live_grace_seconds ));
+    }; then
+      log_info "[SKIPPED] live settlement reservation active (phase=${live_phase}s)"
       exit 2
-    }
+    fi
+
+    wait_started="$(date -u +%s)"
+    while ! flock --nonblock 9; do
+      if [[ "${job_priority}" != "settlement" ]]; then
+        log_info "[SKIPPED] lock unavailable, will retry next tick"
+        exit 2
+      fi
+      waited=$(( $(date -u +%s) - wait_started ))
+      if (( waited >= lock_wait_seconds )); then
+        log_info "[SKIPPED] settlement lock unavailable after ${waited}s; will retry next tick"
+        exit 2
+      fi
+      sleep "${lock_poll_seconds}" 9>&-
+    done
 
     # The full chain must execute as one subshell so timeout covers every step.
     timeout "${max_runtime}" bash -lc "${chain_command}"
