@@ -69,7 +69,9 @@ def test_provider_assessment_accepts_fixture_without_team_stat_rows() -> None:
 def test_provider_assessment_requires_detail_structure() -> None:
     payload = provider_payload()
     payload["lineups"] = []
-    assert assess_provider_payload(payload).status == "provider_pending"
+    assessment = assess_provider_payload(payload)
+    assert assessment.status == "provider_pending"
+    assert assessment.error == "provider lineup/player detail incomplete for team ids 101,202"
 
 
 def test_provider_revision_hash_is_stable_for_collection_order() -> None:
