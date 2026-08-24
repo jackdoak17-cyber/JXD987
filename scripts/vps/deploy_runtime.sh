@@ -29,6 +29,10 @@ required_runtime_entries=(
   "scripts/vps/run_stats_reconciliation.sh"
 )
 for required_entry in "${required_runtime_entries[@]}"; do
+  if [[ ! -f "${REPO_ROOT}/${required_entry}" ]]; then
+    echo "Runtime source missing required production entry: ${required_entry}" >&2
+    exit 1
+  fi
   if ! grep -Fqx -- "${required_entry}" < <(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "${RUNTIME_FILE_LIST}"); then
     echo "Runtime file list missing required production entry: ${required_entry}" >&2
     exit 1
