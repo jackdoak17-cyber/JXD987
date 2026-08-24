@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from scripts import reconcile_stats_provider_queue as queue
+from scripts.postmatch_fixture_detail_delivery import target_candidate_quotas
 
 
 class FakeSportMonksClient:
@@ -18,6 +19,12 @@ class FakeSportMonksClient:
         returned = self.responses.get(endpoint, ids)
         rows = [{"id": fixture_id, "statistics": [], "lineups": []} for fixture_id in returned]
         return {"data": rows if "/multi/" in endpoint else rows[0]}
+
+
+def test_target_candidate_quotas_reserve_historical_progress() -> None:
+    assert target_candidate_quotas(50) == (40, 10)
+    assert target_candidate_quotas(1) == (1, 0)
+    assert target_candidate_quotas(0) == (0, 0)
 
 
 def test_bulk_fetch_preserves_each_fixture_and_reports_one_http_call(monkeypatch) -> None:

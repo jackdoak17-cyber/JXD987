@@ -19,6 +19,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -227,18 +228,29 @@ def export_batch(fixture_ids: list[int], leagues: list[int], report_path: str) -
     return subprocess.run(command, text=True, capture_output=True, check=False)
 
 
-def refresh_seasons(target_url: str, seasons: set[tuple[int, int]]) -> dict[str, int]:
+def refresh_seasons(
+    target_url: str,
+    seasons: set[tuple[int, int]],
+    target_conn: Any | None = None,
+) -> dict[str, int]:
     rows: dict[str, int] = {}
-    import psycopg2
-
-    with psycopg2.connect(target_url, connect_timeout=20) as conn:
-        with conn.cursor() as cur:
+    owns_target_conn = target_conn is None
+    target = target_conn or psycopg2.connect(target_url, connect_timeout=20)
+    try:
+        with target.cursor() as cur:
             for league_id, season_id in sorted(seasons):
                 cur.execute(
                     "select public.refresh_player_stats_season(%s, %s, null)",
                     (league_id, season_id),
                 )
                 rows[f"{league_id}:{season_id}"] = int(cur.fetchone()[0] or 0)
+        target.commit()
+    except Exception:
+        target.rollback()
+        raise
+    finally:
+        if owns_target_conn:
+            target.close()
     return rows
 
 
@@ -314,7 +326,15 @@ def main() -> int:
         "provider_http_calls": 0,
         "fetch_concurrency": fetch_concurrency,
         "bulk_size": bulk_size,
+        "stage_seconds": {},
     }
+    target_conn: Any | None = None
+
+    def shared_target_connection() -> Any:
+        nonlocal target_conn
+        if target_conn is None or target_conn.closed:
+            target_conn = psycopg2.connect(target_url, connect_timeout=20)
+        return target_conn
 
     try:
         while True:
@@ -372,11 +392,13 @@ def main() -> int:
                     "prior_stable": prior_stable,
                 }
 
+            stage_started = time.perf_counter()
             fetched, fetch_errors, http_calls = fetch_provider_fixtures(
                 fixture_ids,
                 fetch_concurrency,
                 bulk_size,
             )
+            report["stage_seconds"]["provider_fetch"] = round(time.perf_counter() - stage_started, 3)
             report["provider_calls"] += len(fixture_ids)
             report["provider_fixture_attempts"] += len(fixture_ids)
             report["provider_http_calls"] += http_calls
@@ -415,12 +437,13 @@ def main() -> int:
                         assessment,
                         payload_hash,
                         normalized_hash,
+                        target_conn=shared_target_connection(),
                     )
                     stable_count = prior_stable + 1 if prior_hash == normalized_hash else 1
                     if assessment.status == "provider_pending":
                         next_at = backoff_time(attempt, datetime.now(timezone.utc))
                         update_ledger(conn, fixture_id, assessment.status, attempt, assessment, error=assessment.error, next_attempt_at=next_at, payload_hash=payload_hash, normalized_hash=normalized_hash, stable_fetch_count=stable_count)
-                        publish_delivery_status(target_url, conn, fixture_id)
+                        publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                         report["provider_pending"].append({"fixture_id": fixture_id, "reason": assessment.error})
                         continue
                     candidate_shrank = (
@@ -436,77 +459,102 @@ def main() -> int:
                             "awaiting one identical confirmation fetch"
                         )
                         update_ledger(conn, fixture_id, "provider_pending", attempt, assessment, error=message, next_attempt_at=next_at, payload_hash=payload_hash, normalized_hash=normalized_hash, stable_fetch_count=stable_count)
-                        publish_delivery_status(target_url, conn, fixture_id)
+                        publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                         report["provider_pending"].append({"fixture_id": fixture_id, "reason": message})
                         continue
                     source = store_provider_detail(engine, client, fixture_id, data, assessment)
-                    clear_provider_unavailable_exclusion(target_url, fixture_id)
+                    clear_provider_unavailable_exclusion(
+                        target_url,
+                        fixture_id,
+                        target_conn=shared_target_connection(),
+                    )
                     if not meta:
                         meta = conn.execute("select league_id,season_id,starting_at from fixtures where id=?", (fixture_id,)).fetchone()
                     accepted.append({"fixture_id": fixture_id, "assessment": assessment, "source": source, "snapshot_id": snapshot_id, "payload_hash": payload_hash, "normalized_hash": normalized_hash, "stable_count": stable_count, "meta": meta})
                 except ProviderFixtureUnavailableError as exc:
                     message = str(exc)[-4000:]
-                    review_at = mark_provider_unavailable(target_url, conn, fixture_id, attempt, message)
+                    review_at = mark_provider_unavailable(
+                        target_url,
+                        conn,
+                        fixture_id,
+                        attempt,
+                        message,
+                        target_conn=shared_target_connection(),
+                    )
                     report["provider_unavailable"].append({"fixture_id": fixture_id, "next_review_at": review_at, "reason": message})
                 except ProviderDetailIncompleteError as exc:
                     message = str(exc)[-4000:]
                     next_at = backoff_time(attempt, datetime.now(timezone.utc))
                     update_ledger(conn, fixture_id, "provider_pending", attempt, assessment, error=message, next_attempt_at=next_at, payload_hash=payload_hash, normalized_hash=normalized_hash, stable_fetch_count=stable_count)
-                    publish_delivery_status(target_url, conn, fixture_id)
+                    publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                     report["provider_pending"].append({"fixture_id": fixture_id, "reason": message})
                 except Exception as exc:
                     message = str(exc)[-4000:]
                     update_ledger(conn, fixture_id, "failed", attempt, error=message, next_attempt_at=backoff_time(attempt, datetime.now(timezone.utc)))
-                    publish_delivery_status(target_url, conn, fixture_id)
+                    publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                     report["failed"].append({"fixture_id": fixture_id, "stage": "fetch_or_store", "error": message})
 
             if not accepted:
                 continue
             accepted_ids = [item["fixture_id"] for item in accepted]
+            stage_started = time.perf_counter()
             export_result = export_batch(accepted_ids, leagues, "/tmp/reconcile_stats_provider_export.json")
+            report["stage_seconds"]["export"] = round(time.perf_counter() - stage_started, 3)
             if export_result.returncode != 0:
                 message = (export_result.stderr or export_result.stdout or "batch export failed")[-4000:]
                 for item in accepted:
                     fixture_id = item["fixture_id"]
                     update_ledger(conn, fixture_id, "export_failed", 0, error=message, next_attempt_at=backoff_time(1, datetime.now(timezone.utc)))
-                    publish_delivery_status(target_url, conn, fixture_id)
+                    publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                     report["failed"].append({"fixture_id": fixture_id, "stage": "export", "error": message})
                 continue
 
             valid: list[dict[str, Any]] = []
             seasons: set[tuple[int, int]] = set()
+            stage_started = time.perf_counter()
             for item in accepted:
                 fixture_id = item["fixture_id"]
-                with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
-                    target = target_snapshot(target_conn, fixture_id)
+                target = target_snapshot(shared_target_connection(), fixture_id)
                 problems = compare_snapshots(item["source"], target)
                 if problems:
                     message = "; ".join(problems)
                     update_ledger(conn, fixture_id, "verification_failed", 0, assessment=item["assessment"], source=item["source"], target=target, error=message, next_attempt_at=backoff_time(1, datetime.now(timezone.utc)))
-                    publish_delivery_status(target_url, conn, fixture_id)
+                    publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                     report["failed"].append({"fixture_id": fixture_id, "stage": "verification", "error": message})
                     continue
                 meta = item["meta"]
                 if meta:
                     seasons.add((int(meta[0]), int(meta[1])))
                 valid.append({**item, "target": target})
+            report["stage_seconds"]["verification"] = round(time.perf_counter() - stage_started, 3)
 
             if seasons:
-                refreshed = refresh_seasons(target_url, seasons)
+                stage_started = time.perf_counter()
+                refreshed = refresh_seasons(target_url, seasons, target_conn=shared_target_connection())
+                report["stage_seconds"]["projection_refresh"] = round(time.perf_counter() - stage_started, 3)
                 for key, count in refreshed.items():
                     report["projection_rows"][key] = report["projection_rows"].get(key, 0) + count
 
+            stage_started = time.perf_counter()
             for item in valid:
                 fixture_id = item["fixture_id"]
-                activate_provider_snapshot(target_url, fixture_id, item["snapshot_id"])
+                activate_provider_snapshot(
+                    target_url,
+                    fixture_id,
+                    item["snapshot_id"],
+                    target_conn=shared_target_connection(),
+                )
                 status = "provider_sparse" if item["assessment"].status == "provider_sparse" else "verified"
                 next_reval = revalidation_time(item["meta"][2] if item["meta"] else None, datetime.now(timezone.utc))
                 update_ledger(conn, fixture_id, status, 0, assessment=item["assessment"], source=item["source"], target=item["target"], successful=True, payload_hash=item["payload_hash"], normalized_hash=item["normalized_hash"], accepted_snapshot_id=item["snapshot_id"], stable_fetch_count=item["stable_count"], next_revalidation_at=next_reval)
-                publish_delivery_status(target_url, conn, fixture_id)
+                publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                 report["fixtures_accepted"] += 1
                 if status == "provider_sparse":
                     report["provider_sparse"].append({"fixture_id": fixture_id})
+            report["stage_seconds"]["activation"] = round(time.perf_counter() - stage_started, 3)
     finally:
+        if target_conn is not None and not target_conn.closed:
+            target_conn.close()
         conn.close()
         engine.dispose()
 

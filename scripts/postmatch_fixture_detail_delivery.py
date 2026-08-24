@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import logging
+import math
 import os
 import sqlite3
 import subprocess
@@ -68,6 +69,7 @@ DEFAULT_RECENT_REVALIDATION_HOURS = 6
 DEFAULT_DAILY_REVALIDATION_HOURS = 24
 DEFAULT_HISTORICAL_REVALIDATION_HOURS = 168
 DEFAULT_PROVIDER_UNAVAILABLE_REVIEW_DAYS = 7
+TARGET_NEW_FIXTURE_SHARE = 0.8
 
 
 @dataclass(frozen=True)
@@ -349,7 +351,15 @@ def candidate_target_fixture_ids(
     force: bool = False,
     season_ids: Sequence[int] | None = None,
 ) -> list[int]:
-    """Select completed target fixtures missing or due for provider detail."""
+    """Select completed target fixtures missing or due for provider detail.
+
+    Historical backfills must make progress even when a large retry queue is
+    eligible. Reserve most of every batch for fixtures with no delivery row,
+    while retaining a bounded retry/revalidation lane. If either lane is
+    smaller than its reservation, the spare slots are filled from the other
+    lane. This prevents repeated shrink confirmations from starving the
+    never-delivered population.
+    """
     clauses = [
         "f.home_score is not null",
         "f.away_score is not null",
@@ -362,32 +372,78 @@ def candidate_target_fixture_ids(
     if season_ids:
         clauses.append("f.season_id = any(%s)")
         params.append(list(season_ids))
-    if not force:
-        clauses.append(
-            "(d.fixture_id is null "
-            "or (d.accepted_snapshot_id is null and ("
-            "d.status in ('verified', 'provider_sparse') "
-            "or d.next_attempt_at is null or d.next_attempt_at <= now())) "
-            "or (d.next_revalidation_at is not null and d.next_revalidation_at <= now()) "
-            "or (d.status = 'verified' and d.next_revalidation_at is null))"
-        )
-    query = f"""
-        select f.id
-          from public.fixtures f
-          left join public.fixture_detail_delivery_status d on d.fixture_id = f.id
-         where {' and '.join(clauses)}
-        -- Resolve legacy/pending rows and customer-visible recent fixtures
-        -- before walking the oldest historical backlog. The cursor remains
-        -- resumable because every selected row is still governed by the
-        -- delivery/revalidation predicates above.
-        order by (d.fixture_id is not null) desc, f.starting_at desc, f.id desc
-        limit %s
-    """
-    params.append(max(int(limit), 0))
-    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+    requested = max(int(limit), 0)
+    if requested == 0:
+        return []
+
+    def fetch_candidates(
+        target_conn: Any,
+        extra_clause: str,
+        order_clause: str,
+    ) -> list[int]:
+        query = f"""
+            select f.id
+              from public.fixtures f
+              left join public.fixture_detail_delivery_status d on d.fixture_id = f.id
+             where {' and '.join([*clauses, extra_clause])}
+             order by {order_clause}
+             limit %s
+        """
         with target_conn.cursor() as cur:
-            cur.execute(query, params)
+            cur.execute(query, [*params, requested])
             return [int(row[0]) for row in cur.fetchall()]
+
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        if force:
+            return fetch_candidates(
+                target_conn,
+                "true",
+                "f.starting_at desc, f.id desc",
+            )
+
+        new_quota, retry_quota = target_candidate_quotas(requested)
+        new_candidates = fetch_candidates(
+            target_conn,
+            "d.fixture_id is null",
+            "f.starting_at desc, f.id desc",
+        )
+        retry_candidates = fetch_candidates(
+            target_conn,
+            """
+            d.fixture_id is not null
+            and (
+              (d.accepted_snapshot_id is null and (
+                d.status in ('verified', 'provider_sparse')
+                or d.next_attempt_at is null
+                or d.next_attempt_at <= now()
+              ))
+              or (d.next_revalidation_at is not null and d.next_revalidation_at <= now())
+              or (d.status = 'verified' and d.next_revalidation_at is null)
+            )
+            """,
+            """
+            case when d.accepted_snapshot_id is null then 0 else 1 end,
+            coalesce(d.next_attempt_at, d.next_revalidation_at, d.updated_at, f.starting_at),
+            f.starting_at desc,
+            f.id desc
+            """,
+        )
+
+    selected = new_candidates[:new_quota] + retry_candidates[:retry_quota]
+    if len(selected) < requested:
+        selected.extend(new_candidates[new_quota : new_quota + requested - len(selected)])
+    if len(selected) < requested:
+        selected.extend(retry_candidates[retry_quota : retry_quota + requested - len(selected)])
+    return selected[:requested]
+
+
+def target_candidate_quotas(limit: int, new_share: float = TARGET_NEW_FIXTURE_SHARE) -> tuple[int, int]:
+    """Return the reserved new-fixture and retry slots for one target batch."""
+    requested = max(int(limit), 0)
+    if requested == 0:
+        return 0, 0
+    new_quota = min(requested, max(1, math.ceil(requested * new_share)))
+    return new_quota, requested - new_quota
 
 
 def excluded_target_fixture_ids(target_url: str, fixture_ids: Sequence[int]) -> set[int]:
@@ -579,6 +635,7 @@ def mark_provider_unavailable(
     fixture_id: int,
     attempt: int,
     error: str,
+    target_conn: Any | None = None,
 ) -> str:
     """Quarantine a provider-absent target while retaining a scheduled review."""
     review_at = iso(utc_now() + timedelta(days=DEFAULT_PROVIDER_UNAVAILABLE_REVIEW_DAYS))
@@ -586,8 +643,10 @@ def mark_provider_unavailable(
         "select league_id, season_id from fixtures where id = ?",
         (fixture_id,),
     ).fetchone()
-    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
-        with target_conn.cursor() as cur:
+    owns_target_conn = target_conn is None
+    target = target_conn or psycopg2.connect(target_url, connect_timeout=20)
+    try:
+        with target.cursor() as cur:
             if not meta:
                 cur.execute(
                     "select league_id, season_id from public.fixtures where id = %s",
@@ -638,6 +697,13 @@ def mark_provider_unavailable(
                     json.dumps({"attempt": attempt, "error": error[:4000]}),
                 ),
             )
+        target.commit()
+    except Exception:
+        target.rollback()
+        raise
+    finally:
+        if owns_target_conn:
+            target.close()
     update_ledger(
         conn,
         fixture_id,
@@ -646,18 +712,31 @@ def mark_provider_unavailable(
         error=f"{error}; quarantined until {review_at}",
         next_attempt_at=review_at,
     )
-    publish_delivery_status(target_url, conn, fixture_id)
+    publish_delivery_status(target_url, conn, fixture_id, target_conn=target_conn)
     return review_at
 
 
-def clear_provider_unavailable_exclusion(target_url: str, fixture_id: int) -> None:
+def clear_provider_unavailable_exclusion(
+    target_url: str,
+    fixture_id: int,
+    target_conn: Any | None = None,
+) -> None:
     """Re-open a quarantined fixture only after a complete provider payload passes validation."""
-    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
-        with target_conn.cursor() as cur:
+    owns_target_conn = target_conn is None
+    target = target_conn or psycopg2.connect(target_url, connect_timeout=20)
+    try:
+        with target.cursor() as cur:
             cur.execute(
                 "delete from public.fixture_stats_quality_exclusions where fixture_id = %s and exclusion_type = 'provider_unavailable'",
                 (fixture_id,),
             )
+        target.commit()
+    except Exception:
+        target.rollback()
+        raise
+    finally:
+        if owns_target_conn:
+            target.close()
 
 
 def persist_provider_snapshot(
@@ -669,10 +748,13 @@ def persist_provider_snapshot(
     assessment: ProviderAssessment,
     payload_hash: str,
     normalized_hash: str,
+    target_conn: Any | None = None,
 ) -> int:
     """Persist every successful provider response before active facts publish."""
-    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
-        with target_conn.cursor() as cur:
+    owns_target_conn = target_conn is None
+    target = target_conn or psycopg2.connect(target_url, connect_timeout=20)
+    try:
+        with target.cursor() as cur:
             cur.execute(
                 """
                 insert into public.fixture_detail_snapshots (
@@ -711,13 +793,28 @@ def persist_provider_snapshot(
             row = cur.fetchone()
             if not row:
                 raise RuntimeError(f"Provider snapshot was not persisted for fixture {fixture_id}")
-            return int(row[0])
+            snapshot_id = int(row[0])
+        target.commit()
+        return snapshot_id
+    except Exception:
+        target.rollback()
+        raise
+    finally:
+        if owns_target_conn:
+            target.close()
 
 
-def activate_provider_snapshot(target_url: str, fixture_id: int, snapshot_id: int) -> None:
+def activate_provider_snapshot(
+    target_url: str,
+    fixture_id: int,
+    snapshot_id: int,
+    target_conn: Any | None = None,
+) -> None:
     """Atomically mark the snapshot accepted and link all active fixture facts."""
-    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
-        with target_conn.cursor() as cur:
+    owns_target_conn = target_conn is None
+    target = target_conn or psycopg2.connect(target_url, connect_timeout=20)
+    try:
+        with target.cursor() as cur:
             for table in ("fixture_players", "fixture_statistics", "fixture_player_statistics"):
                 cur.execute(
                     f"update public.{table} set provider_snapshot_id = %s where fixture_id = %s",
@@ -731,12 +828,20 @@ def activate_provider_snapshot(target_url: str, fixture_id: int, snapshot_id: in
                 """,
                 (snapshot_id, fixture_id),
             )
+        target.commit()
+    except Exception:
+        target.rollback()
+        raise
+    finally:
+        if owns_target_conn:
+            target.close()
 
 
 def publish_delivery_status(
     target_url: str,
     source_conn: sqlite3.Connection,
     fixture_id: int,
+    target_conn: Any | None = None,
 ) -> None:
     """Mirror the durable source ledger into the serving database.
 
@@ -800,8 +905,10 @@ def publish_delivery_status(
         int(row["stable_fetch_count"] or 0),
         row["accepted_snapshot_id"],
     )
-    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
-        with target_conn.cursor() as cur:
+    owns_target_conn = target_conn is None
+    target = target_conn or psycopg2.connect(target_url, connect_timeout=20)
+    try:
+        with target.cursor() as cur:
             cur.execute(
                 f"""
                 insert into public.{TARGET_STATUS_TABLE} (
@@ -855,6 +962,13 @@ def publish_delivery_status(
                 """,
                 values,
             )
+        target.commit()
+    except Exception:
+        target.rollback()
+        raise
+    finally:
+        if owns_target_conn:
+            target.close()
 
 
 def _int(value: object) -> int | None:
