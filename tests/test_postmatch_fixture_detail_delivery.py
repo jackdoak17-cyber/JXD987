@@ -14,7 +14,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     compare_snapshots,
     ensure_ledger,
     source_ready,
-    REQUIRED_TEAM_STAT_TYPES,
+    TRACKED_TEAM_STAT_TYPES,
 )
 from jxd.sync import _extract_stat_value
 
@@ -22,7 +22,7 @@ from jxd.sync import _extract_stat_value
 def provider_payload(*, include_big_chances: bool = True) -> dict:
     stats = []
     for team_id in (101, 202):
-        for type_id in (42, 45, 56, 57, 78, 86, 100, 109):
+        for type_id in (42, 45, 56, 57, 78, 83, 84, 85, 86, 100, 109):
             stats.append({"participant_id": team_id, "type_id": type_id, "data": {"value": 1}})
         if include_big_chances:
             stats.append({"participant_id": team_id, "type_id": 581, "data": {"value": 1}})
@@ -46,6 +46,26 @@ def test_provider_assessment_distinguishes_ready_sparse_and_pending() -> None:
     assert assess_provider_payload(pending).status == "provider_pending"
 
 
+def test_provider_assessment_accepts_valid_fixture_with_optional_metric_gaps() -> None:
+    payload = provider_payload()
+    payload["statistics"] = [
+        row for row in payload["statistics"]
+        if row["type_id"] not in {78, 100, 109, 581}
+    ]
+    assessment = assess_provider_payload(payload)
+    assert assessment.status == "provider_sparse"
+    assert assessment.missing_team_stat_type_ids["101"] == [78, 100, 109, 581]
+    assert assessment.missing_team_stat_type_ids["202"] == [78, 100, 109, 581]
+
+
+def test_provider_assessment_rejects_fixture_without_team_stat_rows_for_a_team() -> None:
+    payload = provider_payload()
+    payload["statistics"] = [
+        row for row in payload["statistics"] if row["participant_id"] == 101
+    ]
+    assert assess_provider_payload(payload).status == "provider_pending"
+
+
 def test_provider_revision_hash_is_stable_for_collection_order() -> None:
     from scripts.postmatch_fixture_detail_delivery import normalized_provider_hash, provider_payload_hash
 
@@ -64,8 +84,8 @@ def test_player_stat_parser_preserves_decimal_ratings() -> None:
 
 def test_source_ready_requires_player_detail_for_each_team() -> None:
     assessment = assess_provider_payload(provider_payload())
-    team_types = {str(team_id): sorted(REQUIRED_TEAM_STAT_TYPES) for team_id in (101, 202)}
-    team_values = {f"{team_id}:{type_id}": 1 for team_id in (101, 202) for type_id in REQUIRED_TEAM_STAT_TYPES}
+    team_types = {str(team_id): sorted(TRACKED_TEAM_STAT_TYPES) for team_id in (101, 202)}
+    team_values = {f"{team_id}:{type_id}": 1 for team_id in (101, 202) for type_id in TRACKED_TEAM_STAT_TYPES}
     incomplete = DetailSnapshot(
         fixture_id=9001,
         team_stat_count=len(team_values),

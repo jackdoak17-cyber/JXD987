@@ -41,12 +41,18 @@ SOURCE_DB = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
 FINISHED_STATUSES = {"FT", "AET", "PEN", "FT_PEN", "FINISHED", "ENDED"}
 
 # These are the provider-backed metrics consumed by the Team Stats surface.
-# Big Chances Missed (581) is known to be legitimately absent for some
-# fixtures, so it is handled as provider-sparse rather than an ingestion
-# failure. Card subtypes can also be absent when no cards of that subtype were
-# recorded and are intentionally not delivery gates.
-REQUIRED_TEAM_STAT_TYPES = {42, 45, 56, 57, 78, 86, 100, 109, 581}
-PROVIDER_SPARSE_TEAM_STAT_TYPES = {581}
+# They describe metric coverage, not fixture validity. SportMonks legitimately
+# omits individual team-stat types by competition, fixture, or zero-event
+# representation. A missing type is therefore recorded as NULL/coverage
+# evidence and classified as provider-sparse; it must not hold a structurally
+# valid completed fixture in an endless pending state.
+TRACKED_TEAM_STAT_TYPES = frozenset({42, 45, 56, 57, 78, 83, 84, 85, 86, 100, 109, 581})
+
+# Kept as a compatibility alias for scripts/tests that imported the old name.
+# There is no provider type that is universally required for every supported
+# competition; structural validity is checked per team below instead.
+REQUIRED_TEAM_STAT_TYPES = frozenset()
+PROVIDER_SPARSE_TEAM_STAT_TYPES = TRACKED_TEAM_STAT_TYPES
 TRACKED_PLAYER_STAT_TYPES = {
     42, 52, 56, 57, 78, 79, 83, 84, 85, 86, 88, 96, 97, 100, 101,
     109, 117, 118, 27267, 580, 9706,
@@ -70,7 +76,7 @@ class ProviderAssessment:
     fixture_status: str | None
     finished: bool
     team_stat_types: dict[str, list[int]]
-    missing_required_type_ids: dict[str, list[int]]
+    missing_team_stat_type_ids: dict[str, list[int]]
     player_stat_types: dict[str, list[int]]
     missing_player_stat_type_ids: dict[str, list[int]]
     lineup_counts: dict[str, int]
@@ -398,15 +404,48 @@ def excluded_target_fixture_ids(target_url: str, fixture_ids: Sequence[int]) -> 
             return {int(row[0]) for row in cur.fetchall()}
 
 
-def ledger_attempt_start(conn: sqlite3.Connection, fixture_id: int, now: datetime) -> int:
+def target_fixture_metadata(
+    target_url: str,
+    fixture_ids: Sequence[int],
+) -> dict[int, tuple[int | None, int | None, str | None]]:
+    """Load serving identity metadata for target-queue fixtures.
+
+    Historical target rows can be absent from the SQLite spool. Keeping their
+    league/season identity in the source ledger is required for scoped API
+    coverage and for resumable backfill selection.
+    """
+    ids = [int(value) for value in fixture_ids]
+    if not ids:
+        return {}
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            cur.execute(
+                "select id, league_id, season_id, starting_at from public.fixtures where id = any(%s)",
+                (ids,),
+            )
+            return {
+                int(row[0]): (_int(row[1]), _int(row[2]), str(row[3]) if row[3] is not None else None)
+                for row in cur.fetchall()
+            }
+
+
+def ledger_attempt_start(
+    conn: sqlite3.Connection,
+    fixture_id: int,
+    now: datetime,
+    league_id: int | None = None,
+    season_id: int | None = None,
+) -> int:
     timestamp = iso(now)
     conn.execute(
         f"""
         insert into {LEDGER_TABLE} (
-          fixture_id, status, attempts, first_seen_at, last_attempted_at,
+          fixture_id, league_id, season_id, status, attempts, first_seen_at, last_attempted_at,
           next_attempt_at, release_id, updated_at
-        ) values (?, 'running', 1, ?, ?, null, ?, ?)
+        ) values (?, ?, ?, 'running', 1, ?, ?, null, ?, ?)
         on conflict(fixture_id) do update set
+          league_id=coalesce(excluded.league_id, {LEDGER_TABLE}.league_id),
+          season_id=coalesce(excluded.season_id, {LEDGER_TABLE}.season_id),
           status='running',
           attempts={LEDGER_TABLE}.attempts + 1,
           last_attempted_at=excluded.last_attempted_at,
@@ -415,7 +454,7 @@ def ledger_attempt_start(conn: sqlite3.Connection, fixture_id: int, now: datetim
           release_id=excluded.release_id,
           updated_at=excluded.updated_at
         """,
-        (fixture_id, timestamp, timestamp, release_id(), timestamp),
+        (fixture_id, league_id, season_id, timestamp, timestamp, release_id(), timestamp),
     )
     row = conn.execute(
         f"select attempts from {LEDGER_TABLE} where fixture_id = ?", (fixture_id,)
@@ -491,7 +530,7 @@ def update_ledger(
             provider.player_stat_count if provider else 0,
             provider.lineup_count if provider else 0,
             json_text(provider.team_stat_types) if provider else None,
-            json_text(provider.missing_required_type_ids) if provider else None,
+            json_text(provider.missing_team_stat_type_ids) if provider else None,
             json_text(provider.player_stat_types) if provider else None,
             json_text(provider.missing_player_stat_type_ids) if provider else None,
             json_text(asdict(source)) if source else None,
@@ -897,7 +936,7 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
     type_output = {str(team_id): sorted(types) for team_id, types in team_types.items()}
     missing: dict[str, list[int]] = {}
     for team_id in teams:
-        missing[str(team_id)] = sorted(REQUIRED_TEAM_STAT_TYPES.difference(team_types.get(team_id, set())))
+        missing[str(team_id)] = sorted(TRACKED_TEAM_STAT_TYPES.difference(team_types.get(team_id, set())))
     player_type_output = {str(team_id): sorted(types) for team_id, types in player_types.items()}
     missing_player_types = {
         str(team_id): sorted(TRACKED_PLAYER_STAT_TYPES.difference(player_types.get(team_id, set())))
@@ -910,9 +949,7 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
         lineup_counts.get(team_id, 0) <= 0 or player_stat_counts.get(team_id, 0) <= 0 for team_id in teams
     ):
         assessment_status = "provider_pending"
-    elif any(
-        set(missing.get(str(team_id), [])) - PROVIDER_SPARSE_TEAM_STAT_TYPES for team_id in teams
-    ):
+    elif any(not team_types.get(team_id) for team_id in teams):
         assessment_status = "provider_pending"
     elif any(missing.get(str(team_id)) for team_id in teams):
         assessment_status = "provider_sparse"
@@ -924,7 +961,7 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
         fixture_status=status,
         finished=finished,
         team_stat_types=type_output,
-        missing_required_type_ids=missing,
+        missing_team_stat_type_ids=missing,
         player_stat_types=player_type_output,
         missing_player_stat_type_ids=missing_player_types,
         lineup_counts={str(team_id): count for team_id, count in lineup_counts.items()},
@@ -1001,8 +1038,10 @@ def source_snapshot(conn: sqlite3.Connection, fixture_id: int) -> DetailSnapshot
 def source_ready(snapshot: DetailSnapshot, assessment: ProviderAssessment) -> bool:
     for team_id in assessment.team_stat_types:
         types = set(snapshot.team_stat_types.get(team_id, []))
-        missing = REQUIRED_TEAM_STAT_TYPES.difference(types) - PROVIDER_SPARSE_TEAM_STAT_TYPES
-        if missing:
+        # The provider assessment has already recorded per-metric gaps. The
+        # delivery gate only requires that each provider team has at least one
+        # authoritative team-stat row; nullable metric gaps are intentional.
+        if not types:
             return False
         if not any(key.startswith(f"{team_id}:") for key in snapshot.team_stat_values):
             return False
@@ -1241,6 +1280,7 @@ def main() -> int:
         fixture_ids = list(dict.fromkeys(selected))
         excluded = excluded_target_fixture_ids(target_url, fixture_ids)
         fixture_ids = [fixture_id for fixture_id in fixture_ids if fixture_id not in excluded][: max(args.limit, 0)]
+    target_metadata = target_fixture_metadata(target_url, fixture_ids)
     report: dict[str, Any] = {
         "release_id": release_id(),
         "leagues": leagues,
@@ -1274,6 +1314,14 @@ def main() -> int:
     export_report_path = "/tmp/postmatch_fixture_detail_export_report.json"
 
     for fixture_id in fixture_ids:
+        source_meta_row = conn.execute(
+            "select league_id, season_id, starting_at from fixtures where id = ?",
+            (fixture_id,),
+        ).fetchone()
+        target_meta = target_metadata.get(fixture_id)
+        league_id = _int(source_meta_row[0]) if source_meta_row else (target_meta[0] if target_meta else None)
+        season_id = _int(source_meta_row[1]) if source_meta_row else (target_meta[1] if target_meta else None)
+        starting_at = source_meta_row[2] if source_meta_row else (target_meta[2] if target_meta else None)
         prior = conn.execute(
             f"select provider_team_stat_count, provider_player_stat_count, last_normalized_hash, stable_fetch_count "
             f"from {LEDGER_TABLE} where fixture_id = ?",
@@ -1283,7 +1331,7 @@ def main() -> int:
         prior_player_count = int(prior[1] or 0) if prior else 0
         prior_normalized_hash = str(prior[2]) if prior and prior[2] else None
         prior_stable_count = int(prior[3] or 0) if prior else 0
-        attempt = ledger_attempt_start(conn, fixture_id, utc_now())
+        attempt = ledger_attempt_start(conn, fixture_id, utc_now(), league_id, season_id)
         assessment: ProviderAssessment | None = None
         snapshot_id: int | None = None
         payload_hash: str | None = None
@@ -1318,15 +1366,11 @@ def main() -> int:
             assessment = assess_provider_payload(data)
             payload_hash = provider_payload_hash(data)
             normalized_hash = normalized_provider_hash(data)
-            fixture_meta = conn.execute(
-                "select league_id, season_id, starting_at from fixtures where id = ?",
-                (fixture_id,),
-            ).fetchone()
             snapshot_id = persist_provider_snapshot(
                 target_url,
                 fixture_id,
-                _int(fixture_meta[0]) if fixture_meta else None,
-                _int(fixture_meta[1]) if fixture_meta else None,
+                league_id,
+                season_id,
                 data,
                 assessment,
                 payload_hash,
@@ -1349,28 +1393,33 @@ def main() -> int:
                     stable_fetch_count=stable_fetch_count,
                 )
                 report["provider_pending"].append({"fixture_id": fixture_id, "next_attempt_at": next_at, "assessment": asdict(assessment)})
-                starting_at = conn.execute("select starting_at from fixtures where id=?", (fixture_id,)).fetchone()
-                started = parse_iso(starting_at[0]) if starting_at else None
+                started = parse_iso(starting_at)
                 if started and utc_now() - started > timedelta(minutes=max(args.grace_minutes, 0)):
-                    report["sla_breaches"].append({"fixture_id": fixture_id, "status": assessment.status, "started_at": starting_at[0]})
+                    report["sla_breaches"].append({"fixture_id": fixture_id, "status": assessment.status, "started_at": starting_at})
                 continue
 
-            # Do not delete an accepted player fact on the first response that
-            # unexpectedly shrinks the player-detail collection. A repeated
-            # identical response confirms a provider correction; recognised
-            # provider-sparse team metrics remain publishable immediately.
+            # Never replace a richer accepted snapshot with a first, changed
+            # response that has fewer team/player facts. A repeated identical
+            # payload confirms a provider correction or a durable sparse
+            # response; only then may the active facts shrink. This applies to
+            # provider-sparse payloads as well as complete payloads.
+            candidate_shrank = (
+                (prior_team_count > 0 and assessment.team_stat_count < prior_team_count)
+                or (prior_player_count > 0 and assessment.player_stat_count < prior_player_count)
+            )
             if (
                 not args.force
-                and assessment.status == "ready"
-                and prior_player_count > 0
-                and assessment.player_stat_count < prior_player_count
+                and candidate_shrank
                 and prior_normalized_hash != normalized_hash
+                and stable_fetch_count < 2
             ):
                 now = utc_now()
                 next_at = backoff_time(attempt, now)
                 message = (
-                    f"provider player-detail collection shrank from {prior_player_count} "
-                    f"to {assessment.player_stat_count}; awaiting confirmation"
+                    "provider detail collection shrank "
+                    f"(team_stats {prior_team_count}->{assessment.team_stat_count}, "
+                    f"player_stats {prior_player_count}->{assessment.player_stat_count}); "
+                    "awaiting one identical confirmation fetch"
                 )
                 update_ledger(
                     conn,
@@ -1432,7 +1481,7 @@ def main() -> int:
             activate_provider_snapshot(target_url, fixture_id, snapshot_id)
             final_status = "provider_sparse" if assessment.status == "provider_sparse" else "verified"
             next_revalidation_at = revalidation_time(
-                fixture_meta[2] if fixture_meta else None,
+                starting_at,
                 utc_now(),
             )
             update_ledger(
