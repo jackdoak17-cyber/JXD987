@@ -299,6 +299,7 @@ run_with_global_lock_and_timeout() {
   local live_tick_seconds="${ODDS_SYNC_LIVE_TICK_SECONDS:-900}"
   local live_reserve_seconds="${ODDS_SYNC_LIVE_RESERVE_SECONDS:-180}"
   local live_grace_seconds="${ODDS_SYNC_LIVE_GRACE_SECONDS:-120}"
+  local min_normal_lease_seconds="${ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS:-0}"
 
   mkdir -p "$(dirname "${lock_file}")"
 
@@ -344,6 +345,10 @@ run_with_global_lock_and_timeout() {
       available_runtime=$((seconds_to_tick - live_grace_seconds))
       if (( available_runtime <= 0 )); then
         log_info "[SKIPPED] no normal-writer lease before settlement grace window (phase=${live_phase}s)"
+        exit 2
+      fi
+      if (( min_normal_lease_seconds > 0 && available_runtime < min_normal_lease_seconds )); then
+        log_info "[SKIPPED] normal-writer lease too short for bounded job (available=${available_runtime}s minimum=${min_normal_lease_seconds}s)"
         exit 2
       fi
       if (( available_runtime < effective_runtime )); then

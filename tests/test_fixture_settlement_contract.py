@@ -86,6 +86,8 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("settlement lock unavailable after", source)
         self.assertIn('effective_runtime="${max_runtime}"', source)
         self.assertIn('available_runtime=$((seconds_to_tick - live_grace_seconds))', source)
+        self.assertIn('min_normal_lease_seconds="${ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS:-0}"', source)
+        self.assertIn("normal-writer lease too short for bounded job", source)
         self.assertIn('timeout --signal=TERM --kill-after=5s "${effective_runtime}"', source)
         self.assertIn("normal-writer lease ended for settlement handoff", source)
 
