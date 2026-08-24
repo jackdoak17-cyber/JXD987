@@ -95,6 +95,8 @@ class FixtureSettlementContractTests(unittest.TestCase):
         source = deploy.read_text(encoding="utf-8")
         self.assertIn("Publish the manifest last", source)
         self.assertIn("scripts/vps/runtime_manifest.sha1", source)
+        self.assertIn("required_runtime_entries", source)
+        self.assertIn("scripts/reconcile_stats_provider_queue.py", source)
 
     def test_heartbeat_report_truncation_cannot_abort_under_pipefail(self) -> None:
         source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")

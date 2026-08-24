@@ -22,6 +22,19 @@ if [[ ! -f "${RUNTIME_FILE_LIST}" ]]; then
   exit 1
 fi
 
+# The stats reconciliation worker is a production dependency. Fail before
+# touching the VPS if a stale/alternate checkout supplies an incomplete list.
+required_runtime_entries=(
+  "scripts/reconcile_stats_provider_queue.py"
+  "scripts/vps/run_stats_reconciliation.sh"
+)
+for required_entry in "${required_runtime_entries[@]}"; do
+  if ! grep -Fqx -- "${required_entry}" < <(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "${RUNTIME_FILE_LIST}"); then
+    echo "Runtime file list missing required production entry: ${required_entry}" >&2
+    exit 1
+  fi
+done
+
 "${SCRIPT_DIR}/update_runtime_manifest.sh"
 
 ssh_cmd=(ssh)
@@ -53,5 +66,5 @@ done < "${RUNTIME_FILE_LIST}"
     scripts/vps/runtime_manifest.sha1 "${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}/"
 )
 
-"${ssh_cmd[@]}" "cd '${TARGET_REPO_ROOT}' && shasum -c scripts/vps/runtime_manifest.sha1"
+"${ssh_cmd[@]}" "cd '${TARGET_REPO_ROOT}' && shasum -c scripts/vps/runtime_manifest.sha1 && grep -Fqx -- 'scripts/reconcile_stats_provider_queue.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_stats_reconciliation.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1)"
 echo "Runtime deployed and verified on ${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}"
