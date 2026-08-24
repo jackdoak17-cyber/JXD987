@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fcntl
 import json
 import logging
@@ -55,6 +56,44 @@ from scripts.postmatch_fixture_detail_delivery import (
 
 
 LOG = logging.getLogger("reconcile_stats_provider_queue")
+
+DETAIL_INCLUDE = ";".join(
+    [
+        "participants",
+        "scores",
+        "state",
+        "statistics",
+        "statistics.type",
+        "lineups.details",
+        "lineups.position",
+        "lineups.detailedposition",
+        "lineups.player",
+    ]
+)
+
+
+def fetch_provider_fixture(fixture_id: int) -> tuple[int, dict[str, Any] | None, Exception | None]:
+    """Fetch one fixture without sharing a requests client between threads.
+
+    Fetching is the only parallel part of reconciliation.  The caller still
+    performs all source-ledger writes, target snapshot writes, exports,
+    verification, and active-snapshot switches serially under the canonical
+    writer lock.  A fresh client per task also keeps its retry/stat counters
+    thread-local and avoids making the existing client stateful across workers.
+    """
+    try:
+        client = SportMonksClient()
+        payload = client.request(
+            "GET",
+            f"fixtures/{fixture_id}",
+            params={"include": DETAIL_INCLUDE},
+        )
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict) or not data:
+            return fixture_id, None, RuntimeError("SportMonks returned no fixture data")
+        return fixture_id, data, None
+    except Exception as exc:  # classified by the existing attempt/error policy
+        return fixture_id, None, exc
 
 
 def acquire_process_lock() -> int | None:
@@ -127,6 +166,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--leagues", required=True)
     parser.add_argument("--season-ids", default=None)
     parser.add_argument("--batch-size", type=int, default=25)
+    parser.add_argument(
+        "--fetch-concurrency",
+        type=int,
+        default=None,
+        help="bounded concurrent SportMonks fetches (default: STATS_RECONCILE_FETCH_CONCURRENCY or 4)",
+    )
     parser.add_argument("--max-batches", type=int, default=0, help="0 means drain the queue.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--report-json", default="/tmp/reconcile_stats_provider_queue.json")
@@ -144,6 +189,11 @@ def main() -> int:
     if not leagues:
         raise SystemExit("At least one league is required")
 
+    configured_fetch_concurrency = args.fetch_concurrency
+    if configured_fetch_concurrency is None:
+        configured_fetch_concurrency = int(os.environ.get("STATS_RECONCILE_FETCH_CONCURRENCY", "4"))
+    fetch_concurrency = max(1, min(configured_fetch_concurrency, 8))
+
     target_url = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
     if not target_url:
         raise SystemExit("SUPABASE_DB_URL_SESSION or SUPABASE_DB_URL is required")
@@ -152,6 +202,9 @@ def main() -> int:
     ensure_ledger(conn)
     source_path = str(Path(os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")).resolve())
     engine = create_engine(f"sqlite:///{source_path}", future=True)
+    # This client is retained for the sequential source-store path.  Provider
+    # fetches use fresh clients in fetch_provider_fixture so bounded parallel
+    # requests cannot race mutable retry/stat state.
     client = SportMonksClient()
     report: dict[str, Any] = {
         "release_id": os.environ.get("RUNTIME_RELEASE_ID", "local"),
@@ -166,6 +219,7 @@ def main() -> int:
         "failed": [],
         "projection_rows": {},
         "provider_calls": 0,
+        "fetch_concurrency": fetch_concurrency,
     }
 
     try:
@@ -186,7 +240,10 @@ def main() -> int:
             report["fixtures_selected"] += len(fixture_ids)
             LOG.info("Processing stats reconciliation batch %s: %s fixtures", report["batches"], len(fixture_ids))
 
-            accepted: list[dict[str, Any]] = []
+            # Mark the complete batch as running before fetching so a worker
+            # handoff cannot leave a subset looking untouched.  The source
+            # ledger is still updated serially because it is SQLite-backed.
+            contexts: dict[int, dict[str, Any]] = {}
             for fixture_id in fixture_ids:
                 source_meta_row = conn.execute(
                     "select league_id,season_id,starting_at from fixtures where id=?",
@@ -212,19 +269,47 @@ def main() -> int:
                     int(meta[0]) if meta and meta[0] is not None else None,
                     int(meta[1]) if meta and meta[1] is not None else None,
                 )
+                contexts[fixture_id] = {
+                    "meta": meta,
+                    "attempt": attempt,
+                    "prior_team_count": prior_team_count,
+                    "prior_player_count": prior_player_count,
+                    "prior_hash": prior_hash,
+                    "prior_stable": prior_stable,
+                }
+
+            fetched: dict[int, dict[str, Any]] = {}
+            fetch_errors: dict[int, Exception] = {}
+            with ThreadPoolExecutor(max_workers=min(fetch_concurrency, len(fixture_ids))) as executor:
+                futures = {
+                    executor.submit(fetch_provider_fixture, fixture_id): fixture_id
+                    for fixture_id in fixture_ids
+                }
+                for future in as_completed(futures):
+                    fixture_id, data, error = future.result()
+                    if error is not None:
+                        fetch_errors[fixture_id] = error
+                    elif data is not None:
+                        fetched[fixture_id] = data
+            report["provider_calls"] += len(fixture_ids)
+
+            accepted: list[dict[str, Any]] = []
+            for fixture_id in fixture_ids:
+                context = contexts[fixture_id]
+                meta = context["meta"]
+                attempt = context["attempt"]
+                prior_team_count = context["prior_team_count"]
+                prior_player_count = context["prior_player_count"]
+                prior_hash = context["prior_hash"]
+                prior_stable = context["prior_stable"]
+                assessment = None
+                payload_hash = None
+                normalized_hash = None
+                stable_count = prior_stable
                 try:
-                    payload = client.request(
-                        "GET",
-                        f"fixtures/{fixture_id}",
-                        params={
-                            "include": ";".join([
-                                "participants", "scores", "state", "statistics", "statistics.type",
-                                "lineups.details", "lineups.position", "lineups.detailedposition", "lineups.player",
-                            ])
-                        },
-                    )
-                    report["provider_calls"] += 1
-                    data = payload.get("data") if isinstance(payload, dict) else None
+                    if fixture_id in fetch_errors:
+                        raise fetch_errors[fixture_id]
+                    data = fetched.get(fixture_id)
                     if not isinstance(data, dict) or not data:
                         message = "SportMonks returned no fixture data"
                         if attempt >= 3:
