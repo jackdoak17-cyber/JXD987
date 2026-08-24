@@ -74,6 +74,7 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS", source)
         self.assertIn("run_with_global_lock_and_timeout", source)
         self.assertIn("STATS_RECONCILE_LOCK_HELD", source)
+        self.assertIn("export REPO_ROOT", source)
         self.assertIn("waiting ${delay}s for the next live-safe reconciliation batch", source)
 
     def test_shared_lock_has_priority_aware_settlement_handoff(self) -> None:

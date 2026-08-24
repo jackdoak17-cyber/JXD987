@@ -17,6 +17,7 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
 fi
 
 export PYTHONPATH="${REPO_ROOT}"
+export REPO_ROOT
 export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(default_league_csv)}"
 # Keep each historical lock hold below the live settlement cadence, then leave
 # a real handoff window for the scheduled writers. Operators can raise these
