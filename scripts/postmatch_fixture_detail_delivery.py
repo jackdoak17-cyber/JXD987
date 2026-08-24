@@ -1176,6 +1176,7 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
             team_stat_count += 1
 
     lineup_counts: dict[int, int] = {team_id: 0 for team_id in teams}
+    lineup_identity_counts: dict[int, int] = {team_id: 0 for team_id in teams}
     player_stat_counts: dict[int, int] = {team_id: 0 for team_id in teams}
     player_types: dict[int, set[int]] = {team_id: set() for team_id in teams}
     lineup_count = 0
@@ -1187,6 +1188,9 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
         if not team_id:
             continue
         lineup_counts[team_id] = lineup_counts.get(team_id, 0) + 1
+        player_id = _int(lineup.get("player_id") or (lineup.get("player") or {}).get("id"))
+        if player_id:
+            lineup_identity_counts[team_id] = lineup_identity_counts.get(team_id, 0) + 1
         lineup_count += 1
         for detail in lineup.get("details") or []:
             if not isinstance(detail, dict):
@@ -1215,16 +1219,23 @@ def assess_provider_payload(data: dict[str, Any]) -> ProviderAssessment:
             f"(status={status or 'unknown'}, teams={len(teams)})"
         )
     elif not lineups_list or any(
-        lineup_counts.get(team_id, 0) <= 0 or player_stat_counts.get(team_id, 0) <= 0 for team_id in teams
+        lineup_counts.get(team_id, 0) <= 0
+        or lineup_identity_counts.get(team_id, 0) < lineup_counts.get(team_id, 0)
+        or player_stat_counts.get(team_id, 0) <= 0
+        for team_id in teams
     ):
         assessment_status = "provider_pending"
         incomplete_teams = [
             str(team_id)
             for team_id in teams
-            if lineup_counts.get(team_id, 0) <= 0 or player_stat_counts.get(team_id, 0) <= 0
+            if (
+                lineup_counts.get(team_id, 0) <= 0
+                or lineup_identity_counts.get(team_id, 0) < lineup_counts.get(team_id, 0)
+                or player_stat_counts.get(team_id, 0) <= 0
+            )
         ]
         assessment_error = (
-            "provider lineup/player detail incomplete "
+            "provider lineup/player identity detail incomplete "
             f"for team ids {','.join(incomplete_teams) or 'unknown'}"
         )
     elif any(missing.get(str(team_id)) for team_id in teams):

@@ -76,7 +76,15 @@ def test_provider_assessment_requires_detail_structure() -> None:
     payload["lineups"] = []
     assessment = assess_provider_payload(payload)
     assert assessment.status == "provider_pending"
-    assert assessment.error == "provider lineup/player detail incomplete for team ids 101,202"
+    assert assessment.error == "provider lineup/player identity detail incomplete for team ids 101,202"
+
+
+def test_provider_assessment_rejects_lineups_without_player_identity() -> None:
+    payload = provider_payload()
+    payload["lineups"][0]["player_id"] = None
+    assessment = assess_provider_payload(payload)
+    assert assessment.status == "provider_pending"
+    assert assessment.error == "provider lineup/player identity detail incomplete for team ids 101"
 
 
 def test_provider_revision_hash_is_stable_for_collection_order() -> None:
