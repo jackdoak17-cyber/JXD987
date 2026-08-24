@@ -59,6 +59,7 @@ class FixtureSettlementContractTests(unittest.TestCase):
         source = wrapper.read_text(encoding="utf-8")
         self.assertIn("--max-batches 1", source)
         self.assertIn("STATS_RECONCILE_SUPERVISOR_LOCK", source)
+        self.assertIn("wait_for_live_window", source)
 
 
 if __name__ == "__main__":

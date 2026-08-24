@@ -23,7 +23,12 @@ export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(default_league_csv)
 # values for an isolated maintenance window, but the production defaults are
 # deliberately live-safe.
 export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-50}"
-export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-300}"
+# Retry delay after a live writer owns the lock. The scheduler gate below
+# decides whether a new batch may begin; this delay is not the handoff policy.
+export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-60}"
+export STATS_RECONCILE_LIVE_TICK_SECONDS="${STATS_RECONCILE_LIVE_TICK_SECONDS:-900}"
+export STATS_RECONCILE_LIVE_GRACE_SECONDS="${STATS_RECONCILE_LIVE_GRACE_SECONDS:-60}"
+export STATS_RECONCILE_MAX_HOLD_SECONDS="${STATS_RECONCILE_MAX_HOLD_SECONDS:-600}"
 export STATS_RECONCILE_REPORT="${STATS_RECONCILE_REPORT:-/tmp/stats_reconcile_provider_batch.json}"
 export STATS_RECONCILE_RUN_LOG="${STATS_RECONCILE_RUN_LOG:-/tmp/stats_reconcile_provider_batch.log}"
 export STATS_RECONCILE_SUPERVISOR_LOCK="${STATS_RECONCILE_SUPERVISOR_LOCK:-/var/lock/stats-reconciliation-supervisor.lock}"
@@ -35,7 +40,32 @@ if ! flock --nonblock 9; then
   exit 0
 fi
 
+wait_for_live_window() {
+  local now phase delay tick hold grace
+  tick="${STATS_RECONCILE_LIVE_TICK_SECONDS}"
+  hold="${STATS_RECONCILE_MAX_HOLD_SECONDS}"
+  grace="${STATS_RECONCILE_LIVE_GRACE_SECONDS}"
+  now="$(date -u +%s)"
+  phase=$((now % tick))
+  delay=0
+
+  # Do not start immediately before the quarter-hour settlement tick. Start
+  # only after the tick plus a grace period, leaving the live writer the first
+  # opportunity to acquire the canonical lock.
+  if (( phase < grace )); then
+    delay=$((grace - phase))
+  elif (( phase > tick - hold )); then
+    delay=$((tick - phase + grace))
+  fi
+
+  if (( delay > 0 )); then
+    log_info "waiting ${delay}s for the next live-safe reconciliation window"
+    sleep "${delay}"
+  fi
+}
+
 while true; do
+  wait_for_live_window
   rm -f "${STATS_RECONCILE_REPORT}" "${STATS_RECONCILE_RUN_LOG}"
   set +e
   "${REPO_ROOT}/.venv/bin/python" \
@@ -77,5 +107,4 @@ PY
   fi
 
   tail -n 8 "${STATS_RECONCILE_RUN_LOG}" || true
-  sleep 2
 done
