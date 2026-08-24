@@ -23,7 +23,7 @@ export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(supported_league_cs
 # a real handoff window for the scheduled writers. Operators can raise these
 # values for an isolated maintenance window, but the production defaults are
 # deliberately live-safe.
-export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-20}"
+export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-50}"
 # Retry delay after a live writer owns the lock. The scheduler gate below
 # decides whether a new batch may begin; this delay is not the handoff policy.
 export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-60}"
@@ -129,17 +129,4 @@ PY
   fi
 
   tail -n 8 "${STATS_RECONCILE_RUN_LOG}" || true
-
-  # One successful batch per live cycle keeps the provider backfill resumable
-  # and leaves the next settlement tick deterministic, even if a batch ends
-  # much faster than its maximum lease.
-  now="$(date -u +%s)"
-  phase=$((now % STATS_RECONCILE_LIVE_TICK_SECONDS))
-  if (( phase < STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS )); then
-    delay=$((STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS - phase))
-  else
-    delay=$((STATS_RECONCILE_LIVE_TICK_SECONDS - phase + STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS))
-  fi
-  log_info "waiting ${delay}s for the next live-safe reconciliation batch"
-  sleep "${delay}" 9>&-
 done

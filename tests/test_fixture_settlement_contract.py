@@ -77,7 +77,6 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("STATS_RECONCILE_LOCK_HELD", source)
         self.assertIn("export REPO_ROOT", source)
         self.assertIn("export RUNTIME_RELEASE_ID", source)
-        self.assertIn("waiting ${delay}s for the next live-safe reconciliation batch", source)
 
     def test_shared_lock_has_priority_aware_settlement_handoff(self) -> None:
         source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")
