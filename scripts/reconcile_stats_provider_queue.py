@@ -10,6 +10,8 @@ once. It is resumable: the serving delivery ledger is the queue cursor.
 from __future__ import annotations
 
 import argparse
+import atexit
+import fcntl
 import json
 import logging
 import os
@@ -52,6 +54,21 @@ from scripts.postmatch_fixture_detail_delivery import (
 
 
 LOG = logging.getLogger("reconcile_stats_provider_queue")
+
+
+def acquire_process_lock() -> int | None:
+    """Prevent concurrent workers from writing the shared SQLite spool."""
+    path = os.environ.get("STATS_RECONCILE_LOCK_PATH", "/var/lock/odds-stats-reconcile.lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    os.ftruncate(fd, 0)
+    os.write(fd, f"pid={os.getpid()}\n".encode())
+    atexit.register(os.close, fd)
+    return fd
 
 
 def parse_csv_ints(value: str | None) -> list[int]:
@@ -108,6 +125,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    if acquire_process_lock() is None:
+        LOG.info("Another stats reconciliation worker owns the shared SQLite spool; exiting")
+        return 0
     leagues = parse_csv_ints(args.leagues)
     season_ids = parse_csv_ints(args.season_ids)
     if not leagues:
