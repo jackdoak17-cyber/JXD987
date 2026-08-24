@@ -342,6 +342,7 @@ def candidate_target_fixture_ids(
     clauses = [
         "f.home_score is not null",
         "f.away_score is not null",
+        "not exists (select 1 from public.fixture_stats_quality_exclusions x where x.fixture_id = f.id)",
     ]
     params: list[object] = []
     if league_ids:
@@ -376,6 +377,20 @@ def candidate_target_fixture_ids(
         with target_conn.cursor() as cur:
             cur.execute(query, params)
             return [int(row[0]) for row in cur.fetchall()]
+
+
+def excluded_target_fixture_ids(target_url: str, fixture_ids: Sequence[int]) -> set[int]:
+    """Return quality-excluded IDs so source and target queues share one gate."""
+    ids = [int(value) for value in fixture_ids]
+    if not ids:
+        return set()
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            cur.execute(
+                "select fixture_id from public.fixture_stats_quality_exclusions where fixture_id = any(%s)",
+                (ids,),
+            )
+            return {int(row[0]) for row in cur.fetchall()}
 
 
 def ledger_attempt_start(conn: sqlite3.Connection, fixture_id: int, now: datetime) -> int:
@@ -1131,7 +1146,9 @@ def main() -> int:
         selected = candidate_fixture_ids(conn, leagues, args.hours_back, args.limit, args.force)
         if args.target_queue:
             selected.extend(candidate_target_fixture_ids(target_url, leagues, args.limit, args.force, season_ids or None))
-        fixture_ids = list(dict.fromkeys(selected))[: max(args.limit, 0)]
+        fixture_ids = list(dict.fromkeys(selected))
+        excluded = excluded_target_fixture_ids(target_url, fixture_ids)
+        fixture_ids = [fixture_id for fixture_id in fixture_ids if fixture_id not in excluded][: max(args.limit, 0)]
     report: dict[str, Any] = {
         "release_id": release_id(),
         "leagues": leagues,

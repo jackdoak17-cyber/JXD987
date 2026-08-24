@@ -16,7 +16,7 @@ begin
       add constraint fixture_detail_delivery_status_status_check check (
         status in (
           'new', 'running', 'provider_pending', 'provider_sparse',
-          'verified', 'failed', 'export_failed', 'verification_failed',
+          'verified', 'failed', 'export_failed', 'verification_failed', 'excluded',
           'projection_failed'
         )
       );

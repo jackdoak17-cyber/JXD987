@@ -3,6 +3,54 @@
 -- aggregation semantics explicit, incremental refreshes idempotent, and API
 -- queries independent of the provider's sparse event-row representation.
 
+create table if not exists public.fixture_stats_quality_exclusions (
+  fixture_id bigint primary key references public.fixtures(id) on delete cascade,
+  league_id bigint,
+  season_id bigint,
+  canonical_fixture_id bigint references public.fixtures(id) on delete restrict,
+  exclusion_type text not null check (exclusion_type in ('duplicate', 'provider_unavailable')),
+  reason text not null,
+  source text not null default 'stats_integrity_audit',
+  first_identified_at timestamptz not null default now(),
+  last_checked_at timestamptz not null default now(),
+  next_review_at timestamptz,
+  evidence jsonb not null default '{}'::jsonb,
+  updated_at timestamptz not null default now(),
+  check (canonical_fixture_id is null or canonical_fixture_id <> fixture_id)
+);
+
+create index if not exists fixture_stats_quality_exclusions_scope_idx
+  on public.fixture_stats_quality_exclusions (league_id, season_id, exclusion_type);
+
+alter table public.fixture_stats_quality_exclusions enable row level security;
+revoke all on table public.fixture_stats_quality_exclusions from public, anon, authenticated;
+grant select, insert, update, delete on table public.fixture_stats_quality_exclusions to service_role;
+
+create or replace function public.stats_fixture_is_excluded(p_fixture_id bigint)
+returns boolean
+language sql
+stable
+security definer
+set search_path to 'pg_catalog', 'public'
+as $function$
+  select exists (
+    select 1
+      from public.fixture_stats_quality_exclusions x
+     where x.fixture_id = p_fixture_id
+       and (x.next_review_at is null or x.next_review_at > now())
+  );
+$function$;
+
+revoke all on function public.stats_fixture_is_excluded(bigint) from public, anon;
+grant execute on function public.stats_fixture_is_excluded(bigint) to authenticated, service_role;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'statsweb_pool') then
+    grant execute on function public.stats_fixture_is_excluded(bigint) to statsweb_pool;
+  end if;
+end;
+$$;
+
 create table if not exists public.player_stats_metric_contract (
   metric_key text primary key,
   label text not null,
@@ -160,6 +208,7 @@ begin
       and f.home_score is not null
       and f.away_score is not null
       and fp.team_id is not null
+      and not public.stats_fixture_is_excluded(f.id)
       and coalesce(fp.minutes_played, 0) > 0
       and (p_player_id is null or fp.player_id = p_player_id)
   ),
@@ -215,6 +264,7 @@ begin
       and f.home_score is not null
       and f.away_score is not null
       and fp.team_id is not null
+      and not public.stats_fixture_is_excluded(f.id)
       and coalesce(fp.minutes_played, 0) > 0
       and (p_player_id is null or fp.player_id = p_player_id)
   ),
