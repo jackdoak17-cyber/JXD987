@@ -41,6 +41,14 @@ export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_fixture_
 # reconciliation. Use the single canonical pipeline lock for every writer.
 export FIXTURE_SETTLEMENT_LOCK_FILE="${FIXTURE_SETTLEMENT_LOCK_FILE:-/var/lock/odds-sync.lock}"
 export SETTLEMENT_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS:-300}"
+export SETTLEMENT_RUN_LOCK_FILE="${SETTLEMENT_RUN_LOCK_FILE:-/var/lock/odds-sync-settlement.lock}"
+
+mkdir -p "$(dirname "${SETTLEMENT_RUN_LOCK_FILE}")"
+exec 8>"${SETTLEMENT_RUN_LOCK_FILE}"
+if ! flock --nonblock 8; then
+  log_info "[SKIPPED] settlement wrapper already running"
+  finalize_with_healthcheck 2 "${HEALTHCHECK_PING_URL_SETTLEMENT:-${HEALTHCHECK_PING_URL:-}}"
+fi
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
