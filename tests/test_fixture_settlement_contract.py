@@ -101,6 +101,11 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('pathlib.Path(sys.argv[1]).read_text', source)
         self.assertNotIn("tr '\\n' ' ' < \"${evidence_file}\" | head -c", source)
 
+    def test_manifest_required_file_check_cannot_false_negative_under_pipefail(self) -> None:
+        source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")
+        self.assertIn('grep -Fqx -- "${relpath}" <<<"${manifest_paths}"', source)
+        self.assertNotIn("printf '%s\\n' \"${manifest_paths}\" | grep -Fxq", source)
+
 
 if __name__ == "__main__":
     unittest.main()

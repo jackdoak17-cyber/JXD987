@@ -109,7 +109,10 @@ require_runtime_manifest_entries_or_exit() {
   local missing=0
   local relpath
   for relpath in "$@"; do
-    if ! printf '%s\n' "${manifest_paths}" | grep -Fxq "${relpath}"; then
+    # Avoid piping into grep -q while pipefail is enabled: grep may exit early
+    # after finding a match, causing printf to receive SIGPIPE and producing a
+    # false missing-file result.
+    if ! grep -Fqx -- "${relpath}" <<<"${manifest_paths}"; then
       log_error "runtime manifest missing required file for $(basename "${entrypoint}"): ${relpath}"
       missing=1
     fi
