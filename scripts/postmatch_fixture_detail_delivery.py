@@ -900,6 +900,9 @@ def source_ready(snapshot: DetailSnapshot, assessment: ProviderAssessment) -> bo
     return all(
         sum(1 for key in snapshot.lineup_values if key.endswith(f":{team_id}")) > 0
         for team_id in assessment.team_stat_types
+    ) and all(
+        sum(1 for key in snapshot.player_stat_values if key.split(":")[1] == str(team_id)) > 0
+        for team_id in assessment.team_stat_types
     )
 
 
