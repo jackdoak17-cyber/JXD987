@@ -14,6 +14,7 @@ scripts/export_to_supabase.py
 scripts/refresh_fixture_delivery.py
 scripts/postmatch_fixture_detail_delivery.py
 scripts/reconcile_stats_provider_queue.py
+scripts/vps/run_stats_reconciliation.sh
 scripts/odds_retention_psql.py
 scripts/preflight_supabase_psql.py
 scripts/reconcile_recent_fixtures.py

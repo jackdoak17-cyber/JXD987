@@ -54,6 +54,12 @@ class FixtureSettlementContractTests(unittest.TestCase):
             result = subprocess.run(["bash", "-n", str(wrapper)], capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, f"{wrapper}: {result.stderr}")
 
+    def test_stats_reconciliation_supervisor_is_bounded(self) -> None:
+        wrapper = ROOT / "scripts/vps/run_stats_reconciliation.sh"
+        source = wrapper.read_text(encoding="utf-8")
+        self.assertIn("--max-batches 1", source)
+        self.assertIn("STATS_RECONCILE_SUPERVISOR_LOCK", source)
+
 
 if __name__ == "__main__":
     unittest.main()

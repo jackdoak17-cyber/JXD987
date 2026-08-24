@@ -53,6 +53,7 @@ Location:
 - `scripts/vps/run_p2.sh`
 - `scripts/vps/run_p3.sh`
 - `scripts/vps/run_postmatch_settlement.sh`
+- `scripts/vps/run_stats_reconciliation.sh`
 
 Exit codes:
 - `0`: success (healthcheck ping sent)
@@ -60,8 +61,10 @@ Exit codes:
 - `2`: skipped due to lock contention (no ping)
 
 Lock/timeout behavior:
-- Odds wrappers share the global odds lock; fixture settlement uses its own lock
-  so a long odds ingest cannot suppress post-match result publication
+- All writers that can touch the shared SQLite spool use the canonical
+  `ODDS_SYNC_LOCK_FILE`, including odds ingestion, settlement, models, and
+  stats reconciliation. Historical reconciliation runs one bounded batch at a
+  time so live settlement can acquire the lock between batches.
 - Non-blocking lock (`flock --nonblock`) -> immediate skip on contention
 - `timeout` enforces kill-on-overrun
 - **The full chain is wrapped as one subshell command**, so timeout covers every step (not only the first command)
