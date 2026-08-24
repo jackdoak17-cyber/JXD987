@@ -294,7 +294,7 @@ begin
     m.total_value,
     case when m.observed_appearances > 0 and m.unknown_appearances = 0
       then m.total_value / m.observed_appearances else null end,
-    case when m.observed_appearances > 0 and m.unknown_appearances = 0 and s.minutes > 0
+    case when c.supports_per90 and m.observed_appearances > 0 and m.unknown_appearances = 0 and s.minutes > 0
       then m.total_value / s.minutes * 90 else null end,
     m.eligible_appearances,
     m.reported_appearances,
@@ -309,6 +309,7 @@ begin
     m.source_revision,
     now()
   from metric_rows m
+  join public.player_stats_metric_contract c on c.metric_key = m.metric_key
   join public.player_stats_season_summary s
     on s.league_id = m.league_id
    and s.season_id = m.season_id

@@ -14,6 +14,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     compare_snapshots,
     ensure_ledger,
 )
+from jxd.sync import _extract_stat_value
 
 
 def provider_payload(*, include_big_chances: bool = True) -> dict:
@@ -43,6 +44,22 @@ def test_provider_assessment_distinguishes_ready_sparse_and_pending() -> None:
     assert assess_provider_payload(pending).status == "provider_pending"
 
 
+def test_provider_revision_hash_is_stable_for_collection_order() -> None:
+    from scripts.postmatch_fixture_detail_delivery import normalized_provider_hash, provider_payload_hash
+
+    first = provider_payload()
+    second = provider_payload()
+    second["statistics"] = list(reversed(second["statistics"]))
+    second["lineups"] = list(reversed(second["lineups"]))
+    assert provider_payload_hash(first) != provider_payload_hash(second)
+    assert normalized_provider_hash(first) == normalized_provider_hash(second)
+
+
+def test_player_stat_parser_preserves_decimal_ratings() -> None:
+    assert str(_extract_stat_value({"value": "7.85"})) == "7.85"
+    assert _extract_stat_value({"value": "7"}) == 7
+
+
 def test_candidate_selection_is_due_and_does_not_require_local_scores() -> None:
     conn = sqlite3.connect(":memory:")
     conn.execute("create table fixtures (id integer, league_id integer, starting_at text)")
@@ -54,7 +71,8 @@ def test_candidate_selection_is_due_and_does_not_require_local_scores() -> None:
         "values (2,8,'verified','2020-01-01T00:00:00Z',null,'2020-01-01T00:00:00Z')"
     )
     conn.commit()
-    assert candidate_fixture_ids(conn, [8], 72, 10) == [1]
+    # A verified fixture is revalidated when it has no prior schedule.
+    assert candidate_fixture_ids(conn, [8], 72, 10) == [1, 2]
 
 
 def test_snapshot_comparison_reports_value_and_row_differences() -> None:

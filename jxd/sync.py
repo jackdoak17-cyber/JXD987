@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, date
 from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 
@@ -164,12 +165,37 @@ def _ensure_team_squad_columns(engine) -> None:
             )
 
 
-def _extract_stat_value(data) -> Optional[int]:
-    """Pull a numeric value from lineup.detail or statistic payloads."""
+def _numeric_value(value) -> Optional[object]:
+    """Return an integer for integral values and Decimal for fractional values."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        return int(value) if value == value.to_integral_value() else value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not value == value or value in (float("inf"), float("-inf")):
+            return None
+        decimal = Decimal(str(value))
+        return int(decimal) if decimal == decimal.to_integral_value() else decimal
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            decimal = Decimal(raw)
+        except InvalidOperation:
+            return None
+        return int(decimal) if decimal == decimal.to_integral_value() else decimal
+    return None
+
+
+def _extract_stat_value(data) -> Optional[object]:
+    """Pull a numeric value without losing provider decimal precision."""
     if data is None:
         return None
     if isinstance(data, (int, float, str)):
-        return _safe_int(data)
+        return _numeric_value(data)
     if isinstance(data, dict):
         for key in (
             "value",
@@ -184,11 +210,11 @@ def _extract_stat_value(data) -> Optional[int]:
             "penalties",
         ):
             if key in data:
-                v = _safe_int(data.get(key))
+                v = _numeric_value(data.get(key))
                 if v is not None:
                     return v
         for v in data.values():
-            parsed = _safe_int(v)
+            parsed = _numeric_value(v)
             if parsed is not None:
                 return parsed
     return None

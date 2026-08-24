@@ -58,6 +58,9 @@ DEFAULT_HOURS_BACK = 72
 DEFAULT_LIMIT = 25
 DEFAULT_GRACE_MINUTES = 60
 DEFAULT_SOURCE_BUSY_TIMEOUT_MS = 30_000
+DEFAULT_RECENT_REVALIDATION_HOURS = 6
+DEFAULT_DAILY_REVALIDATION_HOURS = 24
+DEFAULT_HISTORICAL_REVALIDATION_HOURS = 168
 
 
 @dataclass(frozen=True)
@@ -128,6 +131,66 @@ def json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def provider_payload_hash(data: dict[str, Any]) -> str:
+    return hashlib.sha256(json_text(data).encode("utf-8")).hexdigest()
+
+
+def normalized_provider_payload(data: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize provider-owned collections before revision comparison."""
+    normalized = dict(data)
+    statistics = [item for item in data.get("statistics") or [] if isinstance(item, dict)]
+    normalized["statistics"] = sorted(
+        statistics,
+        key=lambda item: (
+            _int(item.get("participant_id") or item.get("team_id")) or 0,
+            _int(item.get("type_id") or ((item.get("type") or {}).get("id") if isinstance(item.get("type"), dict) else None)) or 0,
+            str(item.get("location") or ""),
+            _int(item.get("id")) or 0,
+        ),
+    )
+    lineups = []
+    for lineup in data.get("lineups") or []:
+        if not isinstance(lineup, dict):
+            continue
+        copy = dict(lineup)
+        details = [item for item in lineup.get("details") or [] if isinstance(item, dict)]
+        copy["details"] = sorted(
+            details,
+            key=lambda item: (
+                _int(item.get("type_id") or ((item.get("type") or {}).get("id") if isinstance(item.get("type"), dict) else None)) or 0,
+                _int(item.get("id")) or 0,
+            ),
+        )
+        lineups.append(copy)
+    normalized["lineups"] = sorted(
+        lineups,
+        key=lambda item: (
+            _int(item.get("team_id") or item.get("participant_id")) or 0,
+            _int(item.get("player_id")) or 0,
+            _int(item.get("id")) or 0,
+        ),
+    )
+    return normalized
+
+
+def normalized_provider_hash(data: dict[str, Any]) -> str:
+    return provider_payload_hash(normalized_provider_payload(data))
+
+
+def revalidation_time(starting_at: object, now: datetime) -> str:
+    started = parse_iso(starting_at)
+    if started is None:
+        return iso(now + timedelta(hours=DEFAULT_HISTORICAL_REVALIDATION_HOURS))
+    age = now - started
+    if age <= timedelta(hours=72):
+        hours = DEFAULT_RECENT_REVALIDATION_HOURS
+    elif age <= timedelta(days=30):
+        hours = DEFAULT_DAILY_REVALIDATION_HOURS
+    else:
+        hours = DEFAULT_HISTORICAL_REVALIDATION_HOURS
+    return iso(now + timedelta(hours=hours))
+
+
 def source_connection() -> sqlite3.Connection:
     path = Path(SOURCE_DB)
     if not path.exists():
@@ -178,9 +241,18 @@ def ensure_ledger(conn: sqlite3.Connection) -> None:
         row[1]
         for row in conn.execute(f"pragma table_info({LEDGER_TABLE})").fetchall()
     }
-    for column in ("provider_player_stat_types", "provider_missing_player_type_ids"):
+    for column, ddl in (
+        ("provider_player_stat_types", "text"),
+        ("provider_missing_player_type_ids", "text"),
+        ("last_checked_at", "text"),
+        ("next_revalidation_at", "text"),
+        ("last_payload_hash", "text"),
+        ("last_normalized_hash", "text"),
+        ("stable_fetch_count", "integer not null default 0"),
+        ("accepted_snapshot_id", "integer"),
+    ):
         if column not in existing_columns:
-            conn.execute(f"alter table {LEDGER_TABLE} add column {column} text")
+            conn.execute(f"alter table {LEDGER_TABLE} add column {column} {ddl}")
     conn.commit()
 
 
@@ -216,11 +288,12 @@ def candidate_fixture_ids(
         params.extend(league_ids)
     rows = conn.execute(
         f"""
-        select f.id, f.starting_at, d.status, d.next_attempt_at, d.updated_at
+        select f.id, f.starting_at, d.status, d.next_attempt_at, d.updated_at,
+               d.next_revalidation_at
           from fixtures f
           left join {LEDGER_TABLE} d on d.fixture_id = f.id
-         where f.starting_at >= ?
-           and f.starting_at <= ?
+         where ((f.starting_at >= ? and f.starting_at <= ?)
+            or d.next_revalidation_at is not null)
            {league_clause}
          order by f.starting_at asc, f.id asc
         """,
@@ -230,16 +303,24 @@ def candidate_fixture_ids(
     now = utc_now()
     for row in rows:
         status = str(row[2] or "new")
-        if not force and status == "verified":
-            continue
         if not force and status == "running":
             running_at = parse_iso(row[4])
             if running_at and now - running_at < timedelta(minutes=30):
                 continue
-        if not force and status == "provider_sparse" and not due(row[3], now):
-            continue
-        if not force and row[3] is not None and not due(row[3], now):
-            continue
+        if not force:
+            if status == "verified":
+                # Verified is deliberately non-terminal. Existing rows from
+                # before revalidation was introduced have no schedule and
+                # are rechecked while they remain in the recent window.
+                revalidation_at = row[5]
+                if revalidation_at is not None and not due(revalidation_at, now):
+                    continue
+                if revalidation_at is None and parse_iso(row[1]) and parse_iso(row[1]) < now - timedelta(hours=max(hours_back, 0)):
+                    continue
+            elif status == "provider_sparse" and not due(row[3], now):
+                continue
+            elif row[3] is not None and not due(row[3], now):
+                continue
         selected.append(int(row[0]))
         if len(selected) >= max(limit, 0):
             break
@@ -288,6 +369,11 @@ def update_ledger(
     error: str | None = None,
     next_attempt_at: str | None = None,
     successful: bool = False,
+    payload_hash: str | None = None,
+    normalized_hash: str | None = None,
+    accepted_snapshot_id: int | None = None,
+    stable_fetch_count: int | None = None,
+    next_revalidation_at: str | None = None,
 ) -> None:
     now = iso(utc_now())
     provider = assessment
@@ -297,6 +383,8 @@ def update_ledger(
            set status = ?,
                attempts = ?,
                next_attempt_at = ?,
+               last_checked_at = ?,
+               next_revalidation_at = coalesce(?, next_revalidation_at),
                last_successful_at = case when ? then ? else last_successful_at end,
                provider_status = ?,
                provider_finished = ?,
@@ -311,13 +399,19 @@ def update_ledger(
                target_snapshot = ?,
                last_error = ?,
                release_id = ?,
-               updated_at = ?
+               updated_at = ?,
+               last_payload_hash = coalesce(?, last_payload_hash),
+               last_normalized_hash = coalesce(?, last_normalized_hash),
+               stable_fetch_count = coalesce(?, stable_fetch_count),
+               accepted_snapshot_id = coalesce(?, accepted_snapshot_id)
          where fixture_id = ?
         """,
         (
             status,
             attempt,
             next_attempt_at,
+            now,
+            next_revalidation_at,
             1 if successful else 0,
             now,
             provider.fixture_status if provider else None,
@@ -334,6 +428,10 @@ def update_ledger(
             (error or (provider.error if provider else None) or "")[:4000] or None,
             release_id(),
             now,
+            payload_hash,
+            normalized_hash,
+            stable_fetch_count,
+            accepted_snapshot_id,
             fixture_id,
         ),
     )
@@ -347,6 +445,79 @@ def _json_value(raw: object) -> Json | None:
         return Json(json.loads(str(raw)))
     except (TypeError, ValueError, json.JSONDecodeError):
         return Json({"raw": str(raw)})
+
+
+def persist_provider_snapshot(
+    target_url: str,
+    fixture_id: int,
+    league_id: int | None,
+    season_id: int | None,
+    data: dict[str, Any],
+    assessment: ProviderAssessment,
+    payload_hash: str,
+    normalized_hash: str,
+) -> int:
+    """Persist every successful provider response before active facts publish."""
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into public.fixture_detail_snapshots (
+                  fixture_id, league_id, season_id, payload_hash,
+                  normalized_hash, provider_status, quality_status,
+                  payload, release_id, error, fetched_at, last_seen_at
+                ) values (
+                  %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s,
+                  now(), now()
+                )
+                on conflict (fixture_id, payload_hash) do update set
+                  league_id = excluded.league_id,
+                  season_id = excluded.season_id,
+                  normalized_hash = excluded.normalized_hash,
+                  provider_status = excluded.provider_status,
+                  quality_status = excluded.quality_status,
+                  payload = excluded.payload,
+                  release_id = excluded.release_id,
+                  error = excluded.error,
+                  last_seen_at = now()
+                returning id
+                """,
+                (
+                    fixture_id,
+                    league_id,
+                    season_id,
+                    payload_hash,
+                    normalized_hash,
+                    assessment.fixture_status,
+                    assessment.status,
+                    json_text(data),
+                    release_id(),
+                    assessment.error,
+                ),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise RuntimeError(f"Provider snapshot was not persisted for fixture {fixture_id}")
+            return int(row[0])
+
+
+def activate_provider_snapshot(target_url: str, fixture_id: int, snapshot_id: int) -> None:
+    """Atomically mark the snapshot accepted and link all active fixture facts."""
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            for table in ("fixture_players", "fixture_statistics", "fixture_player_statistics"):
+                cur.execute(
+                    f"update public.{table} set provider_snapshot_id = %s where fixture_id = %s",
+                    (snapshot_id, fixture_id),
+                )
+            cur.execute(
+                """
+                update public.fixture_detail_snapshots
+                   set accepted_at = now(), quality_status = 'accepted'
+                 where id = %s and fixture_id = %s
+                """,
+                (snapshot_id, fixture_id),
+            )
 
 
 def publish_delivery_status(
@@ -366,13 +537,16 @@ def publish_delivery_status(
                coalesce(d.league_id, f.league_id) as league_id,
                coalesce(d.season_id, f.season_id) as season_id,
                d.status, d.attempts, d.first_seen_at, d.last_attempted_at,
-               d.next_attempt_at, d.last_successful_at, d.provider_status,
+               d.next_attempt_at, d.last_checked_at, d.next_revalidation_at,
+               d.last_successful_at, d.provider_status,
                d.provider_finished, d.provider_team_stat_count,
                d.provider_player_stat_count, d.provider_lineup_count,
                d.provider_team_stat_types, d.provider_missing_type_ids,
                d.provider_player_stat_types, d.provider_missing_player_type_ids,
                d.source_snapshot, d.target_snapshot, d.last_error,
-               d.release_id, d.updated_at
+               d.release_id, d.updated_at, d.last_payload_hash,
+               d.last_normalized_hash, d.stable_fetch_count,
+               d.accepted_snapshot_id
           from {LEDGER_TABLE} d
           left join fixtures f on f.id = d.fixture_id
          where d.fixture_id = ?
@@ -391,6 +565,8 @@ def publish_delivery_status(
         row["first_seen_at"],
         row["last_attempted_at"],
         row["next_attempt_at"],
+        row["last_checked_at"],
+        row["next_revalidation_at"],
         row["last_successful_at"],
         row["provider_status"],
         bool(row["provider_finished"]),
@@ -406,6 +582,10 @@ def publish_delivery_status(
         row["last_error"],
         row["release_id"],
         row["updated_at"],
+        row["last_payload_hash"],
+        row["last_normalized_hash"],
+        int(row["stable_fetch_count"] or 0),
+        row["accepted_snapshot_id"],
     )
     with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
         with target_conn.cursor() as cur:
@@ -414,18 +594,21 @@ def publish_delivery_status(
                 insert into public.{TARGET_STATUS_TABLE} (
                   fixture_id, league_id, season_id, status, attempts,
                   first_seen_at, last_attempted_at, next_attempt_at,
-                  last_successful_at, provider_status, provider_finished,
+                  last_checked_at, next_revalidation_at, last_successful_at,
+                  provider_status, provider_finished,
                   provider_team_stat_count, provider_player_stat_count,
                   provider_lineup_count, provider_team_stat_types,
                   provider_missing_type_ids, provider_player_stat_types,
                   provider_missing_player_type_ids, source_snapshot, target_snapshot,
-                  last_error, release_id, updated_at
+                  last_error, release_id, updated_at, last_payload_hash,
+                  last_normalized_hash, stable_fetch_count, accepted_snapshot_id
                 ) values (
                   %s, %s, %s, %s, %s,
                   %s::timestamptz, %s::timestamptz, %s::timestamptz,
-                  %s::timestamptz, %s, %s,
+                  %s::timestamptz, %s::timestamptz, %s::timestamptz,
+                  %s, %s,
                   %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                  %s, %s, %s::timestamptz
+                  %s, %s, %s::timestamptz, %s, %s, %s, %s
                 )
                 on conflict (fixture_id) do update set
                   league_id = excluded.league_id,
@@ -435,6 +618,8 @@ def publish_delivery_status(
                   first_seen_at = excluded.first_seen_at,
                   last_attempted_at = excluded.last_attempted_at,
                   next_attempt_at = excluded.next_attempt_at,
+                  last_checked_at = excluded.last_checked_at,
+                  next_revalidation_at = excluded.next_revalidation_at,
                   last_successful_at = excluded.last_successful_at,
                   provider_status = excluded.provider_status,
                   provider_finished = excluded.provider_finished,
@@ -449,7 +634,11 @@ def publish_delivery_status(
                   target_snapshot = excluded.target_snapshot,
                   last_error = excluded.last_error,
                   release_id = excluded.release_id,
-                  updated_at = excluded.updated_at
+                  updated_at = excluded.updated_at,
+                  last_payload_hash = excluded.last_payload_hash,
+                  last_normalized_hash = excluded.last_normalized_hash,
+                  stable_fetch_count = excluded.stable_fetch_count,
+                  accepted_snapshot_id = excluded.accepted_snapshot_id
                 """,
                 values,
             )
@@ -903,8 +1092,20 @@ def main() -> int:
     export_report_path = "/tmp/postmatch_fixture_detail_export_report.json"
 
     for fixture_id in fixture_ids:
+        prior = conn.execute(
+            f"select provider_team_stat_count, provider_player_stat_count, last_normalized_hash, stable_fetch_count "
+            f"from {LEDGER_TABLE} where fixture_id = ?",
+            (fixture_id,),
+        ).fetchone()
+        prior_team_count = int(prior[0] or 0) if prior else 0
+        prior_player_count = int(prior[1] or 0) if prior else 0
+        prior_normalized_hash = str(prior[2]) if prior and prior[2] else None
+        prior_stable_count = int(prior[3] or 0) if prior else 0
         attempt = ledger_attempt_start(conn, fixture_id, utc_now())
         assessment: ProviderAssessment | None = None
+        snapshot_id: int | None = None
+        payload_hash: str | None = None
+        normalized_hash: str | None = None
         try:
             payload = client.request(
                 "GET",
@@ -930,15 +1131,75 @@ def main() -> int:
             if not isinstance(data, dict) or not data:
                 raise RuntimeError("SportMonks returned no fixture data")
             assessment = assess_provider_payload(data)
+            payload_hash = provider_payload_hash(data)
+            normalized_hash = normalized_provider_hash(data)
+            fixture_meta = conn.execute(
+                "select league_id, season_id, starting_at from fixtures where id = ?",
+                (fixture_id,),
+            ).fetchone()
+            snapshot_id = persist_provider_snapshot(
+                target_url,
+                fixture_id,
+                _int(fixture_meta[0]) if fixture_meta else None,
+                _int(fixture_meta[1]) if fixture_meta else None,
+                data,
+                assessment,
+                payload_hash,
+                normalized_hash,
+            )
+            stable_fetch_count = prior_stable_count + 1 if prior_normalized_hash == normalized_hash else 1
             if assessment.status == "provider_pending":
                 now = utc_now()
                 next_at = backoff_time(attempt, now)
-                update_ledger(conn, fixture_id, assessment.status, attempt, assessment, error=assessment.error, next_attempt_at=next_at)
+                update_ledger(
+                    conn,
+                    fixture_id,
+                    assessment.status,
+                    attempt,
+                    assessment,
+                    error=assessment.error,
+                    next_attempt_at=next_at,
+                    payload_hash=payload_hash,
+                    normalized_hash=normalized_hash,
+                    stable_fetch_count=stable_fetch_count,
+                )
                 report["provider_pending"].append({"fixture_id": fixture_id, "next_attempt_at": next_at, "assessment": asdict(assessment)})
                 starting_at = conn.execute("select starting_at from fixtures where id=?", (fixture_id,)).fetchone()
                 started = parse_iso(starting_at[0]) if starting_at else None
                 if started and utc_now() - started > timedelta(minutes=max(args.grace_minutes, 0)):
                     report["sla_breaches"].append({"fixture_id": fixture_id, "status": assessment.status, "started_at": starting_at[0]})
+                continue
+
+            # Do not delete an accepted player fact on the first response that
+            # unexpectedly shrinks the player-detail collection. A repeated
+            # identical response confirms a provider correction; recognised
+            # provider-sparse team metrics remain publishable immediately.
+            if (
+                not args.force
+                and assessment.status == "ready"
+                and prior_player_count > 0
+                and assessment.player_stat_count < prior_player_count
+                and prior_normalized_hash != normalized_hash
+            ):
+                now = utc_now()
+                next_at = backoff_time(attempt, now)
+                message = (
+                    f"provider player-detail collection shrank from {prior_player_count} "
+                    f"to {assessment.player_stat_count}; awaiting confirmation"
+                )
+                update_ledger(
+                    conn,
+                    fixture_id,
+                    "provider_pending",
+                    attempt,
+                    assessment,
+                    error=message,
+                    next_attempt_at=next_at,
+                    payload_hash=payload_hash,
+                    normalized_hash=normalized_hash,
+                    stable_fetch_count=stable_fetch_count,
+                )
+                report["provider_pending"].append({"fixture_id": fixture_id, "next_attempt_at": next_at, "reason": message})
                 continue
 
             source = store_provider_detail(engine, client, fixture_id, data, assessment)
@@ -980,13 +1241,34 @@ def main() -> int:
                 report["failed"].append({"fixture_id": fixture_id, "stage": "projection", "error": message})
                 continue
 
+            if snapshot_id is None:
+                raise RuntimeError(f"No provider snapshot ID for accepted fixture {fixture_id}")
+            activate_provider_snapshot(target_url, fixture_id, snapshot_id)
             final_status = "provider_sparse" if assessment.status == "provider_sparse" else "verified"
-            next_at = iso(utc_now() + timedelta(hours=24)) if final_status == "provider_sparse" else None
-            update_ledger(conn, fixture_id, final_status, attempt, assessment, source=source, target=target, next_attempt_at=next_at, successful=True)
+            next_revalidation_at = revalidation_time(
+                fixture_meta[2] if fixture_meta else None,
+                utc_now(),
+            )
+            update_ledger(
+                conn,
+                fixture_id,
+                final_status,
+                attempt,
+                assessment,
+                source=source,
+                target=target,
+                next_attempt_at=None,
+                successful=True,
+                payload_hash=payload_hash,
+                normalized_hash=normalized_hash,
+                accepted_snapshot_id=snapshot_id,
+                stable_fetch_count=stable_fetch_count,
+                next_revalidation_at=next_revalidation_at,
+            )
             if final_status == "provider_sparse":
-                report["provider_sparse"].append({"fixture_id": fixture_id, "assessment": asdict(assessment)})
+                report["provider_sparse"].append({"fixture_id": fixture_id, "assessment": asdict(assessment), "next_revalidation_at": next_revalidation_at})
             else:
-                report["verified"].append({"fixture_id": fixture_id, "assessment": asdict(assessment)})
+                report["verified"].append({"fixture_id": fixture_id, "assessment": asdict(assessment), "next_revalidation_at": next_revalidation_at})
         except Exception as exc:  # provider and storage errors are retried by the ledger
             message = str(exc)[-4000:]
             update_ledger(conn, fixture_id, "failed", attempt, assessment, error=message, next_attempt_at=backoff_time(attempt, utc_now()))

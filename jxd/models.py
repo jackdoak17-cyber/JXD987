@@ -213,7 +213,10 @@ class FixturePlayerStatistic(Base):
     type_id = Column(Integer, nullable=True)
     code = Column(String, nullable=True)
     name = Column(String, nullable=True)
-    value = Column(Integer, nullable=True)
+    # Player ratings and a small number of provider metrics are decimal-valued.
+    # Keep the source model numeric so the ingestion path cannot silently
+    # truncate values such as 7.85 to 7 before export.
+    value = Column(Numeric(12, 4), nullable=True)
     extra = Column(JSON, nullable=True)
 
 
