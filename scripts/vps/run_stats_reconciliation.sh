@@ -94,6 +94,10 @@ wait_for_live_window() {
 
 while true; do
   wait_for_live_window
+  # The supervisor is intentionally long-lived. Refresh the release label for
+  # every bounded batch so hot deployments cannot leave delivery reports and
+  # ledger rows attributed to the release that started the parent shell.
+  export RUNTIME_RELEASE_ID="$(runtime_release_id)"
   rm -f "${STATS_RECONCILE_REPORT}" "${STATS_RECONCILE_RUN_LOG}"
   set +e
   run_with_global_lock_and_timeout "${RECONCILIATION_COMMAND}"
