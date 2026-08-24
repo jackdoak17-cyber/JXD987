@@ -35,9 +35,8 @@ set search_path to 'pg_catalog', 'public'
 as $function$
   select exists (
     select 1
-      from public.fixture_stats_quality_exclusions x
+     from public.fixture_stats_quality_exclusions x
      where x.fixture_id = p_fixture_id
-       and (x.next_review_at is null or x.next_review_at > now())
   );
 $function$;
 
