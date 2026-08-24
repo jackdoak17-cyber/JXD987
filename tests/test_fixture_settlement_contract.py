@@ -69,6 +69,15 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("STATS_RECONCILE_SUPERVISOR_LOCK", source)
         self.assertIn("wait_for_live_window", source)
 
+    def test_stats_reconciliation_cron_installer_is_shell_valid_and_idempotent(self) -> None:
+        installer = ROOT / "scripts/vps/install_stats_reconciliation_cron.sh"
+        result = subprocess.run(["bash", "-n", str(installer)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source = installer.read_text(encoding="utf-8")
+        self.assertIn("crontab -l", source)
+        self.assertIn("grep -Fqx", source)
+        self.assertIn("run_stats_reconciliation.sh", source)
+
 
 if __name__ == "__main__":
     unittest.main()

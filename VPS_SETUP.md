@@ -105,9 +105,14 @@ Use this schedule while the production Supabase project is on Micro compute or w
 */15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
 7,37 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
 
-# Post-match fixture settlement (independent of odds P1/P2/P3). The worker polls
+# Post-match fixture settlement (the stats-critical live writer). The worker polls
 # SportMonks detail until it is complete, then publishes only parity-verified rows.
 */15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_postmatch_settlement.sh >> /var/log/odds-sync-settlement.log 2>&1
+
+# Historical stats reconciliation safety net. The wrapper owns a separate
+# supervisor lock, then takes the canonical data lock for one bounded batch at
+# a time; it exits when drained and cron restarts it for newly queued fixtures.
+*/5 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_stats_reconciliation.sh >> /var/log/stats-reconciliation-supervisor.log 2>&1
 
 # Betting picks publish (Models -> Supabase, optional R2 fallback).
 # Uses the Models lock and can run independently of fixture settlement.
