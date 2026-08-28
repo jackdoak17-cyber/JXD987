@@ -453,6 +453,21 @@ def add_metrics_provenance(metrics: dict[str, Any], mode: str) -> dict[str, Any]
     return metrics
 
 
+def build_season_scoped_history(
+    completed: list[dict[str, Any]],
+) -> dict[tuple[int, int, int], list[dict[str, Any]]]:
+    """Index completed fixtures by league, season, and participating team."""
+    history: dict[tuple[int, int, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in completed:
+        league_id = int(row["league_id"])
+        season_id = int(row["season_id"])
+        history[(league_id, season_id, int(row["home_team_id"]))].append(row)
+        history[(league_id, season_id, int(row["away_team_id"]))].append(row)
+    for rows in history.values():
+        rows.sort(key=lambda row: (row["starting_at"], row["id"]), reverse=True)
+    return history
+
+
 def calculate_metrics(history: list[dict[str, Any]], team_id: int, window: int, venue: str | None) -> tuple[dict[str, Any], datetime | None]:
     selected: list[dict[str, Any]] = []
     for row in history:
@@ -550,12 +565,7 @@ def write_metrics(
                     return prior["rank"]
         return None
 
-    history_by_team: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    for row in completed:
-        history_by_team[int(row["home_team_id"])].append(row)
-        history_by_team[int(row["away_team_id"])].append(row)
-    for rows in history_by_team.values():
-        rows.sort(key=lambda row: (row["starting_at"], row["id"]), reverse=True)
+    history_by_team_season = build_season_scoped_history(completed)
 
     values = []
     coverage = {
@@ -570,7 +580,10 @@ def write_metrics(
     for fixture in schedule:
         fixture_time = fixture["starting_at"]
         for side, team_id in (("home", int(fixture["home_team_id"])), ("away", int(fixture["away_team_id"]))):
-            prior = [row for row in history_by_team.get(team_id, []) if row["starting_at"] < fixture_time]
+            history_key = (int(fixture["league_id"]), int(fixture["season_id"]), team_id)
+            prior = [
+                row for row in history_by_team_season.get(history_key, []) if row["starting_at"] < fixture_time
+            ]
             for window in range(5, 16):
                 samples: dict[str, int] = {}
                 for mode, venue in (("overall", None), ("venue", side)):

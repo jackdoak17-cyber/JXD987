@@ -62,6 +62,55 @@ def _safe_int(val) -> Optional[int]:
             return None
 
 
+def choose_current_season_ids(
+    seasons: Sequence[Dict],
+    today: Optional[date] = None,
+) -> Set[int]:
+    """Choose one active season per league when provider flags are stale or absent."""
+    reference_day = today or datetime.utcnow().date()
+    grouped: Dict[int, list[Dict]] = {}
+    for season in seasons:
+        season_id = _safe_int(season.get("id"))
+        league_id = _safe_int(season.get("league_id"))
+        if season_id is None or league_id is None:
+            continue
+        grouped.setdefault(league_id, []).append(season)
+
+    selected: Set[int] = set()
+    for rows in grouped.values():
+        def season_date(row: Dict, field: str) -> Optional[date]:
+            value = row.get(field)
+            if isinstance(value, datetime):
+                return value.date()
+            if isinstance(value, date):
+                return value
+            return _parse_date(value)
+
+        active = []
+        for row in rows:
+            start = season_date(row, "start_date")
+            end = season_date(row, "end_date")
+            if start is not None and start <= reference_day and (end is None or end >= reference_day):
+                active.append(row)
+        if active:
+            provider_current = [row for row in active if bool(row.get("is_current"))]
+            candidates = provider_current or active
+        else:
+            candidates = [row for row in rows if bool(row.get("is_current"))]
+        if not candidates:
+            continue
+        chosen = max(
+            candidates,
+            key=lambda row: (
+                season_date(row, "start_date") or date.min,
+                season_date(row, "end_date") or date.min,
+                _safe_int(row.get("id")) or 0,
+            ),
+        )
+        selected.add(int(chosen["id"]))
+    return selected
+
+
 def _fixture_status_values(raw: Dict) -> Tuple[Optional[str], Optional[str]]:
     state = raw.get("state") or {}
     state_short = state.get("short_name") if isinstance(state, dict) else None
@@ -549,12 +598,12 @@ class SyncService:
 
     # --- seasons & teams ---
     def sync_seasons(self, league_ids: Sequence[int]) -> int:
-        count = 0
+        rows = []
         for item in self.client.fetch_collection("seasons", includes=["league"], per_page=200):
             league_id = item.get("league_id") or (item.get("league") or {}).get("id")
             if league_ids and league_id not in league_ids:
                 continue
-            data = {
+            rows.append({
                 "id": item.get("id"),
                 "league_id": league_id,
                 "name": item.get("name"),
@@ -562,12 +611,14 @@ class SyncService:
                 "end_date": parse_dt(item.get("end_date") or item.get("ending_at")),
                 "is_current": bool(item.get("is_current") or item.get("current")),
                 "extra": item,
-            }
+            })
+        current_ids = choose_current_season_ids(rows)
+        for data in rows:
+            data["is_current"] = int(data["id"]) in current_ids
             _upsert(self.session, Season, data)
-            count += 1
         self.session.commit()
-        log.info("Synced seasons: %s", count)
-        return count
+        log.info("Synced seasons: %s (current=%s)", len(rows), sorted(current_ids))
+        return len(rows)
 
     def sync_rounds_for_leagues(self, league_ids: Sequence[int]) -> int:
         if not league_ids:

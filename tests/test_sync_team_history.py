@@ -1,11 +1,11 @@
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import unittest
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from jxd.models import Base, Fixture, Season
-from jxd.sync import SyncService
+from jxd.sync import SyncService, choose_current_season_ids
 
 
 class FakeClient:
@@ -26,6 +26,64 @@ def make_service(client):
 
 
 class TeamHistoryTests(unittest.TestCase):
+    def test_current_season_falls_back_to_date_when_provider_flags_are_false(self):
+        current_day = date(2026, 8, 28)
+        rows = [
+            {
+                "id": 25583,
+                "league_id": 8,
+                "start_date": datetime(2025, 8, 1),
+                "end_date": datetime(2026, 5, 31),
+                "is_current": False,
+            },
+            {
+                "id": 28083,
+                "league_id": 8,
+                "start_date": datetime(2026, 8, 1),
+                "end_date": datetime(2027, 5, 31),
+                "is_current": False,
+            },
+            {
+                "id": 40000,
+                "league_id": 600,
+                "start_date": datetime(2026, 8, 1),
+                "end_date": datetime(2027, 5, 31),
+                "is_current": False,
+            },
+        ]
+
+        self.assertEqual(choose_current_season_ids(rows, current_day), {28083, 40000})
+
+    def test_sync_seasons_persists_date_derived_current_flags(self):
+        client = FakeClient(
+            {
+                "seasons": [
+                    {
+                        "id": 25583,
+                        "league_id": 8,
+                        "name": "2025/2026",
+                        "start_date": "2025-08-01",
+                        "end_date": "2026-05-31",
+                        "is_current": False,
+                    },
+                    {
+                        "id": 28083,
+                        "league_id": 8,
+                        "name": "2026/2027",
+                        "start_date": "2026-08-01",
+                        "end_date": "2027-05-31",
+                        "is_current": False,
+                    },
+                ]
+            }
+        )
+        service, session = make_service(client)
+
+        service.sync_seasons([8])
+
+        self.assertFalse(session.get(Season, 25583).is_current)
+        self.assertTrue(session.get(Season, 28083).is_current)
+
     def test_backfill_uses_team_endpoint_and_persists_season_metadata(self):
         now = datetime.utcnow()
         client = FakeClient({})

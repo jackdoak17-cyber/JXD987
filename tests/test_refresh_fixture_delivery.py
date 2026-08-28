@@ -3,13 +3,65 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from scripts.refresh_fixture_delivery import add_metrics_provenance, calculate_metrics
+from scripts.refresh_fixture_delivery import (
+    add_metrics_provenance,
+    build_season_scoped_history,
+    calculate_metrics,
+)
 
 
 UTC = timezone.utc
 
 
 class FixtureDeliveryMetricsTests(unittest.TestCase):
+    def test_history_is_scoped_to_league_and_season(self) -> None:
+        fixture_time = datetime(2026, 8, 28, tzinfo=UTC)
+        history = build_season_scoped_history(
+            [
+                {
+                    "id": 300,
+                    "starting_at": datetime(2026, 8, 1, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 20,
+                    "home_score": 1,
+                    "away_score": 0,
+                },
+                {
+                    "id": 200,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 25583,
+                    "home_team_id": 10,
+                    "away_team_id": 30,
+                    "home_score": 4,
+                    "away_score": 0,
+                },
+                {
+                    "id": 100,
+                    "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
+                    "league_id": 384,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 40,
+                    "home_score": 5,
+                    "away_score": 0,
+                },
+            ]
+        )
+
+        current_season_history = [
+            row
+            for row in history[(8, 28083, 10)]
+            if row["starting_at"] < fixture_time
+        ]
+        metrics, _ = calculate_metrics(current_season_history, 10, 8, None)
+
+        self.assertEqual([row["id"] for row in current_season_history], [300])
+        self.assertEqual(metrics["sample"], 1)
+        self.assertEqual(metrics["goalsScored"], 1)
+
     def test_empty_bucket_is_explicitly_marked_none(self) -> None:
         metrics, source = calculate_metrics([], 10, 8, "home")
         self.assertIsNone(source)
