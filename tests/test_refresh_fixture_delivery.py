@@ -8,6 +8,7 @@ from scripts.refresh_fixture_delivery import (
     build_season_scoped_history,
     calculate_metrics,
     compute_standings,
+    strict_current_season_rank,
 )
 
 
@@ -135,6 +136,25 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
         self.assertEqual(ranked[21]["rank"], 2)
         self.assertEqual(ranked[10]["rank"], 3)
         self.assertEqual(ranked[11]["rank"], 4)
+
+    def test_strict_current_season_rank_does_not_fallback_to_prior_season(self) -> None:
+        standings = compute_standings(
+            [
+                {
+                    "id": 1,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 20,
+                    "away_team_id": 21,
+                    "home_score": 1,
+                    "away_score": 0,
+                }
+            ]
+        )
+
+        self.assertEqual(strict_current_season_rank(standings, 8, 28083, 20), 1)
+        self.assertIsNone(strict_current_season_rank(standings, 8, 28083, 10))
 
 
 if __name__ == "__main__":

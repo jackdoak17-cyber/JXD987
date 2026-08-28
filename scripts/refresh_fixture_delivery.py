@@ -373,6 +373,16 @@ def compute_standings(completed: list[dict[str, Any]]) -> dict[tuple[int, int], 
     return grouped
 
 
+def strict_current_season_rank(
+    standings: dict[tuple[int, int], dict[int, dict[str, int]]],
+    league_id: int,
+    season_id: int,
+    team_id: int,
+) -> int | None:
+    current = standings.get((league_id, season_id), {}).get(team_id)
+    return int(current["rank"]) if current else None
+
+
 def write_standings(cur, standings: dict[tuple[int, int], dict[int, dict[str, int]]], completed: list[dict[str, Any]]) -> int:
     latest: dict[tuple[int, int], datetime] = {}
     for row in completed:
@@ -535,35 +545,6 @@ def write_metrics(
     completed: list[dict[str, Any]],
     standings: dict[tuple[int, int], dict[int, dict[str, int]]],
 ) -> tuple[int, dict[str, int]]:
-    season_watermarks: dict[tuple[int, int], datetime] = {}
-    for row in completed:
-        key = (int(row["league_id"]), int(row["season_id"]))
-        season_watermarks[key] = max(season_watermarks.get(key, datetime.min.replace(tzinfo=UTC)), row["starting_at"])
-    seasons_by_league: dict[int, list[tuple[int, int]]] = defaultdict(list)
-    for (league_id, season_id), watermark in season_watermarks.items():
-        seasons_by_league[league_id].append((season_id, int(watermark.timestamp())))
-    for league_id in seasons_by_league:
-        seasons_by_league[league_id].sort(key=lambda item: item[1], reverse=True)
-    def rank_for(league_id: int, season_id: int, team_id: int) -> int | None:
-        current = standings.get((league_id, season_id), {}).get(team_id)
-        if current:
-            return current["rank"]
-        # At a season restart, preserve the existing product contract: use the
-        # team's latest prior non-cup league table until the current season has
-        # recorded a match. This remains a persisted value, never request work.
-        for prior_season, _ in seasons_by_league.get(league_id, [])[1:]:
-            prior = standings.get((league_id, prior_season), {}).get(team_id)
-            if prior:
-                return prior["rank"]
-        for other_league, season_keys in seasons_by_league.items():
-            if other_league in EXCLUDED_CUPS:
-                continue
-            for other_season, _ in season_keys:
-                prior = standings.get((other_league, other_season), {}).get(team_id)
-                if prior:
-                    return prior["rank"]
-        return None
-
     history_by_team_season = build_season_scoped_history(completed)
 
     values = []
@@ -594,7 +575,13 @@ def write_metrics(
                     values.append(
                         (
                             fixture["id"], team_id, side, window, mode, Json(metrics),
-                            rank_for(int(fixture["league_id"]), int(fixture["season_id"] or 0), team_id), max_source,
+                            strict_current_season_rank(
+                                standings,
+                                int(fixture["league_id"]),
+                                int(fixture["season_id"] or 0),
+                                team_id,
+                            ),
+                            max_source,
                         )
                     )
                 if samples["venue"] == 0 and samples["overall"] > 0:
