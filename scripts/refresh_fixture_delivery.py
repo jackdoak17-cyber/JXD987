@@ -366,7 +366,6 @@ def compute_standings(completed: list[dict[str, Any]]) -> dict[tuple[int, int], 
                 -item[1]["points"],
                 -(item[1]["goals_for"] - item[1]["goals_against"]),
                 -item[1]["goals_for"],
-                item[0],
             ),
         )
         for rank, (team_id, values) in enumerate(ranked, start=1):

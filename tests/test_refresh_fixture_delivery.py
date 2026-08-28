@@ -7,6 +7,7 @@ from scripts.refresh_fixture_delivery import (
     add_metrics_provenance,
     build_season_scoped_history,
     calculate_metrics,
+    compute_standings,
 )
 
 
@@ -101,6 +102,39 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
         self.assertEqual(venue["sampleStatus"], "partial")
         self.assertEqual(overall["metricsSource"], "overall")
         self.assertEqual(venue["metricsSource"], "venue")
+
+    def test_standings_equal_totals_preserve_strict_row_order_tie_break(self) -> None:
+        standings = compute_standings(
+            [
+                {
+                    "id": 2,
+                    "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 20,
+                    "away_team_id": 21,
+                    "home_score": 1,
+                    "away_score": 1,
+                },
+                {
+                    "id": 1,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 11,
+                    "home_score": 1,
+                    "away_score": 1,
+                },
+            ]
+        )
+
+        ranked = standings[(8, 28083)]
+
+        self.assertEqual(ranked[20]["rank"], 1)
+        self.assertEqual(ranked[21]["rank"], 2)
+        self.assertEqual(ranked[10]["rank"], 3)
+        self.assertEqual(ranked[11]["rank"], 4)
 
 
 if __name__ == "__main__":
