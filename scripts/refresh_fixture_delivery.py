@@ -537,6 +537,22 @@ def calculate_metrics(history: list[dict[str, Any]], team_id: int, window: int, 
     return metrics, max(row["starting_at"] for row in selected)
 
 
+def history_rows_for_fixture(
+    history: list[dict[str, Any]],
+    fixture: dict[str, Any],
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Select completed history without leaking an upcoming fixture result."""
+    fixture_time = fixture["starting_at"]
+    cutoff_inclusive = is_finished(fixture, now or datetime.now(UTC))
+    return [
+        row
+        for row in history
+        if row["starting_at"] < fixture_time
+        or (cutoff_inclusive and row["starting_at"] == fixture_time)
+    ]
+
+
 def write_metrics(
     cur,
     schedule: list[dict[str, Any]],
@@ -544,6 +560,7 @@ def write_metrics(
     standings: dict[tuple[int, int], dict[int, dict[str, int]]],
 ) -> tuple[int, dict[str, int]]:
     history_by_team_season = build_season_scoped_history(completed)
+    now = datetime.now(UTC)
 
     values = []
     coverage = {
@@ -556,12 +573,11 @@ def write_metrics(
         "venue_empty_overall_available": 0,
     }
     for fixture in schedule:
-        fixture_time = fixture["starting_at"]
         for side, team_id in (("home", int(fixture["home_team_id"])), ("away", int(fixture["away_team_id"]))):
             history_key = (int(fixture["league_id"]), int(fixture["season_id"]), team_id)
-            prior = [
-                row for row in history_by_team_season.get(history_key, []) if row["starting_at"] < fixture_time
-            ]
+            prior = history_rows_for_fixture(
+                history_by_team_season.get(history_key, []), fixture, now
+            )
             for window in range(5, 16):
                 samples: dict[str, int] = {}
                 for mode, venue in (("overall", None), ("venue", side)):

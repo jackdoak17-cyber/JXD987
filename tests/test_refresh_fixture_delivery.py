@@ -10,6 +10,7 @@ from scripts.refresh_fixture_delivery import (
     build_season_scoped_history,
     calculate_metrics,
     compute_standings,
+    history_rows_for_fixture,
     strict_current_season_rank,
 )
 
@@ -191,6 +192,51 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
         )
 
         self.assertEqual([row["id"] for row in history[(8, 28083, 10)]], [1, 2])
+
+    def test_finished_fixture_history_includes_target_but_upcoming_history_does_not(self) -> None:
+        history = [
+            {
+                "id": 2,
+                "starting_at": datetime(2026, 8, 28, tzinfo=UTC),
+                "home_team_id": 10,
+                "away_team_id": 20,
+                "home_score": 2,
+                "away_score": 0,
+            },
+            {
+                "id": 1,
+                "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
+                "home_team_id": 10,
+                "away_team_id": 30,
+                "home_score": 1,
+                "away_score": 0,
+            },
+        ]
+        finished_fixture = {
+            "id": 2,
+            "starting_at": datetime(2026, 8, 28, tzinfo=UTC),
+            "status": "FT",
+            "status_code": "FT",
+            "home_score": 2,
+            "away_score": 0,
+        }
+        upcoming_fixture = {
+            "id": 2,
+            "starting_at": datetime(2026, 8, 28, tzinfo=UTC),
+            "status": "NS",
+            "status_code": "NS",
+            "home_score": None,
+            "away_score": None,
+        }
+
+        self.assertEqual(
+            [row["id"] for row in history_rows_for_fixture(history, finished_fixture)],
+            [2, 1],
+        )
+        self.assertEqual(
+            [row["id"] for row in history_rows_for_fixture(history[1:], upcoming_fixture)],
+            [1],
+        )
 
 
 if __name__ == "__main__":
