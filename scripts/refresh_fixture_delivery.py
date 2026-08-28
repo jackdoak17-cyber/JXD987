@@ -211,7 +211,7 @@ def all_completed_fixtures(cur, leagues: list[int]) -> list[dict[str, Any]]:
            and league_id <> all(%s)
            and home_score is not null and away_score is not null
            and starting_at <= now()
-         order by starting_at desc, id desc
+         order by starting_at desc
         """,
         (leagues, list(EXCLUDED_CUPS)),
     )
@@ -472,8 +472,6 @@ def build_season_scoped_history(
         season_id = int(row["season_id"])
         history[(league_id, season_id, int(row["home_team_id"]))].append(row)
         history[(league_id, season_id, int(row["away_team_id"]))].append(row)
-    for rows in history.values():
-        rows.sort(key=lambda row: (row["starting_at"], row["id"]), reverse=True)
     return history
 
 

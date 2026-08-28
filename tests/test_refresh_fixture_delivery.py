@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+import inspect
 
 from scripts.refresh_fixture_delivery import (
     add_metrics_provenance,
+    all_completed_fixtures,
     build_season_scoped_history,
     calculate_metrics,
     compute_standings,
@@ -155,6 +157,40 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
 
         self.assertEqual(strict_current_season_rank(standings, 8, 28083, 20), 1)
         self.assertIsNone(strict_current_season_rank(standings, 8, 28083, 10))
+
+    def test_completed_fixture_query_matches_strict_oracle_order(self) -> None:
+        source = inspect.getsource(all_completed_fixtures)
+
+        self.assertIn("order by starting_at desc", source)
+        self.assertNotIn("order by starting_at desc, id desc", source)
+
+    def test_history_preserves_source_order_for_equal_kickoff_times(self) -> None:
+        history = build_season_scoped_history(
+            [
+                {
+                    "id": 1,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 20,
+                    "home_score": 1,
+                    "away_score": 0,
+                },
+                {
+                    "id": 2,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 30,
+                    "home_score": 0,
+                    "away_score": 1,
+                },
+            ]
+        )
+
+        self.assertEqual([row["id"] for row in history[(8, 28083, 10)]], [1, 2])
 
 
 if __name__ == "__main__":
