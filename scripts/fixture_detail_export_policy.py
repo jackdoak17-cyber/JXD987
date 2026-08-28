@@ -113,6 +113,8 @@ def classify_fixture_candidate(candidate: dict[str, Any]) -> FixtureSafetyDecisi
     if len(team_ids) < 2:
         return FixtureSafetyDecision(fixture_id, False, "source_incomplete", "provider assessment has fewer than two teams")
     for team_id in team_ids:
+        if _count_for_team(source, "team_stat_types", team_id) <= 0:
+            return FixtureSafetyDecision(fixture_id, False, "source_incomplete", f"source team-stat detail is empty for team {team_id}")
         if _count_for_team(source, "lineup_values", team_id) <= 0:
             return FixtureSafetyDecision(fixture_id, False, "source_incomplete", f"source lineup detail is empty for team {team_id}")
         if _count_for_team(source, "player_stat_values", team_id) <= 0:

@@ -72,6 +72,31 @@ def test_partition_export_candidates_isolates_unsafe_fixture() -> None:
     assert partition.decisions[3].exportable is False
 
 
+def test_partition_rejects_missing_team_stats_for_strict_export() -> None:
+    from scripts.fixture_detail_export_policy import partition_export_candidates
+
+    source = _source(4)
+    source_without_team_stats = DetailSnapshot(
+        fixture_id=source.fixture_id,
+        team_stat_count=0,
+        player_stat_count=source.player_stat_count,
+        lineup_count=source.lineup_count,
+        team_stat_types={},
+        team_stat_values={},
+        player_stat_values=source.player_stat_values,
+        lineup_values=source.lineup_values,
+    )
+    candidate = _candidate(4)
+    candidate["source"] = source_without_team_stats
+
+    partition = partition_export_candidates([candidate])
+
+    assert partition.exportable_ids == ()
+    assert partition.unsafe_ids == (4,)
+    assert partition.decisions[4].reason_code == "source_incomplete"
+    assert partition.decisions[4].exportable is False
+
+
 def test_queue_exports_safe_subset_when_one_fixture_is_unsafe() -> None:
     calls: list[list[int]] = []
 
