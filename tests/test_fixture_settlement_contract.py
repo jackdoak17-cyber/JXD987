@@ -43,6 +43,14 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("--fixture-core-only", source)
         self.assertNotIn("--with-details", source)
 
+    def test_p3_delivery_refresh_covers_retained_rolling_schedule(self) -> None:
+        wrapper = ROOT / "scripts/vps/run_p3.sh"
+        source = wrapper.read_text(encoding="utf-8")
+        self.assertIn(
+            'FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-43}"',
+            source,
+        )
+
     def test_supported_league_helper_excludes_cups(self) -> None:
         excluded = set(json.loads((ROOT / "config/odds_api_sync_excluded_leagues.json").read_text()))
         result = subprocess.run(
