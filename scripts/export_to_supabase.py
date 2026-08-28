@@ -546,7 +546,7 @@ def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) 
                detailed_position_id, detailed_position_name, detailed_position_code,
                formation_field, formation_position,
                lineup_detailed_position_id, lineup_detailed_position_name, lineup_detailed_position_code,
-               position_abbr
+               position_abbr, extra
         from fixture_players
         where fixture_id in ({q})
         """,
@@ -573,6 +573,7 @@ def fetch_fixture_players(conn: sqlite3.Connection, fixture_ids: Sequence[int]) 
             "lineup_detailed_position_name": r[16],
             "lineup_detailed_position_code": r[17],
             "position_abbr": r[18],
+            "extra": r[19],
         }
         for r in cur.fetchall()
     ]
@@ -585,7 +586,8 @@ def fetch_fixture_statistics(conn: sqlite3.Connection, fixture_ids: Sequence[int
     q = ",".join("?" for _ in fixture_ids)
     cur.execute(
         f"""
-        select fixture_id, team_id, type_id, max(value) as value
+        select fixture_id, team_id, type_id, max(code) as code, max(name) as name,
+               max(location) as location, max(value) as value, max(extra) as extra
         from fixture_statistics
         where fixture_id in ({q})
         group by fixture_id, team_id, type_id
@@ -597,7 +599,11 @@ def fetch_fixture_statistics(conn: sqlite3.Connection, fixture_ids: Sequence[int
             "fixture_id": r[0],
             "team_id": r[1],
             "type_id": r[2],
-            "value": r[3],
+            "code": r[3],
+            "name": r[4],
+            "location": r[5],
+            "value": r[6],
+            "extra": r[7],
         }
         for r in cur.fetchall()
     ]
@@ -610,7 +616,7 @@ def fetch_fixture_player_statistics(conn: sqlite3.Connection, fixture_ids: Seque
     q = ",".join("?" for _ in fixture_ids)
     cur.execute(
         f"""
-        select fixture_id, player_id, team_id, type_id, value
+        select fixture_id, player_id, team_id, type_id, code, name, value, extra
         from fixture_player_statistics
         where fixture_id in ({q})
         """,
@@ -622,7 +628,10 @@ def fetch_fixture_player_statistics(conn: sqlite3.Connection, fixture_ids: Seque
             "player_id": r[1],
             "team_id": r[2],
             "type_id": r[3],
-            "value": r[4],
+            "code": r[4],
+            "name": r[5],
+            "value": r[6],
+            "extra": r[7],
         }
         for r in cur.fetchall()
     ]
@@ -914,6 +923,51 @@ def delete_fixture_rows(table: str, fixture_ids: Sequence[int], dry_run: bool) -
     return total, sorted(set(missed_fixture_ids))
 
 
+def atomic_fixture_detail_publish(
+    target_conn,
+    *,
+    fixture_id: int,
+    snapshot_id: int | None,
+    fixture_players: Sequence[Dict],
+    fixture_statistics: Sequence[Dict],
+    fixture_player_statistics: Sequence[Dict],
+) -> Dict:
+    """Replace one fixture's raw detail through one target-side transaction."""
+    def json_rows(rows: Sequence[Dict]) -> list[Dict]:
+        normalized: list[Dict] = []
+        for row in rows:
+            value = dict(row)
+            if isinstance(value.get("extra"), str):
+                try:
+                    value["extra"] = json.loads(value["extra"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            normalized.append(value)
+        return normalized
+
+    payloads = (
+        json.dumps(json_rows(fixture_players), default=str),
+        json.dumps(json_rows(fixture_statistics), default=str),
+        json.dumps(json_rows(fixture_player_statistics), default=str),
+    )
+    try:
+        with target_conn.cursor() as cur:
+            cur.execute(
+                """
+                select public.publish_fixture_detail_atomic(
+                  %s, %s, %s::jsonb, %s::jsonb, %s::jsonb
+                )
+                """,
+                (fixture_id, snapshot_id, *payloads),
+            )
+            row = cur.fetchone()
+        target_conn.commit()
+        return row[0] if row else {"fixture_id": fixture_id}
+    except Exception:
+        target_conn.rollback()
+        raise
+
+
 def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) -> Tuple[int, int]:
     if not rows:
         return 0, 0
@@ -1038,6 +1092,11 @@ def main():
         "--require-detail",
         action="store_true",
         help="Require non-empty source player statistics for both teams as well as lineups.",
+    )
+    parser.add_argument(
+        "--atomic-fixture-detail",
+        action="store_true",
+        help="Publish each explicit fixture's detail through the target-side atomic publisher.",
     )
     parser.add_argument(
         "--upcoming-days",
@@ -1189,7 +1248,7 @@ def main():
     log.info("Payload counts: odds_snapshots=%s odds_outcomes=%s", len(odds_snapshots), len(odds_outcomes))
 
     delete_stats: Dict[str, Dict[str, object]] = {}
-    if fixture_ids and not args.fixture_core_only:
+    if fixture_ids and not args.fixture_core_only and not args.atomic_fixture_detail:
         log.info("Deleting existing fixture-scoped rows before upsert")
         deleted_fixture_players, missed_fixture_players = delete_fixture_rows("fixture_players", fixture_ids, args.dry_run)
         deleted_fixture_player_stats, missed_fixture_player_stats = delete_fixture_rows(
@@ -1253,11 +1312,51 @@ def main():
                 ("players", players, "id"),
                 ("sidelined_players", sidelined_players, "id"),
                 ("player_team_history", player_team_history, "id"),
+            ]
+        )
+
+    if not args.fixture_core_only and not args.atomic_fixture_detail:
+        exports.extend(
+            [
                 ("fixture_players", fixture_players, "fixture_id,player_id"),
                 ("fixture_statistics", fixture_stats, "fixture_id,team_id,type_id"),
                 ("fixture_player_statistics", fixture_player_stats, "fixture_id,player_id,type_id"),
             ]
         )
+
+    atomic_published: Dict[str, int] = {}
+    if args.atomic_fixture_detail and not args.dry_run:
+        if psycopg2 is None or not SUPABASE_DB_URL:
+            raise SystemExit("--atomic-fixture-detail requires SUPABASE_DB_URL and psycopg2")
+        target_conn = psycopg2.connect(SUPABASE_DB_URL, connect_timeout=20)
+        try:
+            for fixture_id in sorted(fixture_ids):
+                try:
+                    atomic_fixture_detail_publish(
+                        target_conn,
+                        fixture_id=int(fixture_id),
+                        snapshot_id=None,
+                        fixture_players=[row for row in fixture_players if int(row["fixture_id"]) == int(fixture_id)],
+                        fixture_statistics=[row for row in fixture_stats if int(row["fixture_id"]) == int(fixture_id)],
+                        fixture_player_statistics=[
+                            row for row in fixture_player_stats if int(row["fixture_id"]) == int(fixture_id)
+                        ],
+                    )
+                    atomic_published[str(fixture_id)] = 1
+                except Exception as exc:
+                    failure = {
+                        "status": "failed",
+                        "failure_class": "database",
+                        "stage": "atomic_fixture_detail_publish",
+                        "fixture_id": int(fixture_id),
+                        "error": str(exc)[-4000:],
+                    }
+                    _write_json_report(args.report_json, failure)
+                    raise SystemExit(
+                        f"Atomic fixture-detail publish failed for fixture {fixture_id}: {exc}"
+                    ) from exc
+        finally:
+            target_conn.close()
 
     for table, rows, on_conflict in exports:
         log.info("Exporting %s (%s rows)", table, len(rows))

@@ -158,7 +158,8 @@ grant select, insert, update, delete on table public.player_stats_season_metric 
 create or replace function public.refresh_player_stats_season(
   p_league_id integer,
   p_season_id integer,
-  p_player_id bigint default null
+  p_player_id bigint default null,
+  p_fixture_ids bigint[] default null
 )
 returns integer
 language plpgsql
@@ -208,6 +209,15 @@ begin
       and f.away_score is not null
       and fp.team_id is not null
       and not public.stats_fixture_is_excluded(f.id)
+      and (
+        (p_fixture_ids is not null and f.id = any(p_fixture_ids))
+        or exists (
+          select 1
+            from public.fixture_detail_delivery_status d
+           where d.fixture_id = f.id
+             and d.status in ('verified', 'provider_sparse')
+        )
+      )
       and coalesce(fp.minutes_played, 0) > 0
       and (p_player_id is null or fp.player_id = p_player_id)
   ),
@@ -264,6 +274,15 @@ begin
       and f.away_score is not null
       and fp.team_id is not null
       and not public.stats_fixture_is_excluded(f.id)
+      and (
+        (p_fixture_ids is not null and f.id = any(p_fixture_ids))
+        or exists (
+          select 1
+            from public.fixture_detail_delivery_status d
+           where d.fixture_id = f.id
+             and d.status in ('verified', 'provider_sparse')
+        )
+      )
       and coalesce(fp.minutes_played, 0) > 0
       and (p_player_id is null or fp.player_id = p_player_id)
   ),
@@ -392,10 +411,32 @@ begin
   -- Rebuilding the complete season is intentional: it removes projections for
   -- players that a provider correction removed from this fixture, while also
   -- preserving transfer stints and making the operation idempotent.
-  v_rows := public.refresh_player_stats_season(v_league_id, v_season_id, null);
+  v_rows := public.refresh_player_stats_season_eligible(v_league_id, v_season_id, null, array[p_fixture_id]);
   return v_rows;
 end;
 $$;
+
+create or replace function public.refresh_player_stats_season_eligible(
+  p_league_id integer,
+  p_season_id integer,
+  p_player_id bigint default null,
+  p_fixture_ids bigint[] default null
+)
+returns integer
+language sql
+volatile
+set search_path to 'pg_catalog', 'public'
+as $function$
+  select public.refresh_player_stats_season(
+    p_league_id,
+    p_season_id,
+    p_player_id,
+    p_fixture_ids
+  );
+$function$;
+
+revoke all on function public.refresh_player_stats_season_eligible(integer, integer, bigint, bigint[]) from public, anon;
+grant execute on function public.refresh_player_stats_season_eligible(integer, integer, bigint, bigint[]) to service_role;
 
 create or replace function public.player_stats_season_table(
   p_league_id integer,

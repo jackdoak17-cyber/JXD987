@@ -534,11 +534,8 @@ def candidate_target_fixture_ids(
             """
             d.fixture_id is not null
             and (
-              (d.accepted_snapshot_id is null and (
-                d.status in ('verified', 'provider_sparse')
-                or d.next_attempt_at is null
-                or d.next_attempt_at <= now()
-              ))
+              (d.status in ('provider_pending', 'failed', 'export_failed', 'verification_failed', 'projection_failed')
+                and (d.next_attempt_at is null or d.next_attempt_at <= now()))
               or (d.next_revalidation_at is not null and d.next_revalidation_at <= now())
               or (d.status = 'verified' and d.next_revalidation_at is null)
             )
@@ -1282,17 +1279,23 @@ def stable_provider_sparse_assessment(
     revision so a temporary post-match response cannot shrink the serving
     facts.
     """
+    sparse_optional_gap = assessment.status == "provider_sparse" and any(
+        missing for missing in assessment.missing_team_stat_type_ids.values()
+    )
+    identity_gap = (
+        assessment.status == "provider_pending"
+        and (assessment.error or "").startswith(
+            "provider lineup/player identity detail incomplete"
+        )
+    )
     if (
-        assessment.status != "provider_pending"
+        not (sparse_optional_gap or identity_gap)
         or not assessment.finished
         or assessment.fixture_status not in FINISHED_STATUSES
         or assessment.team_stat_count <= 0
         or assessment.player_stat_count <= 0
         or assessment.lineup_count <= 0
         or stable_fetch_count < 2
-        or not (assessment.error or "").startswith(
-            "provider lineup/player identity detail incomplete"
-        )
         or any(count <= 0 for count in assessment.lineup_counts.values())
         or any(count <= 0 for count in assessment.player_stat_counts.values())
     ):
@@ -1301,7 +1304,7 @@ def stable_provider_sparse_assessment(
         assessment,
         status="provider_sparse",
         error=(
-            f"{assessment.error}; provider-sparse classification confirmed "
+            f"{assessment.error or 'optional provider stat types are absent'}; provider-sparse classification confirmed "
             f"after {stable_fetch_count} identical finished payloads"
         ),
     )
@@ -1556,6 +1559,7 @@ def export_fixture(fixture_id: int, leagues: Sequence[int], report_path: str) ->
         str(fixture_id),
         "--protect-empty-detail",
         "--require-detail",
+        "--atomic-fixture-detail",
         "--skip-odds-snapshots",
         "--skip-odds-outcomes",
         "--skip-prune",
@@ -1758,6 +1762,12 @@ def main() -> int:
             terminal_sparse = stable_provider_sparse_assessment(assessment, stable_fetch_count)
             if terminal_sparse is not None:
                 assessment = terminal_sparse
+            elif assessment.status == "provider_sparse":
+                assessment = replace(
+                    assessment,
+                    status="provider_pending",
+                    error="optional provider stat types are absent; awaiting stable confirmation",
+                )
             if assessment.status == "provider_pending":
                 now = utc_now()
                 next_at = backoff_time(attempt, now)

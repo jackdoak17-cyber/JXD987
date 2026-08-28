@@ -20,7 +20,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,6 +59,11 @@ from scripts.postmatch_fixture_detail_delivery import (
     recover_stale_running,
     repair_legacy_ledger,
 )
+from scripts.fixture_detail_export_policy import (
+    FixtureExportPartition,
+    partition_export_candidates,
+    retryable_delivery_status_is_due,
+)
 
 
 LOG = logging.getLogger("reconcile_stats_provider_queue")
@@ -78,6 +83,118 @@ DETAIL_INCLUDE = ";".join(
 )
 MAX_BULK_FIXTURE_IDS = 50
 DEFAULT_MAX_COHORTS = 8
+
+
+@dataclass(frozen=True)
+class ExportCommandResult:
+    fixture_ids: tuple[int, ...]
+    returncode: int
+    successful: bool
+    failure_class: str | None = None
+    stage: str | None = None
+    message: str | None = None
+
+    @classmethod
+    def success(cls, fixture_ids: list[int] | tuple[int, ...]) -> "ExportCommandResult":
+        return cls(tuple(int(value) for value in fixture_ids), 0, True)
+
+    @classmethod
+    def failure(
+        cls,
+        *,
+        fixture_ids: list[int] | tuple[int, ...],
+        failure_class: str,
+        stage: str,
+        message: str,
+        returncode: int = 1,
+    ) -> "ExportCommandResult":
+        return cls(tuple(int(value) for value in fixture_ids), returncode, False, failure_class, stage, message)
+
+
+@dataclass(frozen=True)
+class ExportBatchResult:
+    outcomes: tuple[ExportCommandResult, ...]
+
+    @property
+    def returncode(self) -> int:
+        return 0 if all(outcome.returncode == 0 for outcome in self.outcomes) else 1
+
+    @property
+    def exported_ids(self) -> tuple[int, ...]:
+        return tuple(
+            fixture_id
+            for outcome in self.outcomes
+            if outcome.successful
+            for fixture_id in outcome.fixture_ids
+        )
+
+    @property
+    def failed_ids(self) -> tuple[int, ...]:
+        return tuple(
+            fixture_id
+            for outcome in self.outcomes
+            if not outcome.successful
+            for fixture_id in outcome.fixture_ids
+        )
+
+
+@dataclass(frozen=True)
+class ExportCandidatesResult:
+    exported_ids: tuple[int, ...]
+    retryable_ids: tuple[int, ...]
+    unsafe_ids: tuple[int, ...]
+    partition: FixtureExportPartition
+    exporter_result: ExportCommandResult | ExportBatchResult | None = None
+
+
+def export_candidates(
+    candidates: list[dict[str, Any]],
+    exporter: Any,
+) -> ExportCandidatesResult:
+    """Partition candidates before invoking a fixture-detail exporter."""
+    partition = partition_export_candidates(candidates)
+    if not partition.exportable:
+        return ExportCandidatesResult((), partition.unsafe_ids, partition.unsafe_ids, partition)
+    result = exporter(list(partition.exportable_ids))
+    successful = bool(getattr(result, "successful", False))
+    if isinstance(result, ExportBatchResult):
+        exported_ids = result.exported_ids
+        retryable_ids = result.failed_ids + partition.unsafe_ids
+    elif successful:
+        exported_ids = tuple(int(value) for value in result.fixture_ids)
+        missing_ids = tuple(fixture_id for fixture_id in partition.exportable_ids if fixture_id not in exported_ids)
+        retryable_ids = missing_ids + partition.unsafe_ids
+    else:
+        exported_ids = ()
+        retryable_ids = partition.exportable_ids + partition.unsafe_ids
+    return ExportCandidatesResult(exported_ids, retryable_ids, partition.unsafe_ids, partition, result)
+
+
+def record_export_failure(
+    conn: sqlite3.Connection,
+    target_url: str,
+    candidate: dict[str, Any],
+    result: ExportCommandResult,
+    *,
+    now: datetime | None = None,
+    target_conn: Any | None = None,
+) -> None:
+    """Keep an attempted fixture retryable without changing its attempt number."""
+    fixture_id = int(candidate["fixture_id"])
+    attempt = int(candidate.get("attempt") or 1)
+    current = now or datetime.now(timezone.utc)
+    message = result.message or "fixture-detail export failed"
+    update_ledger(
+        conn,
+        fixture_id,
+        "export_failed",
+        attempt,
+        assessment=candidate.get("assessment"),
+        source=candidate.get("source"),
+        error=f"{result.failure_class or 'exporter'}:{result.stage or 'unknown'}: {message}"[-4000:],
+        next_attempt_at=backoff_time(attempt, current),
+    )
+    publish_delivery_status(target_url, conn, fixture_id, target_conn=target_conn)
 
 
 def cohort_limited_fixture_ids(
@@ -241,30 +358,48 @@ def parse_csv_ints(value: str | None) -> list[int]:
     return [int(token.strip()) for token in (value or "").split(",") if token.strip()]
 
 
-def export_batch(fixture_ids: list[int], leagues: list[int], report_path: str) -> subprocess.CompletedProcess[str]:
-    command = [
-        sys.executable,
-        str(Path(__file__).with_name("export_to_supabase.py")),
-        "--strict",
-        "--leagues",
-        ",".join(str(value) for value in leagues),
-        "--fixture-ids",
-        ",".join(str(value) for value in fixture_ids),
-        "--keep-all-seasons",
-        "--protect-empty-detail",
-        "--require-detail",
-        "--skip-odds-snapshots",
-        "--skip-odds-outcomes",
-        "--skip-prune",
-        "--report-json",
-        report_path,
-    ]
-    return subprocess.run(command, text=True, capture_output=True, check=False)
+def export_batch(fixture_ids: list[int], leagues: list[int], report_path: str) -> ExportBatchResult:
+    """Publish each safe fixture through an atomic target transaction."""
+    outcomes: list[ExportCommandResult] = []
+    for fixture_id in fixture_ids:
+        command = [
+            sys.executable,
+            str(Path(__file__).with_name("export_to_supabase.py")),
+            "--strict",
+            "--leagues",
+            ",".join(str(value) for value in leagues),
+            "--fixture-ids",
+            str(fixture_id),
+            "--keep-all-seasons",
+            "--protect-empty-detail",
+            "--require-detail",
+            "--atomic-fixture-detail",
+            "--skip-odds-snapshots",
+            "--skip-odds-outcomes",
+            "--skip-prune",
+            "--report-json",
+            report_path,
+        ]
+        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+        if completed.returncode == 0:
+            outcomes.append(ExportCommandResult.success([fixture_id]))
+        else:
+            outcomes.append(
+                ExportCommandResult.failure(
+                    fixture_ids=[fixture_id],
+                    failure_class="exporter",
+                    stage="fixture_detail_publish",
+                    message=(completed.stderr or completed.stdout or "fixture-detail export failed")[-4000:],
+                    returncode=completed.returncode,
+                )
+            )
+    return ExportBatchResult(tuple(outcomes))
 
 
 def refresh_seasons(
     target_url: str,
     seasons: set[tuple[int, int]],
+    eligible_fixture_ids: set[int] | None = None,
     target_conn: Any | None = None,
 ) -> dict[str, int]:
     rows: dict[str, int] = {}
@@ -274,8 +409,8 @@ def refresh_seasons(
         with target.cursor() as cur:
             for league_id, season_id in sorted(seasons):
                 cur.execute(
-                    "select public.refresh_player_stats_season(%s, %s, null)",
-                    (league_id, season_id),
+                    "select public.refresh_player_stats_season_eligible(%s, %s, null, %s)",
+                    (league_id, season_id, sorted(eligible_fixture_ids) if eligible_fixture_ids is not None else None),
                 )
                 rows[f"{league_id}:{season_id}"] = int(cur.fetchone()[0] or 0)
         target.commit()
@@ -371,6 +506,14 @@ def main() -> int:
     # requests cannot race mutable retry/stat state.
     client = SportMonksClient()
     report: dict[str, Any] = {
+        "summary": {
+            "status": "running",
+            "batches": 0,
+            "fixtures_selected": 0,
+            "fixtures_accepted": 0,
+            "failed": 0,
+            "provider_pending": 0,
+        },
         "release_id": os.environ.get("RUNTIME_RELEASE_ID", "local"),
         "leagues": leagues,
         "season_ids": season_ids,
@@ -544,6 +687,12 @@ def main() -> int:
                     terminal_sparse = stable_provider_sparse_assessment(assessment, stable_count)
                     if terminal_sparse is not None:
                         assessment = terminal_sparse
+                    elif assessment.status == "provider_sparse":
+                        assessment = replace(
+                            assessment,
+                            status="provider_pending",
+                            error="optional provider stat types are absent; awaiting stable confirmation",
+                        )
                     if assessment.status == "provider_pending":
                         next_at = backoff_time(attempt, datetime.now(timezone.utc))
                         update_ledger(conn, fixture_id, assessment.status, attempt, assessment, error=assessment.error, next_attempt_at=next_at, payload_hash=payload_hash, normalized_hash=normalized_hash, stable_fetch_count=stable_count)
@@ -574,7 +723,7 @@ def main() -> int:
                     )
                     if not meta:
                         meta = conn.execute("select league_id,season_id,starting_at from fixtures where id=?", (fixture_id,)).fetchone()
-                    accepted.append({"fixture_id": fixture_id, "assessment": assessment, "source": source, "snapshot_id": snapshot_id, "payload_hash": payload_hash, "normalized_hash": normalized_hash, "stable_count": stable_count, "meta": meta})
+                    accepted.append({"fixture_id": fixture_id, "attempt": attempt, "assessment": assessment, "source": source, "snapshot_id": snapshot_id, "payload_hash": payload_hash, "normalized_hash": normalized_hash, "stable_count": stable_count, "meta": meta})
                 except ProviderFixtureUnavailableError as exc:
                     message = str(exc)[-4000:]
                     review_at = mark_provider_unavailable(
@@ -607,29 +756,94 @@ def main() -> int:
 
             if not accepted:
                 continue
-            accepted_ids = [item["fixture_id"] for item in accepted]
             stage_started = time.perf_counter()
-            export_result = export_batch(accepted_ids, leagues, "/tmp/reconcile_stats_provider_export.json")
+            export_result = export_candidates(
+                accepted,
+                lambda fixture_ids: export_batch(
+                    fixture_ids,
+                    leagues,
+                    "/tmp/reconcile_stats_provider_export.json",
+                ),
+            )
             report["stage_seconds"]["export"] = round(time.perf_counter() - stage_started, 3)
-            if export_result.returncode != 0:
-                message = (export_result.stderr or export_result.stdout or "batch export failed")[-4000:]
+            for item in export_result.partition.unsafe:
+                decision = export_result.partition.decisions[int(item["fixture_id"])]
+                next_at = backoff_time(int(item.get("attempt") or 1), datetime.now(timezone.utc))
+                update_ledger(
+                    conn,
+                    int(item["fixture_id"]),
+                    "provider_pending",
+                    int(item.get("attempt") or 1),
+                    assessment=item.get("assessment"),
+                    source=item.get("source"),
+                    error=decision.reason,
+                    next_attempt_at=next_at,
+                )
+                publish_delivery_status(
+                    target_url,
+                    conn,
+                    int(item["fixture_id"]),
+                    target_conn=shared_target_connection(),
+                )
+                report["provider_pending"].append({"fixture_id": int(item["fixture_id"]), "reason": decision.reason})
+
+            failed_ids = set(export_result.retryable_ids).difference(export_result.unsafe_ids)
+            if failed_ids:
+                outcomes_by_fixture: dict[int, ExportCommandResult] = {}
+                exporter_result = export_result.exporter_result
+                if isinstance(exporter_result, ExportBatchResult):
+                    outcomes_by_fixture = {
+                        fixture_id: outcome
+                        for outcome in exporter_result.outcomes
+                        for fixture_id in outcome.fixture_ids
+                    }
+                elif isinstance(exporter_result, ExportCommandResult):
+                    outcomes_by_fixture = {
+                        fixture_id: exporter_result
+                        for fixture_id in exporter_result.fixture_ids
+                    }
                 for item in accepted:
-                    fixture_id = item["fixture_id"]
-                    update_ledger(conn, fixture_id, "export_failed", 0, error=message, next_attempt_at=backoff_time(1, datetime.now(timezone.utc)))
-                    publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
-                    report["failed"].append({"fixture_id": fixture_id, "stage": "export", "error": message})
-                continue
+                    fixture_id = int(item["fixture_id"])
+                    if fixture_id not in failed_ids:
+                        continue
+                    failure = outcomes_by_fixture.get(
+                        fixture_id,
+                        ExportCommandResult.failure(
+                            fixture_ids=[fixture_id],
+                            failure_class="exporter",
+                            stage="fixture_detail_publish",
+                            message="fixture was not included in the successful export result",
+                        ),
+                    )
+                    record_export_failure(
+                        conn,
+                        target_url,
+                        item,
+                        failure,
+                        target_conn=shared_target_connection(),
+                    )
+                    report["failed"].append(
+                        {
+                            "fixture_id": fixture_id,
+                            "stage": failure.stage or "export",
+                            "failure_class": failure.failure_class or "exporter",
+                            "error": failure.message or "fixture-detail export failed",
+                        }
+                    )
 
             valid: list[dict[str, Any]] = []
             seasons: set[tuple[int, int]] = set()
             stage_started = time.perf_counter()
             for item in accepted:
                 fixture_id = item["fixture_id"]
+                if fixture_id not in export_result.exported_ids:
+                    continue
                 target = target_snapshot(shared_target_connection(), fixture_id)
                 problems = compare_snapshots(item["source"], target)
                 if problems:
                     message = "; ".join(problems)
-                    update_ledger(conn, fixture_id, "verification_failed", 0, assessment=item["assessment"], source=item["source"], target=target, error=message, next_attempt_at=backoff_time(1, datetime.now(timezone.utc)))
+                    attempt = int(item.get("attempt") or 1)
+                    update_ledger(conn, fixture_id, "verification_failed", attempt, assessment=item["assessment"], source=item["source"], target=target, error=message, next_attempt_at=backoff_time(attempt, datetime.now(timezone.utc)))
                     publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                     report["failed"].append({"fixture_id": fixture_id, "stage": "verification", "error": message})
                     continue
@@ -641,7 +855,40 @@ def main() -> int:
 
             if seasons:
                 stage_started = time.perf_counter()
-                refreshed = refresh_seasons(target_url, seasons, target_conn=shared_target_connection())
+                try:
+                    refreshed = refresh_seasons(
+                        target_url,
+                        seasons,
+                        eligible_fixture_ids={int(item["fixture_id"]) for item in valid},
+                        target_conn=shared_target_connection(),
+                    )
+                except Exception as exc:
+                    message = str(exc)[-4000:]
+                    for item in valid:
+                        attempt = int(item.get("attempt") or 1)
+                        fixture_id = int(item["fixture_id"])
+                        update_ledger(
+                            conn,
+                            fixture_id,
+                            "projection_failed",
+                            attempt,
+                            assessment=item["assessment"],
+                            source=item["source"],
+                            target=item["target"],
+                            error=message,
+                            next_attempt_at=backoff_time(attempt, datetime.now(timezone.utc)),
+                        )
+                        publish_delivery_status(
+                            target_url,
+                            conn,
+                            fixture_id,
+                            target_conn=shared_target_connection(),
+                        )
+                        report["failed"].append(
+                            {"fixture_id": fixture_id, "stage": "projection", "error": message}
+                        )
+                    valid = []
+                    refreshed = {}
                 report["stage_seconds"]["projection_refresh"] = round(time.perf_counter() - stage_started, 3)
                 for key, count in refreshed.items():
                     report["projection_rows"][key] = report["projection_rows"].get(key, 0) + count
@@ -670,6 +917,16 @@ def main() -> int:
         engine.dispose()
 
     report["status"] = "failed" if report["failed"] else "success"
+    report["summary"].update(
+        {
+            "status": report["status"],
+            "batches": report["batches"],
+            "fixtures_selected": report["fixtures_selected"],
+            "fixtures_accepted": report["fixtures_accepted"],
+            "failed": len(report["failed"]),
+            "provider_pending": len(report["provider_pending"]),
+        }
+    )
     Path(args.report_json).write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
     print(json.dumps(report, default=str))
     return 1 if report["status"] == "failed" else 0
