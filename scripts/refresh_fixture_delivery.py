@@ -13,10 +13,12 @@ import argparse
 import json
 import logging
 import os
+from uuid import uuid4
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 import psycopg2
 from psycopg2.extras import Json, execute_values
@@ -24,6 +26,7 @@ from psycopg2.extras import Json, execute_values
 
 LOG = logging.getLogger("refresh_fixture_delivery")
 UTC = timezone.utc
+LONDON = ZoneInfo("Europe/London")
 EXCLUDED_CUPS = {24, 27, 109, 307, 390, 570}
 HIDDEN_STATUSES = {
     "POSTP",
@@ -63,7 +66,10 @@ def as_float(value: Any) -> float | None:
 
 
 def iso_date(value: datetime | date) -> str:
-    return value.date().isoformat() if isinstance(value, datetime) else value.isoformat()
+    if isinstance(value, datetime):
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return aware.astimezone(LONDON).date().isoformat()
+    return value.isoformat()
 
 
 def normalize_status(value: Any) -> str:
@@ -135,15 +141,15 @@ def connection():
     return psycopg2.connect(url, connect_timeout=20)
 
 
-def start_run(cur, component: str, start: date, end: date) -> str:
+def start_run(cur, component: str, start: date, end: date, release_id: str | None = None) -> str:
     cur.execute(
         """
         insert into public.fixture_delivery_refresh_runs
-          (component, requested_start, requested_end)
-        values (%s, %s, %s)
+          (component, requested_start, requested_end, release_id)
+        values (%s, %s, %s, %s)
         returning id
         """,
-        (component, start, end),
+        (component, start, end, release_id),
     )
     return str(cur.fetchone()[0])
 
@@ -171,6 +177,113 @@ def finish_run(cur, run_id: str, status: str, stats: dict[str, Any], error: str 
             run_id,
         ),
     )
+
+
+DELIVERY_COMPONENTS = ("schedule", "standings", "metrics", "odds")
+
+
+def create_release(cur, start: date, end: date) -> str:
+    release_id = str(uuid4())
+    cur.execute(
+        """
+        insert into public.fixture_delivery_releases (id, requested_start, requested_end)
+        values (%s, %s, %s)
+        """,
+        (release_id, start, end),
+    )
+    return release_id
+
+
+def lock_refresh_publication(cur) -> None:
+    """Serialize refresh builds so an older run cannot publish after a newer run."""
+    cur.execute("select pg_advisory_xact_lock(hashtextextended('fixture_delivery_refresh', 0))")
+
+
+def validate_release_components(
+    cur,
+    release_id: str,
+    schedule_fixture_ids: list[int],
+) -> dict[str, int]:
+    """Validate component completeness before exposing a release."""
+    counts: dict[str, int] = {}
+    for component, table in (
+        ("schedule", "fixture_delivery_schedule"),
+        ("standings", "fixture_delivery_standings"),
+        ("metrics", "fixture_delivery_metrics"),
+        ("odds", "fixture_delivery_odds"),
+    ):
+        cur.execute(
+            f"select count(*) from public.{table} where release_id = %s",
+            (release_id,),
+        )
+        counts[component] = int(cur.fetchone()[0])
+
+    expected_metrics = len(schedule_fixture_ids) * 2 * 11 * 2
+    if counts["schedule"] != len(schedule_fixture_ids):
+        raise RuntimeError(
+            f"fixture delivery schedule release mismatch: expected={len(schedule_fixture_ids)} actual={counts['schedule']}"
+        )
+    if counts["metrics"] != expected_metrics:
+        raise RuntimeError(
+            f"fixture delivery metrics release mismatch: expected={expected_metrics} actual={counts['metrics']}"
+        )
+    return counts
+
+
+def publish_release(
+    cur,
+    release_id: str,
+    counts: dict[str, int],
+    source_watermark: datetime | None,
+) -> None:
+    """Switch the sole customer-visible pointer inside the caller's transaction."""
+    cur.execute(
+        """
+        update public.fixture_delivery_releases
+           set status = 'published', published_at = now(),
+               source_watermark = %s,
+               schedule_rows = %s, standings_rows = %s,
+               metrics_rows = %s, odds_rows = %s
+         where id = %s and status = 'building'
+        """,
+        (
+            source_watermark,
+            counts.get("schedule", 0),
+            counts.get("standings", 0),
+            counts.get("metrics", 0),
+            counts.get("odds", 0),
+            release_id,
+        ),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError(f"fixture delivery release {release_id} is not buildable")
+    cur.execute(
+        """
+        insert into public.fixture_delivery_current_publication (publication_key, release_id)
+        values ('fixtures', %s)
+        on conflict (publication_key) do update
+          set release_id = excluded.release_id, updated_at = now()
+        """,
+        (release_id,),
+    )
+
+
+def fail_release(release_id: str, error_message: str) -> None:
+    """Persist failure state after the build transaction has rolled back."""
+    conn = connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                update public.fixture_delivery_releases
+                   set status = 'failed', failed_at = now(), error_message = %s
+                 where id = %s and status = 'building'
+                """,
+                (error_message[:4000], release_id),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def source_fixtures(cur, start: date, end: date, leagues: list[int]) -> list[dict[str, Any]]:
@@ -221,9 +334,10 @@ def all_completed_fixtures(cur, leagues: list[int]) -> list[dict[str, Any]]:
     return [row for row in rows if not is_hidden(row) and is_finished(row, now)]
 
 
-def upsert_schedule(cur, rows: list[dict[str, Any]], start: date, end: date) -> int:
+def upsert_schedule(cur, rows: list[dict[str, Any]], start: date, end: date, release_id: str) -> int:
     values = [
         (
+            release_id,
             row["id"],
             iso_date(row["starting_at"]),
             row["starting_at"],
@@ -253,13 +367,13 @@ def upsert_schedule(cur, rows: list[dict[str, Any]], start: date, end: date) -> 
             cur,
             """
             insert into public.fixture_delivery_schedule
-              (fixture_id, fixture_date, starting_at, status, status_code,
+              (release_id, fixture_id, fixture_date, starting_at, status, status_code,
                league_id, season_id, home_team_id, away_team_id, home_score,
                away_score, league_name, league_logo, home_team_name,
                home_team_short_code, home_team_image_path, away_team_name,
                away_team_short_code, away_team_image_path, source_updated_at)
             values %s
-            on conflict (fixture_id) do update set
+            on conflict (release_id, fixture_id) do update set
               fixture_date = excluded.fixture_date,
               starting_at = excluded.starting_at,
               status = excluded.status,
@@ -288,21 +402,21 @@ def upsert_schedule(cur, rows: list[dict[str, Any]], start: date, end: date) -> 
     if valid_ids:
         cur.execute(
             """
-            delete from public.fixture_delivery_schedule
-             where fixture_date >= %s and fixture_date < %s
+             delete from public.fixture_delivery_schedule
+             where release_id = %s and fixture_date >= %s and fixture_date < %s
                and not (fixture_id = any(%s))
             """,
-            (start, end, valid_ids),
+            (release_id, start, end, valid_ids),
         )
     else:
         cur.execute(
-            "delete from public.fixture_delivery_schedule where fixture_date >= %s and fixture_date < %s",
-            (start, end),
+            "delete from public.fixture_delivery_schedule where release_id = %s and fixture_date >= %s and fixture_date < %s",
+            (release_id, start, end),
         )
     return len(values)
 
 
-def validate_schedule_projection(cur, rows: list[dict[str, Any]]) -> None:
+def validate_schedule_projection(cur, rows: list[dict[str, Any]], release_id: str) -> None:
     """Fail the publication if the delivery projection disagrees with source rows."""
     if not rows:
         return
@@ -311,9 +425,9 @@ def validate_schedule_projection(cur, rows: list[dict[str, Any]]) -> None:
         """
         select fixture_id, status, status_code, home_score, away_score
           from public.fixture_delivery_schedule
-         where fixture_id = any(%s)
+         where release_id = %s and fixture_id = any(%s)
         """,
-        (fixture_ids,),
+        (release_id, fixture_ids),
     )
     projected = {int(row[0]): row[1:] for row in cur.fetchall()}
     mismatches: list[str] = []
@@ -340,6 +454,8 @@ def validate_schedule_projection(cur, rows: list[dict[str, Any]]) -> None:
 def compute_standings(completed: list[dict[str, Any]]) -> dict[tuple[int, int], dict[int, dict[str, int]]]:
     grouped: dict[tuple[int, int], dict[int, dict[str, int]]] = defaultdict(dict)
     for row in completed:
+        if row.get("season_id") is None:
+            continue
         key = (int(row["league_id"]), int(row["season_id"]))
         home_id, away_id = int(row["home_team_id"]), int(row["away_team_id"])
         hs, aws = int(row["home_score"]), int(row["away_score"])
@@ -383,9 +499,11 @@ def strict_current_season_rank(
     return int(current["rank"]) if current else None
 
 
-def write_standings(cur, standings: dict[tuple[int, int], dict[int, dict[str, int]]], completed: list[dict[str, Any]]) -> int:
+def write_standings(cur, standings: dict[tuple[int, int], dict[int, dict[str, int]]], completed: list[dict[str, Any]], release_id: str) -> int:
     latest: dict[tuple[int, int], datetime] = {}
     for row in completed:
+        if row.get("season_id") is None:
+            continue
         key = (int(row["league_id"]), int(row["season_id"]))
         latest[key] = max(latest.get(key, datetime.min.replace(tzinfo=UTC)), row["starting_at"])
     values = []
@@ -393,6 +511,7 @@ def write_standings(cur, standings: dict[tuple[int, int], dict[int, dict[str, in
         for team_id, stats in table.items():
             values.append(
                 (
+                    release_id,
                     league_id,
                     season_id,
                     team_id,
@@ -410,10 +529,10 @@ def write_standings(cur, standings: dict[tuple[int, int], dict[int, dict[str, in
             cur,
             """
             insert into public.fixture_delivery_standings
-              (league_id, season_id, team_id, rank, points, played,
+              (release_id, league_id, season_id, team_id, rank, points, played,
                goals_for, goals_against, goal_diff, source_max_starting_at)
             values %s
-            on conflict (league_id, season_id, team_id) do update set
+            on conflict (release_id, league_id, season_id, team_id) do update set
               rank = excluded.rank, points = excluded.points, played = excluded.played,
               goals_for = excluded.goals_for, goals_against = excluded.goals_against,
               goal_diff = excluded.goal_diff, source_max_starting_at = excluded.source_max_starting_at,
@@ -468,6 +587,8 @@ def build_season_scoped_history(
     """Index completed fixtures by league, season, and participating team."""
     history: dict[tuple[int, int, int], list[dict[str, Any]]] = defaultdict(list)
     for row in completed:
+        if row.get("season_id") is None:
+            continue
         league_id = int(row["league_id"])
         season_id = int(row["season_id"])
         history[(league_id, season_id, int(row["home_team_id"]))].append(row)
@@ -558,6 +679,7 @@ def write_metrics(
     schedule: list[dict[str, Any]],
     completed: list[dict[str, Any]],
     standings: dict[tuple[int, int], dict[int, dict[str, int]]],
+    release_id: str,
 ) -> tuple[int, dict[str, int]]:
     history_by_team_season = build_season_scoped_history(completed)
     now = datetime.now(UTC)
@@ -574,9 +696,13 @@ def write_metrics(
     }
     for fixture in schedule:
         for side, team_id in (("home", int(fixture["home_team_id"])), ("away", int(fixture["away_team_id"]))):
-            history_key = (int(fixture["league_id"]), int(fixture["season_id"]), team_id)
+            history_key = (
+                int(fixture["league_id"]),
+                int(fixture["season_id"]),
+                team_id,
+            ) if fixture.get("season_id") is not None else None
             prior = history_rows_for_fixture(
-                history_by_team_season.get(history_key, []), fixture, now
+                history_by_team_season.get(history_key, []) if history_key is not None else [], fixture, now
             )
             for window in range(5, 16):
                 samples: dict[str, int] = {}
@@ -588,11 +714,12 @@ def write_metrics(
                     samples[mode] = int(metrics.get("sample") or 0)
                     values.append(
                         (
+                            release_id,
                             fixture["id"], team_id, side, window, mode, Json(metrics),
                             strict_current_season_rank(
                                 standings,
                                 int(fixture["league_id"]),
-                                int(fixture["season_id"] or 0),
+                                int(fixture["season_id"]) if fixture.get("season_id") is not None else 0,
                                 team_id,
                             ),
                             max_source,
@@ -605,10 +732,10 @@ def write_metrics(
             cur,
             """
             insert into public.fixture_delivery_metrics
-              (fixture_id, team_id, side, metrics_window, metrics_mode,
+              (release_id, fixture_id, team_id, side, metrics_window, metrics_mode,
                metrics, league_rank, source_max_starting_at)
             values %s
-            on conflict (fixture_id, team_id, side, metrics_window, metrics_mode) do update set
+            on conflict (release_id, fixture_id, team_id, side, metrics_window, metrics_mode) do update set
               metrics = excluded.metrics, league_rank = excluded.league_rank,
               source_max_starting_at = excluded.source_max_starting_at, computed_at = now()
             """,
@@ -618,7 +745,7 @@ def write_metrics(
     return len(values), coverage
 
 
-def source_odds(cur, fixture_ids: list[int]) -> list[dict[str, Any]]:
+def source_odds(cur, fixture_ids: list[int], release_id: str) -> list[dict[str, Any]]:
     if not fixture_ids:
         return []
     cur.execute(
@@ -629,26 +756,28 @@ def source_odds(cur, fixture_ids: list[int]) -> list[dict[str, Any]]:
                o.line, o.price_decimal, o.price_american,
                o.last_updated_at as source_last_updated_at
           from public.odds_outcomes o
-          join public.fixture_delivery_schedule s on s.fixture_id = o.fixture_id
+          join public.fixture_delivery_schedule s
+            on s.release_id = %s and s.fixture_id = o.fixture_id
          where o.fixture_id = any(%s)
            and o.bookmaker_id = any(%s)
            and lower(o.market_key) = any(%s)
            and o.price_decimal > 1 and o.price_decimal <= 500
            and s.league_id <> all(%s)
         """,
-        (fixture_ids, list(ACTIVE_BOOKMAKERS), list(MONEYLINE_MARKETS), list(EXCLUDED_CUPS)),
+        (release_id, fixture_ids, list(ACTIVE_BOOKMAKERS), list(MONEYLINE_MARKETS), list(EXCLUDED_CUPS)),
     )
     columns = [description[0] for description in cur.description]
     return [dict(zip(columns, row)) for row in cur.fetchall()]
 
 
-def write_odds(cur, rows: list[dict[str, Any]]) -> int:
+def write_odds(cur, rows: list[dict[str, Any]], release_id: str) -> int:
     values = []
     for row in rows:
         line = row.get("line")
         line_key = line if line is not None else Decimal("-9999")
         values.append(
             (
+                release_id,
                 row["fixture_id"], row["bookmaker_id"], row["market_key"], row["selection_key"],
                 row["participant_type"], row["participant_id"], line, line_key,
                 row["price_decimal"], row.get("price_american"), row.get("source_last_updated_at"),
@@ -660,11 +789,11 @@ def write_odds(cur, rows: list[dict[str, Any]]) -> int:
             cur,
             """
             insert into public.fixture_delivery_odds
-              (fixture_id, bookmaker_id, market_key, selection_key, participant_type,
+              (release_id, fixture_id, bookmaker_id, market_key, selection_key, participant_type,
                participant_id, line, line_key, price_decimal, price_american,
                source_last_updated_at, observed_at)
             values %s
-            on conflict (fixture_id, bookmaker_id, market_key, selection_key,
+            on conflict (release_id, fixture_id, bookmaker_id, market_key, selection_key,
                          participant_type, participant_id, line_key) do update set
               line = excluded.line, price_decimal = excluded.price_decimal,
               price_american = excluded.price_american,
@@ -693,53 +822,68 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     conn = connection()
     conn.autocommit = False
+    release_id: str | None = None
     try:
         with conn.cursor() as cur:
-            schedule_run = start_run(cur, "schedule", start, end)
+            release_id = create_release(cur, start, end)
+        # Keep the build marker durable so a failed build can be marked failed
+        # after its data transaction is rolled back.
+        conn.commit()
+
+        with conn.cursor() as cur:
+            lock_refresh_publication(cur)
+            schedule_run = start_run(cur, "schedule", start, end, release_id)
             source = source_fixtures(cur, start, end, leagues)
             valid_schedule = [row for row in source if row["league_id"] not in EXCLUDED_CUPS and not is_hidden(row)]
             rejected_cups = sum(row["league_id"] in EXCLUDED_CUPS for row in source)
-            schedule_written = upsert_schedule(cur, valid_schedule, start, end)
-            validate_schedule_projection(cur, valid_schedule)
+            schedule_written = upsert_schedule(cur, valid_schedule, start, end, release_id)
+            validate_schedule_projection(cur, valid_schedule, release_id)
             finish_run(cur, schedule_run, "succeeded", {
                 "rows_read": len(source), "rows_written": schedule_written,
                 "rows_rejected": len(source) - len(valid_schedule), "rejected_cup_rows": rejected_cups,
                 "source_watermark": max((row["starting_at"] for row in source), default=None),
             })
-            conn.commit()
             report["components"]["schedule"] = {"rows_read": len(source), "rows_written": schedule_written, "rejected_cup_rows": rejected_cups}
 
             completed = all_completed_fixtures(cur, leagues)
             standings = compute_standings(completed)
-            standings_run = start_run(cur, "standings", start, end)
-            standings_written = write_standings(cur, standings, completed)
+            standings_run = start_run(cur, "standings", start, end, release_id)
+            standings_written = write_standings(cur, standings, completed, release_id)
             finish_run(cur, standings_run, "succeeded", {"rows_read": len(completed), "rows_written": standings_written})
-            conn.commit()
             report["components"]["standings"] = {"rows_read": len(completed), "rows_written": standings_written}
 
-            metrics_run = start_run(cur, "metrics", start, end)
-            metrics_written, metrics_coverage = write_metrics(cur, valid_schedule, completed, standings)
+            metrics_run = start_run(cur, "metrics", start, end, release_id)
+            metrics_written, metrics_coverage = write_metrics(cur, valid_schedule, completed, standings, release_id)
             finish_run(cur, metrics_run, "succeeded", {
                 "rows_read": len(completed),
                 "rows_written": metrics_written,
                 "rows_missing": metrics_coverage["venue_none"],
                 "coverage": metrics_coverage,
             })
-            conn.commit()
             report["components"]["metrics"] = {
                 "rows_read": len(completed),
                 "rows_written": metrics_written,
                 "coverage": metrics_coverage,
             }
 
-            odds_run = start_run(cur, "odds", start, end)
-            odds_source = source_odds(cur, [int(row["id"]) for row in valid_schedule])
-            odds_written = write_odds(cur, odds_source)
+            odds_run = start_run(cur, "odds", start, end, release_id)
+            odds_source = source_odds(cur, [int(row["id"]) for row in valid_schedule], release_id)
+            odds_written = write_odds(cur, odds_source, release_id)
             finish_run(cur, odds_run, "succeeded", {"rows_read": len(odds_source), "rows_written": odds_written})
-            conn.commit()
             report["components"]["odds"] = {"rows_read": len(odds_source), "rows_written": odds_written}
-    except Exception:
+            counts = validate_release_components(cur, release_id, [int(row["id"]) for row in valid_schedule])
+            source_watermark = max((row["starting_at"] for row in source), default=None)
+            publish_release(cur, release_id, counts, source_watermark)
+            report["release_id"] = release_id
+            report["published"] = True
+            conn.commit()
+    except Exception as error:
         conn.rollback()
+        if release_id is not None:
+            try:
+                fail_release(release_id, str(error))
+            except Exception:
+                LOG.exception("could not mark fixture delivery release %s failed", release_id)
         LOG.exception("fixtures delivery refresh failed")
         raise
     finally:
