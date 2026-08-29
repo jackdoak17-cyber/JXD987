@@ -72,6 +72,22 @@ def iso_date(value: datetime | date) -> str:
     return value.isoformat()
 
 
+def london_today(moment: datetime | None = None) -> str:
+    """Return the current (or supplied) calendar date in the product timezone."""
+    instant = moment or datetime.now(UTC)
+    aware = instant if instant.tzinfo is not None else instant.replace(tzinfo=UTC)
+    return aware.astimezone(LONDON).date().isoformat()
+
+
+def order_history_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return newest history first with a deterministic fixture-id tie break."""
+    return sorted(
+        rows,
+        key=lambda row: (row["starting_at"], -int(row["id"])),
+        reverse=True,
+    )
+
+
 def normalize_status(value: Any) -> str:
     return str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
 
@@ -123,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def get_dates(args: argparse.Namespace) -> tuple[date, date]:
-    start = date.fromisoformat(args.start_date) if args.start_date else date.today()
+    start = date.fromisoformat(args.start_date) if args.start_date else date.fromisoformat(london_today())
     end = date.fromisoformat(args.end_date) if args.end_date else start + timedelta(days=14)
     if end <= start:
         raise SystemExit("end date must be after start date")
@@ -218,16 +234,103 @@ def validate_release_components(
         )
         counts[component] = int(cur.fetchone()[0])
 
-    expected_metrics = len(schedule_fixture_ids) * 2 * 11 * 2
-    if counts["schedule"] != len(schedule_fixture_ids):
+    cur.execute(
+        "select fixture_id from public.fixture_delivery_schedule where release_id = %s",
+        (release_id,),
+    )
+    actual_schedule_ids = [int(row[0]) for row in cur.fetchall()]
+    if set(actual_schedule_ids) != set(int(value) for value in schedule_fixture_ids) or len(actual_schedule_ids) != len(schedule_fixture_ids):
         raise RuntimeError(
-            f"fixture delivery schedule release mismatch: expected={len(schedule_fixture_ids)} actual={counts['schedule']}"
+            "fixture delivery schedule identity mismatch: "
+            f"expected={sorted(set(schedule_fixture_ids))[:20]} actual={sorted(set(actual_schedule_ids))[:20]}"
         )
-    if counts["metrics"] != expected_metrics:
+
+    cur.execute(
+        """
+        select fixture_id, team_id, side, metrics_window, metrics_mode
+          from public.fixture_delivery_metrics
+         where release_id = %s
+        """,
+        (release_id,),
+    )
+    metric_rows = [
+        {
+            "fixture_id": int(row[0]),
+            "team_id": int(row[1]),
+            "side": str(row[2]),
+            "metrics_window": int(row[3]),
+            "metrics_mode": str(row[4]),
+        }
+        for row in cur.fetchall()
+    ]
+    cur.execute(
+        """
+        select fixture_id, home_team_id, away_team_id
+          from public.fixture_delivery_schedule
+         where release_id = %s
+        """,
+        (release_id,),
+    )
+    schedule_teams = {
+        int(row[0]): {"home": int(row[1]), "away": int(row[2])}
+        for row in cur.fetchall()
+    }
+    validate_metric_identity_set(schedule_fixture_ids, metric_rows, schedule_teams)
+    if counts["metrics"] != len(metric_rows):
         raise RuntimeError(
-            f"fixture delivery metrics release mismatch: expected={expected_metrics} actual={counts['metrics']}"
+            f"fixture delivery metrics row count mismatch: expected={len(metric_rows)} actual={counts['metrics']}"
+        )
+
+    cur.execute(
+        "select distinct fixture_id from public.fixture_delivery_odds where release_id = %s",
+        (release_id,),
+    )
+    odds_fixture_ids = {int(row[0]) for row in cur.fetchall()}
+    unknown_odds_ids = odds_fixture_ids - set(int(value) for value in schedule_fixture_ids)
+    if unknown_odds_ids:
+        raise RuntimeError(
+            f"fixture delivery odds identity mismatch: unknown fixture ids={sorted(unknown_odds_ids)[:20]}"
         )
     return counts
+
+
+def validate_metric_identity_set(
+    schedule_fixture_ids: Iterable[int],
+    metric_rows: Iterable[dict[str, Any]],
+    schedule_teams: dict[int, dict[str, int]] | None = None,
+) -> None:
+    """Require exactly two sides, eleven windows, both modes, and valid teams."""
+    fixture_ids = {int(value) for value in schedule_fixture_ids}
+    expected = {
+        (
+            fixture_id,
+            schedule_teams[fixture_id][side] if schedule_teams else None,
+            side,
+            window,
+            mode,
+        )
+        for fixture_id in fixture_ids
+        for side in ("home", "away")
+        for window in range(5, 16)
+        for mode in ("overall", "venue")
+    }
+    actual = {
+        (
+            int(row["fixture_id"]),
+            int(row["team_id"]) if schedule_teams else None,
+            str(row["side"]),
+            int(row["metrics_window"]),
+            str(row["metrics_mode"]),
+        )
+        for row in metric_rows
+    }
+    if actual != expected:
+        missing = sorted(expected - actual, key=str)
+        extra = sorted(actual - expected, key=str)
+        raise RuntimeError(
+            "fixture delivery metrics identity mismatch: "
+            f"missing={missing[:20]} extra={extra[:20]}"
+        )
 
 
 def publish_release(
@@ -241,6 +344,8 @@ def publish_release(
         """
         update public.fixture_delivery_releases
            set status = 'published', published_at = now(),
+               health_checked_at = now(),
+               pin_expires_at = now() + interval '2 hours',
                source_watermark = %s,
                schedule_rows = %s, standings_rows = %s,
                metrics_rows = %s, odds_rows = %s
@@ -324,14 +429,14 @@ def all_completed_fixtures(cur, leagues: list[int]) -> list[dict[str, Any]]:
            and league_id <> all(%s)
            and home_score is not null and away_score is not null
            and starting_at <= now()
-         order by starting_at desc
+         order by starting_at desc, id asc
         """,
         (leagues, list(EXCLUDED_CUPS)),
     )
     columns = [description[0] for description in cur.description]
     now = datetime.now(UTC)
     rows = [dict(zip(columns, row)) for row in cur.fetchall()]
-    return [row for row in rows if not is_hidden(row) and is_finished(row, now)]
+    return order_history_rows(row for row in rows if not is_hidden(row) and is_finished(row, now))
 
 
 def upsert_schedule(cur, rows: list[dict[str, Any]], start: date, end: date, release_id: str) -> int:
@@ -593,6 +698,8 @@ def build_season_scoped_history(
         season_id = int(row["season_id"])
         history[(league_id, season_id, int(row["home_team_id"]))].append(row)
         history[(league_id, season_id, int(row["away_team_id"]))].append(row)
+    for key, rows in history.items():
+        history[key] = order_history_rows(rows)
     return history
 
 
@@ -874,6 +981,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             counts = validate_release_components(cur, release_id, [int(row["id"]) for row in valid_schedule])
             source_watermark = max((row["starting_at"] for row in source), default=None)
             publish_release(cur, release_id, counts, source_watermark)
+            cur.execute("select public.fixture_delivery_gc()")
+            report["garbage_collected_releases"] = int(cur.fetchone()[0] or 0)
             report["release_id"] = release_id
             report["published"] = True
             conn.commit()

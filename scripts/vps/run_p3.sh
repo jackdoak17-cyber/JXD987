@@ -156,8 +156,8 @@ fi
 FIXTURE_DELIVERY_STATUS=0
 if [[ -n "${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}" ]]; then
   python scripts/refresh_fixture_delivery.py \
-    --start-date "$(date -u +%F)" \
-    --end-date "$(date -u -d "+${FIXTURE_DELIVERY_DAYS_FORWARD} days" +%F)" \
+    --start-date "$(TZ=Europe/London date +%F)" \
+    --end-date "$(TZ=Europe/London date -d "+${FIXTURE_DELIVERY_DAYS_FORWARD} days" +%F)" \
     --leagues "${STATS_LEAGUES}" \
     --report-out /tmp/fixture_delivery_v2_report.json || FIXTURE_DELIVERY_STATUS=$?
 else

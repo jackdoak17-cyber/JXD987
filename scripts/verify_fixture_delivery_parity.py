@@ -48,6 +48,15 @@ def expected_fixture_date(value: datetime | date) -> str:
     return value.isoformat()
 
 
+def order_history_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Mirror the public ordering contract without importing the refresh worker."""
+    return sorted(
+        rows,
+        key=lambda row: (row["starting_at"], -int(row["id"])),
+        reverse=True,
+    )
+
+
 def normalize_status(value: Any) -> str:
     return str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
 
@@ -74,10 +83,10 @@ def select_expected_history(history: list[dict[str, Any]], target: dict[str, Any
     now = now or datetime.now(UTC)
     target_time = target["starting_at"]
     include_equal = is_finished(target, now)
-    return [
+    return order_history_rows([
         row for row in history
         if row["starting_at"] < target_time or (include_equal and row["starting_at"] == target_time)
-    ]
+    ])
 
 
 def parse_leagues(raw: str | None) -> list[int]:
@@ -137,26 +146,37 @@ def load_source_history(cur, leagues: list[int]) -> list[dict[str, Any]]:
            and league_id <> all(%s)
            and home_score is not null and away_score is not null
            and starting_at <= now()
-         order by starting_at desc
+         order by starting_at desc, id asc
         """,
         (leagues, list(EXCLUDED_CUPS)),
     )
     now = datetime.now(UTC)
-    return [row for row in rows if not is_hidden(row) and is_finished(row, now)]
+    return order_history_rows(row for row in rows if not is_hidden(row) and is_finished(row, now))
 
 
 def load_published_release(cur, release_id: str | None) -> dict[str, Any]:
     if release_id:
         rows = query_rows(
             cur,
-            "select id, status, requested_start, requested_end, source_watermark from public.fixture_delivery_releases where id = %s",
+            """
+            select r.id, r.status, r.requested_start, r.requested_end,
+                   r.source_watermark, r.pin_expires_at, r.health_checked_at,
+                   exists (
+                     select 1 from public.fixture_delivery_current_publication p
+                      where p.publication_key = 'fixtures' and p.release_id = r.id
+                   ) as is_current
+              from public.fixture_delivery_releases r
+             where r.id = %s
+            """,
             (release_id,),
         )
     else:
         rows = query_rows(
             cur,
             """
-            select r.id, r.status, r.requested_start, r.requested_end, r.source_watermark
+            select r.id, r.status, r.requested_start, r.requested_end,
+                   r.source_watermark, r.pin_expires_at, r.health_checked_at,
+                   true as is_current
               from public.fixture_delivery_current_publication p
               join public.fixture_delivery_releases r on r.id = p.release_id
              where p.publication_key = 'fixtures'
@@ -164,6 +184,8 @@ def load_published_release(cur, release_id: str | None) -> dict[str, Any]:
         )
     if not rows or rows[0]["status"] != "published":
         raise RuntimeError("selected fixture delivery release is not published")
+    if not rows[0]["is_current"] and rows[0]["pin_expires_at"] <= datetime.now(UTC):
+        raise RuntimeError("selected fixture delivery release pin has expired")
     return rows[0]
 
 
@@ -394,8 +416,9 @@ def verify(cur, start: date, end: date, leagues: list[int], release_id: str | No
     for fixture_id in sorted(set(source_by_id) & set(delivery_by_id)):
         source = source_by_id[fixture_id]
         delivered = delivery_by_id[fixture_id]
-        fields = ("fixture_date", "league_id", "season_id", "home_team_id", "away_team_id", "home_score", "away_score", "status", "status_code")
+        fields = ("starting_at", "fixture_date", "league_id", "season_id", "home_team_id", "away_team_id", "home_score", "away_score", "status", "status_code")
         expected = {
+            "starting_at": source["starting_at"],
             "fixture_date": expected_fixture_date(source["starting_at"]),
             "league_id": source["league_id"], "season_id": source["season_id"],
             "home_team_id": source["home_team_id"], "away_team_id": source["away_team_id"],
@@ -414,6 +437,9 @@ def verify(cur, start: date, end: date, leagues: list[int], release_id: str | No
         key = (int(row["league_id"]), int(row["season_id"]), int(row["home_team_id"]))
         history_by_key[key].append(row)
         history_by_key[(int(row["league_id"]), int(row["season_id"]), int(row["away_team_id"]))].append(row)
+    history_by_key = {
+        key: order_history_rows(rows) for key, rows in history_by_key.items()
+    }
     standings = expected_standings(source_history)
     metrics = load_delivery_metrics(cur, selected_id, sorted(delivery_by_id))
     actual_metrics = {(int(row["fixture_id"]), int(row["team_id"]), str(row["side"]), int(row["metrics_window"]), str(row["metrics_mode"])): row for row in metrics}

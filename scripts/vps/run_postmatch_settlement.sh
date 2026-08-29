@@ -72,8 +72,8 @@ python scripts/export_to_supabase.py \
   --report-json "/tmp/postmatch_settlement_export.json"
 
 python scripts/refresh_fixture_delivery.py \
-  --start-date "$(date -u -d "-${SETTLEMENT_DELIVERY_DAYS_BACK} days" +%F)" \
-  --end-date "$(date -u -d "+${SETTLEMENT_DELIVERY_DAYS_FORWARD} days" +%F)" \
+  --start-date "$(TZ=Europe/London date -d "-${SETTLEMENT_DELIVERY_DAYS_BACK} days" +%F)" \
+  --end-date "$(TZ=Europe/London date -d "+${SETTLEMENT_DELIVERY_DAYS_FORWARD} days" +%F)" \
   --leagues "${STATS_LEAGUES}" \
   --report-out "/tmp/postmatch_settlement_delivery.json"
 

@@ -13,6 +13,7 @@ scripts/export_odds_to_supabase_psql.py
 scripts/export_to_supabase.py
 scripts/fixture_detail_export_policy.py
 scripts/refresh_fixture_delivery.py
+scripts/verify_fixture_delivery_parity.py
 scripts/postmatch_fixture_detail_delivery.py
 scripts/reconcile_stats_provider_queue.py
 scripts/vps/run_stats_reconciliation.sh

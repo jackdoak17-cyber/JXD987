@@ -19,6 +19,29 @@ UTC = timezone.utc
 
 
 class FixtureDeliveryMetricsTests(unittest.TestCase):
+    def test_goal_aggregates_are_counted_once(self) -> None:
+        metrics, _ = calculate_metrics(
+            [
+                {
+                    "id": 1,
+                    "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
+                    "home_team_id": 10,
+                    "away_team_id": 20,
+                    "home_score": 3,
+                    "away_score": 1,
+                }
+            ],
+            10,
+            8,
+            None,
+        )
+
+        self.assertEqual(metrics["goalsScored"], 3)
+        self.assertEqual(metrics["goalsConceded"], 1)
+        self.assertEqual(metrics["avgGoalsScored"], 3)
+        self.assertEqual(metrics["avgGoalsConceded"], 1)
+        self.assertEqual(metrics["avgTotalGoals"], 4)
+
     def test_history_is_scoped_to_league_and_season(self) -> None:
         fixture_time = datetime(2026, 8, 28, tzinfo=UTC)
         history = build_season_scoped_history(
