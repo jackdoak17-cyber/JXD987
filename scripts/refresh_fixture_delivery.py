@@ -88,6 +88,22 @@ def order_history_rows(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def validate_source_fixture_identity(rows: Iterable[dict[str, Any]]) -> None:
+    """Reject duplicate provider fixture IDs before a release can be built."""
+    seen: set[int] = set()
+    duplicates: set[int] = set()
+    for row in rows:
+        fixture_id = int(row["id"])
+        if fixture_id in seen:
+            duplicates.add(fixture_id)
+        seen.add(fixture_id)
+    if duplicates:
+        raise RuntimeError(
+            "fixture delivery source contains duplicate fixture ids: "
+            + ", ".join(str(value) for value in sorted(duplicates)[:20])
+        )
+
+
 def normalize_status(value: Any) -> str:
     return str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
 
@@ -941,6 +957,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             lock_refresh_publication(cur)
             schedule_run = start_run(cur, "schedule", start, end, release_id)
             source = source_fixtures(cur, start, end, leagues)
+            validate_source_fixture_identity(source)
             valid_schedule = [row for row in source if row["league_id"] not in EXCLUDED_CUPS and not is_hidden(row)]
             rejected_cups = sum(row["league_id"] in EXCLUDED_CUPS for row in source)
             schedule_written = upsert_schedule(cur, valid_schedule, start, end, release_id)

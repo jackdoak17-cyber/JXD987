@@ -51,6 +51,15 @@ class FixtureSettlementContractTests(unittest.TestCase):
             source,
         )
 
+    def test_settlement_delivery_refresh_preserves_the_rolling_horizon(self) -> None:
+        wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
+        source = wrapper.read_text(encoding="utf-8")
+        self.assertIn('FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-43}"', source)
+        self.assertIn(
+            'SETTLEMENT_DELIVERY_DAYS_FORWARD="${SETTLEMENT_DELIVERY_DAYS_FORWARD:-${FIXTURE_DELIVERY_DAYS_FORWARD}}"',
+            source,
+        )
+
     def test_supported_league_helper_excludes_cups(self) -> None:
         excluded = set(json.loads((ROOT / "config/odds_api_sync_excluded_leagues.json").read_text()))
         result = subprocess.run(
@@ -116,6 +125,11 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("Publish the manifest last", source)
         self.assertIn("scripts/vps/runtime_manifest.sha1", source)
         self.assertIn("required_runtime_entries", source)
+        self.assertIn('TARGET_REPO_ROOT="${2:-${VPS_REPO_ROOT:-}}"', source)
+        self.assertNotIn('/opt/odds-sync/JXD987}}', source)
+        self.assertIn('"scripts/refresh_fixture_delivery.py"', source)
+        self.assertIn('"scripts/vps/run_p3.sh"', source)
+        self.assertIn('"scripts/vps/run_postmatch_settlement.sh"', source)
         self.assertIn("scripts/reconcile_stats_provider_queue.py", source)
 
     def test_heartbeat_report_truncation_cannot_abort_under_pipefail(self) -> None:

@@ -12,6 +12,7 @@ from scripts.refresh_fixture_delivery import (
     compute_standings,
     history_rows_for_fixture,
     strict_current_season_rank,
+    validate_source_fixture_identity,
 )
 
 
@@ -19,6 +20,10 @@ UTC = timezone.utc
 
 
 class FixtureDeliveryMetricsTests(unittest.TestCase):
+    def test_duplicate_source_fixture_ids_fail_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "duplicate fixture ids: 42"):
+            validate_source_fixture_identity([{"id": 42}, {"id": 42}])
+
     def test_goal_aggregates_are_counted_once(self) -> None:
         metrics, _ = calculate_metrics(
             [
