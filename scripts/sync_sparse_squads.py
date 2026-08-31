@@ -86,7 +86,7 @@ def current_season_team_ids(
         )
           and f.away_team_id is not null
           {league_filter}
-        order by league_id, team_id
+        order by 1, 2
         """
     )
     if league_ids:
