@@ -29,7 +29,8 @@ begin
   select home_team_id, away_team_id
     into fixture_home_team_id, fixture_away_team_id
     from public.fixtures
-   where id = p_fixture_id;
+   where id = p_fixture_id
+   for update;
   if not found then
     raise exception using
       errcode = '23503',

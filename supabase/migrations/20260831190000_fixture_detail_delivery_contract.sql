@@ -82,67 +82,11 @@ begin
 end;
 $$;
 
-do $$
-begin
-  if to_regclass('public.fixture_detail_delivery_status') is not null
-     and to_regclass('public.fixtures') is not null
-     and to_regclass('public.fixture_players') is not null
-     and to_regclass('public.fixture_statistics') is not null
-     and to_regclass('public.fixture_player_statistics') is not null then
-    -- Backfill cheap scalar serving counts from the existing indexed detail
-    -- tables.  These counts are evidence only; they do not make a legacy row
-    -- accepted without a snapshot/parity record.
-    update public.fixture_detail_delivery_status d
-       set target_lineup_count = coalesce((
-             select count(distinct fp.player_id)::integer
-               from public.fixture_players fp
-              where fp.fixture_id = d.fixture_id
-           ), 0),
-           target_player_stat_count = coalesce((
-             select count(distinct (fps.player_id, fps.team_id, fps.type_id))::integer
-               from public.fixture_player_statistics fps
-              where fps.fixture_id = d.fixture_id
-           ), 0),
-           target_team_stat_count = coalesce((
-             select count(distinct (fs.team_id, fs.type_id))::integer
-               from public.fixture_statistics fs
-              where fs.fixture_id = d.fixture_id
-           ), 0);
-  end if;
-end;
-$$;
-
-do $$
-begin
-  if to_regclass('public.fixture_detail_delivery_status') is not null then
-    -- Accepted snapshots already contain canonical source/target evidence in
-    -- the pre-contract ledger.  Carry exact value parity forward where it is
-    -- available; producer revalidation fills any remaining legacy nulls.
-    update public.fixture_detail_delivery_status
-       set player_stat_parity = case
-             when source_snapshot->'player_stat_values' is not null
-              and target_snapshot->'player_stat_values' is not null
-             then source_snapshot->'player_stat_values' = target_snapshot->'player_stat_values'
-             else player_stat_parity
-           end,
-           lineup_parity = case
-             when source_snapshot->'lineup_values' is not null
-              and target_snapshot->'lineup_values' is not null
-             then source_snapshot->'lineup_values' = target_snapshot->'lineup_values'
-             else lineup_parity
-           end,
-           parity_checked_at = case
-             when source_snapshot->'player_stat_values' is not null
-              and target_snapshot->'player_stat_values' is not null
-              and source_snapshot->'lineup_values' is not null
-              and target_snapshot->'lineup_values' is not null
-             then coalesce(parity_checked_at, updated_at, now())
-             else parity_checked_at
-           end
-     where status in ('provider_sparse', 'verified');
-  end if;
-end;
-$$;
+-- Do not scan the large fixture-detail tables during this schema migration.
+-- Existing rows remain version 1 until the normal producer revalidates them;
+-- only v2 producer writes are allowed to claim target counts and parity. This
+-- keeps a metadata rollout within the database statement-timeout budget and
+-- avoids making historical row presence look like fresh acceptance evidence.
 
 do $$
 begin
