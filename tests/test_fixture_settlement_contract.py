@@ -35,12 +35,13 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('ODDS_SYNC_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS}"', source)
         self.assertIn('SETTLEMENT_RUN_LOCK_FILE="${SETTLEMENT_RUN_LOCK_FILE:-/var/lock/odds-sync-settlement.lock}"', source)
 
-    def test_p3_rolling_refresh_cannot_overwrite_fixture_detail(self) -> None:
-        wrapper = ROOT / "scripts/vps/run_p3.sh"
+    def test_fixture_core_refresh_cannot_overwrite_fixture_detail(self) -> None:
+        wrapper = ROOT / "scripts/vps/run_p3_fixture_core.sh"
         result = subprocess.run(["bash", "-n", str(wrapper)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         source = wrapper.read_text(encoding="utf-8")
         self.assertIn("--fixture-core-only", source)
+        self.assertIn("--strict", source)
         self.assertNotIn("--with-details", source)
 
     def test_p3_delivery_refresh_covers_retained_rolling_schedule(self) -> None:

@@ -34,12 +34,9 @@ export ODDS_EXPORT_DAYS_BACK="${ODDS_EXPORT_DAYS_BACK:-2}"
 export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-1}"
 export RETENTION_DAYS_FORWARD="${RETENTION_DAYS_FORWARD:-14}"
 export RETENTION_SNAPSHOT_DAYS="${RETENTION_SNAPSHOT_DAYS:-30}"
-export FIXTURE_REFRESH_DAYS_BACK="${FIXTURE_REFRESH_DAYS_BACK:-2}"
-export FIXTURE_REFRESH_DAYS_FORWARD="${FIXTURE_REFRESH_DAYS_FORWARD:-3}"
-export FIXTURE_EXPORT_DAYS_BACK="${FIXTURE_EXPORT_DAYS_BACK:-2}"
-export FIXTURE_EXPORT_DAYS_FORWARD="${FIXTURE_EXPORT_DAYS_FORWARD:-3}"
 export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-43}"
 export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-1800}"
+export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/odds_refresh_report_p3.json}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
 export MONEYLINE_COVERAGE_MIN_PCT="${MONEYLINE_COVERAGE_MIN_PCT:-100}"
@@ -126,31 +123,7 @@ python scripts/odds_retention_psql.py \
   --snapshot-days "${RETENTION_SNAPSHOT_DAYS}" \
   --report-out "/tmp/odds_retention_report_p3.json"
 
-# Step 5: Best-effort recent fixture refresh/export.
-if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
-  if python scripts/reconcile_recent_fixtures.py \
-    --leagues "${STATS_LEAGUES}" \
-    --days-back "${FIXTURE_REFRESH_DAYS_BACK}" \
-    --days-forward "${FIXTURE_REFRESH_DAYS_FORWARD}"; then
-    if ! python scripts/export_to_supabase.py \
-      --strict \
-      --leagues "${STATS_LEAGUES}" \
-      --days-back "${FIXTURE_EXPORT_DAYS_BACK}" \
-      --upcoming-days "${FIXTURE_EXPORT_DAYS_FORWARD}" \
-      --fixture-core-only \
-      --skip-odds-snapshots \
-      --skip-odds-outcomes \
-      --skip-prune; then
-      echo "Recent fixture export failed; continuing odds pipeline" >&2
-    fi
-  else
-    echo "Recent fixture refresh failed; continuing odds pipeline" >&2
-  fi
-else
-  echo "Skipping recent fixture refresh/export; missing SportMonks or Supabase REST env" >&2
-fi
-
-# Step 6: Publish the persistent Fixtures Data Delivery v2 read models.
+# Step 5: Publish the persistent Fixtures Data Delivery v2 read models.
 # This is the only user-facing fixture delivery source after cutover. A failed
 # refresh fails P3 instead of hiding a stale or incomplete read model.
 FIXTURE_DELIVERY_STATUS=0
@@ -165,7 +138,7 @@ else
   FIXTURE_DELIVERY_STATUS=1
 fi
 
-# Step 7: Hard guard for the user-facing fixtures window.
+# Step 6: Hard guard for the user-facing fixtures window.
 set +e
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
@@ -229,7 +202,7 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
   fi
 fi
 
-# Step 8: Best-effort betting picks publish (uses odds already ingested into Supabase).
+# Step 7: Best-effort betting picks publish (uses odds already ingested into Supabase).
 if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; then
   if [[ "${MODELS_PUBLISH_AFTER_P3}" == "true" || "${MODELS_PUBLISH_AFTER_P3}" == "1" ]]; then
     if [[ -d "${MODELS_REPO_ROOT}" ]]; then
@@ -266,5 +239,9 @@ CHAIN
 )
 
 status=0
-run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+run_recorded_pipeline_job \
+  "run_p3" \
+  "P3 Supabase ingest" \
+  "${CHAIN_COMMAND}" \
+  "${PIPELINE_EVIDENCE_FILE}" || status=$?
 finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_P3:-${HEALTHCHECK_PING_URL:-}}"

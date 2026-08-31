@@ -1,6 +1,7 @@
 8f5d9ca4a43667270cf27425ee8c02913dfd1001  config/league_ids.txt
 006372202c8c4fcba511ea89bb7a2bd4b3e239fe  config/odds_api_leagues.json
 800c62aeddd783f713e46b5daec8d8e4fb29b4df  config/odds_api_sync_excluded_leagues.json
+85dfb970dbb150ff0b12be6ce7b965b4176e0024  config/fixture_core_contract.json
 3fa4b803b0a2f65652e072debf1f1f11a20b8474  jxd/__init__.py
 0b571aa2f38df706c16a9a515e526a040e48f7a2  jxd/db.py
 fe1a70408f58e99c4f41584f0b91c0cf492c8286  jxd/models.py
@@ -8,7 +9,7 @@ fe1a70408f58e99c4f41584f0b91c0cf492c8286  jxd/models.py
 7bd8e750f7adc8917e705f517d076f3121ca11a3  jxd/sportmonks_client.py
 abf412ea76349343cc8b27bc90cdf61f52d9adae  jxd/sync.py
 a035edb40cc5e12e1fdd5ccaa78d329b03ebf205  scripts/export_odds_to_supabase_psql.py
-cf6da25b6e5cea83f357f0891a4d753f10e82c9b  scripts/export_to_supabase.py
+c0c99478b934dc8b11f9e0cd91ea04a6a2287c05  scripts/export_to_supabase.py
 aa70601da9c295d2fcda026c08888aa02faa1cb6  scripts/fixture_detail_export_policy.py
 e3d137379a2560ab902a6154612a227f60204937  scripts/refresh_fixture_delivery.py
 d4e5c231fe37cd3900949b2166567429e3377696  scripts/verify_fixture_delivery_parity.py
@@ -21,10 +22,15 @@ b7ae861e9d9d3d6009d562da213ad892440f29cb  scripts/reconcile_recent_fixtures.py
 a1b2e580c78cc5cbc26705c9144fd6b4d2d2b05b  scripts/rest_preflight.py
 6795b7075659a7b45b2a7354e65a1f3f441d874f  scripts/sync_confirmed_lineups.py
 17f2cfe733ecd33826066d5292bece91c02831ee  scripts/sync_odds.py
-67dee692f57416ddc5fbd8e30916a58124357230  scripts/vps/common.sh
+a77a3f8b12d507fb95c953f27c906916a3d39196  scripts/fixture_core_contract.py
+0fd35a2341466b5562cf7a666f5d8a0f9f57b315  scripts/vps/common.sh
 aaf31d37d04da10279a562a2acfda4a74c387fc5  scripts/vps/run_p1.sh
 7e1353a52f73ddfa38b222eead01753c891fcd01  scripts/vps/run_p2.sh
-1b697bda6b73c9952e2998ebf007dd7ebbad42a2  scripts/vps/run_p3.sh
+a8139a765859c87cd3fdc38a22bd00dd6f015fea  scripts/vps/run_p3.sh
+49141ec738e075abfaa9a712b2ff3f5d40bdcbf1  scripts/vps/run_p3_fixture_core.sh
 66a0e50466672eb1618c6e187ed15c4446cf1003  scripts/vps/run_postmatch_settlement.sh
 c1e2db2eb593edf8e11a2a8a62b7a149d4b3b59c  scripts/vps/run_models.sh
 68f0ba013c6d96af3622a6320e7270e4419fa2fd  scripts/vps/run_sync.sh
+30d7b00595442e0909a4c35fd0ad66d0c7443fbf  scripts/sync_sparse_squads.py
+d234992ae2636bd0e98e7f88a3f9b44900b70d19  scripts/verify_squad_freshness.py
+2be304031eb2f1ac5b794baba6c918fd97b4e432  scripts/vps/run_squad_reconciliation.sh

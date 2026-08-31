@@ -277,6 +277,48 @@ SQL
   fi
 }
 
+run_recorded_pipeline_job() {
+  local job_id="$1"
+  local job_name="$2"
+  local chain_command="$3"
+  local evidence_file="${4:-}"
+  local started_at started_epoch finished_at finished_epoch status=0
+  local evidence_was_set=0 previous_evidence_file=""
+
+  if [[ -n "${PIPELINE_EVIDENCE_FILE+x}" ]]; then
+    evidence_was_set=1
+    previous_evidence_file="${PIPELINE_EVIDENCE_FILE}"
+  fi
+  if [[ -n "${evidence_file}" ]]; then
+    export PIPELINE_EVIDENCE_FILE="${evidence_file}"
+  else
+    unset PIPELINE_EVIDENCE_FILE || true
+  fi
+
+  started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  started_epoch="$(date -u +%s)"
+  run_with_global_lock_and_timeout "${chain_command}" || status=$?
+  finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  finished_epoch="$(date -u +%s)"
+
+  # Record the outcome before restoring the caller's evidence context. This
+  # makes lock skips and timeout handoffs observable just like hard failures.
+  record_pipeline_job_run \
+    "${job_id}" \
+    "${job_name}" \
+    "${status}" \
+    "${started_at}" \
+    "${finished_at}" \
+    "$(((finished_epoch - started_epoch) * 1000))"
+
+  if [[ "${evidence_was_set}" -eq 1 ]]; then
+    export PIPELINE_EVIDENCE_FILE="${previous_evidence_file}"
+  else
+    unset PIPELINE_EVIDENCE_FILE || true
+  fi
+  return "${status}"
+}
+
 healthcheck_ping() {
   local url="${1:-}"
   if [[ -z "${url}" ]]; then
