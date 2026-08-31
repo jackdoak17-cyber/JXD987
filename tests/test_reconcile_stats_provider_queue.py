@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 from scripts import reconcile_stats_provider_queue as queue
+from scripts import postmatch_fixture_detail_delivery as postmatch
 from scripts.postmatch_fixture_detail_delivery import (
     HANDOFF_REQUEUE_REASON,
     LEGACY_PENDING_REASON,
@@ -35,6 +36,45 @@ def test_target_candidate_quotas_reserve_historical_progress() -> None:
     assert target_candidate_quotas(50) == (40, 10)
     assert target_candidate_quotas(1) == (1, 0)
     assert target_candidate_quotas(0) == (0, 0)
+
+
+def test_target_selection_requeues_legacy_accepted_rows_for_v2_evidence(
+    monkeypatch,
+) -> None:
+    queries: list[str] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, statement, params):
+            del params
+            queries.append(statement)
+
+        def fetchall(self):
+            return []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setattr(postmatch.psycopg2, "connect", lambda *args, **kwargs: Connection())
+
+    assert postmatch.candidate_target_fixture_ids("postgres://target", [8], 10) == []
+    retry_queries = [query for query in queries if "next_attempt_at" in query]
+    assert retry_queries
+    assert "coalesce(d.delivery_contract_version, 1) < 2" in retry_queries[0]
+    assert "d.player_stat_parity is distinct from true" in retry_queries[0]
+    assert "d.lineup_parity is distinct from true" in retry_queries[0]
 
 
 def test_ledger_upgrade_does_not_promote_pre_contract_rows_to_v2() -> None:

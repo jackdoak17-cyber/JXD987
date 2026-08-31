@@ -583,9 +583,33 @@ def candidate_target_fixture_ids(
                 and (d.next_attempt_at is null or d.next_attempt_at <= now()))
               or (d.next_revalidation_at is not null and d.next_revalidation_at <= now())
               or (d.status = 'verified' and d.next_revalidation_at is null)
+              or (
+                d.status in ('verified', 'provider_sparse')
+                and (
+                  coalesce(d.delivery_contract_version, 1) < 2
+                  or d.accepted_snapshot_id is null
+                  or d.player_stat_parity is distinct from true
+                  or d.lineup_parity is distinct from true
+                  or coalesce(d.target_player_stat_count, 0) <= 0
+                  or coalesce(d.target_lineup_count, 0) <= 0
+                )
+              )
             )
             """,
             """
+            case
+              when d.status in ('verified', 'provider_sparse')
+               and (
+                 coalesce(d.delivery_contract_version, 1) < 2
+                 or d.accepted_snapshot_id is null
+                 or d.player_stat_parity is distinct from true
+                 or d.lineup_parity is distinct from true
+                 or coalesce(d.target_player_stat_count, 0) <= 0
+                 or coalesce(d.target_lineup_count, 0) <= 0
+               )
+              then 0
+              else 1
+            end,
             case when d.accepted_snapshot_id is null then 0 else 1 end,
             case
               when d.status = 'provider_pending'
