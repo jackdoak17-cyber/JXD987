@@ -32,6 +32,8 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
         self.assertIn("--skip-prune", wrapper)
         self.assertIn('"${FIXTURE_CORE_JOB_ID}"', wrapper)
         self.assertIn("run_recorded_pipeline_job", wrapper)
+        self.assertIn('ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-4}"', wrapper)
+        self.assertIn('ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"', wrapper)
         self.assertIn("--no-refresh-squads-missing", wrapper)
         self.assertIn("--no-refresh-sidelined-window", wrapper)
         self.assertIn('FIXTURE_CORE_REFRESH_DAYS_BACK="${FIXTURE_CORE_REFRESH_DAYS_BACK:-2}"', wrapper)
@@ -56,6 +58,40 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
             "scripts/fixture_core_contract.py",
             "scripts/vps/run_p3_fixture_core.sh",
         }.issubset(entries))
+
+    def test_recorded_job_retries_a_transient_lock_handoff(self) -> None:
+        script = r'''
+source scripts/vps/common.sh
+test_dir="$(mktemp -d)"
+trap 'rm -rf "${test_dir}"' EXIT
+lock_file="${test_dir}/lock"
+ready_file="${test_dir}/ready"
+(
+  exec 9>"${lock_file}"
+  flock --nonblock 9
+  touch "${ready_file}"
+  sleep 0.6
+) &
+holder_pid=$!
+while [[ ! -f "${ready_file}" ]]; do sleep 0.01; done
+export ODDS_SYNC_LOCK_FILE="${lock_file}"
+export ODDS_SYNC_LIVE_TICK_SECONDS=86400
+export ODDS_SYNC_LIVE_RESERVE_SECONDS=0
+export ODDS_SYNC_LIVE_GRACE_SECONDS=0
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS=5
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS=0.2
+run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
+wait "${holder_pid}"
+'''
+        result = subprocess.run(
+            ["bash", "-c", script],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("[RETRY]", result.stdout)
 
 
 if __name__ == "__main__":

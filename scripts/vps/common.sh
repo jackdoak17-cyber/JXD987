@@ -297,7 +297,11 @@ run_recorded_pipeline_job() {
 
   started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   started_epoch="$(date -u +%s)"
-  run_with_global_lock_and_timeout "${chain_command}" || status=$?
+  if [[ "${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-0}" =~ ^[1-9][0-9]*$ ]]; then
+    run_with_global_lock_and_retry "${chain_command}" || status=$?
+  else
+    run_with_global_lock_and_timeout "${chain_command}" || status=$?
+  fi
   finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   finished_epoch="$(date -u +%s)"
 
@@ -316,6 +320,37 @@ run_recorded_pipeline_job() {
   else
     unset PIPELINE_EVIDENCE_FILE || true
   fi
+  return "${status}"
+}
+
+run_with_global_lock_and_retry() {
+  local chain_command="$1"
+  local retry_attempts="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-0}"
+  local retry_delay_seconds="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-15}"
+  local attempt=0 status=2
+
+  if [[ ! "${retry_attempts}" =~ ^[0-9]+$ ]]; then
+    log_error "ODDS_SYNC_LOCK_RETRY_ATTEMPTS must be a non-negative integer"
+    return 1
+  fi
+  if [[ ! "${retry_delay_seconds}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    log_error "ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS must be a non-negative number"
+    return 1
+  fi
+
+  while (( attempt <= retry_attempts )); do
+    run_with_global_lock_and_timeout "${chain_command}" && return 0
+    status=$?
+    if [[ "${status}" -ne 2 ]]; then
+      return "${status}"
+    fi
+    attempt=$((attempt + 1))
+    if (( attempt > retry_attempts )); then
+      return 2
+    fi
+    log_info "[RETRY] lock handoff; retry ${attempt}/${retry_attempts} in ${retry_delay_seconds}s"
+    sleep "${retry_delay_seconds}"
+  done
   return "${status}"
 }
 

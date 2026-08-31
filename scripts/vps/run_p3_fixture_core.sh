@@ -48,6 +48,8 @@ export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_leag
 validate_supported_leagues "${STATS_LEAGUES}"
 export FIXTURE_CORE_MAX_RUNTIME_SECONDS="${FIXTURE_CORE_MAX_RUNTIME_SECONDS:-900}"
 export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS:-300}"
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-4}"
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"
 # The exporter treats zero as an unbounded completed-fixture selection. Keep
 # the historical side of this identity refresh bounded as well; the future
 # identity contract is still controlled exclusively by the source window.
