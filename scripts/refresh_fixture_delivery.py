@@ -212,6 +212,64 @@ def finish_run(cur, run_id: str, status: str, stats: dict[str, Any], error: str 
 
 
 DELIVERY_COMPONENTS = ("schedule", "standings", "metrics", "odds")
+EXPECTED_DELIVERY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
+    "fixture_delivery_schedule": ("release_id", "fixture_id"),
+    "fixture_delivery_standings": ("release_id", "league_id", "season_id", "team_id"),
+    "fixture_delivery_metrics": (
+        "release_id",
+        "fixture_id",
+        "team_id",
+        "side",
+        "metrics_window",
+        "metrics_mode",
+        "season_scope",
+    ),
+    "fixture_delivery_odds": (
+        "release_id",
+        "fixture_id",
+        "bookmaker_id",
+        "market_key",
+        "selection_key",
+        "participant_type",
+        "participant_id",
+        "line_key",
+    ),
+}
+
+
+def validate_delivery_schema(cur) -> None:
+    """Fail before creating a release if ON CONFLICT keys cannot target the live PKs."""
+    cur.execute(
+        """
+        select t.relname,
+               array_agg(a.attname order by key_columns.ordinality)
+          from pg_constraint c
+          join pg_class t on t.oid = c.conrelid
+          join pg_namespace n on n.oid = t.relnamespace
+          cross join lateral unnest(c.conkey) with ordinality
+               as key_columns(attnum, ordinality)
+          join pg_attribute a
+            on a.attrelid = t.oid and a.attnum = key_columns.attnum
+         where n.nspname = 'public'
+           and c.contype = 'p'
+           and t.relname = any(%s)
+         group by t.relname
+        """,
+        (list(EXPECTED_DELIVERY_PRIMARY_KEYS),),
+    )
+    actual = {
+        str(row[0]): tuple(str(column) for column in row[1])
+        for row in cur.fetchall()
+    }
+    mismatches = []
+    for table, expected in EXPECTED_DELIVERY_PRIMARY_KEYS.items():
+        observed = actual.get(table)
+        if observed is None:
+            mismatches.append(f"{table}: missing primary key")
+        elif observed != expected:
+            mismatches.append(f"{table}: expected={expected} actual={observed}")
+    if mismatches:
+        raise RuntimeError("fixture delivery schema mismatch: " + "; ".join(mismatches))
 
 
 def create_release(cur, start: date, end: date) -> str:
@@ -235,6 +293,7 @@ def validate_release_components(
     cur,
     release_id: str,
     schedule_fixture_ids: list[int],
+    expected_standings: dict[tuple[int, int], dict[int, dict[str, int]]] | None = None,
 ) -> dict[str, int]:
     """Validate component completeness before exposing a release."""
     counts: dict[str, int] = {}
@@ -263,7 +322,7 @@ def validate_release_components(
 
     cur.execute(
         """
-        select fixture_id, team_id, side, metrics_window, metrics_mode
+        select fixture_id, team_id, side, metrics_window, metrics_mode, season_scope
           from public.fixture_delivery_metrics
          where release_id = %s
         """,
@@ -276,6 +335,7 @@ def validate_release_components(
             "side": str(row[2]),
             "metrics_window": int(row[3]),
             "metrics_mode": str(row[4]),
+            "season_scope": str(row[5]),
         }
         for row in cur.fetchall()
     ]
@@ -297,6 +357,32 @@ def validate_release_components(
             f"fixture delivery metrics row count mismatch: expected={len(metric_rows)} actual={counts['metrics']}"
         )
 
+    if expected_standings is not None:
+        cur.execute(
+            """
+            select league_id, season_id, team_id, rank, points, played,
+                   goals_for, goals_against, goal_diff
+              from public.fixture_delivery_standings
+             where release_id = %s
+            """,
+            (release_id,),
+        )
+        standings_rows = [
+            {
+                "league_id": int(row[0]),
+                "season_id": int(row[1]),
+                "team_id": int(row[2]),
+                "rank": int(row[3]),
+                "points": int(row[4]),
+                "played": int(row[5]),
+                "goals_for": int(row[6]),
+                "goals_against": int(row[7]),
+                "goal_diff": int(row[8]),
+            }
+            for row in cur.fetchall()
+        ]
+        validate_standings_rows(expected_standings, standings_rows)
+
     cur.execute(
         "select distinct fixture_id from public.fixture_delivery_odds where release_id = %s",
         (release_id,),
@@ -315,8 +401,11 @@ def validate_metric_identity_set(
     metric_rows: Iterable[dict[str, Any]],
     schedule_teams: dict[int, dict[str, int]] | None = None,
 ) -> None:
-    """Require exactly two sides, eleven windows, both modes, and valid teams."""
+    """Require the complete metric identity set and valid scheduled teams."""
     fixture_ids = {int(value) for value in schedule_fixture_ids}
+    rows = list(metric_rows)
+    has_scope = any("season_scope" in row for row in rows)
+    scopes: tuple[str | None, ...] = ("all", "current") if has_scope else (None,)
     expected = {
         (
             fixture_id,
@@ -324,11 +413,13 @@ def validate_metric_identity_set(
             side,
             window,
             mode,
+            season_scope,
         )
         for fixture_id in fixture_ids
         for side in ("home", "away")
         for window in range(5, 16)
         for mode in ("overall", "venue")
+        for season_scope in scopes
     }
     actual = {
         (
@@ -337,8 +428,9 @@ def validate_metric_identity_set(
             str(row["side"]),
             int(row["metrics_window"]),
             str(row["metrics_mode"]),
+            str(row["season_scope"]) if has_scope else None,
         )
-        for row in metric_rows
+        for row in rows
     }
     if actual != expected:
         missing = sorted(expected - actual, key=str)
@@ -347,6 +439,45 @@ def validate_metric_identity_set(
             "fixture delivery metrics identity mismatch: "
             f"missing={missing[:20]} extra={extra[:20]}"
         )
+
+
+def validate_standings_rows(
+    expected_standings: dict[tuple[int, int], dict[int, dict[str, int]]],
+    actual_rows: Iterable[dict[str, Any]],
+) -> None:
+    """Require the published standings to match the source-derived set and values."""
+    expected = {
+        (league_id, season_id, team_id): values
+        for (league_id, season_id), table in expected_standings.items()
+        for team_id, values in table.items()
+    }
+    rows = list(actual_rows)
+    actual_keys = [
+        (int(row["league_id"]), int(row["season_id"]), int(row["team_id"]))
+        for row in rows
+    ]
+    actual = dict(zip(actual_keys, rows))
+    if len(actual_keys) != len(actual) or set(actual) != set(expected):
+        missing = sorted(set(expected) - set(actual), key=str)
+        extra = sorted(set(actual) - set(expected), key=str)
+        raise RuntimeError(
+            "fixture delivery standings identity mismatch: "
+            f"missing={missing[:20]} extra={extra[:20]}"
+        )
+
+    fields = ("rank", "points", "played", "goals_for", "goals_against", "goal_diff")
+    for key, expected_values in expected.items():
+        row = actual[key]
+        mismatches = {
+            field: (expected_values[field], int(row[field]))
+            for field in fields
+            if int(row[field]) != int(expected_values[field])
+        }
+        if mismatches:
+            raise RuntimeError(
+                "fixture delivery standings values mismatch: "
+                f"key={key} values={mismatches}"
+            )
 
 
 def publish_release(
@@ -582,13 +713,24 @@ def compute_standings(completed: list[dict[str, Any]]) -> dict[tuple[int, int], 
         hs, aws = int(row["home_score"]), int(row["away_score"])
         table = grouped[key]
         for team_id in (home_id, away_id):
-            table.setdefault(team_id, {"points": 0, "played": 0, "goals_for": 0, "goals_against": 0})
+            table.setdefault(
+                team_id,
+                {
+                    "points": 0,
+                    "played": 0,
+                    "goals_for": 0,
+                    "goals_against": 0,
+                    "goal_diff": 0,
+                },
+            )
         table[home_id]["played"] += 1
         table[away_id]["played"] += 1
         table[home_id]["goals_for"] += hs
         table[home_id]["goals_against"] += aws
+        table[home_id]["goal_diff"] += hs - aws
         table[away_id]["goals_for"] += aws
         table[away_id]["goals_against"] += hs
+        table[away_id]["goal_diff"] += aws - hs
         if hs > aws:
             table[home_id]["points"] += 3
         elif aws > hs:
@@ -719,6 +861,20 @@ def build_season_scoped_history(
     return history
 
 
+def build_league_scoped_history(
+    completed: list[dict[str, Any]],
+) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    """Index completed fixtures by league and participating team across seasons."""
+    history: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in completed:
+        league_id = int(row["league_id"])
+        history[(league_id, int(row["home_team_id"]))].append(row)
+        history[(league_id, int(row["away_team_id"]))].append(row)
+    for key, rows in history.items():
+        history[key] = order_history_rows(rows)
+    return history
+
+
 def calculate_metrics(history: list[dict[str, Any]], team_id: int, window: int, venue: str | None) -> tuple[dict[str, Any], datetime | None]:
     selected: list[dict[str, Any]] = []
     for row in history:
@@ -804,6 +960,7 @@ def write_metrics(
     standings: dict[tuple[int, int], dict[int, dict[str, int]]],
     release_id: str,
 ) -> tuple[int, dict[str, int]]:
+    history_by_team_league = build_league_scoped_history(completed)
     history_by_team_season = build_season_scoped_history(completed)
     now = datetime.now(UTC)
 
@@ -817,48 +974,63 @@ def write_metrics(
         "venue_complete": 0,
         "venue_empty_overall_available": 0,
     }
+    for season_scope in ("all", "current"):
+        for mode in ("overall", "venue"):
+            for status in ("none", "partial", "complete"):
+                coverage[f"{season_scope}_{mode}_{status}"] = 0
+        coverage[f"{season_scope}_venue_empty_overall_available"] = 0
     for fixture in schedule:
         for side, team_id in (("home", int(fixture["home_team_id"])), ("away", int(fixture["away_team_id"]))):
-            history_key = (
-                int(fixture["league_id"]),
-                int(fixture["season_id"]),
-                team_id,
-            ) if fixture.get("season_id") is not None else None
-            prior = history_rows_for_fixture(
-                history_by_team_season.get(history_key, []) if history_key is not None else [], fixture, now
-            )
-            for window in range(5, 16):
-                samples: dict[str, int] = {}
-                for mode, venue in (("overall", None), ("venue", side)):
-                    metrics, max_source = calculate_metrics(prior, team_id, window, venue)
-                    add_metrics_provenance(metrics, mode)
-                    status = str(metrics["sampleStatus"])
-                    coverage[f"{mode}_{status}"] += 1
-                    samples[mode] = int(metrics.get("sample") or 0)
-                    values.append(
-                        (
-                            release_id,
-                            fixture["id"], team_id, side, window, mode, Json(metrics),
-                            strict_current_season_rank(
-                                standings,
-                                int(fixture["league_id"]),
-                                int(fixture["season_id"]) if fixture.get("season_id") is not None else 0,
-                                team_id,
-                            ),
-                            max_source,
+            for season_scope, history in (
+                ("all", history_by_team_league),
+                ("current", history_by_team_season),
+            ):
+                history_key = (
+                    (int(fixture["league_id"]), team_id)
+                    if season_scope == "all"
+                    else (
+                        int(fixture["league_id"]),
+                        int(fixture["season_id"]),
+                        team_id,
+                    ) if fixture.get("season_id") is not None else None
+                )
+                prior = history_rows_for_fixture(
+                    history.get(history_key, []) if history_key is not None else [], fixture, now
+                )
+                for window in range(5, 16):
+                    samples: dict[str, int] = {}
+                    for mode, venue in (("overall", None), ("venue", side)):
+                        metrics, max_source = calculate_metrics(prior, team_id, window, venue)
+                        add_metrics_provenance(metrics, mode)
+                        status = str(metrics["sampleStatus"])
+                        coverage[f"{mode}_{status}"] += 1
+                        coverage[f"{season_scope}_{mode}_{status}"] += 1
+                        samples[mode] = int(metrics.get("sample") or 0)
+                        values.append(
+                            (
+                                release_id,
+                                fixture["id"], team_id, side, window, mode, season_scope, Json(metrics),
+                                strict_current_season_rank(
+                                    standings,
+                                    int(fixture["league_id"]),
+                                    int(fixture["season_id"]) if fixture.get("season_id") is not None else 0,
+                                    team_id,
+                                ),
+                                max_source,
+                            )
                         )
-                    )
-                if samples["venue"] == 0 and samples["overall"] > 0:
-                    coverage["venue_empty_overall_available"] += 1
+                    if samples["venue"] == 0 and samples["overall"] > 0:
+                        coverage["venue_empty_overall_available"] += 1
+                        coverage[f"{season_scope}_venue_empty_overall_available"] += 1
     if values:
         execute_values(
             cur,
             """
             insert into public.fixture_delivery_metrics
               (release_id, fixture_id, team_id, side, metrics_window, metrics_mode,
-               metrics, league_rank, source_max_starting_at)
+               season_scope, metrics, league_rank, source_max_starting_at)
             values %s
-            on conflict (release_id, fixture_id, team_id, side, metrics_window, metrics_mode) do update set
+            on conflict (release_id, fixture_id, team_id, side, metrics_window, metrics_mode, season_scope) do update set
               metrics = excluded.metrics, league_rank = excluded.league_rank,
               source_max_starting_at = excluded.source_max_starting_at, computed_at = now()
             """,
@@ -948,6 +1120,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     release_id: str | None = None
     try:
         with conn.cursor() as cur:
+            validate_delivery_schema(cur)
             release_id = create_release(cur, start, end)
         # Keep the build marker durable so a failed build can be marked failed
         # after its data transaction is rolled back.
@@ -995,7 +1168,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             odds_written = write_odds(cur, odds_source, release_id)
             finish_run(cur, odds_run, "succeeded", {"rows_read": len(odds_source), "rows_written": odds_written})
             report["components"]["odds"] = {"rows_read": len(odds_source), "rows_written": odds_written}
-            counts = validate_release_components(cur, release_id, [int(row["id"]) for row in valid_schedule])
+            counts = validate_release_components(
+                cur,
+                release_id,
+                [int(row["id"]) for row in valid_schedule],
+                standings,
+            )
             source_watermark = max((row["starting_at"] for row in source), default=None)
             publish_release(cur, release_id, counts, source_watermark)
             cur.execute("select public.fixture_delivery_gc()")

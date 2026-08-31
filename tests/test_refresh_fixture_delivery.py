@@ -12,6 +12,7 @@ from scripts.refresh_fixture_delivery import (
     compute_standings,
     history_rows_for_fixture,
     strict_current_season_rank,
+    validate_delivery_schema,
     validate_source_fixture_identity,
 )
 
@@ -19,7 +20,53 @@ from scripts.refresh_fixture_delivery import (
 UTC = timezone.utc
 
 
+class SchemaCursor:
+    def __init__(self, rows):
+        self.rows = rows
+        self.query = None
+        self.params = None
+
+    def execute(self, query, params=None):
+        self.query = query
+        self.params = params
+
+    def fetchall(self):
+        return self.rows
+
+
 class FixtureDeliveryMetricsTests(unittest.TestCase):
+    def test_delivery_schema_contract_accepts_live_primary_keys(self) -> None:
+        cursor = SchemaCursor([
+            ("fixture_delivery_schedule", ["release_id", "fixture_id"]),
+            ("fixture_delivery_standings", ["release_id", "league_id", "season_id", "team_id"]),
+            ("fixture_delivery_metrics", [
+                "release_id", "fixture_id", "team_id", "side", "metrics_window",
+                "metrics_mode", "season_scope",
+            ]),
+            ("fixture_delivery_odds", [
+                "release_id", "fixture_id", "bookmaker_id", "market_key", "selection_key",
+                "participant_type", "participant_id", "line_key",
+            ]),
+        ])
+
+        validate_delivery_schema(cursor)
+
+    def test_delivery_schema_contract_rejects_old_metrics_key(self) -> None:
+        cursor = SchemaCursor([
+            ("fixture_delivery_schedule", ["release_id", "fixture_id"]),
+            ("fixture_delivery_standings", ["release_id", "league_id", "season_id", "team_id"]),
+            ("fixture_delivery_metrics", [
+                "release_id", "fixture_id", "team_id", "side", "metrics_window", "metrics_mode",
+            ]),
+            ("fixture_delivery_odds", [
+                "release_id", "fixture_id", "bookmaker_id", "market_key", "selection_key",
+                "participant_type", "participant_id", "line_key",
+            ]),
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "fixture_delivery_metrics"):
+            validate_delivery_schema(cursor)
+
     def test_duplicate_source_fixture_ids_fail_closed(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "duplicate fixture ids: 42"):
             validate_source_fixture_identity([{"id": 42}, {"id": 42}])

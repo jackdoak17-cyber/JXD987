@@ -53,6 +53,25 @@ class RevisedFixtureDeliveryContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "identity"):
             validate_metric_identity_set([10], wrong, {10: {"home": 100, "away": 200}})
 
+    def test_metric_identity_validation_requires_both_history_scopes(self) -> None:
+        rows = [
+            {
+                "fixture_id": 10,
+                "side": side,
+                "metrics_window": window,
+                "metrics_mode": mode,
+                "season_scope": scope,
+            }
+            for scope in ("all", "current")
+            for side in ("home", "away")
+            for window in range(5, 16)
+            for mode in ("overall", "venue")
+        ]
+        validate_metric_identity_set([10], rows)
+
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            validate_metric_identity_set([10], [row for row in rows if row["season_scope"] == "all"])
+
     def test_goal_aggregates_match_the_source_values(self) -> None:
         metrics, _ = calculate_metrics(
             [{
