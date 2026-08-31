@@ -33,7 +33,10 @@ class FixtureCoreContractError(ValueError):
 class FixtureCoreContract:
     version: int
     identity_window_days: int
+    history_window_days: int
     source_buffer_days: int
+    odds_window_days: int
+    fixture_delivery_window_days: int
     delivery_window_days: int
     same_day_grace_hours: int
     max_job_age_minutes: int
@@ -80,7 +83,10 @@ def parse_contract(payload: Mapping[str, Any]) -> FixtureCoreContract:
     required = {
         "version",
         "identity_window_days",
+        "history_window_days",
         "source_buffer_days",
+        "odds_window_days",
+        "fixture_delivery_window_days",
         "delivery_window_days",
         "same_day_grace_hours",
         "max_job_age_minutes",
@@ -100,8 +106,15 @@ def parse_contract(payload: Mapping[str, Any]) -> FixtureCoreContract:
             f"unsupported fixture-core contract version: {version}; expected {CONTRACT_VERSION}"
         )
     identity_window_days = _integer_field(payload, "identity_window_days", 1)
+    history_window_days = _integer_field(payload, "history_window_days", 0)
     source_buffer_days = _integer_field(payload, "source_buffer_days", 1)
+    odds_window_days = _integer_field(payload, "odds_window_days", 1)
+    fixture_delivery_window_days = _integer_field(payload, "fixture_delivery_window_days", 1)
     delivery_window_days = _integer_field(payload, "delivery_window_days", identity_window_days)
+    if delivery_window_days < fixture_delivery_window_days:
+        raise FixtureCoreContractError(
+            "delivery_window_days must cover fixture_delivery_window_days"
+        )
     same_day_grace_hours = _integer_field(payload, "same_day_grace_hours", 0)
     if same_day_grace_hours > 24:
         raise FixtureCoreContractError("same_day_grace_hours must not exceed 24")
@@ -119,7 +132,10 @@ def parse_contract(payload: Mapping[str, Any]) -> FixtureCoreContract:
     return FixtureCoreContract(
         version=version,
         identity_window_days=identity_window_days,
+        history_window_days=history_window_days,
         source_buffer_days=source_buffer_days,
+        odds_window_days=odds_window_days,
+        fixture_delivery_window_days=fixture_delivery_window_days,
         delivery_window_days=delivery_window_days,
         same_day_grace_hours=same_day_grace_hours,
         max_job_age_minutes=max_job_age_minutes,
@@ -146,9 +162,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=(
             "version",
             "identity_window_days",
+            "history_window_days",
             "source_buffer_days",
             "source_window_days_forward",
             "local_read_lookahead_days",
+            "odds_window_days",
+            "fixture_delivery_window_days",
             "delivery_window_days",
             "same_day_grace_hours",
             "max_job_age_minutes",

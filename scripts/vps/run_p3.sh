@@ -5,7 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
+export FIXTURE_CORE_CONTRACT_PATH="${FIXTURE_CORE_CONTRACT_PATH:-${REPO_ROOT}/config/fixture_core_contract.json}"
+contract_value() {
+  python3 "${REPO_ROOT}/scripts/fixture_core_contract.py" \
+    --contract "${FIXTURE_CORE_CONTRACT_PATH}" \
+    --field "$1"
+}
 require_runtime_manifest_entries_or_exit "$0" \
+  "config/fixture_core_contract.json" \
+  "scripts/fixture_core_contract.py" \
   "config/league_ids.txt" \
   "config/odds_api_sync_excluded_leagues.json" \
   "jxd/__init__.py" \
@@ -26,15 +34,17 @@ export REPO_ROOT
 export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_league_csv)}}"
 validate_supported_leagues "${STATS_LEAGUES}"
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
-export ODDS_SYNC_DAYS_BACK="${ODDS_SYNC_DAYS_BACK:-2}"
-export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
+export ODDS_SYNC_DAYS_BACK="$(contract_value history_window_days)"
+export DAYS_FORWARD="$(contract_value odds_window_days)"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
 export INGEST_MAX_RUNTIME_MINUTES="${ODDS_INGEST_MAX_RUNTIME_MINUTES:-25}"
-export ODDS_EXPORT_DAYS_BACK="${ODDS_EXPORT_DAYS_BACK:-2}"
+export ODDS_EXPORT_DAYS_BACK="$(contract_value history_window_days)"
 export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-1}"
-export RETENTION_DAYS_FORWARD="${RETENTION_DAYS_FORWARD:-14}"
+export RETENTION_DAYS_FORWARD="$(contract_value odds_window_days)"
 export RETENTION_SNAPSHOT_DAYS="${RETENTION_SNAPSHOT_DAYS:-30}"
-export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-43}"
+export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"
+export FIXTURE_CORE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"
+export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_CORE_DELIVERY_DAYS_FORWARD}"
 export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-1800}"
 export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/odds_refresh_report_p3.json}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
@@ -129,7 +139,7 @@ python scripts/odds_retention_psql.py \
 FIXTURE_DELIVERY_STATUS=0
 if [[ -n "${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}" ]]; then
   python scripts/refresh_fixture_delivery.py \
-    --start-date "$(TZ=Europe/London date +%F)" \
+    --start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)" \
     --end-date "$(TZ=Europe/London date -d "+${FIXTURE_DELIVERY_DAYS_FORWARD} days" +%F)" \
     --leagues "${STATS_LEAGUES}" \
     --report-out /tmp/fixture_delivery_v2_report.json || FIXTURE_DELIVERY_STATUS=$?

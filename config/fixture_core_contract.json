@@ -1,7 +1,10 @@
 {
   "version": 1,
   "identity_window_days": 30,
+  "history_window_days": 2,
   "source_buffer_days": 1,
+  "odds_window_days": 14,
+  "fixture_delivery_window_days": 14,
   "delivery_window_days": 43,
   "same_day_grace_hours": 6,
   "max_job_age_minutes": 540,

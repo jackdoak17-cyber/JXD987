@@ -47,17 +47,18 @@ class FixtureSettlementContractTests(unittest.TestCase):
     def test_p3_delivery_refresh_covers_retained_rolling_schedule(self) -> None:
         wrapper = ROOT / "scripts/vps/run_p3.sh"
         source = wrapper.read_text(encoding="utf-8")
-        self.assertIn(
-            'FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-43}"',
-            source,
-        )
+        self.assertIn('export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"', source)
+        self.assertIn('export FIXTURE_CORE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"', source)
+        self.assertIn('--start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)"', source)
 
     def test_settlement_delivery_refresh_preserves_the_rolling_horizon(self) -> None:
         wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
         source = wrapper.read_text(encoding="utf-8")
-        self.assertIn('FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-43}"', source)
+        self.assertIn('export SETTLEMENT_EXPORT_DAYS_BACK="$(contract_value history_window_days)"', source)
+        self.assertIn('export SETTLEMENT_DELIVERY_DAYS_BACK="$(contract_value history_window_days)"', source)
+        self.assertIn('export FIXTURE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"', source)
         self.assertIn(
-            'SETTLEMENT_DELIVERY_DAYS_FORWARD="${SETTLEMENT_DELIVERY_DAYS_FORWARD:-${FIXTURE_DELIVERY_DAYS_FORWARD}}"',
+            'SETTLEMENT_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD}"',
             source,
         )
 

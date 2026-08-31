@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
 require_runtime_manifest_entries_or_exit "$0" \
+  "config/fixture_core_contract.json" \
   "config/league_ids.txt" \
   "config/odds_api_sync_excluded_leagues.json" \
   "jxd/__init__.py" \
@@ -26,17 +27,23 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
 fi
 
 export REPO_ROOT
+export FIXTURE_CORE_CONTRACT_PATH="${FIXTURE_CORE_CONTRACT_PATH:-${REPO_ROOT}/config/fixture_core_contract.json}"
+contract_value() {
+  python3 "${REPO_ROOT}/scripts/fixture_core_contract.py" \
+    --contract "${FIXTURE_CORE_CONTRACT_PATH}" \
+    --field "$1"
+}
 export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_league_csv)}}"
 validate_supported_leagues "${STATS_LEAGUES}"
 export SETTLEMENT_HOURS_BACK="${SETTLEMENT_HOURS_BACK:-48}"
 export SETTLEMENT_MAX_RUNTIME_SECONDS="${SETTLEMENT_MAX_RUNTIME_SECONDS:-1200}"
-export SETTLEMENT_EXPORT_DAYS_BACK="${SETTLEMENT_EXPORT_DAYS_BACK:-2}"
-export SETTLEMENT_DELIVERY_DAYS_BACK="${SETTLEMENT_DELIVERY_DAYS_BACK:-2}"
+export SETTLEMENT_EXPORT_DAYS_BACK="$(contract_value history_window_days)"
+export SETTLEMENT_DELIVERY_DAYS_BACK="$(contract_value history_window_days)"
 # Atomic publication replaces the complete customer-visible release. Keep
 # settlement on the same rolling horizon as P3 so a 15-minute result refresh
 # cannot publish a short snapshot that removes later fixture dates.
-export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-43}"
-export SETTLEMENT_DELIVERY_DAYS_FORWARD="${SETTLEMENT_DELIVERY_DAYS_FORWARD:-${FIXTURE_DELIVERY_DAYS_FORWARD}}"
+export FIXTURE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"
+export SETTLEMENT_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD}"
 export POSTMATCH_DETAIL_HOURS_BACK="${POSTMATCH_DETAIL_HOURS_BACK:-72}"
 export POSTMATCH_DETAIL_LIMIT="${POSTMATCH_DETAIL_LIMIT:-25}"
 export POSTMATCH_DETAIL_GRACE_MINUTES="${POSTMATCH_DETAIL_GRACE_MINUTES:-60}"

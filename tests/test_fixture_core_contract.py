@@ -17,9 +17,12 @@ class FixtureCoreContractTests(unittest.TestCase):
         contract = load_contract()
 
         self.assertEqual(contract.identity_window_days, 30)
+        self.assertEqual(contract.history_window_days, 2)
         self.assertEqual(contract.source_buffer_days, 1)
         self.assertEqual(contract.source_window_days_forward, 31)
         self.assertEqual(contract.local_read_lookahead_days, 31)
+        self.assertEqual(contract.odds_window_days, 14)
+        self.assertEqual(contract.fixture_delivery_window_days, 14)
         self.assertEqual(contract.delivery_window_days, 43)
         self.assertEqual(contract.job_id, "run_p3_fixture_core_export")
         self.assertEqual(contract.time_basis, "UTC")
@@ -30,7 +33,10 @@ class FixtureCoreContractTests(unittest.TestCase):
                 {
                     "version": 1,
                     "identity_window_days": 30,
+                    "history_window_days": 2,
                     "source_buffer_days": 1,
+                    "odds_window_days": 14,
+                    "fixture_delivery_window_days": 14,
                     "delivery_window_days": 43,
                     "same_day_grace_hours": 6,
                     "max_job_age_minutes": 540,
@@ -45,6 +51,14 @@ class FixtureCoreContractTests(unittest.TestCase):
             Path("config/fixture_core_contract.json").read_text(encoding="utf-8")
         )
         payload["delivery_window_days"] = 29
+        with self.assertRaises(FixtureCoreContractError):
+            parse_contract(payload)
+
+    def test_invalid_contract_rejects_delivery_horizon_shorter_than_fixture_window(self) -> None:
+        payload = json.loads(
+            Path("config/fixture_core_contract.json").read_text(encoding="utf-8")
+        )
+        payload["delivery_window_days"] = 13
         with self.assertRaises(FixtureCoreContractError):
             parse_contract(payload)
 

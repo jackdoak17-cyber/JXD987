@@ -28,6 +28,8 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
         wrapper = (ROOT / "scripts/vps/run_p3_fixture_core.sh").read_text(encoding="utf-8")
 
         self.assertIn("--days-forward \"${FIXTURE_CORE_SOURCE_DAYS_FORWARD}\"", wrapper)
+        self.assertIn('FIXTURE_CORE_REFRESH_DAYS_BACK="${FIXTURE_CORE_HISTORY_DAYS}"', wrapper)
+        self.assertIn('--start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)"', wrapper)
         self.assertIn("--fixture-core-only", wrapper)
         self.assertIn("--skip-prune", wrapper)
         self.assertIn('"${FIXTURE_CORE_JOB_ID}"', wrapper)
@@ -36,13 +38,15 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
         self.assertIn('ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"', wrapper)
         self.assertIn("--no-refresh-squads-missing", wrapper)
         self.assertIn("--no-refresh-sidelined-window", wrapper)
-        self.assertIn('FIXTURE_CORE_REFRESH_DAYS_BACK="${FIXTURE_CORE_REFRESH_DAYS_BACK:-2}"', wrapper)
+        self.assertIn('FIXTURE_CORE_REFRESH_DAYS_BACK="${FIXTURE_CORE_HISTORY_DAYS}"', wrapper)
 
     def test_p3_keeps_odds_window_separate_from_fixture_core_job(self) -> None:
         p3 = (ROOT / "scripts/vps/run_p3.sh").read_text(encoding="utf-8")
 
         self.assertIn('--days-forward "${DAYS_FORWARD}"', p3)
-        self.assertIn('export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"', p3)
+        self.assertIn('export DAYS_FORWARD="$(contract_value odds_window_days)"', p3)
+        self.assertIn('export ODDS_EXPORT_DAYS_BACK="$(contract_value history_window_days)"', p3)
+        self.assertIn('export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"', p3)
         self.assertIn("run_recorded_pipeline_job", p3)
         self.assertNotIn("python scripts/reconcile_recent_fixtures.py", p3)
 
@@ -62,26 +66,18 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
     def test_recorded_job_retries_a_transient_lock_handoff(self) -> None:
         script = r'''
 source scripts/vps/common.sh
-test_dir="$(mktemp -d)"
-trap 'rm -rf "${test_dir}"' EXIT
-lock_file="${test_dir}/lock"
-ready_file="${test_dir}/ready"
-(
-  exec 9>"${lock_file}"
-  flock --nonblock 9
-  touch "${ready_file}"
-  sleep 0.6
-) &
-holder_pid=$!
-while [[ ! -f "${ready_file}" ]]; do sleep 0.01; done
-export ODDS_SYNC_LOCK_FILE="${lock_file}"
-export ODDS_SYNC_LIVE_TICK_SECONDS=86400
-export ODDS_SYNC_LIVE_RESERVE_SECONDS=0
-export ODDS_SYNC_LIVE_GRACE_SECONDS=0
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS=5
-export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS=0.2
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS=0
+attempts=0
+run_with_global_lock_and_timeout() {
+  attempts=$((attempts + 1))
+  if [[ "${attempts}" -eq 1 ]]; then
+    return 2
+  fi
+  return 0
+}
 run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
-wait "${holder_pid}"
+[[ "${attempts}" -eq 2 ]]
 '''
         result = subprocess.run(
             ["bash", "-c", script],

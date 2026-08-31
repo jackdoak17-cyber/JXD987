@@ -38,6 +38,7 @@ contract_value() {
 # different contract file for a controlled rehearsal, but may not silently
 # override its horizons or freshness semantics.
 export FIXTURE_CORE_IDENTITY_DAYS="$(contract_value identity_window_days)"
+export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"
 export FIXTURE_CORE_SOURCE_DAYS_FORWARD="$(contract_value source_window_days_forward)"
 export FIXTURE_CORE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"
 export FIXTURE_CORE_JOB_ID="$(contract_value job_id)"
@@ -51,9 +52,10 @@ export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SE
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-4}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"
 # The exporter treats zero as an unbounded completed-fixture selection. Keep
-# the historical side of this identity refresh bounded as well; the future
-# identity contract is still controlled exclusively by the source window.
-export FIXTURE_CORE_REFRESH_DAYS_BACK="${FIXTURE_CORE_REFRESH_DAYS_BACK:-2}"
+# the historical side of this identity refresh bounded by the shared contract
+# as well; the future identity contract is still controlled by the source
+# window.
+export FIXTURE_CORE_REFRESH_DAYS_BACK="${FIXTURE_CORE_HISTORY_DAYS}"
 export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-1800}"
 export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/fixture_core_export_report.json}"
 
@@ -116,7 +118,7 @@ python scripts/export_to_supabase.py \
 # London date boundaries match the public fixture-card contract; the source
 # identity contract itself remains UTC/date-only.
 python scripts/refresh_fixture_delivery.py \
-  --start-date "$(TZ=Europe/London date +%F)" \
+  --start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)" \
   --end-date "$(TZ=Europe/London date -d "+${FIXTURE_CORE_DELIVERY_DAYS_FORWARD} days" +%F)" \
   --leagues "${STATS_LEAGUES}" \
   --report-out "/tmp/fixture_core_delivery_report.json"
