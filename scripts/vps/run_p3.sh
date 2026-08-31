@@ -16,7 +16,6 @@ require_runtime_manifest_entries_or_exit "$0" \
   "config/odds_api_leagues.json" \
   "scripts/sync_odds.py" \
   "scripts/sync_sportmonks_metadata.py" \
-  "scripts/sync_sparse_squads.py" \
   "scripts/export_odds_to_supabase_psql.py" \
   "scripts/odds_retention_psql.py" \
   "scripts/reconcile_recent_fixtures.py" \
@@ -142,18 +141,7 @@ else
   echo "Skipping fixture-core refresh/export; missing SportMonks or Supabase REST env" >&2
 fi
 
-# Step 2: Reconcile/export current-season squads.
-if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
-  run_isolated_pipeline_job \
-    "run_p3_sparse_squad_refresh" \
-    "P3 current squad reconciliation" \
-    "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/sync_sparse_squads.py --leagues \"${STATS_LEAGUES}\" --refresh-all --report-json \"/tmp/sparse_squad_refresh_report_p3.json\"" \
-    "${P3_SPARSE_SQUAD_REFRESH_TIMEOUT_SECONDS:-900}"
-else
-  echo "Skipping squad reconciliation; missing SportMonks or Supabase REST env" >&2
-fi
-
-# Step 3: Odds fetch scoped to P3 fixtures only
+# Step 2: Odds fetch scoped to P3 fixtures only
 python scripts/sync_odds.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_SYNC_DAYS_BACK}" \

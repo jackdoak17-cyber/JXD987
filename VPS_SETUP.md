@@ -32,6 +32,12 @@ New operational vars:
 - `HEALTHCHECK_PING_URL_P3=` (optional)
 - `HEALTHCHECK_PING_URL_MODELS=` (optional)
 
+Current-squad reconciliation vars:
+- `SQUAD_BATCH_SIZE=100` (default; bounded teams per run)
+- `SQUAD_FRESHNESS_MAX_HOURS=12` (default)
+- `SQUAD_OFFSET_FILE=/var/lib/odds-sync/squad-reconciliation-offset` (default)
+- `SQUAD_SUPERVISOR_LOCK_FILE=/var/lock/odds-sync-squad-reconciliation.lock` (default)
+
 Models publish vars (betting picks):
 - `MODELS_REPO_ROOT=/opt/odds-sync/Models` (default)
 - `MODELS_ENV_PATH=/opt/odds-sync/JXD987/.env` (default)
@@ -52,6 +58,7 @@ Location:
 - `scripts/vps/run_p1.sh`
 - `scripts/vps/run_p2.sh`
 - `scripts/vps/run_p3.sh`
+- `scripts/vps/run_squad_reconciliation.sh`
 
 Exit codes:
 - `0`: success (healthcheck ping sent)
@@ -98,6 +105,7 @@ Use this schedule while the production Supabase project is on Micro compute or w
 */10 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
 */15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
 7,37 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
+*/30 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_squad_reconciliation.sh >> /var/log/odds-sync-squads.log 2>&1
 
 # Betting picks publish (Models -> Supabase, optional R2 fallback).
 # Shares the same global lock as P3 and will skip while ingestion is running.
@@ -119,6 +127,7 @@ Only use this after Supabase has enough IO/CPU headroom and the hot tables have 
 */2 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
 */5 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
 */20 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
+*/30 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_squad_reconciliation.sh >> /var/log/odds-sync-squads.log 2>&1
 
 # Betting picks publish (Models -> Supabase, optional R2 fallback).
 # Shares the same global lock as P3 and will skip while ingestion is running.
@@ -133,7 +142,7 @@ Only use this after Supabase has enough IO/CPU headroom and the hot tables have 
 ```
 
 Important:
-- No separate SportMonks cron entry (SportMonks refresh is inside `run_p3.sh`)
+- Fixture metadata refresh remains inside `run_p3.sh`; current-squad reconciliation runs in the separate bounded `run_squad_reconciliation.sh` job.
 - Retention runs only in `run_p3.sh` (and `run_sync.sh` parity mode)
 
 ## 6) Healthcheck timeout formula
@@ -194,6 +203,8 @@ tail -n 200 /var/log/odds-sync.log
 tail -n 200 /var/log/odds-sync-p1.log
 tail -n 200 /var/log/odds-sync-p2.log
 tail -n 200 /var/log/odds-sync-p3.log
+
+tail -n 200 /var/log/odds-sync-squads.log
 
 # inspect reports
 ls -lah /tmp/odds_*_report*.json

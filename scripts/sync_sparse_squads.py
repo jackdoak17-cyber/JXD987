@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
@@ -61,16 +62,31 @@ def current_season_team_ids(
         select distinct f.league_id, f.home_team_id as team_id
         from fixtures f
         join seasons s on s.id = f.season_id
-        where coalesce(s.is_current, 0) = 1
+        where (
+            coalesce(s.is_current, 0) = 1
+            or (
+                s.start_date is not null
+                and s.start_date <= CURRENT_TIMESTAMP
+                and (s.end_date is null or s.end_date >= CURRENT_TIMESTAMP)
+            )
+        )
           and f.home_team_id is not null
           {league_filter}
         union
         select distinct f.league_id, f.away_team_id as team_id
         from fixtures f
         join seasons s on s.id = f.season_id
-        where coalesce(s.is_current, 0) = 1
+        where (
+            coalesce(s.is_current, 0) = 1
+            or (
+                s.start_date is not null
+                and s.start_date <= CURRENT_TIMESTAMP
+                and (s.end_date is null or s.end_date >= CURRENT_TIMESTAMP)
+            )
+        )
           and f.away_team_id is not null
           {league_filter}
+        order by league_id, team_id
         """
     )
     if league_ids:
@@ -85,6 +101,18 @@ def current_season_team_ids(
         if skip_large_leagues_threshold <= 0
         or league_team_counts.get(int(row.league_id), 0) < skip_large_leagues_threshold
     ]
+
+
+def select_team_batch(team_ids: Sequence[int], offset: int = 0, max_teams: int = 0) -> List[int]:
+    """Return a deterministic, bounded slice for resumable fleet reconciliation."""
+    if offset < 0:
+        raise ValueError("team offset must be non-negative")
+    if max_teams < 0:
+        raise ValueError("maximum team batch size must be non-negative")
+    if offset >= len(team_ids):
+        return []
+    end = None if max_teams == 0 else offset + max_teams
+    return [int(team_id) for team_id in team_ids[offset:end]]
 
 
 def team_player_counts(session, team_ids: Sequence[int]) -> Dict[int, int]:
@@ -167,19 +195,85 @@ def fetch_players_by_ids(player_ids: Sequence[int]) -> List[Dict]:
     ]
 
 
+def deactivate_remote_squad_memberships_missing(
+    team_ids: Sequence[int],
+    memberships: Sequence[Dict],
+    dry_run: bool,
+) -> Dict[str, int]:
+    """Close remote active memberships absent from the latest local snapshot."""
+    active_by_team: Dict[int, set[int]] = {}
+    for row in memberships:
+        if row.get("is_active") and row.get("team_id") is not None and row.get("player_id") is not None:
+            active_by_team.setdefault(int(row["team_id"]), set()).add(int(row["player_id"]))
+    deactivated: Dict[str, int] = {}
+    if dry_run:
+        return deactivated
+
+    for team_id in team_ids:
+        response = requests.get(
+            f"{SUPABASE_URL.rstrip()}{REST_PATH}/team_squad_memberships",
+            headers=rest_headers(),
+            params={
+                "select": "player_id",
+                "team_id": f"eq.{team_id}",
+                "is_active": "eq.true",
+                "limit": "1000",
+            },
+            timeout=60,
+        )
+        if not response.ok:
+            raise SystemExit(
+                f"Supabase membership lookup for team {team_id} failed {response.status_code}: {response.text}"
+            )
+        remote_ids = {
+            int(row["player_id"])
+            for row in response.json()
+            if isinstance(row, dict) and row.get("player_id") is not None
+        }
+        stale_ids = sorted(remote_ids - active_by_team.get(int(team_id), set()))
+        if not stale_ids:
+            continue
+        patch = requests.patch(
+            f"{SUPABASE_URL.rstrip()}{REST_PATH}/team_squad_memberships",
+            headers=rest_headers(),
+            params={
+                "team_id": f"eq.{team_id}",
+                "player_id": f"in.({','.join(str(player_id) for player_id in stale_ids)})",
+            },
+            json={"is_active": False, "updated_at": datetime.utcnow().isoformat()},
+            timeout=60,
+        )
+        if not patch.ok:
+            raise SystemExit(
+                f"Supabase membership deactivation for team {team_id} failed {patch.status_code}: {patch.text}"
+            )
+        deactivated[str(team_id)] = len(stale_ids)
+    return deactivated
+
+
 def detach_remote_players_missing_from_squads(
     team_ids: Sequence[int],
     current_players: Sequence[Dict],
     dry_run: bool,
+    memberships: Sequence[Dict] | None = None,
 ) -> Dict[str, int]:
-    """Remove remote team assignments not present in a successful local squad snapshot."""
+    """Remove remote team assignments not present in active squad membership."""
     current_player_ids_by_team: Dict[int, set[int]] = {}
-    for row in current_players:
-        team_id = row.get("team_id")
-        player_id = row.get("id")
-        if team_id is None or player_id is None:
-            continue
-        current_player_ids_by_team.setdefault(int(team_id), set()).add(int(player_id))
+    if memberships is not None:
+        for row in memberships:
+            if not row.get("is_active"):
+                continue
+            team_id = row.get("team_id")
+            player_id = row.get("player_id")
+            if team_id is not None and player_id is not None:
+                current_player_ids_by_team.setdefault(int(team_id), set()).add(int(player_id))
+    else:
+        for row in current_players:
+            team_id = row.get("team_id")
+            player_id = row.get("id")
+            if team_id is None or player_id is None:
+                continue
+            current_player_ids_by_team.setdefault(int(team_id), set()).add(int(player_id))
 
     detached_by_team: Dict[str, int] = {}
     if dry_run:
@@ -325,6 +419,13 @@ def write_report(path: str | None, report: Dict) -> None:
     Path(path).write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def exported_count(result: object) -> int:
+    """Accept both exporter return shapes used by deployed JXD revisions."""
+    if isinstance(result, tuple):
+        result = result[0]
+    return int(result or 0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default=os.environ.get("LEAGUE_IDS", ""))
@@ -341,9 +442,26 @@ def main() -> None:
         default=int(os.environ.get("SQUAD_REFRESH_SKIP_LARGE_LEAGUES_THRESHOLD", "80")),
         help="Skip automatic sparse refresh in leagues with this many current-season teams; explicit team IDs still run.",
     )
+    parser.add_argument(
+        "--team-offset",
+        type=int,
+        default=int(os.environ.get("SQUAD_TEAM_OFFSET", "0")),
+        help="Zero-based offset into the selected team list for a resumable batch.",
+    )
+    parser.add_argument(
+        "--max-teams",
+        type=int,
+        default=int(os.environ.get("SQUAD_MAX_TEAMS", "0")),
+        help="Maximum teams to refresh in this invocation; zero refreshes the full selected list.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--report-json", default="")
     args = parser.parse_args()
+
+    if args.team_offset < 0:
+        raise SystemExit("--team-offset must be non-negative")
+    if args.max_teams < 0:
+        raise SystemExit("--max-teams must be non-negative")
 
     require_env(args.dry_run)
 
@@ -379,17 +497,20 @@ def main() -> None:
             if team_id in explicit_team_ids or before_counts.get(team_id, 0) < args.minimum_players
         ]
     )
+    refresh_team_ids = select_team_batch(sparse_team_ids, args.team_offset, args.max_teams)
+    has_more_teams = args.team_offset + len(refresh_team_ids) < len(sparse_team_ids)
+    next_team_offset = args.team_offset + len(refresh_team_ids) if has_more_teams else 0
     previously_assigned_player_ids = [
         int(row["id"])
-        for row in fetch_players_for_teams(sparse_team_ids)
+        for row in fetch_players_for_teams(refresh_team_ids)
         if row.get("id")
     ]
 
     if not args.dry_run:
-        service.sync_squads_for_teams(sparse_team_ids)
-    after_counts = team_player_counts(session, sparse_team_ids)
+        service.sync_squads_for_teams(refresh_team_ids)
+    after_counts = team_player_counts(session, refresh_team_ids)
 
-    current_players = fetch_players_for_teams(sparse_team_ids)
+    current_players = fetch_players_for_teams(refresh_team_ids)
     players = fetch_players_by_ids(
         unique_ordered([
             *previously_assigned_player_ids,
@@ -398,27 +519,39 @@ def main() -> None:
     )
     player_ids = [int(row["id"]) for row in players if row.get("id")]
     player_team_history = fetch_player_team_history(player_ids)
-    squad_snapshots = fetch_team_squad_snapshots(sparse_team_ids)
-    squad_memberships = fetch_team_squad_memberships(sparse_team_ids)
+    squad_snapshots = fetch_team_squad_snapshots(refresh_team_ids)
+    squad_memberships = fetch_team_squad_memberships(refresh_team_ids)
 
     players_exported = 0
     history_exported = 0
     snapshots_exported = 0
     memberships_exported = 0
     if players:
-        players_exported, _ = upsert_table("players", players, "id", args.dry_run)
+        players_exported = exported_count(upsert_table("players", players, "id", args.dry_run))
     if player_team_history:
-        history_exported, _ = upsert_table("player_team_history", player_team_history, "id", args.dry_run)
-    if squad_snapshots:
-        snapshots_exported, _ = upsert_table("team_squad_snapshots", squad_snapshots, "id", args.dry_run)
-    if squad_memberships:
-        memberships_exported, _ = upsert_table(
-            "team_squad_memberships", squad_memberships, "team_id,player_id", args.dry_run
+        history_exported = exported_count(
+            upsert_table("player_team_history", player_team_history, "id", args.dry_run)
         )
+    if squad_snapshots:
+        snapshots_exported = exported_count(
+            upsert_table("team_squad_snapshots", squad_snapshots, "id", args.dry_run)
+        )
+    if squad_memberships:
+        memberships_exported = exported_count(
+            upsert_table(
+                "team_squad_memberships", squad_memberships, "team_id,player_id", args.dry_run
+            )
+        )
+    remote_memberships_deactivated = deactivate_remote_squad_memberships_missing(
+        refresh_team_ids,
+        squad_memberships,
+        args.dry_run,
+    )
     remote_players_detached = detach_remote_players_missing_from_squads(
-        sparse_team_ids,
+        refresh_team_ids,
         current_players,
         args.dry_run,
+        squad_memberships,
     )
 
     report = {
@@ -428,14 +561,20 @@ def main() -> None:
         "refresh_all": args.refresh_all,
         "skip_large_leagues_threshold": args.skip_large_leagues_threshold,
         "candidate_teams": len(candidate_team_ids),
-        "teams_refreshed": len(sparse_team_ids),
-        "team_ids_refreshed": sparse_team_ids,
-        "before_counts": {str(team_id): before_counts.get(team_id, 0) for team_id in sparse_team_ids},
-        "after_counts": {str(team_id): after_counts.get(team_id, 0) for team_id in sparse_team_ids},
+        "selected_teams": len(sparse_team_ids),
+        "team_offset": args.team_offset,
+        "max_teams": args.max_teams,
+        "has_more_teams": has_more_teams,
+        "next_team_offset": next_team_offset,
+        "teams_refreshed": len(refresh_team_ids),
+        "team_ids_refreshed": refresh_team_ids,
+        "before_counts": {str(team_id): before_counts.get(team_id, 0) for team_id in refresh_team_ids},
+        "after_counts": {str(team_id): after_counts.get(team_id, 0) for team_id in refresh_team_ids},
         "players_exported": players_exported,
         "player_team_history_exported": history_exported,
         "squad_snapshots_exported": snapshots_exported,
         "squad_memberships_exported": memberships_exported,
+        "remote_memberships_deactivated": remote_memberships_deactivated,
         "remote_players_detached": remote_players_detached,
     }
     write_report(args.report_json, report)
