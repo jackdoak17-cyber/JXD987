@@ -48,7 +48,10 @@ export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_leag
 validate_supported_leagues "${STATS_LEAGUES}"
 export FIXTURE_CORE_MAX_RUNTIME_SECONDS="${FIXTURE_CORE_MAX_RUNTIME_SECONDS:-900}"
 export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS:-300}"
-export FIXTURE_CORE_REFRESH_DAYS_BACK="${FIXTURE_CORE_REFRESH_DAYS_BACK:-0}"
+# The exporter treats zero as an unbounded completed-fixture selection. Keep
+# the historical side of this identity refresh bounded as well; the future
+# identity contract is still controlled exclusively by the source window.
+export FIXTURE_CORE_REFRESH_DAYS_BACK="${FIXTURE_CORE_REFRESH_DAYS_BACK:-2}"
 export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-1800}"
 export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/fixture_core_export_report.json}"
 

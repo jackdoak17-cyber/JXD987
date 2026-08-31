@@ -34,6 +34,7 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
         self.assertIn("run_recorded_pipeline_job", wrapper)
         self.assertIn("--no-refresh-squads-missing", wrapper)
         self.assertIn("--no-refresh-sidelined-window", wrapper)
+        self.assertIn('FIXTURE_CORE_REFRESH_DAYS_BACK="${FIXTURE_CORE_REFRESH_DAYS_BACK:-2}"', wrapper)
 
     def test_p3_keeps_odds_window_separate_from_fixture_core_job(self) -> None:
         p3 = (ROOT / "scripts/vps/run_p3.sh").read_text(encoding="utf-8")

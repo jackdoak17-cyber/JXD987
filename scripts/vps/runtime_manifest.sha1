@@ -27,7 +27,7 @@ a77a3f8b12d507fb95c953f27c906916a3d39196  scripts/fixture_core_contract.py
 aaf31d37d04da10279a562a2acfda4a74c387fc5  scripts/vps/run_p1.sh
 7e1353a52f73ddfa38b222eead01753c891fcd01  scripts/vps/run_p2.sh
 a8139a765859c87cd3fdc38a22bd00dd6f015fea  scripts/vps/run_p3.sh
-49141ec738e075abfaa9a712b2ff3f5d40bdcbf1  scripts/vps/run_p3_fixture_core.sh
+a47badaed8062417fb4ef6765774f3840b42545c  scripts/vps/run_p3_fixture_core.sh
 66a0e50466672eb1618c6e187ed15c4446cf1003  scripts/vps/run_postmatch_settlement.sh
 c1e2db2eb593edf8e11a2a8a62b7a149d4b3b59c  scripts/vps/run_models.sh
 68f0ba013c6d96af3622a6320e7270e4419fa2fd  scripts/vps/run_sync.sh
