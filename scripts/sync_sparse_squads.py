@@ -195,6 +195,41 @@ def fetch_players_by_ids(player_ids: Sequence[int]) -> List[Dict]:
     ]
 
 
+def fetch_current_player_assignments(player_ids: Sequence[int]) -> Dict[int, Dict[str, object]]:
+    """Return the same deterministic active assignment used by the read model."""
+    if not player_ids:
+        return {}
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        q = ",".join("?" for _ in player_ids)
+        rows = conn.execute(
+            f"""
+            select player_id, team_id, last_seen_at
+            from team_squad_memberships
+            where is_active = 1 and player_id in ({q})
+            order by
+                player_id,
+                provider_started_at desc,
+                last_seen_at desc,
+                last_snapshot_id desc,
+                team_id asc
+            """,
+            list(player_ids),
+        ).fetchall()
+    finally:
+        conn.close()
+    assignments: Dict[int, Dict[str, object]] = {}
+    for player_id, team_id, last_seen_at in rows:
+        parsed_player_id = int(player_id)
+        if parsed_player_id in assignments:
+            continue
+        assignments[parsed_player_id] = {
+            "team_id": int(team_id),
+            "last_seen_at": last_seen_at,
+        }
+    return assignments
+
+
 def deactivate_remote_squad_memberships_missing(
     team_ids: Sequence[int],
     memberships: Sequence[Dict],
@@ -518,6 +553,13 @@ def main() -> None:
         ])
     )
     player_ids = [int(row["id"]) for row in players if row.get("id")]
+    current_assignments = fetch_current_player_assignments(player_ids)
+    for player in players:
+        player_id = int(player["id"])
+        assignment = current_assignments.get(player_id)
+        player["team_id"] = assignment["team_id"] if assignment else None
+        if assignment and assignment.get("last_seen_at"):
+            player["team_updated_at"] = assignment["last_seen_at"]
     player_team_history = fetch_player_team_history(player_ids)
     squad_snapshots = fetch_team_squad_snapshots(refresh_team_ids)
     squad_memberships = fetch_team_squad_memberships(refresh_team_ids)

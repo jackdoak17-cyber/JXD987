@@ -78,9 +78,17 @@ def _remote_rows(table: str, team_ids: Sequence[int], select_columns: str, extra
 
 
 def _latest_successful_snapshot(rows: Sequence[Dict], now: datetime) -> Dict[int, Dict]:
+    return _latest_snapshots(rows, now, {"success"})
+
+
+def _latest_snapshots(
+    rows: Sequence[Dict],
+    now: datetime,
+    statuses: Set[str] | None = None,
+) -> Dict[int, Dict]:
     latest: Dict[int, Dict] = {}
     for row in rows:
-        if row.get("status") != "success":
+        if statuses is not None and row.get("status") not in statuses:
             continue
         team_id = row.get("team_id")
         observed_at = row.get("observed_at")
@@ -129,13 +137,29 @@ def main() -> None:
         ).bindparams(bindparam("team_ids", expanding=True)),
         {"team_ids": team_ids},
     ).mappings().all() if team_ids else []
-    local_latest = _latest_successful_snapshot(local_rows, now)
+    local_latest = _latest_snapshots(local_rows, now)
+    local_latest_successful = _latest_successful_snapshot(local_rows, now)
 
-    failures: Dict[str, List[Dict]] = {"missing_local_snapshot": [], "stale_local_snapshot": []}
+    failures: Dict[str, List[Dict]] = {
+        "missing_local_snapshot": [],
+        "stale_local_snapshot": [],
+        "local_provider_failure": [],
+    }
+    warnings: Dict[str, List[Dict]] = {"local_provider_empty": []}
     for team_id in team_ids:
         row = local_latest.get(team_id)
         if row is None:
             failures["missing_local_snapshot"].append({"team_id": team_id})
+            continue
+        if row.get("status") == "empty":
+            warnings["local_provider_empty"].append(
+                {"team_id": team_id, "observed_at": str(row.get("observed_at"))}
+            )
+            continue
+        if row.get("status") != "success":
+            failures["local_provider_failure"].append(
+                {"team_id": team_id, "status": row.get("status"), "observed_at": str(row.get("observed_at"))}
+            )
             continue
         observed_at = datetime.fromisoformat(str(row["observed_at"]).replace("Z", "+00:00"))
         if observed_at.tzinfo is None:
@@ -151,8 +175,16 @@ def main() -> None:
             "team_squad_memberships", team_ids, "team_id,player_id,is_active,last_snapshot_id"
         )
         remote_players = _remote_rows("players", team_ids, "id,team_id")
-        remote_latest = _latest_successful_snapshot(remote_snapshots, now)
-        failures.update({"missing_remote_snapshot": [], "stale_remote_snapshot": [], "snapshot_membership_count_mismatch": [], "player_assignment_mismatch": []})
+        remote_latest = _latest_snapshots(remote_snapshots, now)
+        remote_latest_successful = _latest_successful_snapshot(remote_snapshots, now)
+        failures.update({
+            "missing_remote_snapshot": [],
+            "stale_remote_snapshot": [],
+            "remote_provider_failure": [],
+            "snapshot_membership_count_mismatch": [],
+            "player_assignment_mismatch": [],
+        })
+        warnings["remote_provider_empty"] = []
         active_members_by_team: Dict[int, Set[int]] = {}
         members_by_snapshot: Dict[tuple[int, int], Set[int]] = {}
         for row in remote_memberships:
@@ -172,6 +204,20 @@ def main() -> None:
             snapshot = remote_latest.get(team_id)
             if snapshot is None:
                 failures["missing_remote_snapshot"].append({"team_id": team_id})
+                continue
+            if snapshot.get("status") == "empty":
+                warnings["remote_provider_empty"].append(
+                    {"team_id": team_id, "observed_at": str(snapshot.get("observed_at"))}
+                )
+                continue
+            if snapshot.get("status") != "success":
+                failures["remote_provider_failure"].append(
+                    {
+                        "team_id": team_id,
+                        "status": snapshot.get("status"),
+                        "observed_at": str(snapshot.get("observed_at")),
+                    }
+                )
                 continue
             observed_at = datetime.fromisoformat(str(snapshot["observed_at"]).replace("Z", "+00:00"))
             if observed_at.tzinfo is None:
@@ -196,8 +242,10 @@ def main() -> None:
         "checked_at": now.isoformat(),
         "max_age_hours": args.max_age_hours,
         "current_season_team_count": len(team_ids),
-        "local_latest_successful_snapshots": len(local_latest),
+        "local_latest_successful_snapshots": len(local_latest_successful),
+        "remote_latest_successful_snapshots": len(remote_latest_successful) if not args.dry_run else None,
         "dry_run": args.dry_run,
+        "warnings": {name: rows for name, rows in warnings.items() if rows},
         "failures": failing_groups,
         "ok": not failing_groups,
     }
