@@ -601,13 +601,60 @@ def fetch_players(conn: sqlite3.Connection, player_ids: Sequence[int]) -> List[D
     cur = conn.cursor()
     q = ",".join("?" for _ in player_ids)
     cur.execute(
-        f"""
-        select id, name, display_name, short_name, common_name, team_id, team_updated_at, image_path
-        from players
-        where id in ({q})
-        """,
-        player_ids,
+        "select 1 from sqlite_master where name = 'team_squad_memberships' "
+        "and type in ('table', 'view') limit 1"
     )
+    has_squad_memberships = cur.fetchone() is not None
+
+    if has_squad_memberships:
+        cur.execute("pragma table_info(team_squad_memberships)")
+        squad_columns = {str(row[1]) for row in cur.fetchall()}
+    else:
+        squad_columns = set()
+
+    required_squad_columns = {"player_id", "team_id", "is_active"}
+    if required_squad_columns.issubset(squad_columns):
+        seen_expression = "last_seen_at" if "last_seen_at" in squad_columns else "NULL"
+        order_columns = []
+        if "provider_started_at" in squad_columns:
+            order_columns.append("provider_started_at desc")
+        if "last_seen_at" in squad_columns:
+            order_columns.append("last_seen_at desc")
+        if "last_snapshot_id" in squad_columns:
+            order_columns.append("last_snapshot_id desc")
+        order_columns.append("team_id asc")
+        cur.execute(
+            f"""
+            with current_assignment as (
+                select player_id, team_id, {seen_expression} as last_seen_at,
+                       row_number() over (
+                           partition by player_id
+                           order by {', '.join(order_columns)}
+                       ) as assignment_rank
+                from team_squad_memberships
+                where is_active = 1
+            )
+            select p.id, p.name, p.display_name, p.short_name, p.common_name,
+                   ca.team_id, coalesce(ca.last_seen_at, p.team_updated_at), p.image_path
+            from players p
+            left join current_assignment ca
+              on ca.player_id = p.id and ca.assignment_rank = 1
+            where p.id in ({q})
+            """,
+            player_ids,
+        )
+    else:
+        # Older local databases may predate squad memberships. Keep the
+        # exporter usable there, while current databases always use the
+        # canonical active assignment above.
+        cur.execute(
+            f"""
+            select id, name, display_name, short_name, common_name, team_id, team_updated_at, image_path
+            from players
+            where id in ({q})
+            """,
+            player_ids,
+        )
     return [
         {
             "id": r[0],

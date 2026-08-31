@@ -230,6 +230,37 @@ def fetch_current_player_assignments(player_ids: Sequence[int]) -> Dict[int, Dic
     return assignments
 
 
+def normalize_local_player_assignments(
+    players: Sequence[Dict],
+    assignments: Dict[int, Dict[str, object]],
+) -> int:
+    """Keep the local compatibility column aligned with active memberships."""
+    if not players:
+        return 0
+    updated_at = datetime.utcnow().isoformat(sep=" ")
+    conn = sqlite3.connect(DB_PATH)
+    changed = 0
+    try:
+        for player in players:
+            player_id = int(player["id"])
+            assignment = assignments.get(player_id)
+            team_id = assignment["team_id"] if assignment else None
+            team_updated_at = (assignment or {}).get("last_seen_at") or updated_at
+            cursor = conn.execute(
+                """
+                update players
+                set team_id = ?, team_updated_at = ?
+                where id = ? and (team_id is not ? or team_updated_at is not ?)
+                """,
+                (team_id, team_updated_at, player_id, team_id, team_updated_at),
+            )
+            changed += cursor.rowcount
+        conn.commit()
+    finally:
+        conn.close()
+    return changed
+
+
 def deactivate_remote_squad_memberships_missing(
     team_ids: Sequence[int],
     memberships: Sequence[Dict],
@@ -554,12 +585,16 @@ def main() -> None:
     )
     player_ids = [int(row["id"]) for row in players if row.get("id")]
     current_assignments = fetch_current_player_assignments(player_ids)
+    local_projection_normalized = normalize_local_player_assignments(players, current_assignments)
     for player in players:
         player_id = int(player["id"])
         assignment = current_assignments.get(player_id)
         player["team_id"] = assignment["team_id"] if assignment else None
         if assignment and assignment.get("last_seen_at"):
             player["team_updated_at"] = assignment["last_seen_at"]
+    # Re-read after normalization so remote stale-player cleanup uses the
+    # same compatibility projection as the export payload.
+    current_players = fetch_players_for_teams(refresh_team_ids)
     player_team_history = fetch_player_team_history(player_ids)
     squad_snapshots = fetch_team_squad_snapshots(refresh_team_ids)
     squad_memberships = fetch_team_squad_memberships(refresh_team_ids)
@@ -616,6 +651,7 @@ def main() -> None:
         "player_team_history_exported": history_exported,
         "squad_snapshots_exported": snapshots_exported,
         "squad_memberships_exported": memberships_exported,
+        "local_projection_normalized": local_projection_normalized,
         "remote_memberships_deactivated": remote_memberships_deactivated,
         "remote_players_detached": remote_players_detached,
     }
