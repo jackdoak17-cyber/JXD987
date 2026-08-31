@@ -13,6 +13,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     candidate_fixture_ids,
     compare_snapshots,
     DERIVED_STAT_TYPE_IDS,
+    delivery_reason_code,
     ensure_ledger,
     is_non_competitive_provider_assessment,
     source_ready,
@@ -47,6 +48,16 @@ def test_provider_assessment_distinguishes_ready_sparse_and_pending() -> None:
     pending = provider_payload()
     pending["state"] = {"short_name": "NS"}
     assert assess_provider_payload(pending).status == "provider_pending"
+
+
+def test_delivery_reason_code_is_stable_and_machine_readable() -> None:
+    assert delivery_reason_code("provider_pending", "optional provider metrics are absent") == "provider_pending_optional_metrics"
+    assert delivery_reason_code("provider_pending", "provider lineup/player identity detail incomplete") == "provider_pending_identity"
+    assert delivery_reason_code("provider_pending", "provider detail collection shrank") == "provider_pending_shrink"
+    assert delivery_reason_code("export_failed", "insert failed: foreign key violation") == "dependency_missing"
+    assert delivery_reason_code("export_failed", "database connection failed") == "export_failed"
+    assert delivery_reason_code("excluded", "Cup identity is excluded") == "excluded"
+    assert delivery_reason_code("excluded", "SportMonks returned no fixture data") == "provider_unavailable"
 
 
 def test_derived_stat_types_are_excluded_from_provider_shrink_counts() -> None:

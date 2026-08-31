@@ -37,6 +37,25 @@ def test_target_candidate_quotas_reserve_historical_progress() -> None:
     assert target_candidate_quotas(0) == (0, 0)
 
 
+def test_ledger_upgrade_does_not_promote_pre_contract_rows_to_v2() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "create table fixture_detail_deliveries ("
+        "fixture_id integer primary key, status text not null, "
+        "first_seen_at text not null, updated_at text not null)"
+    )
+    conn.execute(
+        "insert into fixture_detail_deliveries values (1, 'verified', '2026-08-24T10:00:00Z', '2026-08-24T10:00:00Z')"
+    )
+
+    ensure_ledger(conn)
+
+    row = conn.execute(
+        "select delivery_contract_version,reason_code from fixture_detail_deliveries where fixture_id=1"
+    ).fetchone()
+    assert row == (1, "legacy_unclassified")
+
+
 def test_cohort_limit_preserves_clustered_prefix() -> None:
     metadata = {
         1: (8, 25583, None, 0, 0),
@@ -67,7 +86,7 @@ def test_stale_running_rows_are_requeued_with_a_reason() -> None:
 
     assert recover_stale_running(conn, now=now) == 1
     stale = conn.execute(
-        "select status,next_attempt_at,last_error from fixture_detail_deliveries where fixture_id=1"
+        "select status,next_attempt_at,last_error,reason_code from fixture_detail_deliveries where fixture_id=1"
     ).fetchone()
     fresh = conn.execute(
         "select status from fixture_detail_deliveries where fixture_id=2"
@@ -75,6 +94,7 @@ def test_stale_running_rows_are_requeued_with_a_reason() -> None:
     assert stale[0] == "provider_pending"
     assert stale[1] == "2026-08-24T18:00:00Z"
     assert "requeued" in stale[2]
+    assert stale[3] == "provider_pending_structure"
     assert fresh[0] == "running"
 
 
@@ -102,11 +122,12 @@ def test_legacy_provider_pending_rows_are_repaired_and_due() -> None:
 
     assert repaired == {"legacy_pending": [1], "handoff_failed": [2]}
     rows = conn.execute(
-        "select fixture_id,status,next_attempt_at,last_error from fixture_detail_deliveries order by fixture_id"
+        "select fixture_id,status,next_attempt_at,last_error,reason_code,delivery_contract_version "
+        "from fixture_detail_deliveries order by fixture_id"
     ).fetchall()
     assert rows == [
-        (1, "provider_pending", "2026-08-24T18:00:00Z", LEGACY_PENDING_REASON),
-        (2, "provider_pending", "2026-08-24T18:00:00Z", HANDOFF_REQUEUE_REASON),
+        (1, "provider_pending", "2026-08-24T18:00:00Z", LEGACY_PENDING_REASON, "legacy_unclassified", 2),
+        (2, "provider_pending", "2026-08-24T18:00:00Z", HANDOFF_REQUEUE_REASON, "legacy_unclassified", 2),
     ]
 
 

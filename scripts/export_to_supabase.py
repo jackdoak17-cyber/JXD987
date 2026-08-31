@@ -978,8 +978,9 @@ def atomic_fixture_detail_publish(
     fixture_players: Sequence[Dict],
     fixture_statistics: Sequence[Dict],
     fixture_player_statistics: Sequence[Dict],
+    player_dimensions: Sequence[Dict] = (),
 ) -> Dict:
-    """Replace one fixture's raw detail through one target-side transaction."""
+    """Replace one fixture's raw detail through the dependency-safe RPC."""
     def json_rows(rows: Sequence[Dict]) -> list[Dict]:
         normalized: list[Dict] = []
         for row in rows:
@@ -993,6 +994,7 @@ def atomic_fixture_detail_publish(
         return normalized
 
     payloads = (
+        json.dumps(json_rows(player_dimensions), default=str),
         json.dumps(json_rows(fixture_players), default=str),
         json.dumps(json_rows(fixture_statistics), default=str),
         json.dumps(json_rows(fixture_player_statistics), default=str),
@@ -1001,8 +1003,8 @@ def atomic_fixture_detail_publish(
         with target_conn.cursor() as cur:
             cur.execute(
                 """
-                select public.publish_fixture_detail_atomic(
-                  %s, %s, %s::jsonb, %s::jsonb, %s::jsonb
+                select public.publish_fixture_detail_atomic_v2(
+                  %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb
                 )
                 """,
                 (fixture_id, snapshot_id, *payloads),
@@ -1144,6 +1146,12 @@ def main():
         "--atomic-fixture-detail",
         action="store_true",
         help="Publish each explicit fixture's detail through the target-side atomic publisher.",
+    )
+    parser.add_argument(
+        "--provider-snapshot-id",
+        type=int,
+        default=None,
+        help="Accepted provider snapshot ID to link to atomically published fixture detail.",
     )
     parser.add_argument(
         "--upcoming-days",
@@ -1353,16 +1361,26 @@ def main():
         ("teams", teams, "id"),
         ("fixtures", fixtures, "id"),
     ]
+    post_atomic_exports = []
     if not args.fixture_core_only:
-        exports.extend(
-            [
-                ("players", players, "id"),
+        if args.atomic_fixture_detail and not args.dry_run:
+            # The v2 RPC inserts missing player parents in the same transaction
+            # as detail publication.  Keep dependent ancillary exports after
+            # that boundary; do not REST-merge canonical player rows first.
+            post_atomic_exports = [
                 ("sidelined_players", sidelined_players, "id"),
                 ("player_team_history", player_team_history, "id"),
             ]
-        )
+        else:
+            exports.extend(
+                [
+                    ("players", players, "id"),
+                    ("sidelined_players", sidelined_players, "id"),
+                    ("player_team_history", player_team_history, "id"),
+                ]
+            )
 
-    if not args.fixture_core_only and not args.atomic_fixture_detail:
+    if not args.fixture_core_only and (not args.atomic_fixture_detail or args.dry_run):
         exports.extend(
             [
                 ("fixture_players", fixture_players, "fixture_id,player_id"),
@@ -1371,18 +1389,42 @@ def main():
             ]
         )
 
+    def export_rows(rows_to_export):
+        for table, rows, on_conflict in rows_to_export:
+            log.info("Exporting %s (%s rows)", table, len(rows))
+            exported_count, timeout_splits = upsert_table(table, rows, on_conflict, args.dry_run)
+            exported[table] = exported_count
+            if timeout_splits:
+                log.warning("Timeout split recovery used for %s: %s split events", table, timeout_splits)
+
+    # Fixture-detail publication depends on the core fixture/team rows.  Make
+    # that ordering explicit even though the v2 RPC also preflights the FKs.
+    export_rows(exports)
+
     atomic_published: Dict[str, int] = {}
     if args.atomic_fixture_detail and not args.dry_run:
         if psycopg2 is None or not SUPABASE_DB_URL:
             raise SystemExit("--atomic-fixture-detail requires SUPABASE_DB_URL and psycopg2")
         target_conn = psycopg2.connect(SUPABASE_DB_URL, connect_timeout=20)
         try:
+            player_ids_by_fixture: Dict[int, Set[int]] = {}
+            for detail_row in fixture_players + fixture_player_stats:
+                detail_fixture_id = detail_row.get("fixture_id")
+                detail_player_id = detail_row.get("player_id")
+                if detail_fixture_id is None or detail_player_id is None:
+                    continue
+                player_ids_by_fixture.setdefault(int(detail_fixture_id), set()).add(int(detail_player_id))
             for fixture_id in sorted(fixture_ids):
                 try:
                     atomic_fixture_detail_publish(
                         target_conn,
                         fixture_id=int(fixture_id),
-                        snapshot_id=None,
+                        snapshot_id=args.provider_snapshot_id,
+                        player_dimensions=[
+                            row
+                            for row in players
+                            if int(row["id"]) in player_ids_by_fixture.get(int(fixture_id), set())
+                        ],
                         fixture_players=[row for row in fixture_players if int(row["fixture_id"]) == int(fixture_id)],
                         fixture_statistics=[row for row in fixture_stats if int(row["fixture_id"]) == int(fixture_id)],
                         fixture_player_statistics=[
@@ -1405,12 +1447,8 @@ def main():
         finally:
             target_conn.close()
 
-    for table, rows, on_conflict in exports:
-        log.info("Exporting %s (%s rows)", table, len(rows))
-        exported_count, timeout_splits = upsert_table(table, rows, on_conflict, args.dry_run)
-        exported[table] = exported_count
-        if timeout_splits:
-            log.warning("Timeout split recovery used for %s: %s split events", table, timeout_splits)
+    if post_atomic_exports:
+        export_rows(post_atomic_exports)
 
     if args.fixture_core_only or args.skip_odds_snapshots:
         exported["odds_snapshots"] = 0

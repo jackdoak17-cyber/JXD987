@@ -69,6 +69,26 @@ DERIVED_STAT_TYPE_IDS = frozenset({200001, 200010, 200011, 200012, 200013})
 
 LEDGER_TABLE = "fixture_detail_deliveries"
 TARGET_STATUS_TABLE = "fixture_detail_delivery_status"
+DELIVERY_CONTRACT_VERSION = 2
+DELIVERY_REASON_CODES = frozenset(
+    {
+        "new",
+        "running",
+        "provider_pending_structure",
+        "provider_pending_identity",
+        "provider_pending_optional_metrics",
+        "provider_pending_shrink",
+        "provider_unavailable",
+        "accepted",
+        "export_failed",
+        "dependency_missing",
+        "verification_failed",
+        "projection_failed",
+        "excluded",
+        "legacy_unclassified",
+        "unknown",
+    }
+)
 LEGACY_PENDING_REASON = (
     "Legacy provider_pending record had no durable classification reason; "
     "provider revalidation required"
@@ -273,6 +293,7 @@ def ensure_ledger(conn: sqlite3.Connection) -> None:
         row[1]
         for row in conn.execute(f"pragma table_info({LEDGER_TABLE})").fetchall()
     }
+    contract_columns_added = False
     for column, ddl in (
         ("provider_player_stat_types", "text"),
         ("provider_missing_player_type_ids", "text"),
@@ -282,9 +303,30 @@ def ensure_ledger(conn: sqlite3.Connection) -> None:
         ("last_normalized_hash", "text"),
         ("stable_fetch_count", "integer not null default 0"),
         ("accepted_snapshot_id", "integer"),
+        ("delivery_contract_version", "integer not null default 2"),
+        ("reason_code", "text not null default 'legacy_unclassified'"),
+        ("player_stat_parity", "integer"),
+        ("lineup_parity", "integer"),
+        ("target_player_stat_count", "integer not null default 0"),
+        ("target_lineup_count", "integer not null default 0"),
+        ("target_team_stat_count", "integer not null default 0"),
+        ("parity_checked_at", "text"),
     ):
         if column not in existing_columns:
             conn.execute(f"alter table {LEDGER_TABLE} add column {column} {ddl}")
+            contract_columns_added = True
+    if contract_columns_added:
+        # SQLite applies an ADD COLUMN default to pre-existing rows.  Those
+        # rows have not passed the v2 producer/serving contract yet, so do not
+        # let the default version 2 make Operations treat missing parity as a
+        # genuine data failure. New rows are promoted to v2 by update_ledger.
+        conn.execute(
+            f"""
+            update {LEDGER_TABLE}
+               set delivery_contract_version = 1
+             where reason_code = 'legacy_unclassified'
+            """
+        )
     conn.commit()
 
 
@@ -307,6 +349,7 @@ def recover_stale_running(
         f"""
         update {LEDGER_TABLE}
            set status = 'provider_pending',
+               reason_code = 'provider_pending_structure',
                next_attempt_at = ?,
                last_error = 'Previous reconciliation worker exited before final classification; fixture requeued',
                updated_at = ?
@@ -363,6 +406,7 @@ def repair_legacy_ledger(
             f"""
             update {LEDGER_TABLE}
                set last_error = ?,
+                   reason_code = 'legacy_unclassified',
                    next_attempt_at = ?,
                    release_id = ?,
                    updated_at = ?
@@ -376,6 +420,7 @@ def repair_legacy_ledger(
             f"""
             update {LEDGER_TABLE}
                set status = 'provider_pending',
+                   reason_code = 'legacy_unclassified',
                    next_attempt_at = ?,
                    last_error = ?,
                    release_id = ?,
@@ -655,6 +700,7 @@ def ledger_attempt_start(
           last_attempted_at=excluded.last_attempted_at,
           next_attempt_at=null,
           last_error=null,
+          reason_code='running',
           release_id=excluded.release_id,
           updated_at=excluded.updated_at
         """,
@@ -670,6 +716,49 @@ def ledger_attempt_start(
 def backoff_time(attempt: int, now: datetime) -> str:
     minutes = (15, 30, 60, 180, 360, 720, 1440)[min(max(attempt - 1, 0), 6)]
     return iso(now + timedelta(minutes=minutes))
+
+
+def delivery_reason_code(
+    status: str,
+    error: str | None = None,
+    assessment: ProviderAssessment | None = None,
+    explicit: str | None = None,
+) -> str:
+    """Return the stable machine-readable reason for one ledger transition."""
+    if explicit in DELIVERY_REASON_CODES:
+        return explicit
+    if status == "new":
+        return "new"
+    if status == "running":
+        return "running"
+    if status in {"verified", "provider_sparse"}:
+        return "accepted"
+    if status == "excluded":
+        return "provider_unavailable" if "no fixture" in (error or "").lower() else "excluded"
+    if status == "provider_pending":
+        detail = " ".join(
+            value.lower()
+            for value in (
+                error or "",
+                assessment.error if assessment else "",
+            )
+            if value
+        )
+        if "shrank" in detail or "shrink" in detail:
+            return "provider_pending_shrink"
+        if "optional provider" in detail or "optional metric" in detail:
+            return "provider_pending_optional_metrics"
+        if "identity" in detail or "lineup/player" in detail:
+            return "provider_pending_identity"
+        return "provider_pending_structure"
+    if status == "export_failed" or status == "failed":
+        detail = (error or "").lower()
+        return "dependency_missing" if "foreign key" in detail or "dependency missing" in detail else "export_failed"
+    if status == "verification_failed":
+        return "verification_failed"
+    if status == "projection_failed":
+        return "projection_failed"
+    return "unknown"
 
 
 def update_ledger(
@@ -688,9 +777,12 @@ def update_ledger(
     accepted_snapshot_id: int | None = None,
     stable_fetch_count: int | None = None,
     next_revalidation_at: str | None = None,
+    reason_code: str | None = None,
 ) -> None:
     now = iso(utc_now())
     provider = assessment
+    resolved_reason = delivery_reason_code(status, error, provider, reason_code)
+    has_parity_evidence = source is not None and target is not None
     conn.execute(
         f"""
         update {LEDGER_TABLE}
@@ -700,24 +792,32 @@ def update_ledger(
                last_checked_at = ?,
                next_revalidation_at = coalesce(?, next_revalidation_at),
                last_successful_at = case when ? then ? else last_successful_at end,
-               provider_status = ?,
-               provider_finished = ?,
-               provider_team_stat_count = ?,
-               provider_player_stat_count = ?,
-               provider_lineup_count = ?,
-               provider_team_stat_types = ?,
-               provider_missing_type_ids = ?,
-               provider_player_stat_types = ?,
-               provider_missing_player_type_ids = ?,
-               source_snapshot = ?,
-               target_snapshot = ?,
+               delivery_contract_version = ?,
+               reason_code = ?,
+               provider_status = coalesce(?, provider_status),
+               provider_finished = coalesce(?, provider_finished),
+               provider_team_stat_count = coalesce(?, provider_team_stat_count),
+               provider_player_stat_count = coalesce(?, provider_player_stat_count),
+               provider_lineup_count = coalesce(?, provider_lineup_count),
+               provider_team_stat_types = coalesce(?, provider_team_stat_types),
+               provider_missing_type_ids = coalesce(?, provider_missing_type_ids),
+               provider_player_stat_types = coalesce(?, provider_player_stat_types),
+               provider_missing_player_type_ids = coalesce(?, provider_missing_player_type_ids),
+               source_snapshot = coalesce(?, source_snapshot),
+               target_snapshot = coalesce(?, target_snapshot),
                last_error = ?,
                release_id = ?,
                updated_at = ?,
                last_payload_hash = coalesce(?, last_payload_hash),
                last_normalized_hash = coalesce(?, last_normalized_hash),
                stable_fetch_count = coalesce(?, stable_fetch_count),
-               accepted_snapshot_id = coalesce(?, accepted_snapshot_id)
+               accepted_snapshot_id = coalesce(?, accepted_snapshot_id),
+               player_stat_parity = coalesce(?, player_stat_parity),
+               lineup_parity = coalesce(?, lineup_parity),
+               target_player_stat_count = coalesce(?, target_player_stat_count),
+               target_lineup_count = coalesce(?, target_lineup_count),
+               target_team_stat_count = coalesce(?, target_team_stat_count),
+               parity_checked_at = case when ? then ? else parity_checked_at end
          where fixture_id = ?
         """,
         (
@@ -728,11 +828,13 @@ def update_ledger(
             next_revalidation_at,
             1 if successful else 0,
             now,
+            DELIVERY_CONTRACT_VERSION,
+            resolved_reason,
             provider.fixture_status if provider else None,
-            1 if provider and provider.finished else 0,
-            provider.team_stat_count if provider else 0,
-            provider.player_stat_count if provider else 0,
-            provider.lineup_count if provider else 0,
+            1 if provider and provider.finished else None,
+            provider.team_stat_count if provider else None,
+            provider.player_stat_count if provider else None,
+            provider.lineup_count if provider else None,
             json_text(provider.team_stat_types) if provider else None,
             json_text(provider.missing_team_stat_type_ids) if provider else None,
             json_text(provider.player_stat_types) if provider else None,
@@ -746,6 +848,13 @@ def update_ledger(
             normalized_hash,
             stable_fetch_count,
             accepted_snapshot_id,
+            (source.player_stat_values == target.player_stat_values) if has_parity_evidence else None,
+            (source.lineup_values == target.lineup_values) if has_parity_evidence else None,
+            target.player_stat_count if target else None,
+            target.lineup_count if target else None,
+            target.team_stat_count if target else None,
+            has_parity_evidence,
+            now,
             fixture_id,
         ),
     )
@@ -771,6 +880,7 @@ def mark_provider_unavailable(
     evidence: dict[str, Any] | None = None,
     assessment: ProviderAssessment | None = None,
     target_conn: Any | None = None,
+    reason_code: str | None = None,
 ) -> str:
     """Quarantine a provider-absent target while retaining a scheduled review."""
     review_at = iso(utc_now() + timedelta(days=DEFAULT_PROVIDER_UNAVAILABLE_REVIEW_DAYS))
@@ -851,6 +961,7 @@ def mark_provider_unavailable(
         assessment=assessment,
         error=f"{resolved_reason}; {error}; quarantined until {review_at}",
         next_attempt_at=review_at,
+        reason_code=reason_code or ("excluded" if exclusion_reason else "provider_unavailable"),
     )
     publish_delivery_status(target_url, conn, fixture_id, target_conn=target_conn)
     return review_at
@@ -1004,7 +1115,10 @@ def publish_delivery_status(
                d.source_snapshot, d.target_snapshot, d.last_error,
                d.release_id, d.updated_at, d.last_payload_hash,
                d.last_normalized_hash, d.stable_fetch_count,
-               d.accepted_snapshot_id
+               d.accepted_snapshot_id, d.delivery_contract_version,
+               d.reason_code, d.player_stat_parity, d.lineup_parity,
+               d.target_player_stat_count, d.target_lineup_count,
+               d.target_team_stat_count, d.parity_checked_at
           from {LEDGER_TABLE} d
           left join fixtures f on f.id = d.fixture_id
          where d.fixture_id = ?
@@ -1044,6 +1158,14 @@ def publish_delivery_status(
         row["last_normalized_hash"],
         int(row["stable_fetch_count"] or 0),
         row["accepted_snapshot_id"],
+        int(row["delivery_contract_version"] or DELIVERY_CONTRACT_VERSION),
+        row["reason_code"] or "legacy_unclassified",
+        None if row["player_stat_parity"] is None else bool(row["player_stat_parity"]),
+        None if row["lineup_parity"] is None else bool(row["lineup_parity"]),
+        int(row["target_player_stat_count"] or 0),
+        int(row["target_lineup_count"] or 0),
+        int(row["target_team_stat_count"] or 0),
+        row["parity_checked_at"],
     )
     owns_target_conn = target_conn is None
     target = target_conn or psycopg2.connect(target_url, connect_timeout=20)
@@ -1061,14 +1183,18 @@ def publish_delivery_status(
                   provider_missing_type_ids, provider_player_stat_types,
                   provider_missing_player_type_ids, source_snapshot, target_snapshot,
                   last_error, release_id, updated_at, last_payload_hash,
-                  last_normalized_hash, stable_fetch_count, accepted_snapshot_id
+                  last_normalized_hash, stable_fetch_count, accepted_snapshot_id,
+                  delivery_contract_version, reason_code, player_stat_parity,
+                  lineup_parity, target_player_stat_count, target_lineup_count,
+                  target_team_stat_count, parity_checked_at
                 ) values (
                   %s, %s, %s, %s, %s,
                   %s::timestamptz, %s::timestamptz, %s::timestamptz,
                   %s::timestamptz, %s::timestamptz, %s::timestamptz,
                   %s, %s,
                   %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                  %s, %s, %s::timestamptz, %s, %s, %s, %s
+                  %s, %s, %s::timestamptz, %s, %s, %s, %s,
+                  %s, %s, %s, %s, %s, %s, %s, %s::timestamptz
                 )
                 on conflict (fixture_id) do update set
                   league_id = excluded.league_id,
@@ -1098,7 +1224,15 @@ def publish_delivery_status(
                   last_payload_hash = excluded.last_payload_hash,
                   last_normalized_hash = excluded.last_normalized_hash,
                   stable_fetch_count = excluded.stable_fetch_count,
-                  accepted_snapshot_id = excluded.accepted_snapshot_id
+                  accepted_snapshot_id = excluded.accepted_snapshot_id,
+                  delivery_contract_version = excluded.delivery_contract_version,
+                  reason_code = excluded.reason_code,
+                  player_stat_parity = excluded.player_stat_parity,
+                  lineup_parity = excluded.lineup_parity,
+                  target_player_stat_count = excluded.target_player_stat_count,
+                  target_lineup_count = excluded.target_lineup_count,
+                  target_team_stat_count = excluded.target_team_stat_count,
+                  parity_checked_at = excluded.parity_checked_at
                 """,
                 values,
             )
@@ -1548,7 +1682,12 @@ def source_snapshot_from_session(session: Any, fixture_id: int) -> DetailSnapsho
     )
 
 
-def export_fixture(fixture_id: int, leagues: Sequence[int], report_path: str) -> subprocess.CompletedProcess[str]:
+def export_fixture(
+    fixture_id: int,
+    leagues: Sequence[int],
+    report_path: str,
+    snapshot_id: int | None = None,
+) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
         str(Path(__file__).with_name("export_to_supabase.py")),
@@ -1566,6 +1705,8 @@ def export_fixture(fixture_id: int, leagues: Sequence[int], report_path: str) ->
         "--report-json",
         report_path,
     ]
+    if snapshot_id is not None:
+        command.extend(["--provider-snapshot-id", str(snapshot_id)])
     LOG.info("Exporting verified fixture detail: fixture_id=%s", fixture_id)
     return subprocess.run(command, text=True, capture_output=True, check=False)
 
@@ -1751,6 +1892,7 @@ def main() -> int:
                     exclusion_reason=reason,
                     evidence={"provider_status": assessment.fixture_status, "assessment": asdict(assessment)},
                     assessment=assessment,
+                    reason_code="excluded",
                 )
                 report["excluded"].append({"fixture_id": fixture_id, "next_review_at": review_at, "reason": reason})
                 try:
@@ -1829,7 +1971,12 @@ def main() -> int:
 
             source = store_provider_detail(engine, client, fixture_id, data, assessment)
             clear_provider_unavailable_exclusion(target_url, fixture_id)
-            export_result = export_fixture(fixture_id, leagues, export_report_path)
+            export_result = export_fixture(
+                fixture_id,
+                leagues,
+                export_report_path,
+                snapshot_id=snapshot_id,
+            )
             if export_result.returncode != 0:
                 message = (export_result.stderr or export_result.stdout or "export failed")[-4000:]
                 update_ledger(conn, fixture_id, "export_failed", attempt, assessment, source=source, error=message, next_attempt_at=backoff_time(attempt, utc_now()))
