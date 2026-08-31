@@ -5,7 +5,15 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
+export FIXTURE_CORE_CONTRACT_PATH="${FIXTURE_CORE_CONTRACT_PATH:-${REPO_ROOT}/config/fixture_core_contract.json}"
+contract_value() {
+  python3 "${REPO_ROOT}/scripts/fixture_core_contract.py" \
+    --contract "${FIXTURE_CORE_CONTRACT_PATH}" \
+    --field "$1"
+}
 require_runtime_manifest_entries_or_exit "$0" \
+  "config/fixture_core_contract.json" \
+  "scripts/fixture_core_contract.py" \
   "config/league_ids.txt" \
   "config/odds_api_sync_excluded_leagues.json" \
   "jxd/__init__.py" \
@@ -26,20 +34,19 @@ export REPO_ROOT
 export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_league_csv)}}"
 validate_supported_leagues "${STATS_LEAGUES}"
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
-export ODDS_SYNC_DAYS_BACK="${ODDS_SYNC_DAYS_BACK:-2}"
-export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
+export ODDS_SYNC_DAYS_BACK="$(contract_value history_window_days)"
+export DAYS_FORWARD="$(contract_value odds_window_days)"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
 export INGEST_MAX_RUNTIME_MINUTES="${ODDS_INGEST_MAX_RUNTIME_MINUTES:-25}"
-export ODDS_EXPORT_DAYS_BACK="${ODDS_EXPORT_DAYS_BACK:-2}"
+export ODDS_EXPORT_DAYS_BACK="$(contract_value history_window_days)"
 export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-1}"
-export RETENTION_DAYS_FORWARD="${RETENTION_DAYS_FORWARD:-14}"
+export RETENTION_DAYS_FORWARD="$(contract_value odds_window_days)"
 export RETENTION_SNAPSHOT_DAYS="${RETENTION_SNAPSHOT_DAYS:-30}"
-export FIXTURE_REFRESH_DAYS_BACK="${FIXTURE_REFRESH_DAYS_BACK:-2}"
-export FIXTURE_REFRESH_DAYS_FORWARD="${FIXTURE_REFRESH_DAYS_FORWARD:-3}"
-export FIXTURE_EXPORT_DAYS_BACK="${FIXTURE_EXPORT_DAYS_BACK:-2}"
-export FIXTURE_EXPORT_DAYS_FORWARD="${FIXTURE_EXPORT_DAYS_FORWARD:-3}"
-export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-14}"
+export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"
+export FIXTURE_CORE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"
+export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_CORE_DELIVERY_DAYS_FORWARD}"
 export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-1800}"
+export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/odds_refresh_report_p3.json}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
 export MONEYLINE_COVERAGE_MIN_PCT="${MONEYLINE_COVERAGE_MIN_PCT:-100}"
@@ -126,38 +133,14 @@ python scripts/odds_retention_psql.py \
   --snapshot-days "${RETENTION_SNAPSHOT_DAYS}" \
   --report-out "/tmp/odds_retention_report_p3.json"
 
-# Step 5: Best-effort recent fixture refresh/export.
-if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
-  if python scripts/reconcile_recent_fixtures.py \
-    --leagues "${STATS_LEAGUES}" \
-    --days-back "${FIXTURE_REFRESH_DAYS_BACK}" \
-    --days-forward "${FIXTURE_REFRESH_DAYS_FORWARD}"; then
-    if ! python scripts/export_to_supabase.py \
-      --strict \
-      --leagues "${STATS_LEAGUES}" \
-      --days-back "${FIXTURE_EXPORT_DAYS_BACK}" \
-      --upcoming-days "${FIXTURE_EXPORT_DAYS_FORWARD}" \
-      --fixture-core-only \
-      --skip-odds-snapshots \
-      --skip-odds-outcomes \
-      --skip-prune; then
-      echo "Recent fixture export failed; continuing odds pipeline" >&2
-    fi
-  else
-    echo "Recent fixture refresh failed; continuing odds pipeline" >&2
-  fi
-else
-  echo "Skipping recent fixture refresh/export; missing SportMonks or Supabase REST env" >&2
-fi
-
-# Step 6: Publish the persistent Fixtures Data Delivery v2 read models.
+# Step 5: Publish the persistent Fixtures Data Delivery v2 read models.
 # This is the only user-facing fixture delivery source after cutover. A failed
 # refresh fails P3 instead of hiding a stale or incomplete read model.
 FIXTURE_DELIVERY_STATUS=0
 if [[ -n "${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}" ]]; then
   python scripts/refresh_fixture_delivery.py \
-    --start-date "$(date -u +%F)" \
-    --end-date "$(date -u -d "+${FIXTURE_DELIVERY_DAYS_FORWARD} days" +%F)" \
+    --start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)" \
+    --end-date "$(TZ=Europe/London date -d "+${FIXTURE_DELIVERY_DAYS_FORWARD} days" +%F)" \
     --leagues "${STATS_LEAGUES}" \
     --report-out /tmp/fixture_delivery_v2_report.json || FIXTURE_DELIVERY_STATUS=$?
 else
@@ -165,7 +148,7 @@ else
   FIXTURE_DELIVERY_STATUS=1
 fi
 
-# Step 7: Hard guard for the user-facing fixtures window.
+# Step 6: Hard guard for the user-facing fixtures window.
 set +e
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
@@ -229,7 +212,7 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
   fi
 fi
 
-# Step 8: Best-effort betting picks publish (uses odds already ingested into Supabase).
+# Step 7: Best-effort betting picks publish (uses odds already ingested into Supabase).
 if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; then
   if [[ "${MODELS_PUBLISH_AFTER_P3}" == "true" || "${MODELS_PUBLISH_AFTER_P3}" == "1" ]]; then
     if [[ -d "${MODELS_REPO_ROOT}" ]]; then
@@ -266,5 +249,9 @@ CHAIN
 )
 
 status=0
-run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+run_recorded_pipeline_job \
+  "run_p3" \
+  "P3 Supabase ingest" \
+  "${CHAIN_COMMAND}" \
+  "${PIPELINE_EVIDENCE_FILE}" || status=$?
 finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_P3:-${HEALTHCHECK_PING_URL:-}}"

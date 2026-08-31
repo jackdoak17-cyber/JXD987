@@ -108,10 +108,21 @@ while true; do
   # ledger rows attributed to the release that started the parent shell.
   export RUNTIME_RELEASE_ID="$(runtime_release_id)"
   rm -f "${STATS_RECONCILE_REPORT}" "${STATS_RECONCILE_RUN_LOG}"
+  RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  RUN_STARTED_EPOCH="$(date -u +"%s")"
   set +e
   run_with_global_lock_and_timeout "${RECONCILIATION_COMMAND}"
   status=$?
   set -e
+  RUN_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  RUN_FINISHED_EPOCH="$(date -u +"%s")"
+  PIPELINE_EVIDENCE_FILE="${STATS_RECONCILE_REPORT}" record_pipeline_job_run \
+    "run_stats_reconciliation" \
+    "Stats reconciliation" \
+    "${status}" \
+    "${RUN_STARTED_AT}" \
+    "${RUN_FINISHED_AT}" \
+    "$(((RUN_FINISHED_EPOCH - RUN_STARTED_EPOCH) * 1000))"
 
   if [[ ! -f "${STATS_RECONCILE_REPORT}" ]]; then
     # The Python worker exits without a report when another SQLite writer owns

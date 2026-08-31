@@ -2,14 +2,146 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timezone
+import inspect
 
-from scripts.refresh_fixture_delivery import add_metrics_provenance, calculate_metrics
+from scripts.refresh_fixture_delivery import (
+    add_metrics_provenance,
+    all_completed_fixtures,
+    build_season_scoped_history,
+    calculate_metrics,
+    compute_standings,
+    history_rows_for_fixture,
+    strict_current_season_rank,
+    validate_delivery_schema,
+    validate_source_fixture_identity,
+)
 
 
 UTC = timezone.utc
 
 
+class SchemaCursor:
+    def __init__(self, rows):
+        self.rows = rows
+        self.query = None
+        self.params = None
+
+    def execute(self, query, params=None):
+        self.query = query
+        self.params = params
+
+    def fetchall(self):
+        return self.rows
+
+
 class FixtureDeliveryMetricsTests(unittest.TestCase):
+    def test_delivery_schema_contract_accepts_live_primary_keys(self) -> None:
+        cursor = SchemaCursor([
+            ("fixture_delivery_schedule", ["release_id", "fixture_id"]),
+            ("fixture_delivery_standings", ["release_id", "league_id", "season_id", "team_id"]),
+            ("fixture_delivery_metrics", [
+                "release_id", "fixture_id", "team_id", "side", "metrics_window",
+                "metrics_mode", "season_scope",
+            ]),
+            ("fixture_delivery_odds", [
+                "release_id", "fixture_id", "bookmaker_id", "market_key", "selection_key",
+                "participant_type", "participant_id", "line_key",
+            ]),
+        ])
+
+        validate_delivery_schema(cursor)
+
+    def test_delivery_schema_contract_rejects_old_metrics_key(self) -> None:
+        cursor = SchemaCursor([
+            ("fixture_delivery_schedule", ["release_id", "fixture_id"]),
+            ("fixture_delivery_standings", ["release_id", "league_id", "season_id", "team_id"]),
+            ("fixture_delivery_metrics", [
+                "release_id", "fixture_id", "team_id", "side", "metrics_window", "metrics_mode",
+            ]),
+            ("fixture_delivery_odds", [
+                "release_id", "fixture_id", "bookmaker_id", "market_key", "selection_key",
+                "participant_type", "participant_id", "line_key",
+            ]),
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "fixture_delivery_metrics"):
+            validate_delivery_schema(cursor)
+
+    def test_duplicate_source_fixture_ids_fail_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "duplicate fixture ids: 42"):
+            validate_source_fixture_identity([{"id": 42}, {"id": 42}])
+
+    def test_goal_aggregates_are_counted_once(self) -> None:
+        metrics, _ = calculate_metrics(
+            [
+                {
+                    "id": 1,
+                    "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
+                    "home_team_id": 10,
+                    "away_team_id": 20,
+                    "home_score": 3,
+                    "away_score": 1,
+                }
+            ],
+            10,
+            8,
+            None,
+        )
+
+        self.assertEqual(metrics["goalsScored"], 3)
+        self.assertEqual(metrics["goalsConceded"], 1)
+        self.assertEqual(metrics["avgGoalsScored"], 3)
+        self.assertEqual(metrics["avgGoalsConceded"], 1)
+        self.assertEqual(metrics["avgTotalGoals"], 4)
+
+    def test_history_is_scoped_to_league_and_season(self) -> None:
+        fixture_time = datetime(2026, 8, 28, tzinfo=UTC)
+        history = build_season_scoped_history(
+            [
+                {
+                    "id": 300,
+                    "starting_at": datetime(2026, 8, 1, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 20,
+                    "home_score": 1,
+                    "away_score": 0,
+                },
+                {
+                    "id": 200,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 25583,
+                    "home_team_id": 10,
+                    "away_team_id": 30,
+                    "home_score": 4,
+                    "away_score": 0,
+                },
+                {
+                    "id": 100,
+                    "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
+                    "league_id": 384,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 40,
+                    "home_score": 5,
+                    "away_score": 0,
+                },
+            ]
+        )
+
+        current_season_history = [
+            row
+            for row in history[(8, 28083, 10)]
+            if row["starting_at"] < fixture_time
+        ]
+        metrics, _ = calculate_metrics(current_season_history, 10, 8, None)
+
+        self.assertEqual([row["id"] for row in current_season_history], [300])
+        self.assertEqual(metrics["sample"], 1)
+        self.assertEqual(metrics["goalsScored"], 1)
+
     def test_empty_bucket_is_explicitly_marked_none(self) -> None:
         metrics, source = calculate_metrics([], 10, 8, "home")
         self.assertIsNone(source)
@@ -49,6 +181,137 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
         self.assertEqual(venue["sampleStatus"], "partial")
         self.assertEqual(overall["metricsSource"], "overall")
         self.assertEqual(venue["metricsSource"], "venue")
+
+    def test_standings_equal_totals_preserve_strict_row_order_tie_break(self) -> None:
+        standings = compute_standings(
+            [
+                {
+                    "id": 2,
+                    "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 20,
+                    "away_team_id": 21,
+                    "home_score": 1,
+                    "away_score": 1,
+                },
+                {
+                    "id": 1,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 11,
+                    "home_score": 1,
+                    "away_score": 1,
+                },
+            ]
+        )
+
+        ranked = standings[(8, 28083)]
+
+        self.assertEqual(ranked[20]["rank"], 1)
+        self.assertEqual(ranked[21]["rank"], 2)
+        self.assertEqual(ranked[10]["rank"], 3)
+        self.assertEqual(ranked[11]["rank"], 4)
+
+    def test_strict_current_season_rank_does_not_fallback_to_prior_season(self) -> None:
+        standings = compute_standings(
+            [
+                {
+                    "id": 1,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 20,
+                    "away_team_id": 21,
+                    "home_score": 1,
+                    "away_score": 0,
+                }
+            ]
+        )
+
+        self.assertEqual(strict_current_season_rank(standings, 8, 28083, 20), 1)
+        self.assertIsNone(strict_current_season_rank(standings, 8, 28083, 10))
+
+    def test_completed_fixture_query_matches_strict_oracle_order(self) -> None:
+        source = inspect.getsource(all_completed_fixtures)
+
+        self.assertIn("order by starting_at desc", source)
+        self.assertNotIn("order by starting_at desc, id desc", source)
+
+    def test_history_preserves_source_order_for_equal_kickoff_times(self) -> None:
+        history = build_season_scoped_history(
+            [
+                {
+                    "id": 1,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 20,
+                    "home_score": 1,
+                    "away_score": 0,
+                },
+                {
+                    "id": 2,
+                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
+                    "league_id": 8,
+                    "season_id": 28083,
+                    "home_team_id": 10,
+                    "away_team_id": 30,
+                    "home_score": 0,
+                    "away_score": 1,
+                },
+            ]
+        )
+
+        self.assertEqual([row["id"] for row in history[(8, 28083, 10)]], [1, 2])
+
+    def test_finished_fixture_history_includes_target_but_upcoming_history_does_not(self) -> None:
+        history = [
+            {
+                "id": 2,
+                "starting_at": datetime(2026, 8, 28, tzinfo=UTC),
+                "home_team_id": 10,
+                "away_team_id": 20,
+                "home_score": 2,
+                "away_score": 0,
+            },
+            {
+                "id": 1,
+                "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
+                "home_team_id": 10,
+                "away_team_id": 30,
+                "home_score": 1,
+                "away_score": 0,
+            },
+        ]
+        finished_fixture = {
+            "id": 2,
+            "starting_at": datetime(2026, 8, 28, tzinfo=UTC),
+            "status": "FT",
+            "status_code": "FT",
+            "home_score": 2,
+            "away_score": 0,
+        }
+        upcoming_fixture = {
+            "id": 2,
+            "starting_at": datetime(2026, 8, 28, tzinfo=UTC),
+            "status": "NS",
+            "status_code": "NS",
+            "home_score": None,
+            "away_score": None,
+        }
+
+        self.assertEqual(
+            [row["id"] for row in history_rows_for_fixture(history, finished_fixture)],
+            [2, 1],
+        )
+        self.assertEqual(
+            [row["id"] for row in history_rows_for_fixture(history[1:], upcoming_fixture)],
+            [1],
+        )
 
 
 if __name__ == "__main__":
