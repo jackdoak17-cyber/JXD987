@@ -34,7 +34,7 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
         self.assertIn("--skip-prune", wrapper)
         self.assertIn('"${FIXTURE_CORE_JOB_ID}"', wrapper)
         self.assertIn("run_recorded_pipeline_job", wrapper)
-        self.assertIn('ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-4}"', wrapper)
+        self.assertIn('ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-60}"', wrapper)
         self.assertIn('ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"', wrapper)
         self.assertIn("--no-refresh-squads-missing", wrapper)
         self.assertIn("--no-refresh-sidelined-window", wrapper)
