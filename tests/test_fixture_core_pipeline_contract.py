@@ -45,7 +45,10 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
 
         self.assertIn('--days-forward "${DAYS_FORWARD}"', p3)
         self.assertIn('export DAYS_FORWARD="$(contract_value odds_window_days)"', p3)
-        self.assertIn('export ODDS_EXPORT_DAYS_BACK="$(contract_value history_window_days)"', p3)
+        self.assertIn('export SETTLED_HISTORY_DAYS="$(contract_value history_window_days)"', p3)
+        self.assertIn('export ODDS_EXPORT_DAYS_BACK="${SETTLED_HISTORY_DAYS}"', p3)
+        self.assertIn('--priority settled-history', p3)
+        self.assertIn('--calendar-window', p3)
         self.assertIn('export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"', p3)
         self.assertIn("run_recorded_pipeline_job", p3)
         self.assertNotIn("python scripts/reconcile_recent_fixtures.py", p3)

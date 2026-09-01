@@ -36,12 +36,13 @@ export REPO_ROOT
 export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_league_csv)}}"
 validate_supported_leagues "${STATS_LEAGUES}"
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
-export ODDS_SYNC_DAYS_BACK="$(contract_value history_window_days)"
+export SETTLED_HISTORY_DAYS="$(contract_value history_window_days)"
+export ODDS_SYNC_DAYS_BACK="${ODDS_SYNC_DAYS_BACK:-0}"
 export DAYS_FORWARD="$(contract_value odds_window_days)"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-$(odds_bookmaker_csv)}"
 export INGEST_MAX_RUNTIME_MINUTES="${ODDS_INGEST_MAX_RUNTIME_MINUTES:-25}"
-export ODDS_EXPORT_DAYS_BACK="$(contract_value history_window_days)"
-export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-1}"
+export ODDS_EXPORT_DAYS_BACK="${SETTLED_HISTORY_DAYS}"
+export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-${SETTLED_HISTORY_DAYS}}"
 export RETENTION_DAYS_FORWARD="$(contract_value odds_window_days)"
 export RETENTION_SNAPSHOT_DAYS="${RETENTION_SNAPSHOT_DAYS:-30}"
 export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"
@@ -105,7 +106,20 @@ python scripts/sync_odds.py \
   --refresh-only \
   --report-out "/tmp/odds_refresh_report_p3.json"
 
-# Step 2: Odds fetch scoped to P3 fixtures only
+# Step 2: Backfill the previous calendar days through the historical odds
+# endpoint. This lane is separate from the pre-match priority tiers so a
+# rolling window cannot age out the first history day. Existing settled rows
+# are immutable; only missing keys are inserted.
+python scripts/sync_odds.py \
+  --leagues "${ODDS_LEAGUES}" \
+  --days-back "${SETTLED_HISTORY_DAYS}" \
+  --days-forward 0 \
+  --priority settled-history \
+  --bookmakers "${ODDS_BOOKMAKERS}" \
+  --report-out "/tmp/odds_sync_report_history_p3.json" \
+  --unmatched-out "/tmp/unmatched_players_history_p3.json"
+
+# Step 3: Odds fetch scoped to P3 fixtures only
 python scripts/sync_odds.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_SYNC_DAYS_BACK}" \
@@ -115,11 +129,13 @@ python scripts/sync_odds.py \
   --report-out "/tmp/odds_sync_report_p3.json" \
   --unmatched-out "/tmp/unmatched_players_p3.json"
 
-# Step 3: Ingest full window (Path B)
+# Step 4: Ingest the complete calendar window (Path B)
+export ODDS_SYNC_REPORT_PATH="/tmp/odds_sync_report_p3.json"
 python scripts/export_odds_to_supabase_psql.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_EXPORT_DAYS_BACK}" \
   --days-forward "${DAYS_FORWARD}" \
+  --calendar-window \
   --csv-out "/tmp/odds_outcomes_export_p3.csv" \
   --no-include-fixture-leagues \
   --progress-rows 10000 \
@@ -130,14 +146,17 @@ python scripts/export_odds_to_supabase_psql.py \
   --skip-retention-snapshots \
   ${COVERAGE_ARGS}
 
-# Step 4: Retention only on P3
+# Step 5: Retention only on P3. Keep the same complete calendar history
+# window as the exporter; a rolling 24-hour delete would remove yesterday's
+# settled odds before the fixtures page can display them.
 python scripts/odds_retention_psql.py \
   --days-back "${RETENTION_DAYS_BACK}" \
   --days-forward "${RETENTION_DAYS_FORWARD}" \
+  --calendar-window \
   --snapshot-days "${RETENTION_SNAPSHOT_DAYS}" \
   --report-out "/tmp/odds_retention_report_p3.json"
 
-# Step 5: Publish the persistent Fixtures Data Delivery v2 read models.
+# Step 6: Publish the persistent Fixtures Data Delivery v2 read models.
 # This is the only user-facing fixture delivery source after cutover. A failed
 # refresh fails P3 instead of hiding a stale or incomplete read model.
 FIXTURE_DELIVERY_STATUS=0
@@ -152,7 +171,7 @@ else
   FIXTURE_DELIVERY_STATUS=1
 fi
 
-# Step 6: Hard guard for the user-facing fixtures window.
+# Step 7: Hard guard for the user-facing fixtures window.
 set +e
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
@@ -184,6 +203,7 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
         --leagues "${ODDS_LEAGUES}" \
         --days-back "${ODDS_EXPORT_DAYS_BACK}" \
         --days-forward "${DAYS_FORWARD}" \
+        --calendar-window \
         --csv-out "/tmp/odds_outcomes_export_p3_repair_${repair_attempt}.csv" \
         --no-include-fixture-leagues \
         --progress-rows 10000 \
@@ -218,7 +238,7 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
   fi
 fi
 
-# Step 7: Best-effort betting picks publish (uses odds already ingested into Supabase).
+# Step 8: Best-effort betting picks publish (uses odds already ingested into Supabase).
 if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; then
   if [[ "${MODELS_PUBLISH_AFTER_P3}" == "true" || "${MODELS_PUBLISH_AFTER_P3}" == "1" ]]; then
     if [[ -d "${MODELS_REPO_ROOT}" ]]; then

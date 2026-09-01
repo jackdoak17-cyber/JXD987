@@ -61,15 +61,29 @@ def run_psql(sql: str, label: str) -> str:
     return (proc.stdout or "").strip()
 
 
-def retention_cleanup_query(days_back: int, days_forward: int) -> str:
+def retention_cleanup_query(
+    days_back: int,
+    days_forward: int,
+    calendar_window: bool = False,
+) -> str:
+    start_expr = (
+        f"date_trunc('day', now() at time zone 'utc') - interval '{days_back} days'"
+        if calendar_window
+        else f"(now() at time zone 'utc') - interval '{days_back} days'"
+    )
+    end_expr = (
+        f"date_trunc('day', now() at time zone 'utc') + interval '{max(0, days_forward) + 1} days'"
+        if calendar_window
+        else f"(now() at time zone 'utc') + interval '{days_forward} days'"
+    )
     return f"""
 with deleted as (
   delete from public.odds_outcomes o
   using public.fixtures f
   where f.id = o.fixture_id
     and (
-      f.starting_at < (now() at time zone 'utc') - interval '{days_back} days'
-      or f.starting_at >= (now() at time zone 'utc') + interval '{days_forward} days'
+      f.starting_at < {start_expr}
+      or f.starting_at >= {end_expr}
     )
   returning 1
 )
@@ -77,7 +91,22 @@ select count(*)::bigint from deleted;
 """
 
 
-def retention_snapshots_query(days_back: int, days_forward: int, max_age_days: int) -> str:
+def retention_snapshots_query(
+    days_back: int,
+    days_forward: int,
+    max_age_days: int,
+    calendar_window: bool = False,
+) -> str:
+    start_expr = (
+        f"date_trunc('day', now() at time zone 'utc') - interval '{days_back} days'"
+        if calendar_window
+        else f"(now() at time zone 'utc') - interval '{days_back} days'"
+    )
+    end_expr = (
+        f"date_trunc('day', now() at time zone 'utc') + interval '{max(0, days_forward) + 1} days'"
+        if calendar_window
+        else f"(now() at time zone 'utc') + interval '{days_forward} days'"
+    )
     return f"""
 with deleted as (
   delete from public.odds_snapshots s
@@ -87,8 +116,8 @@ with deleted as (
        from public.fixtures f
        where f.id = s.fixture_id
          and (
-           f.starting_at < (now() at time zone 'utc') - interval '{days_back} days'
-           or f.starting_at >= (now() at time zone 'utc') + interval '{days_forward} days'
+           f.starting_at < {start_expr}
+           or f.starting_at >= {end_expr}
          )
      )
   returning 1
@@ -143,6 +172,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--days-back", type=int, default=1)
     parser.add_argument("--days-forward", type=int, default=14)
+    parser.add_argument(
+        "--calendar-window",
+        action="store_true",
+        help="Retain complete UTC calendar days rather than a rolling window.",
+    )
     parser.add_argument("--snapshot-days", type=int, default=30)
     parser.add_argument("--report-out", default="/tmp/odds_retention_report.json")
     args = parser.parse_args()
@@ -160,14 +194,22 @@ def main() -> None:
     past_24h_range: dict[str, Optional[str]] = {"min_starting_at": None, "max_starting_at": None}
 
     try:
-        deleted_out = run_psql(retention_cleanup_query(args.days_back, args.days_forward), label="retention")
+        deleted_out = run_psql(
+            retention_cleanup_query(args.days_back, args.days_forward, args.calendar_window),
+            label="retention",
+        )
         deleted_rows = int(deleted_out.strip()) if deleted_out else 0
     except Exception:
         deleted_rows = 0
 
     try:
         snapshots_out = run_psql(
-            retention_snapshots_query(args.days_back, args.days_forward, args.snapshot_days),
+            retention_snapshots_query(
+                args.days_back,
+                args.days_forward,
+                args.snapshot_days,
+                args.calendar_window,
+            ),
             label="retention_snapshots",
         )
         snapshots_deleted = int(snapshots_out.strip()) if snapshots_out else 0
@@ -211,6 +253,7 @@ def main() -> None:
         "end_time": datetime.utcnow().isoformat() + "Z",
         "days_back": args.days_back,
         "days_forward": args.days_forward,
+        "window_kind": "calendar" if args.calendar_window else "rolling",
         "snapshot_days": args.snapshot_days,
         "deleted_rows": deleted_rows,
         "snapshots_deleted": snapshots_deleted,

@@ -743,23 +743,48 @@ def sqlite_utc_timestamp(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def fixture_window_bounds(days_back: int, days_forward: int) -> Tuple[datetime, datetime]:
+def fixture_window_bounds(
+    days_back: int,
+    days_forward: int,
+    calendar_history: bool = False,
+) -> Tuple[datetime, datetime]:
     now_utc = utc_now_naive()
+    if calendar_history:
+        # Settled history is a calendar contract, not a rolling 48-hour
+        # contract. The latter drops the first day's fixtures as soon as the
+        # job runs late in the day, which is how visible history loses odds.
+        # UTC is the pipeline's declared time basis.
+        today_start = datetime.combine(now_utc.date(), datetime.min.time())
+        return today_start - timedelta(days=max(0, days_back)), today_start
     start_dt = now_utc - timedelta(days=max(0, days_back))
     end_dt = now_utc + timedelta(days=days_forward)
     return start_dt, end_dt
 
 
-def load_fixture_moneyline_presence(session, fixture_ids: List[int]) -> Set[int]:
+def load_fixture_moneyline_completeness(session, fixture_ids: List[int]) -> Set[int]:
+    """Return fixtures with a complete usable home/draw/away moneyline.
+
+    Historical fetches are intentionally skipped only when the local row set
+    already satisfies the same three-side contract used by the public
+    validator.  Treating one arbitrary moneyline row as "present" permanently
+    stranded partially-ingested settled fixtures.
+    """
     if not fixture_ids:
         return set()
     stmt = (
         text(
             """
-            select distinct fixture_id
-            from odds_outcomes
-            where fixture_id in :fixture_ids
-              and market_key in :market_keys
+            select o.fixture_id,
+                   f.home_team_id,
+                   f.away_team_id,
+                   o.participant_type,
+                   o.participant_id,
+                   o.selection_key,
+                   o.price_decimal
+            from odds_outcomes o
+            join fixtures f on f.id = o.fixture_id
+            where o.fixture_id in :fixture_ids
+              and o.market_key in :market_keys
             """
         )
         .bindparams(bindparam("fixture_ids", expanding=True))
@@ -769,13 +794,59 @@ def load_fixture_moneyline_presence(session, fixture_ids: List[int]) -> Set[int]
         stmt,
         {"fixture_ids": fixture_ids, "market_keys": sorted(MONEYLINE_MARKET_KEYS)},
     ).fetchall()
-    return {int(row[0]) for row in rows}
+    sides_by_fixture: Dict[int, Set[str]] = {}
+    for row in rows:
+        fixture_id = int(row[0])
+        price = parse_float(row[6])
+        if price is None or price <= 1 or price > 500:
+            continue
+        participant_type = str(row[3] or "").strip().lower()
+        participant_id = int(row[4]) if row[4] is not None else None
+        selection_key = str(row[5] or "").strip().lower()
+        sides = sides_by_fixture.setdefault(fixture_id, set())
+        if participant_type == "team" and participant_id == row[1]:
+            sides.add("home")
+        elif participant_type == "team" and participant_id == row[2]:
+            sides.add("away")
+        elif selection_key in {"draw", "x"} or "draw" in selection_key:
+            sides.add("draw")
+    return {
+        fixture_id
+        for fixture_id, sides in sides_by_fixture.items()
+        if sides == set(MONEYLINE_SIDES)
+    }
 
 
-def load_fixtures(session, league_ids: List[int], days_back: int, days_forward: int) -> List[Dict[str, object]]:
+def is_settled_fixture(
+    status: Optional[object],
+    status_code: Optional[object],
+    home_score: Optional[object],
+    away_score: Optional[object],
+    starting_at: Optional[datetime],
+) -> bool:
+    settled_statuses = SETTLED_EVENT_STATUSES | {"ft", "aet", "pen", "ft_pen"}
+    normalized_status = str(status or "").strip().lower()
+    normalized_code = str(status_code or "").strip().lower()
+    if normalized_status in settled_statuses or normalized_code in settled_statuses:
+        return True
+    return (
+        home_score is not None
+        and away_score is not None
+        and starting_at is not None
+        and starting_at <= utc_now_naive()
+    )
+
+
+def load_fixtures(
+    session,
+    league_ids: List[int],
+    days_back: int,
+    days_forward: int,
+    calendar_history: bool = False,
+) -> List[Dict[str, object]]:
     if not league_ids:
         return []
-    start_dt, end_dt = fixture_window_bounds(days_back, days_forward)
+    start_dt, end_dt = fixture_window_bounds(days_back, days_forward, calendar_history)
     start_dt_sql = sqlite_utc_timestamp(start_dt)
     end_dt_sql = sqlite_utc_timestamp(end_dt)
     stmt = text(
@@ -783,8 +854,12 @@ def load_fixtures(session, league_ids: List[int], days_back: int, days_forward: 
         select f.id,
                f.league_id,
                f.starting_at,
+               f.status,
+               f.status_code,
                f.home_team_id,
                f.away_team_id,
+               f.home_score,
+               f.away_score,
                th.name as home_name,
                th.short_code as home_short,
                ta.name as away_name,
@@ -805,7 +880,7 @@ def load_fixtures(session, league_ids: List[int], days_back: int, days_forward: 
             "end_dt": end_dt_sql,
         },
     ).fetchall()
-    moneyline_fixture_ids = load_fixture_moneyline_presence(
+    complete_moneyline_fixture_ids = load_fixture_moneyline_completeness(
         session,
         [int(row.id) for row in rows if row.id],
     )
@@ -827,11 +902,22 @@ def load_fixtures(session, league_ids: List[int], days_back: int, days_forward: 
                 "fixture_id": int(row.id),
                 "league_id": int(row.league_id),
                 "starting_at": start_val,
+                "status": row.status,
+                "status_code": row.status_code,
                 "home_team_id": row.home_team_id,
                 "away_team_id": row.away_team_id,
+                "home_score": row.home_score,
+                "away_score": row.away_score,
                 "home_alias": home_alias,
                 "away_alias": away_alias,
-                "has_moneyline_odds": int(row.id) in moneyline_fixture_ids,
+                "has_complete_moneyline_odds": int(row.id) in complete_moneyline_fixture_ids,
+                "is_settled": is_settled_fixture(
+                    row.status,
+                    row.status_code,
+                    row.home_score,
+                    row.away_score,
+                    start_val,
+                ),
             }
         )
     return fixtures
@@ -861,6 +947,12 @@ def filter_fixtures_by_priority(
     now_utc = utc_now_naive()
     filtered: List[Dict[str, object]] = []
     for fixture in fixtures:
+        if priority == "settled-history":
+            # The calendar window is already bounded to dates before today.
+            # Do not make delayed SportMonks status updates hide a fixture
+            # from the historical provider lookup.
+            filtered.append(fixture)
+            continue
         bucket = fixture_priority_bucket(fixture.get("starting_at"), now_utc)
         if bucket == priority:
             filtered.append(fixture)
@@ -886,6 +978,7 @@ def fetch_league_odds_payload(
     days_forward: int,
     bookmakers: List[str],
     per_league_limit: int,
+    calendar_history: bool = False,
 ) -> LeagueResult:
     started = time.time()
     client = OddsApiClient()
@@ -903,7 +996,7 @@ def fetch_league_odds_payload(
     odds_response_by_event_id: Dict[int, Dict[str, object]] = {}
 
     try:
-        start_dt, end_dt = fixture_window_bounds(days_back, days_forward)
+        start_dt, end_dt = fixture_window_bounds(days_back, days_forward, calendar_history)
         event_start_dt = start_dt - timedelta(hours=UPSTREAM_EVENT_WINDOW_PAD_HOURS)
         event_end_dt = end_dt + timedelta(hours=UPSTREAM_EVENT_WINDOW_PAD_HOURS)
         params = {
@@ -951,8 +1044,8 @@ def fetch_league_odds_payload(
                 }
             )
             event_status = str(event.get("status") or "").strip().lower()
-            if event_status in SETTLED_EVENT_STATUSES:
-                if not bool(fixture.get("has_moneyline_odds")):
+            if calendar_history or event_status in SETTLED_EVENT_STATUSES:
+                if not bool(fixture.get("has_complete_moneyline_odds")):
                     historical_backfill.append((event_id, int(fixture["fixture_id"])))
                 continue
             event_to_fixture[event_id] = int(fixture["fixture_id"])
@@ -1507,14 +1600,26 @@ def resolve_player_id(
     return None
 
 
-def upsert_outcomes(session, rows: List[Dict]) -> None:
+def upsert_outcomes(session, rows: List[Dict], preserve_existing: bool = False) -> None:
     if not rows:
         return
     rows = dedupe_outcome_rows(rows)
     if not rows:
         return
-    sql = text(
+    conflict_sql = (
+        "do nothing"
+        if preserve_existing
+        else """
+        do update set
+          participant_type = coalesce(excluded.participant_type, odds_outcomes.participant_type),
+          participant_id = excluded.participant_id,
+          price_decimal = excluded.price_decimal,
+          price_american = excluded.price_american,
+          last_updated_at = excluded.last_updated_at
         """
+    )
+    sql = text(
+        f"""
         insert into odds_outcomes (
           fixture_id, bookmaker_id, market_key, selection_key,
           participant_type, participant_id, line,
@@ -1525,12 +1630,7 @@ def upsert_outcomes(session, rows: List[Dict]) -> None:
           :price_decimal, :price_american, :last_updated_at
         )
         on conflict(fixture_id, bookmaker_id, market_key, selection_key, line)
-        do update set
-          participant_type = coalesce(excluded.participant_type, odds_outcomes.participant_type),
-          participant_id = excluded.participant_id,
-          price_decimal = excluded.price_decimal,
-          price_american = excluded.price_american,
-          last_updated_at = excluded.last_updated_at
+        {conflict_sql}
         """
     )
     session.execute(sql, rows)
@@ -1620,11 +1720,12 @@ def delete_invalid_goals_over_under(
     league_ids: Iterable[int],
     days_back: int,
     days_forward: int,
+    calendar_history: bool = False,
 ) -> int:
     league_list = [int(value) for value in league_ids if value]
     if not league_list:
         return 0
-    start_dt, end_dt = fixture_window_bounds(days_back, days_forward)
+    start_dt, end_dt = fixture_window_bounds(days_back, days_forward, calendar_history)
     start_dt_sql = sqlite_utc_timestamp(start_dt)
     end_dt_sql = sqlite_utc_timestamp(end_dt)
     stmt = (
@@ -2331,9 +2432,9 @@ def main() -> None:
     parser.add_argument("--sport", default="football")
     parser.add_argument(
         "--priority",
-        choices=["p1", "p2", "p3"],
+        choices=["p1", "p2", "p3", "settled-history"],
         default=None,
-        help="Optional kickoff tier filter: p1<=2h, p2=2-24h, p3=24h-14d.",
+        help="Optional scope: p1<=2h, p2=2-24h, p3=24h-14d, or settled-history for the previous calendar days.",
     )
     parser.add_argument(
         "--refresh-upcoming",
@@ -2396,6 +2497,15 @@ def main() -> None:
     )
     parser.set_defaults(refresh_squads_missing=True, refresh_sidelined_window=True)
     args = parser.parse_args()
+    calendar_history = args.priority == "settled-history"
+    window_start, window_end = fixture_window_bounds(
+        args.days_back,
+        args.days_forward,
+        calendar_history,
+    )
+    window_kind = "settled_history_calendar" if calendar_history else "rolling"
+    window_start_iso = window_start.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
+    window_end_iso = window_end.replace(tzinfo=timezone.utc).isoformat().replace("+00:00", "Z")
 
     raw_leagues = args.leagues.replace('"', "").replace("'", "")
     league_ids = [int(x) for x in raw_leagues.split(",") if x.strip()]
@@ -2446,7 +2556,13 @@ def main() -> None:
                 log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
                 svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
 
-    fixtures = load_fixtures(session, league_ids, args.days_back, args.days_forward)
+    fixtures = load_fixtures(
+        session,
+        league_ids,
+        args.days_back,
+        args.days_forward,
+        calendar_history,
+    )
     if args.priority:
         before = len(fixtures)
         fixtures = filter_fixtures_by_priority(fixtures, args.priority)
@@ -2458,6 +2574,9 @@ def main() -> None:
                 "generated_at": utc_now_iso(),
                 "league_ids": league_ids,
                 "priority": args.priority,
+                "window_kind": window_kind,
+                "window_start": window_start_iso,
+                "window_end": window_end_iso,
                 "refresh_only": args.refresh_only,
                 "fixtures_in_scope": 0,
                 "events_matched": 0,
@@ -2510,6 +2629,9 @@ def main() -> None:
                 "generated_at": utc_now_iso(),
                 "league_ids": league_ids,
                 "priority": args.priority,
+                "window_kind": window_kind,
+                "window_start": window_start_iso,
+                "window_end": window_end_iso,
                 "refresh_only": True,
                 "fixtures_in_scope": len(fixtures),
                 "teams_in_window": len(teams_in_window),
@@ -2590,6 +2712,7 @@ def main() -> None:
                     args.days_forward,
                     bookmakers,
                     args.limit,
+                    calendar_history,
                 ): league_id
                 for league_id, odds_league, league_fixtures in leagues_with_fixtures
             }
@@ -2688,20 +2811,27 @@ def main() -> None:
                 if not rows:
                     continue
                 market_keys = {row.get("market_key") for row in rows if row.get("market_key")}
-                delete_fixture_market_rows(
-                    session,
-                    fixture_id,
-                    BOOKMAKER_NAME_TO_ID[book_key],
-                    market_keys,
-                )
-                upsert_outcomes(session, rows)
+                if not calendar_history:
+                    delete_fixture_market_rows(
+                        session,
+                        fixture_id,
+                        BOOKMAKER_NAME_TO_ID[book_key],
+                        market_keys,
+                    )
+                upsert_outcomes(session, rows, preserve_existing=calendar_history)
                 outcomes_total += len(rows)
                 bookmaker_names_saved.add(canonical_name)
             session.commit()
 
     removed_invalid = 0
     if args.priority is None:
-        removed_invalid = delete_invalid_goals_over_under(session, league_ids, args.days_back, args.days_forward)
+        removed_invalid = delete_invalid_goals_over_under(
+            session,
+            league_ids,
+            args.days_back,
+            args.days_forward,
+            calendar_history,
+        )
     if removed_invalid:
         log.warning("Removed %s invalid goals_over_under rows after sync.", removed_invalid)
         session.commit()
@@ -2750,6 +2880,9 @@ def main() -> None:
             "teams_squads_refreshed": len(refreshed_team_ids),
             "teams_sidelined_refreshed": len(sidelined_refreshed_team_ids),
             "priority": args.priority,
+            "window_kind": window_kind,
+            "window_start": window_start_iso,
+            "window_end": window_end_iso,
             "refresh_only": False,
             "days_back": args.days_back,
             "days_forward": args.days_forward,

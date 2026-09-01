@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from scripts.sync_odds import (
     DEFAULT_BOOKMAKERS,
     canonicalize_bookmakers,
+    fixture_window_bounds,
     fetch_league_odds_payload,
     inspect_upstream_moneyline,
+    load_fixture_moneyline_completeness,
     load_default_bookmakers,
     match_event_to_fixture,
     team_aliases,
@@ -44,6 +46,27 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
     def test_default_bookmakers_match_the_user_facing_contract(self) -> None:
         self.assertEqual(DEFAULT_BOOKMAKERS, ["Bet365", "Paddy Power", "Unibet", "BetMGM"])
         self.assertEqual(load_default_bookmakers(), DEFAULT_BOOKMAKERS)
+
+    def test_settled_history_window_uses_complete_utc_calendar_days(self) -> None:
+        start, end = fixture_window_bounds(2, 0, calendar_history=True)
+
+        self.assertEqual(end.tzinfo, None)
+        self.assertEqual(end.hour, 0)
+        self.assertEqual(end.minute, 0)
+        self.assertEqual(end.second, 0)
+        self.assertEqual((end - start).days, 2)
+        self.assertEqual(end.date(), datetime.now(timezone.utc).date())
+
+    def test_historical_fetch_is_required_until_all_moneyline_sides_exist(self) -> None:
+        session = MagicMock()
+        session.execute.return_value.fetchall.return_value = [
+            (1, 100, 200, "team", 100, "home", 2.1),
+            (1, 100, 200, "team", 200, "away", 3.2),
+            (1, 100, 200, None, None, "draw", 3.4),
+            (2, 100, 200, "team", 100, "home", 2.1),
+        ]
+
+        self.assertEqual(load_fixture_moneyline_completeness(session, [1, 2]), {1})
 
     def test_inspects_only_usable_configured_moneyline_markets(self) -> None:
         sides = inspect_upstream_moneyline(
@@ -127,6 +150,66 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
             evidence["moneyline_sides_by_bookmaker"],
             {"Unibet": ["home", "draw", "away"]},
         )
+
+    @patch("scripts.sync_odds.OddsApiClient")
+    def test_settled_history_uses_historical_endpoint_and_emits_evidence(self, client_type) -> None:
+        events_client = MagicMock()
+        historical_client = MagicMock()
+        events_client.request.return_value = [
+            {
+                "id": 8001,
+                "home": "Home FC",
+                "away": "Away FC",
+                "date": "2026-08-31T16:00:00Z",
+                "status": "finished",
+            }
+        ]
+        historical_client.request.return_value = {
+            "bookmakers": {
+                "Unibet": [
+                    {"name": "ML", "odds": [{"home": "2.1", "draw": "3.4", "away": "3.2"}]}
+                ]
+            }
+        }
+        stats = SimpleNamespace(
+            total_calls=1,
+            calls_by_endpoint={"events": 1},
+            api_time_seconds=0.1,
+            rate_limit_hits=0,
+            rate_limit_sleeps=0,
+            last_rate_limit=None,
+        )
+        historical_stats = SimpleNamespace(
+            total_calls=1,
+            calls_by_endpoint={"historical/odds": 1},
+            api_time_seconds=0.1,
+            rate_limit_hits=0,
+            rate_limit_sleeps=0,
+            last_rate_limit=None,
+        )
+        events_client.stats = stats
+        historical_client.stats = historical_stats
+        client_type.side_effect = [events_client, historical_client]
+
+        result = fetch_league_odds_payload(
+            444,
+            "test-league",
+            [build_fixture(19629715, "Home FC", "Away FC", datetime(2026, 8, 31, 16, 0))],
+            "football",
+            2,
+            0,
+            ["Unibet"],
+            0,
+            calendar_history=True,
+        )
+
+        self.assertIsNone(result.error)
+        historical_client.request.assert_called_once_with(
+            "historical/odds",
+            params={"eventId": "8001", "bookmakers": "Unibet"},
+        )
+        self.assertEqual(len(result.odds_records), 1)
+        self.assertEqual(result.moneyline_coverage[0]["odds_response_status"], "received")
 
     def test_accepts_all_supported_odds_bookmakers(self) -> None:
         bookmakers, unknown = canonicalize_bookmakers(
