@@ -375,7 +375,14 @@ def classify_provider_evidence(
             "matched provider evidence did not contain a positive event_id",
             row,
         )
-    if row.get("odds_response_status") != "received":
+    response_status = row.get("odds_response_status")
+    if response_status == "empty":
+        return (
+            "PROVIDER_GAP",
+            "the provider returned a valid odds response that contained no payload for the matched event",
+            row,
+        )
+    if response_status != "received":
         return (
             "ODDS_RESPONSE_INCOMPLETE",
             "the matched event did not have a valid, returned odds response",

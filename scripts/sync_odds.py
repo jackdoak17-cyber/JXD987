@@ -1135,6 +1135,8 @@ def fetch_league_odds_payload(
                             if response_received
                             else "invalid"
                             if response_valid is False
+                            else "empty"
+                            if response_valid is True
                             else "missing"
                             if response.get("requested")
                             else "not_requested"

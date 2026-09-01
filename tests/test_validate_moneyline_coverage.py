@@ -113,6 +113,34 @@ class ValidateMoneylineCoverageTests(unittest.TestCase):
         self.assertEqual(provider_gaps, [])
         self.assertEqual(unresolved, [])
 
+    def test_accepts_valid_empty_odds_response_as_provider_gap(self) -> None:
+        failures, provider_gaps, pipeline_failures, unresolved = evaluate_provider_aware_failures(
+            [
+                {
+                    "league_id": 444,
+                    "fixtures_in_window": 2,
+                    "fixtures_with_complete_moneyline": 1,
+                    "coverage_pct": 50.0,
+                    "missing_fixture_ids": [19629715],
+                }
+            ],
+            {
+                19629715: {
+                    "fixture_id": 19629715,
+                    "event_id": 7001,
+                    "matching_status": "matched",
+                    "odds_response_status": "empty",
+                    "supported_moneyline_bookmakers": [],
+                }
+            },
+            fail_below_pct=100.0,
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual([row["fixture_id"] for row in provider_gaps], [19629715])
+        self.assertEqual(pipeline_failures, [])
+        self.assertEqual(unresolved, [])
+
     def test_missing_provider_evidence_fails_closed(self) -> None:
         failures, provider_gaps, pipeline_failures, unresolved = evaluate_provider_aware_failures(
             [
