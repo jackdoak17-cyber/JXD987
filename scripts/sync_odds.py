@@ -981,8 +981,8 @@ def fetch_league_odds_payload(
     calendar_history: bool = False,
 ) -> LeagueResult:
     started = time.time()
-    client = OddsApiClient()
-    historical_client: Optional[OddsApiClient] = None
+    client = OddsApiClient(base_url=HISTORICAL_ODDS_BASE_URL if calendar_history else None)
+    historical_client: Optional[OddsApiClient] = client if calendar_history else None
     result = LeagueResult(
         league_id=league_id,
         league_name=odds_league,
@@ -1007,7 +1007,7 @@ def fetch_league_odds_payload(
         }
         if days_back <= 0:
             params["status"] = "pending,live"
-        events = client.request("events", params=params)
+        events = client.request("historical/events" if calendar_history else "events", params=params)
         if not isinstance(events, list):
             raise OddsApiError(f"Unexpected events response for league {odds_league}")
 
@@ -1103,7 +1103,8 @@ def fetch_league_odds_payload(
                     )
 
         if historical_backfill:
-            historical_client = OddsApiClient(base_url=HISTORICAL_ODDS_BASE_URL)
+            if historical_client is None:
+                historical_client = OddsApiClient(base_url=HISTORICAL_ODDS_BASE_URL)
             if per_league_limit > 0:
                 historical_backfill = historical_backfill[:per_league_limit]
             for event_id, fixture_id in historical_backfill:
@@ -1216,7 +1217,7 @@ def fetch_league_odds_payload(
         result.error = exc
     finally:
         stats_clients = [client]
-        if historical_client is not None:
+        if historical_client is not None and historical_client is not client:
             stats_clients.append(historical_client)
         result.fetch_duration_seconds = round(time.time() - started, 2)
         result.api_calls_made = sum(stats.stats.total_calls for stats in stats_clients)

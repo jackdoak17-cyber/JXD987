@@ -175,43 +175,35 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
 
     @patch("scripts.sync_odds.OddsApiClient")
     def test_settled_history_uses_historical_endpoint_and_emits_evidence(self, client_type) -> None:
-        events_client = MagicMock()
-        historical_client = MagicMock()
-        events_client.request.return_value = [
+        client = MagicMock()
+        client.request.side_effect = [
+            [
+                {
+                    "id": 8001,
+                    "home": "Home FC",
+                    "away": "Away FC",
+                    "date": "2026-08-31T16:00:00Z",
+                    "status": "finished",
+                }
+            ],
             {
-                "id": 8001,
-                "home": "Home FC",
-                "away": "Away FC",
-                "date": "2026-08-31T16:00:00Z",
-                "status": "finished",
-            }
-        ]
-        historical_client.request.return_value = {
             "bookmakers": {
                 "Unibet": [
                     {"name": "ML", "odds": [{"home": "2.1", "draw": "3.4", "away": "3.2"}]}
                 ]
             }
-        }
+            },
+        ]
         stats = SimpleNamespace(
-            total_calls=1,
-            calls_by_endpoint={"events": 1},
-            api_time_seconds=0.1,
+            total_calls=2,
+            calls_by_endpoint={"historical/events": 1, "historical/odds": 1},
+            api_time_seconds=0.2,
             rate_limit_hits=0,
             rate_limit_sleeps=0,
             last_rate_limit=None,
         )
-        historical_stats = SimpleNamespace(
-            total_calls=1,
-            calls_by_endpoint={"historical/odds": 1},
-            api_time_seconds=0.1,
-            rate_limit_hits=0,
-            rate_limit_sleeps=0,
-            last_rate_limit=None,
-        )
-        events_client.stats = stats
-        historical_client.stats = historical_stats
-        client_type.side_effect = [events_client, historical_client]
+        client.stats = stats
+        client_type.return_value = client
 
         result = fetch_league_odds_payload(
             444,
@@ -226,10 +218,9 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         )
 
         self.assertIsNone(result.error)
-        historical_client.request.assert_called_once_with(
-            "historical/odds",
-            params={"eventId": "8001", "bookmakers": "Unibet"},
-        )
+        self.assertEqual(client.request.call_args_list[0].args[0], "historical/events")
+        self.assertEqual(client.request.call_args_list[1].args[0], "historical/odds")
+        self.assertEqual(client.request.call_args_list[1].kwargs["params"], {"eventId": "8001", "bookmakers": "Unibet"})
         self.assertEqual(len(result.odds_records), 1)
         self.assertEqual(result.moneyline_coverage[0]["odds_response_status"], "received")
 
