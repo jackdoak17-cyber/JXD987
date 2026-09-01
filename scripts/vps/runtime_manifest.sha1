@@ -30,6 +30,7 @@ fa3c102f14664a9d38ac677ea5a967183e58dd8f  scripts/fixture_core_contract.py
 a889e7f62cf6ed7f0f5f044120e807b766232ce2  scripts/vps/run_p1.sh
 dc56e8406900f9db116890e6a0f118a305adf238  scripts/vps/run_p2.sh
 30d57c2a93d2970aba8a9eac06f35ea376cb1c09  scripts/vps/run_p3.sh
+bdc4e1cb19f9835615081d41b598860179c32bbc  scripts/vps/run_odds_p3.sh
 e79624ed0199fba5afd712ba60066716ccc7912e  scripts/vps/run_p3_fixture_core.sh
 649d9378314774bec9e570e7a9303de2c230eeb2  scripts/vps/run_postmatch_settlement.sh
 c4b76b52642c66576372a64093b928f035a6e5ae  scripts/vps/run_models.sh

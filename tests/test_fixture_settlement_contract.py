@@ -57,6 +57,20 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('export FIXTURE_CORE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"', source)
         self.assertIn('--start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)"', source)
 
+    def test_odds_p3_lane_is_bounded_and_keeps_run_p3_identity(self) -> None:
+        wrapper = ROOT / "scripts/vps/run_odds_p3.sh"
+        result = subprocess.run(["bash", "-n", str(wrapper)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        source = wrapper.read_text(encoding="utf-8")
+        self.assertIn("run_recorded_pipeline_job", source)
+        self.assertIn('"run_p3"', source)
+        self.assertIn('ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-', source)
+        self.assertIn('ODDS_SYNC_P3_MAX_DURATION_SECONDS="${ODDS_P3_ODDS_MAX_RUNTIME_SECONDS:-300}"', source)
+        self.assertIn("--priority settled-history", source)
+        self.assertIn("--priority p3", source)
+        self.assertIn("validate_moneyline_coverage.py", source)
+        self.assertNotIn("refresh_fixture_delivery.py", source)
+
     def test_odds_wrappers_record_pipeline_heartbeats(self) -> None:
         for wrapper_name, job_id, job_name in (
             ("run_p1.sh", "run_p1", "P1 odds fetch"),

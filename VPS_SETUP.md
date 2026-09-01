@@ -52,6 +52,7 @@ Location:
 - `scripts/vps/run_p1.sh`
 - `scripts/vps/run_p2.sh`
 - `scripts/vps/run_p3.sh`
+- `scripts/vps/run_odds_p3.sh`
 - `scripts/vps/run_postmatch_settlement.sh`
 - `scripts/vps/run_stats_reconciliation.sh`
 
@@ -102,7 +103,8 @@ Use one cron entry equivalent to existing cadence:
 Path B is enforced:
 - P1/P2: fetch-only
 - P2: fetch-only + best-effort confirmed-lineup refresh for imminent fixtures
-- P3: SportMonks refresh + fetch + ingest + retention + best-effort recent fixture-core refresh/export
+- P3 odds lane: settled-history + long-range odds fetch + ingest + retention + moneyline fidelity validation
+- Fixture-core publication: the dedicated `run_p3_fixture_core.sh` lane owns SportMonks identity refresh/export
 - Post-match settlement: every 15 minutes, refresh fixture cores and run the bounded full-detail delivery worker for recently started fixtures. The worker retries provider-pending fixtures and verifies source-to-Supabase parity before marking them delivered. P3 deliberately uses `--fixture-core-only` so it cannot delete or overwrite fixture-player/statistics detail while the detail pipeline is reconciling it.
 
 P3 is an odds/core-data job, not the stats-detail cadence. If the Odds API is
@@ -117,7 +119,7 @@ Use this schedule while the production Supabase project is on Micro compute or w
 ```cron
 */10 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
 */15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
-7,37 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
+19 */6 * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_odds_p3.sh >> /var/log/odds-sync-p3.log 2>&1
 
 # Post-match fixture settlement (the stats-critical live writer). The worker polls
 # SportMonks detail until it is complete, then publishes only parity-verified rows.
@@ -163,7 +165,7 @@ Only use this after Supabase has enough IO/CPU headroom and the hot tables have 
 
 Important:
 - No separate historical SportMonks cron entry (historical refresh remains inside `run_p3.sh`; the post-match worker polls only the bounded recent-fixture queue)
-- Retention runs only in `run_p3.sh` (and `run_sync.sh` parity mode)
+- Retention runs only in `run_odds_p3.sh` (and `run_sync.sh` parity mode)
 
 ## 6) Healthcheck timeout formula
 Because P1/P2 can skip while P3 holds the global lock, heartbeat timeout must include worst-case lock occupancy.

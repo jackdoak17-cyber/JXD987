@@ -33,6 +33,7 @@ scripts/vps/common.sh
 scripts/vps/run_p1.sh
 scripts/vps/run_p2.sh
 scripts/vps/run_p3.sh
+scripts/vps/run_odds_p3.sh
 scripts/vps/run_p3_fixture_core.sh
 scripts/vps/run_postmatch_settlement.sh
 scripts/vps/run_models.sh
