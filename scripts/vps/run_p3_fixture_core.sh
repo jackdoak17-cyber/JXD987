@@ -48,14 +48,18 @@ export FIXTURE_CORE_SOURCE_BUFFER_DAYS="$(contract_value source_buffer_days)"
 export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_league_csv)}}"
 validate_supported_leagues "${STATS_LEAGUES}"
 export FIXTURE_CORE_MAX_RUNTIME_SECONDS="${FIXTURE_CORE_MAX_RUNTIME_SECONDS:-900}"
-# The complete identity refresh is normally well below two minutes. Keep a
-# three-minute class of bounded execution available after settlement while
-# still leaving the canonical grace period before the next tick.
-export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS:-180}"
+# The complete identity refresh has measured at roughly fifty seconds on the
+# production-shaped dataset. Admit a one-minute lease so a late settlement
+# handoff can still use the final safe minute before the next tick; the shared
+# timeout remains the hard safety boundary if the refresh runs long.
+export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS:-60}"
 # The detail writer can legitimately hold the canonical lock for several
 # minutes after its quarter-hour tick. Keep this identity-refresh lane
 # resumable across that handoff rather than losing its six-hour cron tick.
-export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-60}"
+# A six-hour lane may start during the settlement writer's quarter-hour
+# reservation. Thirty minutes is finite, exceeds the settlement timeout, and
+# spans the next normal handoff window without allowing an unbounded process.
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-120}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"
 # The exporter treats zero as an unbounded completed-fixture selection. Keep
 # the historical side of this identity refresh bounded by the shared contract
