@@ -34,6 +34,7 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('ODDS_SYNC_JOB_PRIORITY="settlement"', source)
         self.assertIn('ODDS_SYNC_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS}"', source)
         self.assertIn('SETTLEMENT_RUN_LOCK_FILE="${SETTLEMENT_RUN_LOCK_FILE:-/var/lock/odds-sync-settlement.lock}"', source)
+        self.assertIn("--no-fail-on-sla-breach", source)
 
     def test_fixture_core_refresh_cannot_overwrite_fixture_detail(self) -> None:
         wrapper = ROOT / "scripts/vps/run_p3_fixture_core.sh"

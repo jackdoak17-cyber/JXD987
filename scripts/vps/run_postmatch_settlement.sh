@@ -93,6 +93,7 @@ python scripts/postmatch_fixture_detail_delivery.py \
   --hours-back "${POSTMATCH_DETAIL_HOURS_BACK}" \
   --limit "${POSTMATCH_DETAIL_LIMIT}" \
   --grace-minutes "${POSTMATCH_DETAIL_GRACE_MINUTES}" \
+  --no-fail-on-sla-breach \
   --report-json "/tmp/postmatch_fixture_detail_delivery_report.json"
 CHAIN
 )
