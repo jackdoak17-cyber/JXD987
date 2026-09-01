@@ -691,7 +691,15 @@ select
   fixture_id, bookmaker_id, market_key, selection_key, line,
   price_decimal, price_american, participant_type, participant_id, last_updated_at
 from src
-on conflict do update set
+on conflict (
+  fixture_id,
+  market_key,
+  bookmaker_id,
+  (coalesce(participant_type, '')),
+  (coalesce(participant_id, -1)),
+  (coalesce(selection_key, '')),
+  (coalesce(line, -9999))
+) do update set
   price_decimal = excluded.price_decimal,
   price_american = excluded.price_american,
   participant_type = coalesce(excluded.participant_type, o.participant_type),
@@ -723,7 +731,15 @@ upserted as (
     fixture_id, bookmaker_id, market_key, selection_key, line,
     price_decimal, price_american, participant_type, participant_id, last_updated_at
   from src
-  on conflict do update set
+  on conflict (
+    fixture_id,
+    market_key,
+    bookmaker_id,
+    (coalesce(participant_type, '')),
+    (coalesce(participant_id, -1)),
+    (coalesce(selection_key, '')),
+    (coalesce(line, -9999))
+  ) do update set
     price_decimal = excluded.price_decimal,
     price_american = excluded.price_american,
     participant_type = coalesce(excluded.participant_type, o.participant_type),

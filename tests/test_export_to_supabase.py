@@ -73,8 +73,9 @@ class ExportOddsConflictContractTests(unittest.TestCase):
                 )
 
         self.assertEqual(counts["upserted_total"], 1)
-        self.assertEqual(captured_sql["text"].count("on conflict do update set"), 1)
-        self.assertNotIn("on conflict (fixture_id", captured_sql["text"])
+        self.assertEqual(captured_sql["text"].count("on conflict ("), 1)
+        self.assertIn("(coalesce(participant_type, ''))", captured_sql["text"])
+        self.assertIn("(coalesce(line, -9999))", captured_sql["text"])
         self.assertIn("coalesce(line, -9999)", captured_sql["text"])
 
 
