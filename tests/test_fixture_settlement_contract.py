@@ -56,6 +56,19 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('export FIXTURE_CORE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"', source)
         self.assertIn('--start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)"', source)
 
+    def test_odds_wrappers_record_pipeline_heartbeats(self) -> None:
+        for wrapper_name, job_id, job_name in (
+            ("run_p1.sh", "run_p1", "P1 odds fetch"),
+            ("run_p2.sh", "run_p2", "P2 reconciliation"),
+        ):
+            wrapper = ROOT / "scripts/vps" / wrapper_name
+            result = subprocess.run(["bash", "-n", str(wrapper)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, f"{wrapper}: {result.stderr}")
+            source = wrapper.read_text(encoding="utf-8")
+            self.assertIn("run_recorded_pipeline_job", source)
+            self.assertIn(f'"{job_id}"', source)
+            self.assertIn(f'"{job_name}"', source)
+
     def test_settlement_delivery_refresh_preserves_the_rolling_horizon(self) -> None:
         wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
         source = wrapper.read_text(encoding="utf-8")
