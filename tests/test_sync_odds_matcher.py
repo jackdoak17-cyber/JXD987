@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from scripts.sync_odds import (
     DEFAULT_BOOKMAKERS,
     canonicalize_bookmakers,
+    fetch_league_odds_payload,
+    inspect_upstream_moneyline,
     load_default_bookmakers,
     match_event_to_fixture,
     team_aliases,
@@ -40,6 +44,89 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
     def test_default_bookmakers_match_the_user_facing_contract(self) -> None:
         self.assertEqual(DEFAULT_BOOKMAKERS, ["Bet365", "Paddy Power", "Unibet", "BetMGM"])
         self.assertEqual(load_default_bookmakers(), DEFAULT_BOOKMAKERS)
+
+    def test_inspects_only_usable_configured_moneyline_markets(self) -> None:
+        sides = inspect_upstream_moneyline(
+            {
+                "Unibet": [
+                    {"name": "ML", "odds": [{"home": "2.1", "draw": "3.4", "away": "3.2"}]},
+                    {"name": "ML HT", "odds": [{"home": "2.0", "draw": "3.0", "away": "4.0"}]},
+                ],
+                "Unknown": [{"name": "ML", "odds": [{"home": "2.0"}]}],
+            },
+            {"unibet"},
+        )
+
+        self.assertEqual(sides, {"Unibet": ["home", "draw", "away"]})
+
+    def test_does_not_treat_invalid_or_non_moneyline_prices_as_provider_support(self) -> None:
+        sides = inspect_upstream_moneyline(
+            {
+                "Bet365": [
+                    {"name": "ML", "odds": [{"home": "1", "draw": "501", "away": "not-a-price"}]},
+                    {"name": "Totals", "odds": [{"home": "2.0"}]},
+                ]
+            },
+            {"bet365"},
+        )
+
+        self.assertEqual(sides, {})
+
+    @patch("scripts.sync_odds.OddsApiClient")
+    def test_fetch_emits_per_fixture_evidence_for_matched_provider_response(self, client_type) -> None:
+        client = MagicMock()
+        client.request.side_effect = [
+            [
+                {
+                    "id": 7001,
+                    "home": "Home FC",
+                    "away": "Away FC",
+                    "date": "2026-09-04T16:00:00Z",
+                    "status": "pending",
+                }
+            ],
+            [
+                {
+                    "id": 7001,
+                    "bookmakers": {
+                        "Unibet": [
+                            {"name": "ML", "odds": [{"home": "2.1", "draw": "3.4", "away": "3.2"}]}
+                        ]
+                    },
+                }
+            ],
+        ]
+        client.stats = SimpleNamespace(
+            total_calls=2,
+            calls_by_endpoint={"events": 1, "odds/multi": 1},
+            api_time_seconds=0.1,
+            rate_limit_hits=0,
+            rate_limit_sleeps=0,
+            last_rate_limit=None,
+        )
+        client_type.return_value = client
+
+        result = fetch_league_odds_payload(
+            444,
+            "test-league",
+            [build_fixture(19629715, "Home FC", "Away FC", datetime(2026, 9, 4, 16, 0))],
+            "football",
+            0,
+            14,
+            ["Unibet"],
+            0,
+        )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(len(result.moneyline_coverage), 1)
+        evidence = result.moneyline_coverage[0]
+        self.assertEqual(evidence["matching_status"], "matched")
+        self.assertEqual(evidence["odds_response_status"], "received")
+        self.assertEqual(evidence["supported_moneyline_bookmakers"], ["Unibet"])
+        self.assertEqual(
+            evidence["moneyline_sides_by_bookmaker"],
+            {"Unibet": ["home", "draw", "away"]},
+        )
 
     def test_accepts_all_supported_odds_bookmakers(self) -> None:
         bookmakers, unknown = canonicalize_bookmakers(

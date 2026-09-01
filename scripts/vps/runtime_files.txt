@@ -25,6 +25,7 @@ scripts/reconcile_recent_fixtures.py
 scripts/rest_preflight.py
 scripts/sync_confirmed_lineups.py
 scripts/sync_odds.py
+scripts/validate_moneyline_coverage.py
 scripts/fixture_core_contract.py
 scripts/vps/common.sh
 scripts/vps/run_p1.sh

@@ -14,7 +14,7 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -73,6 +73,117 @@ def get_db_url() -> str:
 
 def parse_league_ids(raw: str) -> List[int]:
     return [int(value) for value in raw.split(",") if value.strip()]
+
+
+def parse_report_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def load_provider_evidence(
+    report_paths: List[str],
+    max_age_hours: float,
+    now: datetime | None = None,
+) -> Tuple[Dict[int, Dict[str, object]], List[str]]:
+    """Load fresh, compact per-fixture evidence emitted by sync_odds.py.
+
+    Evidence is intentionally fail-closed.  A validator must never turn an
+    absent, malformed, stale, or conflicting report into an accepted provider
+    gap.  When multiple reports contain a fixture, the newest report wins only
+    when the evidence is identical; conflicting observations are rejected.
+    """
+    evidence_by_fixture: Dict[int, Dict[str, object]] = {}
+    errors: List[str] = []
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        observed_at = observed_at.replace(tzinfo=timezone.utc)
+    observed_at = observed_at.astimezone(timezone.utc)
+
+    for raw_path in report_paths:
+        path = Path(raw_path)
+        if not path.exists():
+            errors.append(f"provider evidence report is missing: {path}")
+            continue
+        try:
+            report = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"provider evidence report cannot be read: {path}: {exc}")
+            continue
+        if not isinstance(report, dict):
+            errors.append(f"provider evidence report is not an object: {path}")
+            continue
+
+        generated_at = parse_report_timestamp(report.get("generated_at"))
+        if generated_at is None:
+            errors.append(f"provider evidence report has no valid generated_at: {path}")
+            continue
+        age_hours = (observed_at - generated_at).total_seconds() / 3600
+        if age_hours > max_age_hours:
+            errors.append(
+                f"provider evidence report is stale ({age_hours:.2f}h > {max_age_hours:.2f}h): {path}"
+            )
+            continue
+        if age_hours < -0.25:
+            errors.append(f"provider evidence report is from the future: {path}")
+            continue
+
+        rows = report.get("moneyline_coverage")
+        if not isinstance(rows, list):
+            errors.append(f"provider evidence report has no moneyline_coverage array: {path}")
+            continue
+
+        for row in rows:
+            if not isinstance(row, dict):
+                errors.append(f"provider evidence report contains a non-object row: {path}")
+                continue
+            try:
+                fixture_id = int(row["fixture_id"])
+            except (KeyError, TypeError, ValueError):
+                errors.append(f"provider evidence row has no valid fixture_id: {path}")
+                continue
+            if fixture_id <= 0:
+                errors.append(f"provider evidence row has invalid fixture_id={fixture_id}: {path}")
+                continue
+
+            normalized = dict(row)
+            normalized["fixture_id"] = fixture_id
+            normalized["_generated_at"] = generated_at.isoformat()
+            normalized["_report_path"] = str(path)
+            existing = evidence_by_fixture.get(fixture_id)
+            if existing is None:
+                evidence_by_fixture[fixture_id] = normalized
+                continue
+
+            comparable_existing = {
+                key: value
+                for key, value in existing.items()
+                if not key.startswith("_")
+            }
+            comparable_new = {
+                key: value
+                for key, value in normalized.items()
+                if not key.startswith("_")
+            }
+            if comparable_existing != comparable_new:
+                errors.append(
+                    f"conflicting provider evidence for fixture {fixture_id}: "
+                    f"{existing.get('_report_path')} vs {path}"
+                )
+                evidence_by_fixture.pop(fixture_id, None)
+                continue
+
+            existing_generated = parse_report_timestamp(existing.get("_generated_at"))
+            if existing_generated is None or generated_at > existing_generated:
+                evidence_by_fixture[fixture_id] = normalized
+
+    return evidence_by_fixture, errors
 
 
 def fetch_league_coverage(
@@ -226,6 +337,128 @@ def evaluate_failures(leagues: List[Dict[str, object]], fail_below_pct: float) -
     return failures
 
 
+def classify_provider_evidence(
+    fixture_id: int,
+    evidence: Dict[int, Dict[str, object]],
+) -> Tuple[str, str, Dict[str, object] | None]:
+    """Classify one database-missing fixture using provider facts.
+
+    Only a matched event with a valid odds response and zero usable supported
+    moneyline bookmakers is an accepted provider gap.  Everything else is a
+    hard failure category so matcher, transport, and ingestion defects remain
+    visible.
+    """
+    row = evidence.get(fixture_id)
+    if row is None:
+        return (
+            "EVIDENCE_MISSING",
+            "no fresh provider evidence was supplied for this fixture",
+            None,
+        )
+    if row.get("matching_status") != "matched":
+        return (
+            "UPSTREAM_UNMATCHED",
+            "the canonical provider run did not match an upstream event to this fixture",
+            row,
+        )
+    try:
+        event_id = int(row.get("event_id"))
+    except (TypeError, ValueError):
+        return (
+            "EVIDENCE_INVALID",
+            "matched provider evidence did not contain a valid event_id",
+            row,
+        )
+    if event_id <= 0:
+        return (
+            "EVIDENCE_INVALID",
+            "matched provider evidence did not contain a positive event_id",
+            row,
+        )
+    if row.get("odds_response_status") != "received":
+        return (
+            "ODDS_RESPONSE_INCOMPLETE",
+            "the matched event did not have a valid, returned odds response",
+            row,
+        )
+    supported = row.get("supported_moneyline_bookmakers")
+    if not isinstance(supported, list) or not all(isinstance(value, str) for value in supported):
+        return (
+            "EVIDENCE_INVALID",
+            "provider evidence did not contain a supported_moneyline_bookmakers list",
+            row,
+        )
+    if supported:
+        return (
+            "PIPELINE_FAILURE",
+            "the provider returned usable supported moneyline odds but the database is incomplete",
+            row,
+        )
+    return (
+        "PROVIDER_GAP",
+        "the provider returned a valid event response with no usable supported moneyline odds",
+        row,
+    )
+
+
+def evaluate_provider_aware_failures(
+    leagues: List[Dict[str, object]],
+    evidence: Dict[int, Dict[str, object]],
+    fail_below_pct: float,
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]], List[Dict[str, object]], List[Dict[str, object]]]:
+    """Evaluate coverage while preserving hard failures and provider gaps."""
+    failures: List[Dict[str, object]] = []
+    provider_gaps: List[Dict[str, object]] = []
+    pipeline_failures: List[Dict[str, object]] = []
+    unresolved: List[Dict[str, object]] = []
+
+    for league in leagues:
+        fixtures_in_window = int(league.get("fixtures_in_window") or 0)
+        if fixtures_in_window == 0:
+            continue
+        missing_fixture_ids = [int(value) for value in (league.get("missing_fixture_ids") or [])]
+        hard_missing: List[int] = []
+        provider_gap_ids: List[int] = []
+        for fixture_id in missing_fixture_ids:
+            classification, reason, row = classify_provider_evidence(fixture_id, evidence)
+            audit = {
+                "fixture_id": fixture_id,
+                "league_id": int(league["league_id"]),
+                "classification": classification,
+                "reason": reason,
+                "evidence": row,
+            }
+            if classification == "PROVIDER_GAP":
+                provider_gap_ids.append(fixture_id)
+                provider_gaps.append(audit)
+            else:
+                hard_missing.append(fixture_id)
+                if classification == "PIPELINE_FAILURE":
+                    pipeline_failures.append(audit)
+                else:
+                    unresolved.append(audit)
+
+        effective_complete = fixtures_in_window - len(hard_missing)
+        effective_coverage = 100.0 * effective_complete / fixtures_in_window
+        if effective_coverage + 1e-9 < fail_below_pct:
+            failures.append(
+                {
+                    "league_id": int(league["league_id"]),
+                    "fixtures_in_window": fixtures_in_window,
+                    "fixtures_with_complete_moneyline": int(
+                        league.get("fixtures_with_complete_moneyline") or 0
+                    ),
+                    "coverage_pct": float(league.get("coverage_pct") or 0),
+                    "effective_coverage_pct": effective_coverage,
+                    "missing_fixture_ids": hard_missing,
+                    "provider_gap_fixture_ids": provider_gap_ids,
+                    "first_missing_starting_at": league.get("first_missing_starting_at"),
+                }
+            )
+
+    return failures, provider_gaps, pipeline_failures, unresolved
+
+
 def build_markdown_report(report: Dict[str, object]) -> str:
     lines = [
         "# Moneyline Coverage Report",
@@ -233,16 +466,18 @@ def build_markdown_report(report: Dict[str, object]) -> str:
         f"Generated: {report['generated_at']}",
         f"Days forward: {report['days_forward']}",
         f"Fail below coverage %: {report['fail_below_pct']}",
+        f"Provider evidence: {'enabled' if report.get('provider_evidence_enabled') else 'not supplied (strict database-only mode)'}",
         f"Status: {'PASS' if report['ok'] else 'FAIL'}",
         "",
-        "| League | Fixtures | Complete moneyline | Coverage % | Missing fixture IDs |",
-        "|---|---:|---:|---:|---|",
+        "| League | Fixtures | Complete moneyline | Coverage % | Effective % | Missing fixture IDs |",
+        "|---|---:|---:|---:|---:|---|",
     ]
     for league in report["leagues"]:
         missing_fixture_ids = ", ".join(str(value) for value in league["missing_fixture_ids"]) or "-"
         lines.append(
             f"| {league['league_id']} | {league['fixtures_in_window']} | "
             f"{league['fixtures_with_complete_moneyline']} | {league['coverage_pct']:.2f} | "
+            f"{float(league.get('effective_coverage_pct', league['coverage_pct'])):.2f} | "
             f"{missing_fixture_ids} |"
         )
     if report["failures"]:
@@ -254,6 +489,14 @@ def build_markdown_report(report: Dict[str, object]) -> str:
                 f"fixtures with complete moneyline "
                 f"({failure['coverage_pct']:.2f}%)."
             )
+    if report.get("provider_gaps"):
+        lines.extend(["", "## Accepted provider gaps", ""])
+        for gap in report["provider_gaps"]:
+            lines.append(f"- Fixture {gap['fixture_id']} in league {gap['league_id']}: {gap['reason']}.")
+    if report.get("unresolved"):
+        lines.extend(["", "## Unresolved evidence", ""])
+        for item in report["unresolved"]:
+            lines.append(f"- Fixture {item['fixture_id']} in league {item['league_id']}: {item['reason']}.")
     return "\n".join(lines) + "\n"
 
 
@@ -272,6 +515,17 @@ def main() -> None:
     )
     parser.add_argument("--out-json", default="")
     parser.add_argument("--out-md", default="")
+    parser.add_argument(
+        "--provider-report",
+        action="append",
+        default=[],
+        help="Fresh sync_odds JSON evidence report; may be supplied more than once.",
+    )
+    parser.add_argument(
+        "--provider-report-max-age-hours",
+        type=float,
+        default=float(os.environ.get("MONEYLINE_PROVIDER_REPORT_MAX_AGE_HOURS", "6")),
+    )
     args = parser.parse_args()
 
     db_url = get_db_url()
@@ -287,7 +541,45 @@ def main() -> None:
     finally:
         conn.close()
 
-    failures = evaluate_failures(leagues, args.fail_below_pct)
+    provider_evidence_enabled = bool(args.provider_report)
+    provider_evidence: Dict[int, Dict[str, object]] = {}
+    provider_evidence_errors: List[str] = []
+    provider_gaps: List[Dict[str, object]] = []
+    provider_pipeline_failures: List[Dict[str, object]] = []
+    unresolved: List[Dict[str, object]] = []
+    if provider_evidence_enabled:
+        provider_evidence, provider_evidence_errors = load_provider_evidence(
+            args.provider_report,
+            args.provider_report_max_age_hours,
+        )
+        (
+            failures,
+            provider_gaps,
+            provider_pipeline_failures,
+            unresolved,
+        ) = evaluate_provider_aware_failures(
+            leagues,
+            provider_evidence,
+            args.fail_below_pct,
+        )
+    else:
+        failures = evaluate_failures(leagues, args.fail_below_pct)
+
+    if provider_evidence_errors:
+        failures = list(failures)
+        failures.append(
+            {
+                "league_id": None,
+                "fixtures_in_window": 0,
+                "fixtures_with_complete_moneyline": 0,
+                "coverage_pct": 0,
+                "effective_coverage_pct": 0,
+                "missing_fixture_ids": [],
+                "provider_gap_fixture_ids": [],
+                "first_missing_starting_at": None,
+                "reason": "provider evidence errors",
+            }
+        )
     report = {
         "generated_at": utc_now_iso(),
         "days_forward": args.days_forward,
@@ -296,7 +588,15 @@ def main() -> None:
         "excluded_league_ids": excluded_league_ids,
         "leagues": leagues,
         "failures": failures,
-        "ok": len(failures) == 0,
+        "provider_evidence_enabled": provider_evidence_enabled,
+        "provider_report_paths": args.provider_report,
+        "provider_report_max_age_hours": args.provider_report_max_age_hours,
+        "provider_evidence_fixture_count": len(provider_evidence),
+        "provider_evidence_errors": provider_evidence_errors,
+        "provider_gaps": provider_gaps,
+        "provider_pipeline_failures": provider_pipeline_failures,
+        "unresolved": unresolved,
+        "ok": len(failures) == 0 and not provider_evidence_errors,
     }
 
     if args.out_json:

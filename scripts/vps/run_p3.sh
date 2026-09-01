@@ -25,6 +25,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/sync.py" \
   "config/odds_api_leagues.json" \
   "scripts/sync_odds.py" \
+  "scripts/validate_moneyline_coverage.py" \
   "scripts/export_odds_to_supabase_psql.py" \
   "scripts/odds_retention_psql.py" \
   "scripts/reconcile_recent_fixtures.py" \
@@ -157,6 +158,7 @@ python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
   --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
+  --provider-report "/tmp/odds_sync_report_p3.json" \
   --out-json "/tmp/moneyline_coverage_report_p3.json" \
   --out-md "/tmp/moneyline_coverage_report_p3.md"
 MONEYLINE_VALIDATION_STATUS=$?
@@ -200,6 +202,7 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
         --leagues "${ODDS_LEAGUES}" \
         --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
         --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
+        --provider-report "/tmp/odds_sync_report_p3_repair_${repair_attempt}.json" \
         --out-json "/tmp/moneyline_coverage_report_p3.json" \
         --out-md "/tmp/moneyline_coverage_report_p3.md"
       MONEYLINE_VALIDATION_STATUS=$?

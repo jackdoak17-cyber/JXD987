@@ -61,6 +61,7 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
             "config/fixture_core_contract.json",
             "scripts/fixture_core_contract.py",
             "scripts/vps/run_p3_fixture_core.sh",
+            "scripts/validate_moneyline_coverage.py",
         }.issubset(entries))
 
     def test_recorded_job_retries_a_transient_lock_handoff(self) -> None:

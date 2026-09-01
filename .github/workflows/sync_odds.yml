@@ -309,6 +309,7 @@ jobs:
             --leagues "${{ matrix.league_id }}" \
             --days-forward 7 \
             --fail-below-pct 100 \
+            --provider-report "/tmp/odds_sync_report_${{ matrix.league_id }}.json" \
             --out-json /tmp/moneyline_coverage_${{ matrix.league_id }}.json \
             --out-md /tmp/moneyline_coverage_${{ matrix.league_id }}.md
 

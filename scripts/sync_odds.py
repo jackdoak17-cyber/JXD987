@@ -65,6 +65,7 @@ MONEYLINE_MARKET_KEYS = {
     "1x2",
     "home_draw_away",
 }
+MONEYLINE_SIDES = ("home", "draw", "away")
 
 DEFAULT_MARKET_ALLOWLIST = {
     "moneyline",
@@ -308,6 +309,7 @@ class LeagueResult:
     events_returned: int = 0
     events_matched: int = 0
     unmatched_samples: List[Dict[str, object]] = field(default_factory=list)
+    moneyline_coverage: List[Dict[str, object]] = field(default_factory=list)
     raw_events: List[Dict[str, object]] = field(default_factory=list)
     raw_odds_payloads: Dict[int, object] = field(default_factory=dict)
     api_calls_by_endpoint: Dict[str, int] = field(default_factory=dict)
@@ -561,6 +563,52 @@ def parse_float(value: Optional[object]) -> Optional[float]:
             return None
 
 
+def inspect_upstream_moneyline(
+    bookmakers_payload: object,
+    requested_bookmaker_keys: Set[str],
+) -> Dict[str, List[str]]:
+    """Return usable moneyline sides by configured bookmaker.
+
+    This deliberately inspects the same market names and price bounds that
+    the writer accepts.  The result is compact evidence for downstream
+    validators; raw provider payloads remain an opt-in debug artifact.
+    """
+    if not isinstance(bookmakers_payload, dict):
+        return {}
+
+    sides_by_bookmaker: Dict[str, Set[str]] = {}
+    for raw_bookmaker, raw_markets in bookmakers_payload.items():
+        bookmaker_key = normalize_bookmaker_key(str(raw_bookmaker))
+        canonical_name = BOOKMAKER_CANONICAL.get(bookmaker_key)
+        if not canonical_name or bookmaker_key not in requested_bookmaker_keys:
+            continue
+        if not isinstance(raw_markets, list):
+            continue
+
+        available_sides = sides_by_bookmaker.setdefault(canonical_name, set())
+        for raw_market in raw_markets:
+            if not isinstance(raw_market, dict):
+                continue
+            if resolve_market_key(str(raw_market.get("name") or "")) != "moneyline":
+                continue
+            raw_odds = raw_market.get("odds")
+            if not isinstance(raw_odds, list):
+                continue
+            for raw_odd in raw_odds:
+                if not isinstance(raw_odd, dict):
+                    continue
+                for side in MONEYLINE_SIDES:
+                    price = parse_float(raw_odd.get(side))
+                    if price is not None and 1 < price <= 500:
+                        available_sides.add(side)
+
+    return {
+        bookmaker: [side for side in MONEYLINE_SIDES if side in sides]
+        for bookmaker, sides in sorted(sides_by_bookmaker.items())
+        if sides
+    }
+
+
 def extract_player_market_price(
     market_key: str,
     bookmaker_id: int,
@@ -737,6 +785,10 @@ def utc_now_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
 def sqlite_utc_timestamp(value: datetime) -> str:
     return value.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -897,6 +949,8 @@ def fetch_league_odds_payload(
         fetch_duration_seconds=0.0,
         error=None,
     )
+    event_candidates_by_fixture: Dict[int, List[Dict[str, object]]] = {}
+    odds_response_by_event_id: Dict[int, Dict[str, object]] = {}
 
     try:
         start_dt, end_dt = fixture_window_bounds(days_back, days_forward)
@@ -936,42 +990,70 @@ def fetch_league_odds_payload(
             event_id = event.get("id")
             if event_id is None:
                 continue
+            event_id = int(event_id)
+            event_candidates_by_fixture.setdefault(int(fixture["fixture_id"]), []).append(
+                {
+                    "event_id": event_id,
+                    "home": event.get("home"),
+                    "away": event.get("away"),
+                    "date": event.get("date"),
+                    "status": event.get("status"),
+                }
+            )
             event_status = str(event.get("status") or "").strip().lower()
             if event_status in SETTLED_EVENT_STATUSES:
                 if not bool(fixture.get("has_moneyline_odds")):
-                    historical_backfill.append((int(event_id), int(fixture["fixture_id"])))
+                    historical_backfill.append((event_id, int(fixture["fixture_id"])))
                 continue
-            event_to_fixture[int(event_id)] = int(fixture["fixture_id"])
+            event_to_fixture[event_id] = int(fixture["fixture_id"])
 
         result.events_matched = len(event_to_fixture) + len(historical_backfill)
         if event_to_fixture:
             event_ids = list(event_to_fixture.keys())
             if per_league_limit > 0:
                 event_ids = event_ids[:per_league_limit]
+            for event_id in event_ids:
+                odds_response_by_event_id[event_id] = {
+                    "requested": True,
+                    "received": False,
+                    "valid": None,
+                }
             batches = [event_ids[i : i + 10] for i in range(0, len(event_ids), 10)]
 
             for batch in batches:
-                odds_batch = client.request(
-                    "odds/multi",
-                    params={
-                        "eventIds": ",".join(str(event_id) for event_id in batch),
-                        "bookmakers": ",".join(bookmakers),
-                    },
-                )
+                try:
+                    odds_batch = client.request(
+                        "odds/multi",
+                        params={
+                            "eventIds": ",".join(str(event_id) for event_id in batch),
+                            "bookmakers": ",".join(bookmakers),
+                        },
+                    )
+                except Exception:
+                    for event_id in batch:
+                        odds_response_by_event_id[event_id]["valid"] = False
+                    raise
                 if not isinstance(odds_batch, list):
+                    for event_id in batch:
+                        odds_response_by_event_id[event_id]["valid"] = False
                     continue
+                for event_id in batch:
+                    odds_response_by_event_id[event_id]["valid"] = True
                 for odds_event in odds_batch:
                     event_id = odds_event.get("id")
                     if event_id is None:
                         continue
+                    event_id = int(event_id)
                     fixture_id = event_to_fixture.get(int(event_id))
                     if not fixture_id:
                         continue
+                    if event_id in odds_response_by_event_id:
+                        odds_response_by_event_id[event_id]["received"] = True
                     bookmakers_payload = odds_event.get("bookmakers") or {}
-                    result.raw_odds_payloads[int(event_id)] = bookmakers_payload
+                    result.raw_odds_payloads[event_id] = bookmakers_payload
                     result.odds_records.append(
                         {
-                            "event_id": int(event_id),
+                            "event_id": event_id,
                             "fixture_id": int(fixture_id),
                             "bookmakers_payload": bookmakers_payload,
                         }
@@ -982,26 +1064,109 @@ def fetch_league_odds_payload(
             if per_league_limit > 0:
                 historical_backfill = historical_backfill[:per_league_limit]
             for event_id, fixture_id in historical_backfill:
-                historical_payload = historical_client.request(
-                    "historical/odds",
-                    params={
-                        "eventId": str(event_id),
-                        "bookmakers": ",".join(bookmakers),
-                    },
-                )
+                odds_response_by_event_id[event_id] = {
+                    "requested": True,
+                    "received": False,
+                    "valid": None,
+                }
+                try:
+                    historical_payload = historical_client.request(
+                        "historical/odds",
+                        params={
+                            "eventId": str(event_id),
+                            "bookmakers": ",".join(bookmakers),
+                        },
+                    )
+                except Exception:
+                    odds_response_by_event_id[event_id]["valid"] = False
+                    raise
                 if not isinstance(historical_payload, dict):
+                    odds_response_by_event_id[event_id]["valid"] = False
                     continue
+                odds_response_by_event_id[event_id]["valid"] = True
+                odds_response_by_event_id[event_id]["received"] = True
                 bookmakers_payload = historical_payload.get("bookmakers") or {}
-                if not bookmakers_payload:
-                    continue
-                result.raw_odds_payloads[int(event_id)] = bookmakers_payload
-                result.odds_records.append(
+                result.raw_odds_payloads[event_id] = bookmakers_payload
+                if bookmakers_payload:
+                    result.odds_records.append(
+                        {
+                            "event_id": event_id,
+                            "fixture_id": int(fixture_id),
+                            "bookmakers_payload": bookmakers_payload,
+                        }
+                    )
+
+        for fixture in league_fixtures:
+            fixture_id = int(fixture["fixture_id"])
+            candidates = event_candidates_by_fixture.get(fixture_id, [])
+            if not candidates:
+                result.moneyline_coverage.append(
                     {
-                        "event_id": int(event_id),
-                        "fixture_id": int(fixture_id),
-                        "bookmakers_payload": bookmakers_payload,
+                        "fixture_id": fixture_id,
+                        "league_id": league_id,
+                        "odds_api_league": odds_league,
+                        "matching_status": "unmatched",
+                        "event_id": None,
+                        "event": None,
+                        "candidate_event_ids": [],
+                        "odds_response_status": "not_applicable",
+                        "supported_moneyline_bookmakers": [],
+                        "moneyline_sides_by_bookmaker": {},
                     }
                 )
+                continue
+
+            candidate_evidence: List[Dict[str, object]] = []
+            for candidate in candidates:
+                event_id = int(candidate["event_id"])
+                response = odds_response_by_event_id.get(event_id, {})
+                response_received = bool(response.get("received"))
+                response_valid = response.get("valid")
+                payload = result.raw_odds_payloads.get(event_id, {}) if response_received else {}
+                sides_by_bookmaker = inspect_upstream_moneyline(payload, {
+                    normalize_bookmaker_key(bookmaker) for bookmaker in bookmakers
+                })
+                candidate_evidence.append(
+                    {
+                        "event_id": event_id,
+                        "event": candidate,
+                        "odds_response_status": (
+                            "received"
+                            if response_received
+                            else "invalid"
+                            if response_valid is False
+                            else "missing"
+                            if response.get("requested")
+                            else "not_requested"
+                        ),
+                        "supported_moneyline_bookmakers": sorted(sides_by_bookmaker),
+                        "moneyline_sides_by_bookmaker": sides_by_bookmaker,
+                    }
+                )
+
+            selected = max(
+                candidate_evidence,
+                key=lambda item: (
+                    len(item["supported_moneyline_bookmakers"]),
+                    item["odds_response_status"] == "received",
+                    int(item["event_id"]),
+                ),
+            )
+            selected_event = dict(selected["event"])
+            result.moneyline_coverage.append(
+                {
+                    "fixture_id": fixture_id,
+                    "league_id": league_id,
+                    "odds_api_league": odds_league,
+                    "matching_status": "matched",
+                    "event_id": int(selected["event_id"]),
+                    "event": selected_event,
+                    "candidate_event_ids": [int(item["event_id"]) for item in candidate_evidence],
+                    "odds_response_status": selected["odds_response_status"],
+                    "supported_moneyline_bookmakers": selected["supported_moneyline_bookmakers"],
+                    "moneyline_sides_by_bookmaker": selected["moneyline_sides_by_bookmaker"],
+                }
+            )
     except Exception as exc:
         result.error = exc
     finally:
@@ -2332,12 +2497,14 @@ def main() -> None:
         log.info("No fixtures found for odds window")
         if args.report_out:
             report = {
+                "generated_at": utc_now_iso(),
                 "league_ids": league_ids,
                 "priority": args.priority,
                 "refresh_only": args.refresh_only,
                 "fixtures_in_scope": 0,
                 "events_matched": 0,
                 "outcomes_written": 0,
+                "moneyline_coverage": [],
                 "errors": [],
             }
             Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -2382,6 +2549,7 @@ def main() -> None:
         log.info("Refresh-only mode complete; skipping odds fetch/write stage.")
         if args.report_out:
             report = {
+                "generated_at": utc_now_iso(),
                 "league_ids": league_ids,
                 "priority": args.priority,
                 "refresh_only": True,
@@ -2392,6 +2560,7 @@ def main() -> None:
                 "teams_sidelined_refreshed": len(sidelined_refreshed_team_ids),
                 "events_matched": 0,
                 "outcomes_written": 0,
+                "moneyline_coverage": [],
                 "errors": [],
             }
             Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -2407,6 +2576,7 @@ def main() -> None:
     bookmaker_names_saved: set[str] = set()
     bookmaker_names_unknown: set[str] = set()
     league_stats: Dict[int, Dict[str, int]] = {}
+    moneyline_coverage: List[Dict[str, object]] = []
     fetch_errors: List[str] = []
 
     fixtures_by_id: Dict[int, Dict[str, object]] = {int(fixture["fixture_id"]): fixture for fixture in fixtures}
@@ -2498,8 +2668,10 @@ def main() -> None:
             "fixtures_in_window": result.fixtures_fetched,
             "events_returned": result.events_returned,
             "events_matched": result.events_matched,
+            "moneyline_evidence": len(result.moneyline_coverage),
         }
         events_matched_total += result.events_matched
+        moneyline_coverage.extend(result.moneyline_coverage)
         api_calls_total += result.api_calls_made
         api_time_seconds += result.api_time_seconds
         rate_limit_hits += result.rate_limit_hits
@@ -2607,6 +2779,7 @@ def main() -> None:
 
     if args.report_out:
         report = {
+            "generated_at": utc_now_iso(),
             "league_ids": league_ids,
             "bookmakers": bookmakers,
             "bookmakers_requested": bookmakers,
@@ -2628,6 +2801,7 @@ def main() -> None:
             "configured_rate_limit_per_hour": configured_rate_limit or None,
             "events_matched": events_matched_total,
             "events_unmatched_samples": events_unmatched_samples,
+            "moneyline_coverage": moneyline_coverage,
             "league_stats": league_stats,
             "outcomes_written": outcomes_total,
             "api_calls_total": api_calls_total,
