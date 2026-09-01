@@ -9,6 +9,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
   "config/odds_api_leagues.json" \
   "config/odds_api_sync_excluded_leagues.json" \
+  "config/odds_api_bookmakers.json" \
   "jxd/__init__.py" \
   "jxd/db.py" \
   "jxd/models.py" \
@@ -23,7 +24,7 @@ export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_leag
 validate_supported_leagues "${STATS_LEAGUES}"
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
-export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
+export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-$(odds_bookmaker_csv)}"
 export LINEUP_SYNC_HOURS_BACK="${LINEUP_SYNC_HOURS_BACK:-2}"
 export LINEUP_SYNC_HOURS_FORWARD="${LINEUP_SYNC_HOURS_FORWARD:-3}"
 export LINEUP_SYNC_LIMIT="${LINEUP_SYNC_LIMIT:-40}"

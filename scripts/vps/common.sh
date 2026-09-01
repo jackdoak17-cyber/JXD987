@@ -195,6 +195,22 @@ print(",".join(str(league_id) for league_id in configured_ids if league_id in od
 PY
 }
 
+odds_bookmaker_csv() {
+  python3 - "${REPO_ROOT}/config/odds_api_bookmakers.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+raw = json.loads(path.read_text(encoding="utf-8"))
+items = raw.get("bookmakers") if isinstance(raw, dict) and raw.get("schemaVersion") == 1 else None
+names = [item.get("name", "").strip() for item in items] if isinstance(items, list) else []
+if not names or any(not name for name in names):
+    raise SystemExit(f"Invalid bookmaker configuration in {path}")
+print(",".join(names))
+PY
+}
+
 pipeline_job_status_name() {
   local status="$1"
   case "${status}" in

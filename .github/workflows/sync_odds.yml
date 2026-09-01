@@ -89,7 +89,7 @@ jobs:
       # Keep this list within the bookmaker selection allowed by the active
       # Odds API account. A disallowed name makes /odds/multi return 403 and
       # prevents every league shard from restoring odds.
-      ODDS_BOOKMAKERS: "Unibet,BetMGM,Betfair Exchange,Paddy Power,Bet365"
+      ODDS_BOOKMAKERS: "Bet365,Paddy Power,Unibet,BetMGM"
       ODDS_API_RETRIES: ${{ vars.ODDS_API_RETRIES || '3' }}
       ODDS_API_SLEEP_BASE: ${{ vars.ODDS_API_SLEEP_BASE || '1' }}
       ODDS_API_SLEEP_MAX: ${{ vars.ODDS_API_SLEEP_MAX || '10' }}

@@ -3,6 +3,8 @@ config/league_ids.txt
 config/odds_api_leagues.json
 # Keep the default VPS odds list aligned with the no-cup-consumption policy.
 config/odds_api_sync_excluded_leagues.json
+# Keep the user-facing bookmaker set aligned with the odds API producer defaults.
+config/odds_api_bookmakers.json
 jxd/__init__.py
 jxd/db.py
 jxd/models.py

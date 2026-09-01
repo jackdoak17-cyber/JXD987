@@ -44,6 +44,19 @@ def load_excluded_league_ids(repo_root: Path) -> set[int]:
     return {int(value) for value in raw}
 
 
+def load_default_bookmakers(repo_root: Path) -> str:
+    path = repo_root / "config" / "odds_api_bookmakers.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Unable to load bookmaker configuration from {path}: {exc}") from exc
+    items = raw.get("bookmakers") if isinstance(raw, dict) and raw.get("schemaVersion") == 1 else None
+    names = [item.get("name", "").strip() for item in items] if isinstance(items, list) else []
+    if not names or any(not name for name in names):
+        raise SystemExit(f"Invalid bookmaker configuration in {path}")
+    return ",".join(names)
+
+
 def load_odds_league_ids(repo_root: Path, include_excluded: bool = False) -> list[int]:
     config_ids = load_league_ids(repo_root / "config" / "league_ids.txt")
     odds_map_path = repo_root / "config" / "odds_api_leagues.json"
@@ -89,6 +102,7 @@ def load_fixture_league_ids(db_path: Path, start_dt: str, end_dt: str) -> list[i
 
 
 def main() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser()
     parser.add_argument("--days-forward", type=int, default=14)
     parser.add_argument("--limit", type=int, default=0)
@@ -99,12 +113,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--bookmakers",
-        default=os.environ.get("ODDS_BOOKMAKERS", "Bet365,Paddy Power"),
+        default=os.environ.get("ODDS_BOOKMAKERS", load_default_bookmakers(repo_root)),
         help="Comma-separated bookmaker names",
     )
     args = parser.parse_args()
 
-    repo_root = Path(__file__).resolve().parent.parent
     db_path = Path(os.environ.get("JXD_DB_PATH", str(repo_root / "data" / "jxd.sqlite")))
     start_dt, end_dt = window_bounds(args.days_forward)
 

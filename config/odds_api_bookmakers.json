@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "bookmakers": [
+    { "id": 2, "name": "Bet365" },
+    { "id": 4, "name": "Paddy Power" },
+    { "id": 5, "name": "Unibet" },
+    { "id": 8, "name": "BetMGM" }
+  ]
+}

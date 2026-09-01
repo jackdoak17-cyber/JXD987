@@ -3,7 +3,13 @@ from __future__ import annotations
 import unittest
 from datetime import datetime
 
-from scripts.sync_odds import canonicalize_bookmakers, match_event_to_fixture, team_aliases
+from scripts.sync_odds import (
+    DEFAULT_BOOKMAKERS,
+    canonicalize_bookmakers,
+    load_default_bookmakers,
+    match_event_to_fixture,
+    team_aliases,
+)
 
 
 def build_fixture(
@@ -31,6 +37,10 @@ def build_event(home_name: str, away_name: str, date_iso: str) -> dict[str, obje
 
 
 class MatchEventToFixtureRegressionTests(unittest.TestCase):
+    def test_default_bookmakers_match_the_user_facing_contract(self) -> None:
+        self.assertEqual(DEFAULT_BOOKMAKERS, ["Bet365", "Paddy Power", "Unibet", "BetMGM"])
+        self.assertEqual(load_default_bookmakers(), DEFAULT_BOOKMAKERS)
+
     def test_accepts_all_supported_odds_bookmakers(self) -> None:
         bookmakers, unknown = canonicalize_bookmakers(
             ["Unibet", "BetMGM", "Betfair Exchange", "Paddy Power", "Bet365"]

@@ -80,5 +80,7 @@ alter table public.fixture_players
 ## SportMonks best-practice mapping
 - Uses `filters=populate` automatically for bulk endpoints without includes (per docs: raises page size to 1000).
 - Keeps includes on heavy endpoints (`statistics`, `lineups`) only when needed.
-- Odds fetcher supports per-bookmaker filtering (Bet365 default).
+- Odds fetcher supports per-bookmaker filtering. The default set is defined in
+  `config/odds_api_bookmakers.json` and is shared by the VPS wrappers and direct
+  sync entrypoints; set `ODDS_BOOKMAKERS` only for an intentional scoped run.
 - League defaults mirror your old repo (`LEAGUE_IDS` in `.env`), but CLI flags can narrow scope to save requests.

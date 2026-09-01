@@ -9,6 +9,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
   "config/odds_api_leagues.json" \
   "config/odds_api_sync_excluded_leagues.json" \
+  "config/odds_api_bookmakers.json" \
   "jxd/__init__.py" \
   "jxd/db.py" \
   "jxd/models.py" \
@@ -20,7 +21,7 @@ require_runtime_manifest_entries_or_exit "$0" \
 export REPO_ROOT
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
-export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
+export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-$(odds_bookmaker_csv)}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail

@@ -1,6 +1,7 @@
 8f5d9ca4a43667270cf27425ee8c02913dfd1001  config/league_ids.txt
 006372202c8c4fcba511ea89bb7a2bd4b3e239fe  config/odds_api_leagues.json
 800c62aeddd783f713e46b5daec8d8e4fb29b4df  config/odds_api_sync_excluded_leagues.json
+17792425bcd728baefce2797a95d0837f3a27dad  config/odds_api_bookmakers.json
 3fa4b803b0a2f65652e072debf1f1f11a20b8474  jxd/__init__.py
 0b571aa2f38df706c16a9a515e526a040e48f7a2  jxd/db.py
 fe1a70408f58e99c4f41584f0b91c0cf492c8286  jxd/models.py
@@ -19,11 +20,11 @@ ba0ef5bf362e46d8deececa8c38aa7546c924666  scripts/reconcile_stats_provider_queue
 b7ae861e9d9d3d6009d562da213ad892440f29cb  scripts/reconcile_recent_fixtures.py
 a1b2e580c78cc5cbc26705c9144fd6b4d2d2b05b  scripts/rest_preflight.py
 6795b7075659a7b45b2a7354e65a1f3f441d874f  scripts/sync_confirmed_lineups.py
-5bde783e0c0d5727169768012dd8d74ff8522b00  scripts/sync_odds.py
-67dee692f57416ddc5fbd8e30916a58124357230  scripts/vps/common.sh
-aaf31d37d04da10279a562a2acfda4a74c387fc5  scripts/vps/run_p1.sh
-7e1353a52f73ddfa38b222eead01753c891fcd01  scripts/vps/run_p2.sh
-19132cf97a64cf9e4089f56a6e6c2c633b7ef0db  scripts/vps/run_p3.sh
+3270ce0c7dd482ebedc870206ebd6fc737cd52a1  scripts/sync_odds.py
+539a56221e3cc67f8c74968c9af0609bd75318d9  scripts/vps/common.sh
+384370f27f158deb0c88c2f9b017ab6c5847658a  scripts/vps/run_p1.sh
+71cdea58c1b8dfa15ce9bad163e87651db89364a  scripts/vps/run_p2.sh
+d512d822549528064cdafa3a31685aa80e8a07cf  scripts/vps/run_p3.sh
 5b05d742a7a43ef570739e765781af1c7df69c2d  scripts/vps/run_postmatch_settlement.sh
 c1e2db2eb593edf8e11a2a8a62b7a149d4b3b59c  scripts/vps/run_models.sh
-68f0ba013c6d96af3622a6320e7270e4419fa2fd  scripts/vps/run_sync.sh
+a168c7da2d85cfe095b8d2ffe8f5b166bc10478d  scripts/vps/run_sync.sh

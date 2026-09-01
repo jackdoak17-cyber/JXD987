@@ -34,7 +34,6 @@ from jxd.odds_api_client import OddsApiClient, OddsApiError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
-DEFAULT_BOOKMAKERS = ["Bet365", "Paddy Power", "Unibet", "BetMGM", "Betfair Exchange"]
 BOOKMAKER_NAME_TO_ID = {
     "bet365": 2,
     "kambi": 3,
@@ -466,6 +465,48 @@ def normalize_bookmaker_key(value: str) -> str:
     if "betfair" in raw and "exchange" in raw:
         return "betfairexchange"
     return raw
+
+
+def load_default_bookmakers() -> List[str]:
+    """Load the bookmaker set supported by the user-facing odds contract."""
+    config_path = Path(__file__).resolve().parent.parent / "config" / "odds_api_bookmakers.json"
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Unable to load bookmaker configuration from {config_path}: {exc}") from exc
+
+    if not isinstance(raw, dict) or raw.get("schemaVersion") != 1:
+        raise SystemExit(f"Invalid bookmaker configuration schema in {config_path}")
+    items = raw.get("bookmakers")
+    if not isinstance(items, list) or not items:
+        raise SystemExit(f"Bookmaker configuration must contain a non-empty bookmakers list: {config_path}")
+
+    names: List[str] = []
+    seen_ids: Set[int] = set()
+    seen_names: Set[str] = set()
+    known_names = set(BOOKMAKER_CANONICAL.values())
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), int) or not isinstance(item.get("name"), str):
+            raise SystemExit(f"Invalid bookmaker entry in {config_path}: {item!r}")
+        bookmaker_id = int(item["id"])
+        name = item["name"].strip()
+        key = normalize_bookmaker_key(name)
+        if not name or name not in known_names or key not in BOOKMAKER_NAME_TO_ID:
+            raise SystemExit(f"Unsupported bookmaker in {config_path}: {name!r}")
+        if bookmaker_id != BOOKMAKER_NAME_TO_ID[key]:
+            raise SystemExit(
+                f"Bookmaker id mismatch in {config_path}: {name!r} has id {bookmaker_id}, "
+                f"expected {BOOKMAKER_NAME_TO_ID[key]}"
+            )
+        if bookmaker_id in seen_ids or name in seen_names:
+            raise SystemExit(f"Duplicate bookmaker in {config_path}: {name!r}")
+        seen_ids.add(bookmaker_id)
+        seen_names.add(name)
+        names.append(name)
+    return names
+
+
+DEFAULT_BOOKMAKERS = load_default_bookmakers()
 
 
 def canonicalize_bookmakers(raw_items: Iterable[str]) -> Tuple[List[str], List[str]]:
