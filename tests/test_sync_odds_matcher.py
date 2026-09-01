@@ -137,6 +137,41 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         self.assertIsNotNone(matched)
         self.assertEqual(matched["fixture_id"], 19746638)
 
+    def test_does_not_match_unrelated_teams_sharing_the_al_prefix(self) -> None:
+        event = build_event(
+            "Al-Fayha FC",
+            "Al-Kholood",
+            "2026-04-17T15:55:00Z",
+        )
+        fixture = build_fixture(
+            19467901,
+            "Al Draih",
+            "Al-Qadsiah",
+            datetime(2026, 4, 17, 15, 55, 0),
+        )
+
+        matched = match_event_to_fixture(event, [fixture])
+
+        self.assertIsNone(matched)
+
+    def test_matches_exact_teams_that_use_the_al_prefix(self) -> None:
+        event = build_event(
+            "Al Draih",
+            "Al-Qadsiah",
+            "2026-04-17T15:55:00Z",
+        )
+        fixture = build_fixture(
+            19467902,
+            "Al Draih",
+            "Al-Qadsiah",
+            datetime(2026, 4, 17, 15, 55, 0),
+        )
+
+        matched = match_event_to_fixture(event, [fixture])
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["fixture_id"], 19467902)
+
     def test_matches_provider_renamed_saudi_club(self) -> None:
         event = build_event(
             "Diriyah Club",

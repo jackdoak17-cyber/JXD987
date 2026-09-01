@@ -202,6 +202,9 @@ TEAM_TOKEN_DROP = {
 
 # Generic suffix/prefix tokens that should not be treated as strong standalone team matches.
 TEAM_VARIANT_NOISE = {
+    # Arabic club names commonly share this article. It is not a team
+    # identity and must never be used as a standalone alias.
+    "al",
     "city",
     "united",
     "town",
