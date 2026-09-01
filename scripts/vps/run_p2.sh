@@ -66,5 +66,9 @@ CHAIN
 )
 
 status=0
-run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+run_recorded_pipeline_job \
+  "run_p2" \
+  "P2 reconciliation" \
+  "${CHAIN_COMMAND}" \
+  "/tmp/odds_sync_report_p2.json" || status=$?
 finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_P2:-${HEALTHCHECK_PING_URL:-}}"

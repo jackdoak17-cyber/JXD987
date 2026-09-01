@@ -27,8 +27,8 @@ a1b2e580c78cc5cbc26705c9144fd6b4d2d2b05b  scripts/rest_preflight.py
 0b7300c7466cf6ed998eef3eabfa86f8ef632d9d  scripts/validate_moneyline_coverage.py
 fa3c102f14664a9d38ac677ea5a967183e58dd8f  scripts/fixture_core_contract.py
 6aaea401d027602d1f57846adb8153c4473fdc5c  scripts/vps/common.sh
-384370f27f158deb0c88c2f9b017ab6c5847658a  scripts/vps/run_p1.sh
-71cdea58c1b8dfa15ce9bad163e87651db89364a  scripts/vps/run_p2.sh
+d60f50bae478b6ae17acf34cdc77c62a9b1e6bc3  scripts/vps/run_p1.sh
+213c46309474068e174bdd18e5bede2088661f29  scripts/vps/run_p2.sh
 30d57c2a93d2970aba8a9eac06f35ea376cb1c09  scripts/vps/run_p3.sh
 e79624ed0199fba5afd712ba60066716ccc7912e  scripts/vps/run_p3_fixture_core.sh
 2f863d9af42b3f692ee6f82ff020bac7058fad9e  scripts/vps/run_postmatch_settlement.sh

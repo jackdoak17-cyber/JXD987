@@ -47,5 +47,9 @@ CHAIN
 )
 
 status=0
-run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+run_recorded_pipeline_job \
+  "run_p1" \
+  "P1 odds fetch" \
+  "${CHAIN_COMMAND}" \
+  "/tmp/odds_sync_report_p1.json" || status=$?
 finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_P1:-${HEALTHCHECK_PING_URL:-}}"
