@@ -22,6 +22,13 @@ export REPO_ROOT
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-$(odds_bookmaker_csv)}"
+# A cron tick is a scheduling opportunity, not proof that the shared writer
+# lock was available.  Retry the bounded, idempotent P1 chain across a
+# settlement handoff so a long detail delivery cannot starve odds ingestion.
+# The retry budget is finite: a persistent lock or repeated lease handoff is
+# still recorded as skipped and remains visible to Operations.
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-${ODDS_SYNC_P1_LOCK_RETRY_ATTEMPTS:-60}}"
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-${ODDS_SYNC_P1_LOCK_RETRY_DELAY_SECONDS:-15}}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail

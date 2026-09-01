@@ -65,7 +65,7 @@ Lock/timeout behavior:
   `ODDS_SYNC_LOCK_FILE`, including odds ingestion, settlement, models, and
   stats reconciliation. Historical reconciliation runs one bounded batch at a
   time so live settlement can acquire the lock between batches.
-- Normal writers honor a three-minute pre-tick/two-minute post-tick settlement reservation and skip before taking the lock
+- Normal writers honor a three-minute pre-tick/two-minute post-tick settlement reservation. P1/P2 use a finite, lock-handoff retry budget so a scheduled tick queues across a long settlement writer instead of losing the lane; the final timeout/skip is still recorded in the Operations heartbeat.
 - Settlement has priority and waits up to `SETTLEMENT_LOCK_WAIT_SECONDS` (default 300s) for an already-running writer, so one transient lock owner cannot silently lose a stats tick
 - `timeout` enforces kill-on-overrun
 - **The full chain is wrapped as one subshell command**, so timeout covers every step (not only the first command)
@@ -177,10 +177,13 @@ Example (`ODDS_SYNC_P3_MAX_DURATION_SECONDS=600`):
 - P1/P2 heartbeat timeout: 720s
 - P3 heartbeat timeout: 660s
 
-## 7) P1 SLO note (expected behavior)
-P1 is best-effort every 2 minutes, but can skip while P3 holds the lock.
-- Typical off-peak gap: ~2 minutes
-- Worst-case gap: approximately `ODDS_SYNC_P3_MAX_DURATION_SECONDS`
+## 7) P1/P2 SLO note (expected behavior)
+P1/P2 cron entries are bounded queue triggers. Their wrappers retry lock handoffs
+for a finite budget (60 attempts at 15 seconds by default), while the canonical
+lock still gives settlement priority and caps a normal writer before the next
+settlement grace window. A persistent lock, provider outage, or repeated lease
+handoff ends as an observable `skipped`/failure heartbeat; it is never converted
+to success.
 
 ## 8) Cutover checklist (strict order)
 1. Setup VPS dependencies and repo

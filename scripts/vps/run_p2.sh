@@ -28,6 +28,12 @@ export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-$(odds_bookmaker_csv)}"
 export LINEUP_SYNC_HOURS_BACK="${LINEUP_SYNC_HOURS_BACK:-2}"
 export LINEUP_SYNC_HOURS_FORWARD="${LINEUP_SYNC_HOURS_FORWARD:-3}"
 export LINEUP_SYNC_LIMIT="${LINEUP_SYNC_LIMIT:-40}"
+# Treat the cron tick as a bounded queue trigger.  P2 must wait through an
+# active settlement writer and retry at the next live-safe handoff rather than
+# silently losing its only two-hour opportunity.  A finite budget preserves
+# observability when the lock or provider remains unhealthy.
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-${ODDS_SYNC_P2_LOCK_RETRY_ATTEMPTS:-60}}"
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-${ODDS_SYNC_P2_LOCK_RETRY_DELAY_SECONDS:-15}}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail

@@ -70,6 +70,14 @@ class FixtureSettlementContractTests(unittest.TestCase):
             self.assertIn(f'"{job_id}"', source)
             self.assertIn(f'"{job_name}"', source)
 
+    def test_odds_wrappers_retry_lock_handoffs_with_a_finite_budget(self) -> None:
+        for wrapper_name, lane in (("run_p1.sh", "P1"), ("run_p2.sh", "P2")):
+            source = (ROOT / "scripts/vps" / wrapper_name).read_text(encoding="utf-8")
+            self.assertIn('ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-', source)
+            self.assertIn(f"ODDS_SYNC_{lane}_LOCK_RETRY_ATTEMPTS", source)
+            self.assertIn('ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-', source)
+            self.assertIn(f"ODDS_SYNC_{lane}_LOCK_RETRY_DELAY_SECONDS", source)
+
     def test_settlement_delivery_refresh_preserves_the_rolling_horizon(self) -> None:
         wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
         source = wrapper.read_text(encoding="utf-8")
