@@ -115,6 +115,16 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('timeout --signal=TERM --kill-after=5s "${effective_runtime}"', source)
         self.assertIn("normal-writer lease ended for settlement handoff", source)
 
+    def test_experimental_model_lane_uses_a_separate_bounded_lock(self) -> None:
+        common = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")
+        models = (ROOT / "scripts/vps/run_models.sh").read_text(encoding="utf-8")
+        self.assertIn("run_with_dedicated_lock_and_timeout", common)
+        self.assertIn("/var/lock/models-experimental.lock", common)
+        self.assertIn("experimental model process exceeded", common)
+        self.assertIn("MODELS_EXPERIMENTAL_LOCK_FILE", models)
+        self.assertIn("run_with_dedicated_lock_and_timeout", models)
+        self.assertIn("experimental-only output uses a dedicated private-ledger lock", models)
+
     def test_stats_reconciliation_cron_installer_is_shell_valid_and_idempotent(self) -> None:
         installer = ROOT / "scripts/vps/install_stats_reconciliation_cron.sh"
         result = subprocess.run(["bash", "-n", str(installer)], capture_output=True, text=True)

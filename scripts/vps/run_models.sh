@@ -10,8 +10,9 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/vps/run_models.sh"
 
 # This wrapper publishes betting picks into Supabase (and optionally R2) by running the
-# publisher inside the Models repo. It intentionally shares the same global lock as the
-# odds sync pipeline, so it never overlaps with P3 ingestion.
+# publisher inside the Models repo. The public feed uses the global odds-sync lock;
+# experimental-only output uses a dedicated private-ledger lock so model scoring
+# cannot starve production odds/settlement writers.
 #
 # Expected VPS layout (defaults):
 # - JXD987 repo:  /opt/odds-sync/JXD987
@@ -40,6 +41,7 @@ export MODELS_SKIP_PLAYER_AI="${MODELS_SKIP_PLAYER_AI:-false}"
 export MODELS_SKIP_TEAM_AI="${MODELS_SKIP_TEAM_AI:-false}"
 export MODELS_PUBLISH_R2="${MODELS_PUBLISH_R2:-true}"
 export MODELS_EXPERIMENTAL_ONLY="${MODELS_EXPERIMENTAL_ONLY:-false}"
+export MODELS_EXPERIMENTAL_LOCK_FILE="${MODELS_EXPERIMENTAL_LOCK_FILE:-/var/lock/models-experimental.lock}"
 
 # Reuse the global lock helper, but allow a separate timeout for model publishing.
 export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${MODELS_MAX_DURATION_SECONDS:-900}"
@@ -118,7 +120,14 @@ CHAIN
 status=0
 RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RUN_STARTED_EPOCH="$(date -u +"%s")"
-run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+if [[ "${MODELS_EXPERIMENTAL_ONLY}" == "true" || "${MODELS_EXPERIMENTAL_ONLY}" == "1" ]]; then
+  run_with_dedicated_lock_and_timeout \
+    "${CHAIN_COMMAND}" \
+    "${MODELS_EXPERIMENTAL_LOCK_FILE}" \
+    "${MODELS_MAX_DURATION_SECONDS:-900}" || status=$?
+else
+  run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+fi
 RUN_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RUN_FINISHED_EPOCH="$(date -u +"%s")"
 record_pipeline_job_run \

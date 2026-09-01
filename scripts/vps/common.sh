@@ -469,6 +469,42 @@ run_with_global_lock_and_timeout() {
   ) 9>"${lock_file}"
 }
 
+# Experimental model generation writes only the private research ledger. It
+# must not occupy the production odds/settlement lock while CPU-heavy feature
+# generation and model scoring run. A separate bounded lock still prevents a
+# model publisher and the experimental settlement worker from mutating the
+# private ledger concurrently.
+run_with_dedicated_lock_and_timeout() {
+  local chain_command="$1"
+  local lock_file="${2:-/var/lock/models-experimental.lock}"
+  local max_runtime="${3:-${MODELS_MAX_DURATION_SECONDS:-900}}"
+
+  if [[ ! "${max_runtime}" =~ ^[1-9][0-9]*$ ]]; then
+    log_error "dedicated model lock timeout must be a positive integer"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "${lock_file}")"
+  (
+    if ! flock --nonblock 9; then
+      log_info "[SKIPPED] dedicated model lock unavailable, will retry next tick"
+      exit 2
+    fi
+
+    local status=0
+    timeout --signal=TERM --kill-after=5s "${max_runtime}" bash -lc "${chain_command}" || status=$?
+    if [[ "${status}" -eq 124 || "${status}" -eq 137 ]]; then
+      log_error "experimental model process exceeded ${max_runtime}s bound"
+      exit 1
+    fi
+    if [[ "${status}" -eq 2 ]]; then
+      log_error "experimental model process exited with usage/status code 2"
+      exit 1
+    fi
+    exit "${status}"
+  ) 9>"${lock_file}"
+}
+
 finalize_with_healthcheck() {
   local status="$1"
   local ping_url="${2:-}"
