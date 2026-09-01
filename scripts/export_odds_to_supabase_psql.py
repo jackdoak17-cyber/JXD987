@@ -693,11 +693,9 @@ select
 from src
 on conflict (
   fixture_id,
-  market_key,
   bookmaker_id,
-  (coalesce(participant_type, '')),
-  (coalesce(participant_id, -1)),
-  (coalesce(selection_key, '')),
+  market_key,
+  selection_key,
   (coalesce(line, -9999))
 ) do update set
   price_decimal = excluded.price_decimal,
@@ -733,11 +731,9 @@ upserted as (
   from src
   on conflict (
     fixture_id,
-    market_key,
     bookmaker_id,
-    (coalesce(participant_type, '')),
-    (coalesce(participant_id, -1)),
-    (coalesce(selection_key, '')),
+    market_key,
+    selection_key,
     (coalesce(line, -9999))
   ) do update set
     price_decimal = excluded.price_decimal,
