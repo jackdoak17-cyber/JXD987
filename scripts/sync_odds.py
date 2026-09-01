@@ -2410,6 +2410,25 @@ def parse_player_market_rows(
     return rows
 
 
+def refresh_settled_history_fixtures(
+    session,
+    league_ids: List[int],
+    window_start: datetime,
+    window_end: datetime,
+) -> int:
+    """Hydrate the exact UTC calendar-history fixture scope before odds fetch."""
+    client = SportMonksClient()
+    service = SyncService(client, session)
+    service.ensure_schema()
+    history_end_date = (window_end - timedelta(microseconds=1)).date()
+    return service.sync_fixtures_between(
+        window_start.date(),
+        history_end_date,
+        league_ids=league_ids,
+        includes=["participants", "scores", "state"],
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
@@ -2440,6 +2459,11 @@ def main() -> None:
         "--refresh-upcoming",
         action="store_true",
         help="Refresh upcoming fixtures from SportMonks before fetching odds.",
+    )
+    parser.add_argument(
+        "--refresh-history",
+        action="store_true",
+        help="Refresh the exact settled-history calendar window from SportMonks before fetching historical odds.",
     )
     parser.add_argument(
         "--refresh-squads",
@@ -2533,9 +2557,12 @@ def main() -> None:
     Base.metadata.create_all(engine)
 
     refresh_upcoming = bool(args.refresh_upcoming)
+    refresh_history = bool(args.refresh_history)
     refresh_squads = bool(args.refresh_squads)
     refresh_squads_missing = bool(args.refresh_squads_missing)
     refresh_sidelined_window = bool(args.refresh_sidelined_window)
+    if refresh_history and not calendar_history:
+        raise SystemExit("--refresh-history requires --priority settled-history")
     if args.priority:
         if refresh_upcoming or refresh_squads or refresh_squads_missing or refresh_sidelined_window:
             log.info("Priority mode %s active: skipping SportMonks refresh steps.", args.priority)
@@ -2545,13 +2572,25 @@ def main() -> None:
         refresh_sidelined_window = False
 
     svc: Optional[SyncService] = None
-    if refresh_upcoming or refresh_squads or refresh_squads_missing or refresh_sidelined_window:
+    if refresh_history or refresh_upcoming or refresh_squads or refresh_squads_missing or refresh_sidelined_window:
         if not os.environ.get("SPORTMONKS_API_TOKEN"):
+            if refresh_history:
+                raise SystemExit(
+                    "--refresh-history requires SPORTMONKS_API_TOKEN so the settled-history fixture scope cannot be stale"
+                )
             log.warning("SPORTMONKS_API_TOKEN missing; skipping SportMonks refresh steps.")
         else:
             client_sm = SportMonksClient()
             svc = SyncService(client_sm, session)
             svc.ensure_schema()
+            if refresh_history:
+                history_end_date = (window_end - timedelta(microseconds=1)).date()
+                log.info(
+                    "Refreshing settled-history fixtures from SportMonks: %s through %s",
+                    window_start.date(),
+                    history_end_date,
+                )
+                refresh_settled_history_fixtures(session, league_ids, window_start, window_end)
             if refresh_upcoming:
                 log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
                 svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)

@@ -14,6 +14,7 @@ from scripts.sync_odds import (
     load_fixture_moneyline_completeness,
     load_default_bookmakers,
     match_event_to_fixture,
+    refresh_settled_history_fixtures,
     team_aliases,
 )
 
@@ -56,6 +57,27 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         self.assertEqual(end.second, 0)
         self.assertEqual((end - start).days, 2)
         self.assertEqual(end.date(), datetime.now(timezone.utc).date())
+
+    @patch("scripts.sync_odds.SyncService")
+    @patch("scripts.sync_odds.SportMonksClient")
+    def test_settled_history_refresh_hydrates_exact_calendar_dates(self, client_type, service_type) -> None:
+        service = service_type.return_value
+
+        refreshed = refresh_settled_history_fixtures(
+            MagicMock(),
+            [8, 384],
+            datetime(2026, 8, 30, 0, 0),
+            datetime(2026, 9, 1, 0, 0),
+        )
+
+        self.assertEqual(refreshed, service.sync_fixtures_between.return_value)
+        service.ensure_schema.assert_called_once_with()
+        service.sync_fixtures_between.assert_called_once_with(
+            datetime(2026, 8, 30).date(),
+            datetime(2026, 8, 31).date(),
+            league_ids=[8, 384],
+            includes=["participants", "scores", "state"],
+        )
 
     def test_historical_fetch_is_required_until_all_moneyline_sides_exist(self) -> None:
         session = MagicMock()

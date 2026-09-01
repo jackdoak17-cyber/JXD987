@@ -125,6 +125,7 @@ python scripts/sync_odds.py \
   --days-back "${SETTLED_HISTORY_DAYS}" \
   --days-forward 0 \
   --priority settled-history \
+  --refresh-history \
   --bookmakers "${ODDS_BOOKMAKERS}" \
   --report-out "/tmp/odds_sync_report_history_p3.json" \
   --unmatched-out "/tmp/unmatched_players_history_p3.json"
