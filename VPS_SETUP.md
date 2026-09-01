@@ -149,7 +149,7 @@ Only use this after Supabase has enough IO/CPU headroom and the hot tables have 
 ```cron
 */2 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
 */5 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
-*/20 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
+*/20 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_odds_p3.sh >> /var/log/odds-sync-p3.log 2>&1
 
 # Betting picks publish (Models -> Supabase, optional R2 fallback).
 # Shares the same global lock as P3 and will skip while ingestion is running.
@@ -164,7 +164,7 @@ Only use this after Supabase has enough IO/CPU headroom and the hot tables have 
 ```
 
 Important:
-- No separate historical SportMonks cron entry (historical refresh remains inside `run_p3.sh`; the post-match worker polls only the bounded recent-fixture queue)
+- No separate historical SportMonks cron entry (historical refresh remains inside `run_odds_p3.sh`; fixture identity/detail publication remains in the dedicated fixture-core and post-match workers)
 - Retention runs only in `run_odds_p3.sh` (and `run_sync.sh` parity mode)
 
 ## 6) Healthcheck timeout formula
