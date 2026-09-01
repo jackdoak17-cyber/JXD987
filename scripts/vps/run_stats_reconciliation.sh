@@ -32,6 +32,8 @@ export STATS_RECONCILE_MAX_COHORTS="${STATS_RECONCILE_MAX_COHORTS:-5}"
 # decides whether a new batch may begin; this delay is not the handoff policy.
 export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-60}"
 export STATS_RECONCILE_LIVE_TICK_SECONDS="${STATS_RECONCILE_LIVE_TICK_SECONDS:-900}"
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${STATS_RECONCILE_LOCK_RETRY_ATTEMPTS:-60}"
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${STATS_RECONCILE_LOCK_RETRY_DELAY_SECONDS:-15}"
 # The live settlement normally owns the spool for several minutes after the
 # quarter-hour tick. Do not race that work; begin historical reconciliation
 # after this guard and let the canonical lease cap the run before the next
@@ -111,7 +113,7 @@ while true; do
   RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   RUN_STARTED_EPOCH="$(date -u +"%s")"
   set +e
-  run_with_global_lock_and_timeout "${RECONCILIATION_COMMAND}"
+  run_with_global_lock_and_retry "${RECONCILIATION_COMMAND}"
   status=$?
   set -e
   RUN_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
