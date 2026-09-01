@@ -323,6 +323,24 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         self.assertIsNotNone(matched)
         self.assertEqual(matched["fixture_id"], 19667205)
 
+    def test_matches_brazilian_state_qualifiers_with_schedule_drift(self) -> None:
+        event = build_event(
+            "Botafogo FC SP",
+            "Goias EC GO",
+            "2026-09-12T18:00:00Z",
+        )
+        fixture = build_fixture(
+            19667167,
+            "Botafogo SP",
+            "Goiás",
+            datetime(2026, 9, 14, 22, 30, 0),
+        )
+
+        matched = match_event_to_fixture(event, [fixture])
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["fixture_id"], 19667167)
+
 
 if __name__ == "__main__":
     unittest.main()

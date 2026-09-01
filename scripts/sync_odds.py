@@ -52,8 +52,6 @@ BOOKMAKER_CANONICAL = {
 }
 HISTORICAL_ODDS_BASE_URL = os.environ.get("ODDS_API_HISTORICAL_BASE") or "https://api.odds-api.io/v3"
 SETTLED_EVENT_STATUSES = {"settled", "finished", "final", "ended", "completed"}
-UPSTREAM_EVENT_WINDOW_PAD_HOURS = 72
-EXACT_NAME_KICKOFF_DRIFT_HOURS = 72
 MONEYLINE_MARKET_KEYS = {
     "moneyline",
     "match_result",
@@ -66,6 +64,74 @@ MONEYLINE_MARKET_KEYS = {
     "home_draw_away",
 }
 MONEYLINE_SIDES = ("home", "draw", "away")
+
+MATCHER_CONTRACT_PATH = Path(
+    os.environ.get("ODDS_API_MATCHER_CONTRACT_PATH")
+    or Path(__file__).resolve().parent.parent / "config" / "odds_api_matcher_contract.json"
+)
+
+
+def _load_matcher_contract() -> Dict[str, object]:
+    try:
+        contract = json.loads(MATCHER_CONTRACT_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Unable to load odds API matcher contract: {MATCHER_CONTRACT_PATH}") from exc
+    if not isinstance(contract, dict) or contract.get("schemaVersion") != 1:
+        raise RuntimeError(f"Unsupported odds API matcher contract: {MATCHER_CONTRACT_PATH}")
+    normalization = contract.get("nameNormalization")
+    matching = contract.get("matching")
+    if not isinstance(normalization, dict) or not isinstance(matching, dict):
+        raise RuntimeError(f"Incomplete odds API matcher contract: {MATCHER_CONTRACT_PATH}")
+    aliases = normalization.get("teamAliases")
+    token_drop = normalization.get("tokenDrop")
+    variant_noise = normalization.get("variantNoise")
+    if (
+        not isinstance(aliases, dict)
+        or not all(isinstance(key, str) and isinstance(value, str) and key and value for key, value in aliases.items())
+        or not isinstance(token_drop, list)
+        or not all(isinstance(value, str) and value for value in token_drop)
+        or not isinstance(variant_noise, list)
+        or not all(isinstance(value, str) and value for value in variant_noise)
+    ):
+        raise RuntimeError(f"Invalid name normalization in odds API matcher contract: {MATCHER_CONTRACT_PATH}")
+
+    required_matching = (
+        "upstreamEventWindowPadHours",
+        "exactNameKickoffDriftHours",
+        "placeholderKickoffDriftHours",
+        "nearKickoffHours",
+        "exactTeamScore",
+        "minimumTeamScore",
+        "exactCombinedScore",
+        "disambiguatedCombinedScore",
+        "minimumScoreMargin",
+        "prefixSuffixScore",
+        "prefixSuffixMinimumLength",
+    )
+    for key in required_matching:
+        value = matching.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise RuntimeError(f"Invalid matching value {key} in odds API matcher contract: {MATCHER_CONTRACT_PATH}")
+    return contract
+
+
+MATCHER_CONTRACT = _load_matcher_contract()
+_MATCHER_NORMALIZATION = MATCHER_CONTRACT["nameNormalization"]
+_MATCHER_MATCHING = MATCHER_CONTRACT["matching"]
+TEAM_NAME_ALIAS = dict(_MATCHER_NORMALIZATION["teamAliases"])
+TEAM_TOKEN_DROP = set(_MATCHER_NORMALIZATION["tokenDrop"])
+TEAM_VARIANT_NOISE = set(_MATCHER_NORMALIZATION["variantNoise"])
+UPSTREAM_EVENT_WINDOW_PAD_HOURS = int(_MATCHER_MATCHING["upstreamEventWindowPadHours"])
+EXACT_NAME_KICKOFF_DRIFT_HOURS = float(_MATCHER_MATCHING["exactNameKickoffDriftHours"])
+PLACEHOLDER_KICKOFF_DRIFT_HOURS = float(_MATCHER_MATCHING["placeholderKickoffDriftHours"])
+NEAR_KICKOFF_HOURS = float(_MATCHER_MATCHING["nearKickoffHours"])
+EXACT_TEAM_SCORE = float(_MATCHER_MATCHING["exactTeamScore"])
+MINIMUM_TEAM_SCORE = float(_MATCHER_MATCHING["minimumTeamScore"])
+EXACT_COMBINED_SCORE = float(_MATCHER_MATCHING["exactCombinedScore"])
+DISAMBIGUATED_COMBINED_SCORE = float(_MATCHER_MATCHING["disambiguatedCombinedScore"])
+MINIMUM_SCORE_MARGIN = float(_MATCHER_MATCHING["minimumScoreMargin"])
+PREFIX_SUFFIX_SCORE = float(_MATCHER_MATCHING["prefixSuffixScore"])
+PREFIX_SUFFIX_MINIMUM_LENGTH = int(_MATCHER_MATCHING["prefixSuffixMinimumLength"])
 
 DEFAULT_MARKET_ALLOWLIST = {
     "moneyline",
@@ -103,122 +169,6 @@ BET365_SINGLE_SIDED_POSITIVE_PLAYER_MARKETS = {
     "player_fouls_committed",
     "player_fouls_drawn",
 }
-
-TEAM_NAME_ALIAS = {
-    "manutd": "manchesterunited",
-    "manunited": "manchesterunited",
-    "manchesterutd": "manchesterunited",
-    "mancity": "manchestercity",
-    "manchestercity": "manchestercity",
-    "manchester city": "manchestercity",
-    "psg": "parissaintgermain",
-    "paris saint germain": "parissaintgermain",
-    "lilleosc": "losclille",
-    "spurs": "tottenhamhotspur",
-    "tottenham": "tottenhamhotspur",
-    "koln": "cologne",
-    "cologne": "koln",
-    "inter": "internazionale",
-    "acmilan": "milan",
-    "athleticbilbao": "athleticclub",
-    "realbetisseville": "realbetis",
-    "realsociedadsansebastian": "realsociedad",
-    "realsociedadsansebastianb": "realsociedadii",
-    "albacetebalompie": "albacete",
-    "adceuta": "ceuta",
-    "rcdeportivodelacoruna": "deportivolacoruna",
-    "malagacf": "malaga",
-    # Brazilian provider names often append federation/state qualifiers that
-    # are absent from the SportMonks fixture names. Keep these explicit so
-    # kickoff matching does not discard otherwise valid markets.
-    "botafogofrrj": "botafogo",
-    "caparanaensepr": "athleticopr",
-    "athletic": "athleticclub",
-    "athleticclubsjdrmg": "athleticclub",
-    "athleticsjdrmg": "athleticclub",
-    "athleticsjdr": "athleticclub",
-    "gremionovorizontinosp": "novorizontino",
-    "ecjuventuders": "juventude",
-    "crbrasilal": "crb",
-    "nauticope": "nautico",
-    "goiasecgo": "goias",
-    "saobernardofc": "saobernardo",
-    "cadizcf": "cadiz",
-    "cdleganes": "leganes",
-    "cordobacf": "cordoba",
-    "sdeibar": "eibar",
-    "sdhuesca": "huesca",
-    "udlaspalmas": "laspalmas",
-    "elchecf": "elche",
-    "rcdmallorca": "mallorca",
-    "glasgowrangers": "rangers",
-    "celticglasgow": "celtic",
-    "heartofmidlothian": "hearts",
-    "ikstart": "start",
-    "aalesunds": "aalesund",
-    "vaalerenga": "valerenga",
-    "vaalerengaif": "valerenga",
-    "bodoeglimt": "bodoglimt",
-    "lillestroemsk": "lillestrom",
-    "kristiansundbk": "kristiansund",
-    "skbrann": "brann",
-    "sandefjordfotball": "sandefjord",
-    "tromsoeil": "tromso",
-    "fredrikstadfk": "fredrikstad",
-    "fckobenhavn": "fccopenhagen",
-    "fckoebenhavn": "fccopenhagen",
-    "fckbenhavn": "fccopenhagen",
-    "kobenhavn": "copenhagen",
-    "koebenhavn": "copenhagen",
-    "kbenhavn": "copenhagen",
-    "copenhagen": "kobenhavn",
-    "sportingkc": "sportingkansascity",
-    "lagalaxy": "losangelesgalaxy",
-    "kasimpasa": "kasmpasa",
-    "kasimpasaistanbul": "kasmpasa",
-    "rcceltavigo": "celtavigo",
-    "staderennais": "rennes",
-    "staderennaisfc": "rennes",
-    "fcmetz": "metz",
-    # SportMonks currently labels this Saudi club "Al Draih" while Odds-API
-    # uses its current name, "Diriyah Club".
-    "aldraih": "diriyah",
-}
-
-TEAM_TOKEN_DROP = {
-    "fc",
-    "cf",
-    "sc",
-    "ssc",
-    "ac",
-    "afc",
-    "cfc",
-    "club",
-    "the",
-    "de",
-    "da",
-    "cd",
-}
-
-# Generic suffix/prefix tokens that should not be treated as strong standalone team matches.
-TEAM_VARIANT_NOISE = {
-    # Arabic club names commonly share this article. It is not a team
-    # identity and must never be used as a standalone alias.
-    "al",
-    "city",
-    "united",
-    "town",
-    "county",
-    "athletic",
-    "rovers",
-    "wanderers",
-    "albion",
-    "hotspur",
-    "sporting",
-    "real",
-    "club",
-}
-
 
 MARKET_NAME_MAP = {
     "ml": "moneyline",
@@ -1212,10 +1162,16 @@ def score_name_match(event_name: str, aliases: Iterable[str]) -> float:
             # prefix/suffix as a strong match; kickoff and the opposite team
             # are still checked by match_event_to_fixture, preventing broad
             # names from matching unrelated fixtures.
-            if len(alias) >= 4 and (event_norm.startswith(alias) or event_norm.endswith(alias)):
-                best = max(best, 0.9)
-            elif len(event_norm) >= 4 and (alias.startswith(event_norm) or alias.endswith(event_norm)):
-                best = max(best, 0.9)
+            if (
+                len(alias) >= PREFIX_SUFFIX_MINIMUM_LENGTH
+                and (event_norm.startswith(alias) or event_norm.endswith(alias))
+            ):
+                best = max(best, PREFIX_SUFFIX_SCORE)
+            elif (
+                len(event_norm) >= PREFIX_SUFFIX_MINIMUM_LENGTH
+                and (alias.startswith(event_norm) or alias.endswith(event_norm))
+            ):
+                best = max(best, PREFIX_SUFFIX_SCORE)
             score = difflib.SequenceMatcher(None, event_norm, alias).ratio()
             if score > best:
                 best = score
@@ -1237,21 +1193,21 @@ def kickoff_match_rank(
     if event_dt is None or fixture_dt is None:
         return 0, 0.0
     delta_hours = abs((fixture_dt - event_dt).total_seconds()) / 3600.0
-    if delta_hours <= 3:
+    if delta_hours <= NEAR_KICKOFF_HOURS:
         return 0, delta_hours
     # SportMonks sometimes leaves upcoming kickoffs at 00:00:00 until a later refresh.
     # When both team names are effectively exact, allow a wider window so those fixtures
     # still ingest odds instead of being dropped on date mismatch alone.
     if (
         fixture_has_placeholder_kickoff(fixture_dt)
-        and home_score >= 0.95
-        and away_score >= 0.95
-        and delta_hours <= 36
+        and home_score >= EXACT_TEAM_SCORE
+        and away_score >= EXACT_TEAM_SCORE
+        and delta_hours <= PLACEHOLDER_KICKOFF_DRIFT_HOURS
     ):
         return 1, delta_hours
     if (
-        home_score >= 0.95
-        and away_score >= 0.95
+        home_score >= EXACT_TEAM_SCORE
+        and away_score >= EXACT_TEAM_SCORE
         and delta_hours <= EXACT_NAME_KICKOFF_DRIFT_HOURS
     ):
         return 2, delta_hours
@@ -1307,11 +1263,11 @@ def match_event_to_fixture(event: Dict[str, object], fixtures: List[Dict[str, ob
 
     if not best:
         return None
-    if best_min < 0.8:
+    if best_min < MINIMUM_TEAM_SCORE:
         return None
-    if best_score >= 1.85:
+    if best_score >= EXACT_COMBINED_SCORE:
         return best
-    if best_score >= 1.7 and (best_score - second_best) >= 0.1:
+    if best_score >= DISAMBIGUATED_COMBINED_SCORE and (best_score - second_best) >= MINIMUM_SCORE_MARGIN:
         return best
     return None
 
