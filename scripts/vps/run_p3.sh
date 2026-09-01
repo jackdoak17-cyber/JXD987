@@ -45,6 +45,16 @@ export ODDS_EXPORT_DAYS_BACK="${SETTLED_HISTORY_DAYS}"
 export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-${SETTLED_HISTORY_DAYS}}"
 export RETENTION_DAYS_FORWARD="$(contract_value odds_window_days)"
 export RETENTION_SNAPSHOT_DAYS="${RETENTION_SNAPSHOT_DAYS:-30}"
+
+if ! [[ "${RETENTION_DAYS_BACK}" =~ ^[0-9]+$ ]]; then
+  echo "RETENTION_DAYS_BACK must be a non-negative integer" >&2
+  exit 1
+fi
+if (( RETENTION_DAYS_BACK < SETTLED_HISTORY_DAYS )); then
+  echo "RETENTION_DAYS_BACK=${RETENTION_DAYS_BACK} cannot be less than settled history window ${SETTLED_HISTORY_DAYS}" >&2
+  exit 1
+fi
+
 export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"
 export FIXTURE_CORE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"
 export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_CORE_DELIVERY_DAYS_FORWARD}"
