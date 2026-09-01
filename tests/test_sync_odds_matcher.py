@@ -174,6 +174,116 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         )
 
     @patch("scripts.sync_odds.OddsApiClient")
+    def test_empty_date_probe_emits_explicit_provider_gap_evidence(self, client_type) -> None:
+        client = MagicMock()
+        client.request.side_effect = [
+            [
+                {
+                    "id": 7000,
+                    "home": "Earlier Home FC",
+                    "away": "Earlier Away FC",
+                    "date": "2026-09-06T16:00:00Z",
+                    "status": "pending",
+                }
+            ],
+            [],
+        ]
+        client.stats = SimpleNamespace(
+            total_calls=2,
+            calls_by_endpoint={"events": 2},
+            api_time_seconds=0.1,
+            rate_limit_hits=0,
+            rate_limit_sleeps=0,
+            last_rate_limit=None,
+        )
+        client_type.return_value = client
+
+        result = fetch_league_odds_payload(
+            989,
+            "china-chinese-super-league",
+            [build_fixture(19674675, "Tianjin Jinmen Tiger", "Liaoning Tieren FC", datetime(2026, 9, 12, 11, 0))],
+            "football",
+            0,
+            14,
+            ["Unibet"],
+            0,
+        )
+
+        self.assertIsNone(result.error)
+        evidence = result.moneyline_coverage[0]
+        self.assertEqual(evidence["matching_status"], "provider_gap")
+        self.assertEqual(evidence["provider_gap_reason"], "no_events_for_fixture_date")
+        self.assertEqual(evidence["provider_event_feed_status"], "empty")
+        self.assertEqual(evidence["provider_event_probe"]["events_returned"], 0)
+        self.assertEqual(evidence["provider_event_probe"]["response_status"], "ok")
+        self.assertEqual(client.request.call_args_list[1].args[0], "events")
+        self.assertEqual(
+            client.request.call_args_list[1].kwargs["params"]["from"],
+            "2026-09-12T00:00:00Z",
+        )
+
+    @patch("scripts.sync_odds.OddsApiClient")
+    def test_date_probe_recovers_event_before_marking_fixture_unmatched(self, client_type) -> None:
+        client = MagicMock()
+        client.request.side_effect = [
+            [
+                {
+                    "id": 7000,
+                    "home": "Earlier Home FC",
+                    "away": "Earlier Away FC",
+                    "date": "2026-09-06T16:00:00Z",
+                    "status": "pending",
+                }
+            ],
+            [
+                {
+                    "id": 7001,
+                    "home": "Tianjin Jinmen Tiger",
+                    "away": "Liaoning Tieren FC",
+                    "date": "2026-09-12T11:00:00Z",
+                    "status": "pending",
+                }
+            ],
+            [
+                {
+                    "id": 7001,
+                    "bookmakers": {
+                        "Unibet": [
+                            {"name": "ML", "odds": [{"home": "2.1", "draw": "3.4", "away": "3.2"}]}
+                        ]
+                    },
+                }
+            ],
+        ]
+        client.stats = SimpleNamespace(
+            total_calls=3,
+            calls_by_endpoint={"events": 2, "odds/multi": 1},
+            api_time_seconds=0.1,
+            rate_limit_hits=0,
+            rate_limit_sleeps=0,
+            last_rate_limit=None,
+        )
+        client_type.return_value = client
+
+        result = fetch_league_odds_payload(
+            989,
+            "china-chinese-super-league",
+            [build_fixture(19674675, "Tianjin Jinmen Tiger", "Liaoning Tieren FC", datetime(2026, 9, 12, 11, 0))],
+            "football",
+            0,
+            14,
+            ["Unibet"],
+            0,
+        )
+
+        self.assertIsNone(result.error)
+        evidence = result.moneyline_coverage[0]
+        self.assertEqual(evidence["matching_status"], "matched")
+        self.assertEqual(evidence["event_id"], 7001)
+        self.assertEqual(evidence["odds_response_status"], "received")
+        self.assertEqual(len(result.odds_records), 1)
+
+    @patch("scripts.sync_odds.OddsApiClient")
     def test_settled_history_uses_historical_endpoint_and_emits_evidence(self, client_type) -> None:
         client = MagicMock()
         client.request.side_effect = [

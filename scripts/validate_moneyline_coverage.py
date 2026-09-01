@@ -337,6 +337,31 @@ def evaluate_failures(leagues: List[Dict[str, object]], fail_below_pct: float) -
     return failures
 
 
+def is_explicit_empty_provider_event_feed(row: Dict[str, object]) -> bool:
+    """Return whether a row proves a successful empty event-day probe.
+
+    An empty bulk response is not enough to explain a missing fixture: it can
+    also be caused by an invalid league mapping or by a request that did not
+    cover the fixture date.  The sync producer must therefore emit the
+    date-scoped probe metadata, and this validator checks that shape strictly
+    before accepting the row as a provider gap.
+    """
+    if row.get("matching_status") != "provider_gap":
+        return False
+    if row.get("provider_gap_reason") != "no_events_for_fixture_date":
+        return False
+    if row.get("provider_event_feed_status") != "empty":
+        return False
+    probe = row.get("provider_event_probe")
+    if not isinstance(probe, dict):
+        return False
+    if probe.get("endpoint") != "events" or probe.get("response_status") != "ok":
+        return False
+    if probe.get("events_returned") != 0:
+        return False
+    return isinstance(probe.get("from"), str) and isinstance(probe.get("to"), str)
+
+
 def classify_provider_evidence(
     fixture_id: int,
     evidence: Dict[int, Dict[str, object]],
@@ -344,9 +369,9 @@ def classify_provider_evidence(
     """Classify one database-missing fixture using provider facts.
 
     Only a matched event with a valid odds response and zero usable supported
-    moneyline bookmakers is an accepted provider gap.  Everything else is a
-    hard failure category so matcher, transport, and ingestion defects remain
-    visible.
+    moneyline bookmakers, or a successful empty date-scoped event probe, is an
+    accepted provider gap. Everything else is a hard failure category so
+    matcher, transport, and ingestion defects remain visible.
     """
     row = evidence.get(fixture_id)
     if row is None:
@@ -354,6 +379,18 @@ def classify_provider_evidence(
             "EVIDENCE_MISSING",
             "no fresh provider evidence was supplied for this fixture",
             None,
+        )
+    if row.get("matching_status") == "provider_gap":
+        if is_explicit_empty_provider_event_feed(row):
+            return (
+                "PROVIDER_GAP",
+                "the provider returned a valid empty event feed for the fixture's UTC calendar date",
+                row,
+            )
+        return (
+            "EVIDENCE_INVALID",
+            "provider-gap evidence did not contain a valid empty date-scoped event probe",
+            row,
         )
     if row.get("matching_status") != "matched":
         return (

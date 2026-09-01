@@ -141,6 +141,78 @@ class ValidateMoneylineCoverageTests(unittest.TestCase):
         self.assertEqual(pipeline_failures, [])
         self.assertEqual(unresolved, [])
 
+    def test_accepts_only_a_valid_empty_date_scoped_event_probe_as_provider_gap(self) -> None:
+        failures, provider_gaps, pipeline_failures, unresolved = evaluate_provider_aware_failures(
+            [
+                {
+                    "league_id": 989,
+                    "fixtures_in_window": 2,
+                    "fixtures_with_complete_moneyline": 1,
+                    "coverage_pct": 50.0,
+                    "missing_fixture_ids": [19674675],
+                }
+            ],
+            {
+                19674675: {
+                    "fixture_id": 19674675,
+                    "odds_api_league": "china-chinese-super-league",
+                    "matching_status": "provider_gap",
+                    "provider_gap_reason": "no_events_for_fixture_date",
+                    "provider_event_feed_status": "empty",
+                    "provider_event_probe": {
+                        "endpoint": "events",
+                        "response_status": "ok",
+                        "from": "2026-09-12T00:00:00Z",
+                        "to": "2026-09-12T23:59:59Z",
+                        "events_returned": 0,
+                    },
+                    "event_id": None,
+                    "odds_response_status": "not_applicable",
+                    "supported_moneyline_bookmakers": [],
+                }
+            },
+            fail_below_pct=100.0,
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual([row["fixture_id"] for row in provider_gaps], [19674675])
+        self.assertEqual(pipeline_failures, [])
+        self.assertEqual(unresolved, [])
+
+    def test_rejects_unproven_provider_gap_evidence(self) -> None:
+        failures, provider_gaps, pipeline_failures, unresolved = evaluate_provider_aware_failures(
+            [
+                {
+                    "league_id": 989,
+                    "fixtures_in_window": 1,
+                    "fixtures_with_complete_moneyline": 0,
+                    "coverage_pct": 0.0,
+                    "missing_fixture_ids": [19674675],
+                }
+            ],
+            {
+                19674675: {
+                    "fixture_id": 19674675,
+                    "matching_status": "provider_gap",
+                    "provider_gap_reason": "no_events_for_fixture_date",
+                    "provider_event_feed_status": "empty",
+                    "provider_event_probe": {
+                        "endpoint": "events",
+                        "response_status": "ok",
+                        "from": "2026-09-12T00:00:00Z",
+                        "to": "2026-09-12T23:59:59Z",
+                        "events_returned": 1,
+                    },
+                }
+            },
+            fail_below_pct=100.0,
+        )
+
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(provider_gaps, [])
+        self.assertEqual(pipeline_failures, [])
+        self.assertEqual([row["fixture_id"] for row in unresolved], [19674675])
+
     def test_missing_provider_evidence_fails_closed(self) -> None:
         failures, provider_gaps, pipeline_failures, unresolved = evaluate_provider_aware_failures(
             [

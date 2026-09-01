@@ -994,6 +994,7 @@ def fetch_league_odds_payload(
     )
     event_candidates_by_fixture: Dict[int, List[Dict[str, object]]] = {}
     odds_response_by_event_id: Dict[int, Dict[str, object]] = {}
+    provider_event_probe_by_fixture: Dict[int, Dict[str, object]] = {}
 
     try:
         start_dt, end_dt = fixture_window_bounds(days_back, days_forward, calendar_history)
@@ -1011,12 +1012,28 @@ def fetch_league_odds_payload(
         if not isinstance(events, list):
             raise OddsApiError(f"Unexpected events response for league {odds_league}")
 
-        result.raw_events = events
-        result.events_returned = len(events)
-
         event_to_fixture: Dict[int, int] = {}
         historical_backfill: List[Tuple[int, int]] = []
-        for event in events:
+        seen_event_ids: Set[int] = set()
+
+        def register_event(event: object) -> Optional[int]:
+            """Associate one provider event with the best local fixture.
+
+            The bulk league request and the bounded date probe can overlap.
+            Deduplicating by provider event id keeps event counts, odds
+            requests, and evidence deterministic when that happens.
+            """
+            if not isinstance(event, dict):
+                return None
+            event_id_value = event.get("id")
+            try:
+                event_id = int(event_id_value)
+            except (TypeError, ValueError):
+                return None
+            if event_id <= 0 or event_id in seen_event_ids:
+                return event_to_fixture.get(event_id)
+            seen_event_ids.add(event_id)
+
             fixture = match_event_to_fixture(event, league_fixtures)
             if not fixture:
                 if len(result.unmatched_samples) < 20:
@@ -1029,26 +1046,114 @@ def fetch_league_odds_payload(
                             "date": event.get("date"),
                         }
                     )
-                continue
-            event_id = event.get("id")
-            if event_id is None:
-                continue
-            event_id = int(event_id)
-            event_candidates_by_fixture.setdefault(int(fixture["fixture_id"]), []).append(
-                {
-                    "event_id": event_id,
-                    "home": event.get("home"),
-                    "away": event.get("away"),
-                    "date": event.get("date"),
-                    "status": event.get("status"),
-                }
-            )
+                return None
+
+            fixture_id = int(fixture["fixture_id"])
+            candidate_ids = {
+                int(candidate["event_id"])
+                for candidate in event_candidates_by_fixture.get(fixture_id, [])
+                if candidate.get("event_id") is not None
+            }
+            if event_id not in candidate_ids:
+                event_candidates_by_fixture.setdefault(fixture_id, []).append(
+                    {
+                        "event_id": event_id,
+                        "home": event.get("home"),
+                        "away": event.get("away"),
+                        "date": event.get("date"),
+                        "status": event.get("status"),
+                    }
+                )
+
             event_status = str(event.get("status") or "").strip().lower()
             if calendar_history or event_status in SETTLED_EVENT_STATUSES:
                 if not bool(fixture.get("has_complete_moneyline_odds")):
-                    historical_backfill.append((event_id, int(fixture["fixture_id"])))
-                continue
-            event_to_fixture[event_id] = int(fixture["fixture_id"])
+                    if (event_id, fixture_id) not in historical_backfill:
+                        historical_backfill.append((event_id, fixture_id))
+                return fixture_id
+
+            event_to_fixture[event_id] = fixture_id
+            return fixture_id
+
+        result.raw_events = [event for event in events if isinstance(event, dict)]
+        for event in events:
+            register_event(event)
+
+        # The provider's bulk event feed is not guaranteed to contain every
+        # future date in a long delivery window.  Probe each still-unmatched
+        # rolling fixture's UTC calendar day once per league/date.  A non-empty
+        # probe is still subject to the normal matcher (so aliases remain
+        # visible as hard failures); only a successful empty probe becomes an
+        # explicit provider publication gap.
+        if not calendar_history:
+            probe_cache: Dict[Tuple[str, str], Dict[str, object]] = {}
+            for fixture in league_fixtures:
+                fixture_id = int(fixture["fixture_id"])
+                if event_candidates_by_fixture.get(fixture_id):
+                    continue
+                fixture_dt = fixture.get("starting_at")
+                if not isinstance(fixture_dt, datetime):
+                    continue
+                if fixture_dt.tzinfo is not None:
+                    fixture_dt = fixture_dt.astimezone(timezone.utc).replace(tzinfo=None)
+                probe_start = datetime.combine(fixture_dt.date(), datetime.min.time())
+                probe_end = probe_start + timedelta(days=1) - timedelta(seconds=1)
+                probe_from = probe_start.isoformat() + "Z"
+                probe_to = probe_end.isoformat() + "Z"
+                probe_key = (odds_league, probe_from)
+                probe = probe_cache.get(probe_key)
+                if probe is None:
+                    probe_events = client.request(
+                        "events",
+                        params={
+                            "sport": sport,
+                            "league": odds_league,
+                            "from": probe_from,
+                            "to": probe_to,
+                        },
+                    )
+                    if not isinstance(probe_events, list):
+                        raise OddsApiError(
+                            f"Unexpected date-scoped events response for league {odds_league}"
+                        )
+                    probe = {
+                        "endpoint": "events",
+                        "response_status": "ok",
+                        "from": probe_from,
+                        "to": probe_to,
+                        "events_returned": len(probe_events),
+                        "event_ids": [
+                            int(event["id"])
+                            for event in probe_events
+                            if isinstance(event, dict)
+                            and event.get("id") is not None
+                            and str(event.get("id")).isdigit()
+                        ],
+                        "events": probe_events,
+                    }
+                    probe_cache[probe_key] = probe
+
+                for event in probe["events"]:
+                    if event not in result.raw_events:
+                        result.raw_events.append(event)
+                    register_event(event)
+
+                probe_event_ids = set(int(event_id) for event_id in probe["event_ids"])
+                matched_probe_event_ids = [
+                    int(candidate["event_id"])
+                    for candidate in event_candidates_by_fixture.get(fixture_id, [])
+                    if int(candidate["event_id"]) in probe_event_ids
+                ]
+                provider_event_probe_by_fixture[fixture_id] = {
+                    "endpoint": probe["endpoint"],
+                    "response_status": probe["response_status"],
+                    "from": probe["from"],
+                    "to": probe["to"],
+                    "events_returned": int(probe["events_returned"]),
+                    "matched_event_ids": sorted(set(matched_probe_event_ids)),
+                }
+
+        result.events_returned = len(result.raw_events)
 
         result.events_matched = len(event_to_fixture) + len(historical_backfill)
         if event_to_fixture:
@@ -1144,20 +1249,36 @@ def fetch_league_odds_payload(
             fixture_id = int(fixture["fixture_id"])
             candidates = event_candidates_by_fixture.get(fixture_id, [])
             if not candidates:
-                result.moneyline_coverage.append(
-                    {
-                        "fixture_id": fixture_id,
-                        "league_id": league_id,
-                        "odds_api_league": odds_league,
-                        "matching_status": "unmatched",
-                        "event_id": None,
-                        "event": None,
-                        "candidate_event_ids": [],
-                        "odds_response_status": "not_applicable",
-                        "supported_moneyline_bookmakers": [],
-                        "moneyline_sides_by_bookmaker": {},
-                    }
+                provider_probe = provider_event_probe_by_fixture.get(fixture_id)
+                provider_feed_empty = bool(
+                    provider_probe
+                    and provider_probe.get("response_status") == "ok"
+                    and int(provider_probe.get("events_returned") or 0) == 0
                 )
+                coverage = {
+                    "fixture_id": fixture_id,
+                    "league_id": league_id,
+                    "odds_api_league": odds_league,
+                    "matching_status": "provider_gap" if provider_feed_empty else "unmatched",
+                    "event_id": None,
+                    "event": None,
+                    "candidate_event_ids": [],
+                    "odds_response_status": "not_applicable",
+                    "supported_moneyline_bookmakers": [],
+                    "moneyline_sides_by_bookmaker": {},
+                }
+                if provider_probe is not None:
+                    coverage["provider_event_feed_status"] = (
+                        "empty" if provider_feed_empty else "non_empty"
+                    )
+                    coverage["provider_event_probe"] = {
+                        key: value
+                        for key, value in provider_probe.items()
+                        if key != "matched_event_ids"
+                    }
+                    if provider_feed_empty:
+                        coverage["provider_gap_reason"] = "no_events_for_fixture_date"
+                result.moneyline_coverage.append(coverage)
                 continue
 
             candidate_evidence: List[Dict[str, object]] = []
