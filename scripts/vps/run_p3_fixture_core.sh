@@ -48,7 +48,10 @@ export FIXTURE_CORE_SOURCE_BUFFER_DAYS="$(contract_value source_buffer_days)"
 export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_league_csv)}}"
 validate_supported_leagues "${STATS_LEAGUES}"
 export FIXTURE_CORE_MAX_RUNTIME_SECONDS="${FIXTURE_CORE_MAX_RUNTIME_SECONDS:-900}"
-export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS:-300}"
+# The complete identity refresh is normally well below two minutes. Keep a
+# three-minute class of bounded execution available after settlement while
+# still leaving the canonical grace period before the next tick.
+export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS:-180}"
 # The detail writer can legitimately hold the canonical lock for several
 # minutes after its quarter-hour tick. Keep this identity-refresh lane
 # resumable across that handoff rather than losing its six-hour cron tick.
