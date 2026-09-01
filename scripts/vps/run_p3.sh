@@ -92,6 +92,8 @@ python scripts/sync_odds.py \
   --days-back "${ODDS_SYNC_DAYS_BACK}" \
   --days-forward "${DAYS_FORWARD}" \
   --refresh-upcoming \
+  --no-refresh-squads-missing \
+  --no-refresh-sidelined-window \
   --refresh-only \
   --report-out "/tmp/odds_refresh_report_p3.json"
 

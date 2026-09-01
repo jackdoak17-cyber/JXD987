@@ -43,6 +43,11 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("--fixture-core-only", source)
         self.assertNotIn("--with-details", source)
 
+    def test_p3_fixture_refresh_does_not_consume_the_odds_writer_lease(self) -> None:
+        source = (ROOT / "scripts/vps/run_p3.sh").read_text(encoding="utf-8")
+        self.assertIn("--no-refresh-squads-missing", source)
+        self.assertIn("--no-refresh-sidelined-window", source)
+
     def test_p3_delivery_refresh_covers_retained_rolling_schedule(self) -> None:
         wrapper = ROOT / "scripts/vps/run_p3.sh"
         source = wrapper.read_text(encoding="utf-8")
