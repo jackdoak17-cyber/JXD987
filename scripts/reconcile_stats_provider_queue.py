@@ -358,9 +358,15 @@ def parse_csv_ints(value: str | None) -> list[int]:
     return [int(token.strip()) for token in (value or "").split(",") if token.strip()]
 
 
-def export_batch(fixture_ids: list[int], leagues: list[int], report_path: str) -> ExportBatchResult:
+def export_batch(
+    fixture_ids: list[int],
+    leagues: list[int],
+    report_path: str,
+    snapshot_ids: dict[int, int] | None = None,
+) -> ExportBatchResult:
     """Publish each safe fixture through an atomic target transaction."""
     outcomes: list[ExportCommandResult] = []
+    snapshot_ids = snapshot_ids or {}
     for fixture_id in fixture_ids:
         command = [
             sys.executable,
@@ -380,6 +386,9 @@ def export_batch(fixture_ids: list[int], leagues: list[int], report_path: str) -
             "--report-json",
             report_path,
         ]
+        snapshot_id = snapshot_ids.get(int(fixture_id))
+        if snapshot_id is not None:
+            command.extend(["--provider-snapshot-id", str(snapshot_id)])
         completed = subprocess.run(command, text=True, capture_output=True, check=False)
         if completed.returncode == 0:
             outcomes.append(ExportCommandResult.success([fixture_id]))
@@ -679,6 +688,7 @@ def main() -> int:
                             evidence={"provider_status": assessment.fixture_status, "assessment": asdict(assessment)},
                             assessment=assessment,
                             target_conn=shared_target_connection(),
+                            reason_code="excluded",
                         )
                         if meta:
                             excluded_seasons.add((int(meta[0]), int(meta[1])))
@@ -763,6 +773,11 @@ def main() -> int:
                     fixture_ids,
                     leagues,
                     "/tmp/reconcile_stats_provider_export.json",
+                    {
+                        int(item["fixture_id"]): int(item["snapshot_id"])
+                        for item in accepted
+                        if item.get("snapshot_id") is not None
+                    },
                 ),
             )
             report["stage_seconds"]["export"] = round(time.perf_counter() - stage_started, 3)

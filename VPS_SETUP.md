@@ -74,7 +74,15 @@ Runtime drift protection:
 - wrappers verify `scripts/vps/runtime_manifest.sha1` before doing any work
 - if a critical runtime file on the VPS drifts from the committed manifest, the wrapper fails loudly instead of silently running stale logic
 - refresh the manifest locally with `scripts/vps/update_runtime_manifest.sh`
-- deploy the runtime file set with `scripts/vps/deploy_runtime.sh <host> [remote_repo_root]`
+- deploy the runtime file set with `scripts/vps/deploy_runtime.sh <host> <remote_repo_root>`; the target is intentionally required so a deployment cannot update an unscheduled checkout
+
+The fixture-delivery cron in production must deploy to the same checkout used
+by both the P3 and settlement entries. For the current production schedule that
+target is `/opt/odds-sync/JXD987-fixture-metrics-closeout-release`:
+
+```bash
+scripts/vps/deploy_runtime.sh <host> /opt/odds-sync/JXD987-fixture-metrics-closeout-release
+```
 
 ## 4) Phase 1 schedule (parity mode)
 Use one cron entry equivalent to existing cadence:

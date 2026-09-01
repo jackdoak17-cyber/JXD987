@@ -3,8 +3,8 @@ config/league_ids.txt
 config/odds_api_leagues.json
 # Keep the default VPS odds list aligned with the no-cup-consumption policy.
 config/odds_api_sync_excluded_leagues.json
-# Keep the user-facing bookmaker set aligned with the odds API producer defaults.
 config/odds_api_bookmakers.json
+config/fixture_core_contract.json
 jxd/__init__.py
 jxd/db.py
 jxd/models.py
@@ -15,6 +15,7 @@ scripts/export_odds_to_supabase_psql.py
 scripts/export_to_supabase.py
 scripts/fixture_detail_export_policy.py
 scripts/refresh_fixture_delivery.py
+scripts/verify_fixture_delivery_parity.py
 scripts/postmatch_fixture_detail_delivery.py
 scripts/reconcile_stats_provider_queue.py
 scripts/vps/run_stats_reconciliation.sh
@@ -24,10 +25,15 @@ scripts/reconcile_recent_fixtures.py
 scripts/rest_preflight.py
 scripts/sync_confirmed_lineups.py
 scripts/sync_odds.py
+scripts/fixture_core_contract.py
 scripts/vps/common.sh
 scripts/vps/run_p1.sh
 scripts/vps/run_p2.sh
 scripts/vps/run_p3.sh
+scripts/vps/run_p3_fixture_core.sh
 scripts/vps/run_postmatch_settlement.sh
 scripts/vps/run_models.sh
 scripts/vps/run_sync.sh
+scripts/sync_sparse_squads.py
+scripts/verify_squad_freshness.py
+scripts/vps/run_squad_reconciliation.sh

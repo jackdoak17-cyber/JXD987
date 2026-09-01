@@ -230,6 +230,53 @@ def test_atomic_or_staged_publication_survives_failure_after_delete() -> None:
     assert transaction.rollbacks == 1
 
 
+def test_atomic_publication_calls_v2_with_player_dimensions_and_snapshot() -> None:
+    from scripts.export_to_supabase import atomic_fixture_detail_publish
+
+    captured: dict[str, object] = {}
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, statement, params):
+            captured["statement"] = statement
+            captured["params"] = params
+
+        def fetchone(self):
+            return ({"fixture_id": 1},)
+
+    class Transaction:
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            captured["committed"] = True
+
+        def rollback(self):
+            captured["rolled_back"] = True
+
+    atomic_fixture_detail_publish(
+        Transaction(),
+        fixture_id=1,
+        snapshot_id=2,
+        player_dimensions=[{"id": 11, "name": "Player 11"}],
+        fixture_players=[{"fixture_id": 1, "player_id": 11, "team_id": 101}],
+        fixture_statistics=[],
+        fixture_player_statistics=[],
+    )
+
+    assert "publish_fixture_detail_atomic_v2" in str(captured["statement"])
+    params = captured["params"]
+    assert params[0] == 1
+    assert params[1] == 2
+    assert '"id": 11' in params[2]
+    assert captured["committed"] is True
+
+
 def test_partial_export_rerun_is_idempotent() -> None:
     from scripts.export_to_supabase import atomic_fixture_detail_publish
 
@@ -314,3 +361,21 @@ def test_postmatch_single_fixture_contract_remains_unchanged(
 
     assert result.returncode == 0
     assert "--atomic-fixture-detail" in captured[0]
+
+
+def test_postmatch_single_fixture_passes_provider_snapshot_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import postmatch_fixture_detail_delivery as postmatch
+
+    captured: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        captured.append(command)
+        return queue.ExportCommandResult.success([9001])
+
+    monkeypatch.setattr(postmatch.subprocess, "run", fake_run)
+    result = postmatch.export_fixture(9001, [8], "/tmp/postmatch-report.json", snapshot_id=77)
+
+    assert result.returncode == 0
+    assert captured[0][captured[0].index("--provider-snapshot-id") + 1] == "77"

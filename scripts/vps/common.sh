@@ -293,6 +293,83 @@ SQL
   fi
 }
 
+run_recorded_pipeline_job() {
+  local job_id="$1"
+  local job_name="$2"
+  local chain_command="$3"
+  local evidence_file="${4:-}"
+  local started_at started_epoch finished_at finished_epoch status=0
+  local evidence_was_set=0 previous_evidence_file=""
+
+  if [[ -n "${PIPELINE_EVIDENCE_FILE+x}" ]]; then
+    evidence_was_set=1
+    previous_evidence_file="${PIPELINE_EVIDENCE_FILE}"
+  fi
+  if [[ -n "${evidence_file}" ]]; then
+    export PIPELINE_EVIDENCE_FILE="${evidence_file}"
+  else
+    unset PIPELINE_EVIDENCE_FILE || true
+  fi
+
+  started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  started_epoch="$(date -u +%s)"
+  if [[ "${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-0}" =~ ^[1-9][0-9]*$ ]]; then
+    run_with_global_lock_and_retry "${chain_command}" || status=$?
+  else
+    run_with_global_lock_and_timeout "${chain_command}" || status=$?
+  fi
+  finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  finished_epoch="$(date -u +%s)"
+
+  # Record the outcome before restoring the caller's evidence context. This
+  # makes lock skips and timeout handoffs observable just like hard failures.
+  record_pipeline_job_run \
+    "${job_id}" \
+    "${job_name}" \
+    "${status}" \
+    "${started_at}" \
+    "${finished_at}" \
+    "$(((finished_epoch - started_epoch) * 1000))"
+
+  if [[ "${evidence_was_set}" -eq 1 ]]; then
+    export PIPELINE_EVIDENCE_FILE="${previous_evidence_file}"
+  else
+    unset PIPELINE_EVIDENCE_FILE || true
+  fi
+  return "${status}"
+}
+
+run_with_global_lock_and_retry() {
+  local chain_command="$1"
+  local retry_attempts="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-0}"
+  local retry_delay_seconds="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-15}"
+  local attempt=0 status=2
+
+  if [[ ! "${retry_attempts}" =~ ^[0-9]+$ ]]; then
+    log_error "ODDS_SYNC_LOCK_RETRY_ATTEMPTS must be a non-negative integer"
+    return 1
+  fi
+  if [[ ! "${retry_delay_seconds}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    log_error "ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS must be a non-negative number"
+    return 1
+  fi
+
+  while (( attempt <= retry_attempts )); do
+    run_with_global_lock_and_timeout "${chain_command}" && return 0
+    status=$?
+    if [[ "${status}" -ne 2 ]]; then
+      return "${status}"
+    fi
+    attempt=$((attempt + 1))
+    if (( attempt > retry_attempts )); then
+      return 2
+    fi
+    log_info "[RETRY] lock handoff; retry ${attempt}/${retry_attempts} in ${retry_delay_seconds}s"
+    sleep "${retry_delay_seconds}"
+  done
+  return "${status}"
+}
+
 healthcheck_ping() {
   local url="${1:-}"
   if [[ -z "${url}" ]]; then

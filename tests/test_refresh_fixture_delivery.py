@@ -12,13 +12,88 @@ from scripts.refresh_fixture_delivery import (
     compute_standings,
     history_rows_for_fixture,
     strict_current_season_rank,
+    validate_delivery_schema,
+    validate_source_fixture_identity,
 )
 
 
 UTC = timezone.utc
 
 
+class SchemaCursor:
+    def __init__(self, rows):
+        self.rows = rows
+        self.query = None
+        self.params = None
+
+    def execute(self, query, params=None):
+        self.query = query
+        self.params = params
+
+    def fetchall(self):
+        return self.rows
+
+
 class FixtureDeliveryMetricsTests(unittest.TestCase):
+    def test_delivery_schema_contract_accepts_live_primary_keys(self) -> None:
+        cursor = SchemaCursor([
+            ("fixture_delivery_schedule", ["release_id", "fixture_id"]),
+            ("fixture_delivery_standings", ["release_id", "league_id", "season_id", "team_id"]),
+            ("fixture_delivery_metrics", [
+                "release_id", "fixture_id", "team_id", "side", "metrics_window",
+                "metrics_mode", "season_scope",
+            ]),
+            ("fixture_delivery_odds", [
+                "release_id", "fixture_id", "bookmaker_id", "market_key", "selection_key",
+                "participant_type", "participant_id", "line_key",
+            ]),
+        ])
+
+        validate_delivery_schema(cursor)
+
+    def test_delivery_schema_contract_rejects_old_metrics_key(self) -> None:
+        cursor = SchemaCursor([
+            ("fixture_delivery_schedule", ["release_id", "fixture_id"]),
+            ("fixture_delivery_standings", ["release_id", "league_id", "season_id", "team_id"]),
+            ("fixture_delivery_metrics", [
+                "release_id", "fixture_id", "team_id", "side", "metrics_window", "metrics_mode",
+            ]),
+            ("fixture_delivery_odds", [
+                "release_id", "fixture_id", "bookmaker_id", "market_key", "selection_key",
+                "participant_type", "participant_id", "line_key",
+            ]),
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "fixture_delivery_metrics"):
+            validate_delivery_schema(cursor)
+
+    def test_duplicate_source_fixture_ids_fail_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "duplicate fixture ids: 42"):
+            validate_source_fixture_identity([{"id": 42}, {"id": 42}])
+
+    def test_goal_aggregates_are_counted_once(self) -> None:
+        metrics, _ = calculate_metrics(
+            [
+                {
+                    "id": 1,
+                    "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
+                    "home_team_id": 10,
+                    "away_team_id": 20,
+                    "home_score": 3,
+                    "away_score": 1,
+                }
+            ],
+            10,
+            8,
+            None,
+        )
+
+        self.assertEqual(metrics["goalsScored"], 3)
+        self.assertEqual(metrics["goalsConceded"], 1)
+        self.assertEqual(metrics["avgGoalsScored"], 3)
+        self.assertEqual(metrics["avgGoalsConceded"], 1)
+        self.assertEqual(metrics["avgTotalGoals"], 4)
+
     def test_history_is_scoped_to_league_and_season(self) -> None:
         fixture_time = datetime(2026, 8, 28, tzinfo=UTC)
         history = build_season_scoped_history(
