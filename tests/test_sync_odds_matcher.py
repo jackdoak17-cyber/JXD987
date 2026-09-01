@@ -330,6 +330,24 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         self.assertIsNotNone(matched)
         self.assertEqual(matched["fixture_id"], 19746638)
 
+    def test_matches_formal_provider_name_to_short_local_name_with_placeholder_kickoff(self) -> None:
+        event = build_event(
+            "Amed Sportif Faaliyetler",
+            "Istanbul Basaksehir",
+            "2026-09-13T15:00:00Z",
+        )
+        fixture = build_fixture(
+            19746615,
+            "Amed SK",
+            "İstanbul Başakşehir",
+            datetime(2026, 9, 13, 0, 0, 0),
+        )
+
+        matched = match_event_to_fixture(event, [fixture])
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["fixture_id"], 19746615)
+
     def test_does_not_match_unrelated_teams_sharing_the_al_prefix(self) -> None:
         event = build_event(
             "Al-Fayha FC",
