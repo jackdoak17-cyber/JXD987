@@ -48,6 +48,22 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         self.assertEqual(DEFAULT_BOOKMAKERS, ["Bet365", "Paddy Power", "Unibet", "BetMGM"])
         self.assertEqual(load_default_bookmakers(), DEFAULT_BOOKMAKERS)
 
+    def test_matches_current_diriyah_provider_rename(self) -> None:
+        fixture = build_fixture(
+            19777688,
+            "Al Diraiyah FC",
+            "Al-Qadsiah",
+            datetime(2026, 9, 3, 18, 0),
+        )
+
+        matched = match_event_to_fixture(
+            build_event("Diriyah Club", "Al Qadsiah", "2026-09-03T18:00:00Z"),
+            [fixture],
+        )
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["fixture_id"], 19777688)
+
     def test_settled_history_window_uses_complete_utc_calendar_days(self) -> None:
         start, end = fixture_window_bounds(2, 0, calendar_history=True)
 
