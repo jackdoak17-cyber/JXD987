@@ -80,6 +80,20 @@ fi
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
 
+build_moneyline_provider_report_args() {
+  local primary_report="$1"
+  MONEYLINE_PROVIDER_REPORT_ARGS=(--provider-report "${primary_report}")
+  # The coverage window spans the P1/P2/P3 lanes. Include the freshest evidence
+  # from the other lanes so a P3 validation cannot misclassify an imminent
+  # fixture simply because it is owned by P2 or P1.
+  local report_path
+  for report_path in /tmp/odds_sync_report_p2.json /tmp/odds_sync_report_p1.json; do
+    if [[ -f "${report_path}" ]]; then
+      MONEYLINE_PROVIDER_REPORT_ARGS+=(--provider-report "${report_path}")
+    fi
+  done
+}
+
 cd "${REPO_ROOT}"
 source .venv/bin/activate
 export PYTHONPATH="${REPO_ROOT}"
@@ -133,11 +147,12 @@ python scripts/odds_retention_psql.py \
   --report-out "/tmp/odds_retention_report_p3.json"
 
 set +e
+build_moneyline_provider_report_args "/tmp/odds_sync_report_p3.json"
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
   --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
-  --provider-report "/tmp/odds_sync_report_p3.json" \
+  "${MONEYLINE_PROVIDER_REPORT_ARGS[@]}" \
   --out-json "/tmp/moneyline_coverage_report_p3.json" \
   --out-md "/tmp/moneyline_coverage_report_p3.md"
 MONEYLINE_VALIDATION_STATUS=$?
@@ -178,11 +193,12 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
       repair_export_status=${repair_sync_status}
     fi
     if [[ "${repair_sync_status}" -eq 0 && "${repair_export_status}" -eq 0 ]]; then
+      build_moneyline_provider_report_args "/tmp/odds_sync_report_p3_repair_${repair_attempt}.json"
       python scripts/validate_moneyline_coverage.py \
         --leagues "${ODDS_LEAGUES}" \
         --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
         --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
-        --provider-report "/tmp/odds_sync_report_p3_repair_${repair_attempt}.json" \
+        "${MONEYLINE_PROVIDER_REPORT_ARGS[@]}" \
         --out-json "/tmp/moneyline_coverage_report_p3.json" \
         --out-md "/tmp/moneyline_coverage_report_p3.md"
       MONEYLINE_VALIDATION_STATUS=$?
