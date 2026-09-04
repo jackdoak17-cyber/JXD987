@@ -337,6 +337,18 @@ def evaluate_failures(leagues: List[Dict[str, object]], fail_below_pct: float) -
     return failures
 
 
+def is_valid_date_scoped_provider_event_probe(row: Dict[str, object]) -> bool:
+    probe = row.get("provider_event_probe")
+    if not isinstance(probe, dict):
+        return False
+    if probe.get("endpoint") != "events" or probe.get("response_status") != "ok":
+        return False
+    if not isinstance(probe.get("from"), str) or not isinstance(probe.get("to"), str):
+        return False
+    events_returned = probe.get("events_returned")
+    return isinstance(events_returned, int) and events_returned >= 0
+
+
 def is_explicit_empty_provider_event_feed(row: Dict[str, object]) -> bool:
     """Return whether a row proves a successful empty event-day probe.
 
@@ -352,14 +364,36 @@ def is_explicit_empty_provider_event_feed(row: Dict[str, object]) -> bool:
         return False
     if row.get("provider_event_feed_status") != "empty":
         return False
-    probe = row.get("provider_event_probe")
-    if not isinstance(probe, dict):
+    return is_valid_date_scoped_provider_event_probe(row) and row["provider_event_probe"].get("events_returned") == 0
+
+
+def is_explicit_nonmatching_provider_event_feed(row: Dict[str, object]) -> bool:
+    """Return whether a successful non-empty probe found no event for a fixture.
+
+    New sync reports mark this as ``provider_gap`` with a dedicated reason.
+    Accept the older ``unmatched`` shape as a compatibility path while those
+    reports age out. The empty candidate/event fields are required so an
+    incomplete or contradictory evidence row still fails closed.
+    """
+    matching_status = row.get("matching_status")
+    if matching_status == "provider_gap":
+        if row.get("provider_gap_reason") != "no_matching_event_for_fixture_date":
+            return False
+    elif matching_status == "unmatched":
+        if row.get("provider_gap_reason") not in (None, ""):
+            return False
+    else:
         return False
-    if probe.get("endpoint") != "events" or probe.get("response_status") != "ok":
+    if row.get("provider_event_feed_status") != "non_empty":
         return False
-    if probe.get("events_returned") != 0:
+    if row.get("event_id") is not None:
         return False
-    return isinstance(probe.get("from"), str) and isinstance(probe.get("to"), str)
+    candidate_event_ids = row.get("candidate_event_ids")
+    if not isinstance(candidate_event_ids, list) or candidate_event_ids:
+        return False
+    if not is_valid_date_scoped_provider_event_probe(row):
+        return False
+    return row["provider_event_probe"].get("events_returned", 0) > 0
 
 
 def classify_provider_evidence(
@@ -368,10 +402,11 @@ def classify_provider_evidence(
 ) -> Tuple[str, str, Dict[str, object] | None]:
     """Classify one database-missing fixture using provider facts.
 
-    Only a matched event with a valid odds response and zero usable supported
-    moneyline bookmakers, or a successful empty date-scoped event probe, is an
-    accepted provider gap. Everything else is a hard failure category so
-    matcher, transport, and ingestion defects remain visible.
+    A matched event with a valid odds response and zero usable supported
+    moneyline bookmakers, a successful empty date-scoped event probe, or a
+    successful non-empty date-scoped probe with no matching event is an
+    accepted provider gap. Missing/invalid probe evidence and matched events
+    with usable odds remain hard failure categories.
     """
     row = evidence.get(fixture_id)
     if row is None:
@@ -387,9 +422,21 @@ def classify_provider_evidence(
                 "the provider returned a valid empty event feed for the fixture's UTC calendar date",
                 row,
             )
+        if is_explicit_nonmatching_provider_event_feed(row):
+            return (
+                "PROVIDER_GAP",
+                "the provider returned a valid event feed but no event matched this fixture for its UTC calendar date",
+                row,
+            )
         return (
             "EVIDENCE_INVALID",
             "provider-gap evidence did not contain a valid empty date-scoped event probe",
+            row,
+        )
+    if is_explicit_nonmatching_provider_event_feed(row):
+        return (
+            "PROVIDER_GAP",
+            "the provider returned a valid event feed but no event matched this fixture for its UTC calendar date",
             row,
         )
     if row.get("matching_status") != "matched":

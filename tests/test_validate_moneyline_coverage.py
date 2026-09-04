@@ -57,7 +57,7 @@ class ValidateMoneylineCoverageTests(unittest.TestCase):
         )
         self.assertEqual(failures, [])
 
-    def test_accepts_only_explicit_empty_provider_market_as_provider_gap(self) -> None:
+    def test_accepts_matched_event_without_supported_market_as_provider_gap(self) -> None:
         failures, provider_gaps, pipeline_failures, unresolved = evaluate_provider_aware_failures(
             [
                 {
@@ -82,6 +82,43 @@ class ValidateMoneylineCoverageTests(unittest.TestCase):
 
         self.assertEqual(failures, [])
         self.assertEqual([row["fixture_id"] for row in provider_gaps], [19629715])
+        self.assertEqual(pipeline_failures, [])
+        self.assertEqual(unresolved, [])
+
+    def test_accepts_verified_non_empty_event_feed_without_fixture_match_as_provider_gap(self) -> None:
+        failures, provider_gaps, pipeline_failures, unresolved = evaluate_provider_aware_failures(
+            [
+                {
+                    "league_id": 651,
+                    "fixtures_in_window": 2,
+                    "fixtures_with_complete_moneyline": 1,
+                    "coverage_pct": 50.0,
+                    "missing_fixture_ids": [19667164],
+                }
+            ],
+            {
+                19667164: {
+                    "fixture_id": 19667164,
+                    "matching_status": "unmatched",
+                    "provider_event_feed_status": "non_empty",
+                    "provider_event_probe": {
+                        "endpoint": "events",
+                        "response_status": "ok",
+                        "from": "2026-09-15T00:00:00Z",
+                        "to": "2026-09-15T23:59:59Z",
+                        "events_returned": 1,
+                    },
+                    "event_id": None,
+                    "candidate_event_ids": [],
+                    "odds_response_status": "not_applicable",
+                    "supported_moneyline_bookmakers": [],
+                }
+            },
+            fail_below_pct=100.0,
+        )
+
+        self.assertEqual(failures, [])
+        self.assertEqual([row["fixture_id"] for row in provider_gaps], [19667164])
         self.assertEqual(pipeline_failures, [])
         self.assertEqual(unresolved, [])
 

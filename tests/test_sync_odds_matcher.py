@@ -300,6 +300,58 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         self.assertEqual(len(result.odds_records), 1)
 
     @patch("scripts.sync_odds.OddsApiClient")
+    def test_non_empty_date_probe_without_fixture_match_emits_provider_gap_evidence(self, client_type) -> None:
+        client = MagicMock()
+        client.request.side_effect = [
+            [
+                {
+                    "id": 7000,
+                    "home": "Earlier Home FC",
+                    "away": "Earlier Away FC",
+                    "date": "2026-09-06T16:00:00Z",
+                    "status": "pending",
+                }
+            ],
+            [
+                {
+                    "id": 7002,
+                    "home": "Nautico PE",
+                    "away": "Operario Ferroviario EC PR",
+                    "date": "2026-09-15T22:30:00Z",
+                    "status": "pending",
+                }
+            ],
+        ]
+        client.stats = SimpleNamespace(
+            total_calls=2,
+            calls_by_endpoint={"events": 2},
+            api_time_seconds=0.1,
+            rate_limit_hits=0,
+            rate_limit_sleeps=0,
+            last_rate_limit=None,
+        )
+        client_type.return_value = client
+
+        result = fetch_league_odds_payload(
+            651,
+            "brazil-brasileiro-serie-b",
+            [build_fixture(19667164, "Londrina", "Ponte Preta", datetime(2026, 9, 15, 22, 30))],
+            "football",
+            0,
+            14,
+            ["Unibet"],
+            0,
+        )
+
+        self.assertIsNone(result.error)
+        evidence = result.moneyline_coverage[0]
+        self.assertEqual(evidence["matching_status"], "provider_gap")
+        self.assertEqual(evidence["provider_gap_reason"], "no_matching_event_for_fixture_date")
+        self.assertEqual(evidence["provider_event_feed_status"], "non_empty")
+        self.assertEqual(evidence["provider_event_probe"]["events_returned"], 1)
+        self.assertEqual(evidence["candidate_event_ids"], [])
+
+    @patch("scripts.sync_odds.OddsApiClient")
     def test_settled_history_uses_historical_endpoint_and_emits_evidence(self, client_type) -> None:
         client = MagicMock()
         client.request.side_effect = [

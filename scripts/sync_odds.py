@@ -1081,10 +1081,12 @@ def fetch_league_odds_payload(
 
         # The provider's bulk event feed is not guaranteed to contain every
         # future date in a long delivery window.  Probe each still-unmatched
-        # rolling fixture's UTC calendar day once per league/date.  A non-empty
-        # probe is still subject to the normal matcher (so aliases remain
-        # visible as hard failures); only a successful empty probe becomes an
-        # explicit provider publication gap.
+        # rolling fixture's UTC calendar day once per league/date.  A
+        # successful date probe with no matching event is an explicit provider
+        # publication gap for that fixture; an event recovered by the normal
+        # matcher remains matched and continues through odds ingestion. Missing
+        # or invalid probe evidence remains unmatched so the consumers fail
+        # closed when the provider observation is incomplete.
         if not calendar_history:
             probe_cache: Dict[Tuple[str, str], Dict[str, object]] = {}
             for fixture in league_fixtures:
@@ -1255,11 +1257,20 @@ def fetch_league_odds_payload(
                     and provider_probe.get("response_status") == "ok"
                     and int(provider_probe.get("events_returned") or 0) == 0
                 )
+                provider_probe_valid = bool(
+                    provider_probe
+                    and provider_probe.get("endpoint") == "events"
+                    and provider_probe.get("response_status") == "ok"
+                    and isinstance(provider_probe.get("from"), str)
+                    and isinstance(provider_probe.get("to"), str)
+                    and isinstance(provider_probe.get("events_returned"), int)
+                    and int(provider_probe["events_returned"]) >= 0
+                )
                 coverage = {
                     "fixture_id": fixture_id,
                     "league_id": league_id,
                     "odds_api_league": odds_league,
-                    "matching_status": "provider_gap" if provider_feed_empty else "unmatched",
+                    "matching_status": "provider_gap" if provider_probe_valid else "unmatched",
                     "event_id": None,
                     "event": None,
                     "candidate_event_ids": [],
@@ -1276,8 +1287,12 @@ def fetch_league_odds_payload(
                         for key, value in provider_probe.items()
                         if key != "matched_event_ids"
                     }
-                    if provider_feed_empty:
-                        coverage["provider_gap_reason"] = "no_events_for_fixture_date"
+                    if provider_probe_valid:
+                        coverage["provider_gap_reason"] = (
+                            "no_events_for_fixture_date"
+                            if provider_feed_empty
+                            else "no_matching_event_for_fixture_date"
+                        )
                 result.moneyline_coverage.append(coverage)
                 continue
 
