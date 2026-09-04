@@ -12,10 +12,16 @@ TARGET_USER="${VPS_USER:-root}"
 SSH_KEY="${VPS_SSH_KEY:-}"
 TARGET_VENV_PATH="${VPS_VENV_PATH:-/opt/odds-sync/JXD987/.venv}"
 TARGET_ENV_PATH="${VPS_ENV_PATH:-/opt/odds-sync/JXD987/.env}"
+TARGET_DB_PATH="${VPS_DB_PATH:-}"
 
 if [[ -z "${TARGET_HOST}" || -z "${TARGET_REPO_ROOT}" ]]; then
   echo "Usage: $(basename "$0") <host> <remote_repo_root>" >&2
-  echo "Or set VPS_HOST and VPS_REPO_ROOT (plus VPS_USER / VPS_SSH_KEY)." >&2
+  echo "Or set VPS_HOST and VPS_REPO_ROOT (plus VPS_USER / VPS_SSH_KEY / VPS_DB_PATH)." >&2
+  exit 1
+fi
+
+if [[ -z "${TARGET_DB_PATH}" ]]; then
+  echo "VPS_DB_PATH is required; refusing to deploy a release with an isolated SQLite spool." >&2
   exit 1
 fi
 
@@ -25,6 +31,10 @@ if [[ "${TARGET_VENV_PATH}" != /* ]]; then
 fi
 if [[ "${TARGET_ENV_PATH}" != /* ]]; then
   echo "VPS_ENV_PATH must be an absolute path: ${TARGET_ENV_PATH}" >&2
+  exit 1
+fi
+if [[ "${TARGET_DB_PATH}" != /* ]]; then
+  echo "VPS_DB_PATH must be an absolute path: ${TARGET_DB_PATH}" >&2
   exit 1
 fi
 
@@ -84,5 +94,5 @@ done < "${RUNTIME_FILE_LIST}"
     scripts/vps/runtime_manifest.sha1 "${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}/"
 )
 
-"${ssh_cmd[@]}" "set -e; venv_target='${TARGET_REPO_ROOT}/.venv'; venv_shared='${TARGET_VENV_PATH}'; if [[ -e \"\${venv_target}\" || -L \"\${venv_target}\" ]]; then if [[ ! -L \"\${venv_target}\" || \"\$(readlink \"\${venv_target}\")\" != \"\${venv_shared}\" ]]; then echo \"Existing .venv does not point to \${venv_shared}: \${venv_target}\" >&2; exit 1; fi; else test -d \"\${venv_shared}\"; ln -s \"\${venv_shared}\" \"\${venv_target}\"; fi; test -f \"\${venv_target}/bin/activate\"; env_target='${TARGET_REPO_ROOT}/.env'; env_shared='${TARGET_ENV_PATH}'; if [[ -e \"\${env_target}\" || -L \"\${env_target}\" ]]; then if [[ ! -L \"\${env_target}\" || \"\$(readlink \"\${env_target}\")\" != \"\${env_shared}\" ]]; then echo \"Existing .env does not point to \${env_shared}: \${env_target}\" >&2; exit 1; fi; else test -f \"\${env_shared}\"; ln -s \"\${env_shared}\" \"\${env_target}\"; fi; test -f \"\${env_target}\"; cd '${TARGET_REPO_ROOT}' && shasum -c scripts/vps/runtime_manifest.sha1 && grep -Fqx -- 'scripts/refresh_fixture_delivery.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_p3.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_postmatch_settlement.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/reconcile_stats_provider_queue.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_stats_reconciliation.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1)"
+"${ssh_cmd[@]}" "set -e; venv_target='${TARGET_REPO_ROOT}/.venv'; venv_shared='${TARGET_VENV_PATH}'; if [[ -e \"\${venv_target}\" || -L \"\${venv_target}\" ]]; then if [[ ! -L \"\${venv_target}\" || \"\$(readlink \"\${venv_target}\")\" != \"\${venv_shared}\" ]]; then echo \"Existing .venv does not point to \${venv_shared}: \${venv_target}\" >&2; exit 1; fi; else test -d \"\${venv_shared}\"; ln -s \"\${venv_shared}\" \"\${venv_target}\"; fi; test -f \"\${venv_target}/bin/activate\"; env_target='${TARGET_REPO_ROOT}/.env'; env_shared='${TARGET_ENV_PATH}'; if [[ -e \"\${env_target}\" || -L \"\${env_target}\" ]]; then if [[ ! -L \"\${env_target}\" || \"\$(readlink \"\${env_target}\")\" != \"\${env_shared}\" ]]; then echo \"Existing .env does not point to \${env_shared}: \${env_target}\" >&2; exit 1; fi; else test -f \"\${env_shared}\"; ln -s \"\${env_shared}\" \"\${env_target}\"; fi; test -f \"\${env_target}\"; db_target='${TARGET_REPO_ROOT}/data/jxd.sqlite'; db_shared='${TARGET_DB_PATH}'; mkdir -p \"\$(dirname \"\${db_target}\")\"; if [[ -e \"\${db_target}\" || -L \"\${db_target}\" ]]; then if [[ ! -L \"\${db_target}\" || \"\$(readlink \"\${db_target}\")\" != \"\${db_shared}\" ]]; then echo \"Existing SQLite spool does not point to \${db_shared}: \${db_target}\" >&2; exit 1; fi; else test -f \"\${db_shared}\"; ln -s \"\${db_shared}\" \"\${db_target}\"; fi; test -f \"\${db_target}\"; cd '${TARGET_REPO_ROOT}' && shasum -c scripts/vps/runtime_manifest.sha1 && grep -Fqx -- 'scripts/refresh_fixture_delivery.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_p3.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_postmatch_settlement.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/reconcile_stats_provider_queue.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_stats_reconciliation.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1)"
 echo "Runtime deployed and verified on ${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}"

@@ -32,6 +32,11 @@ New operational vars:
 - `HEALTHCHECK_PING_URL_P3=` (optional)
 - `HEALTHCHECK_PING_URL_MODELS=` (optional)
 
+Runtime release paths:
+- `VPS_DB_PATH` is required by `scripts/vps/deploy_runtime.sh` and must point to the existing shared production SQLite spool. The deploy refuses to create an isolated release-local database.
+- `VPS_VENV_PATH=/opt/odds-sync/JXD987/.venv` (default)
+- `VPS_ENV_PATH=/opt/odds-sync/JXD987/.env` (default)
+
 Models publish vars (betting picks):
 - `MODELS_REPO_ROOT=/opt/odds-sync/Models` (default)
 - `MODELS_ENV_PATH=/opt/odds-sync/JXD987/.env` (default)
@@ -82,7 +87,8 @@ by both the P3 and settlement entries. For the current production schedule that
 target is `/opt/odds-sync/JXD987-fixture-metrics-closeout-release`:
 
 ```bash
-scripts/vps/deploy_runtime.sh <host> /opt/odds-sync/JXD987-fixture-metrics-closeout-release
+VPS_DB_PATH=/opt/odds-sync/JXD987-odds-matcher-586a3ef-release/data/jxd.sqlite \
+  scripts/vps/deploy_runtime.sh <host> /opt/odds-sync/JXD987-fixture-metrics-closeout-release
 ```
 
 ## 4) Phase 1 schedule (parity mode)
