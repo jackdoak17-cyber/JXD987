@@ -65,7 +65,7 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("run_recorded_pipeline_job", source)
         self.assertIn('"run_p3"', source)
         self.assertIn('ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-', source)
-        self.assertIn('ODDS_SYNC_P3_MAX_DURATION_SECONDS="${ODDS_P3_ODDS_MAX_RUNTIME_SECONDS:-300}"', source)
+        self.assertIn('ODDS_SYNC_P3_MAX_DURATION_SECONDS="${ODDS_P3_ODDS_MAX_RUNTIME_SECONDS:-600}"', source)
         self.assertIn("--priority settled-history", source)
         self.assertIn("--priority p3", source)
         self.assertIn("validate_moneyline_coverage.py", source)

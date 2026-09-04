@@ -66,9 +66,15 @@ fi
 # owners, so the variable-cost detail worker cannot starve the +7d odds lane.
 # A finite retry budget makes a cron tick a bounded queue trigger while still
 # preserving settlement priority and truthful skipped/failure heartbeats.
+# The timeout covers the complete history sync, +7d sync, CSV build, Supabase
+# export, retention, and moneyline validation chain. Three hundred seconds was
+# shorter than a full provider sync on the current production fixture set, so
+# the process could be killed after fetching data but before committing it.
+# Keep the documented 600-second safety bound as the default while allowing a
+# controlled operator override for a larger production-shaped recovery run.
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-${ODDS_P3_LOCK_RETRY_ATTEMPTS:-60}}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-${ODDS_P3_LOCK_RETRY_DELAY_SECONDS:-15}}"
-export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${ODDS_P3_ODDS_MAX_RUNTIME_SECONDS:-300}"
+export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${ODDS_P3_ODDS_MAX_RUNTIME_SECONDS:-600}"
 export ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS="${ODDS_P3_MIN_NORMAL_LEASE_SECONDS:-180}"
 
 if [[ "${RUN_COVERAGE:-false}" == "true" || "${RUN_COVERAGE:-false}" == "1" ]]; then
