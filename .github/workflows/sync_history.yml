@@ -78,6 +78,7 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
           SUPABASE_EXPORT_CHUNK: "1000"
           SUPABASE_EXPORT_SLEEP: "0"
           SUPABASE_EXPORT_RETRIES: "5"
@@ -86,6 +87,7 @@ jobs:
           # delete seasons belonging to the other matrix jobs.
           python3 scripts/export_to_supabase.py \
             --strict \
+            --atomic-fixture-detail \
             --skip-prune \
             --skip-odds-snapshots \
             --skip-odds-outcomes \
