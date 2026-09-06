@@ -174,6 +174,21 @@ def test_candidate_selection_is_due_and_does_not_require_local_scores() -> None:
     assert candidate_fixture_ids(conn, [8], 72, 10) == [1, 2]
 
 
+def test_candidate_selection_prioritizes_recent_fixtures_over_old_revalidation() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("create table fixtures (id integer, league_id integer, starting_at text)")
+    conn.execute("insert into fixtures values (1, 8, datetime('now', '-20 days'))")
+    conn.execute("insert into fixtures values (2, 8, datetime('now', '-3 hours'))")
+    ensure_ledger(conn)
+    conn.execute(
+        "insert into fixture_detail_deliveries(fixture_id,league_id,status,first_seen_at,next_revalidation_at,updated_at) "
+        "values (1,8,'verified','2020-01-01T00:00:00Z','2020-01-02T00:00:00Z','2020-01-01T00:00:00Z')"
+    )
+    conn.commit()
+
+    assert candidate_fixture_ids(conn, [8], 72, 1) == [2]
+
+
 def test_snapshot_comparison_reports_value_and_row_differences() -> None:
     source = DetailSnapshot(
         fixture_id=1,

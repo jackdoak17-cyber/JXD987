@@ -474,9 +474,12 @@ def candidate_fixture_ids(
          where ((f.starting_at >= ? and f.starting_at <= ?)
             or d.next_revalidation_at is not null)
            {league_clause}
-         order by f.starting_at asc, f.id asc
+         order by
+           case when f.starting_at >= ? then 0 else 1 end,
+           f.starting_at asc,
+           f.id asc
         """,
-        params,
+        [*params, cutoff.strftime("%Y-%m-%d %H:%M:%S")],
     ).fetchall()
     selected: list[int] = []
     now = utc_now()
@@ -1791,9 +1794,11 @@ def main() -> int:
         # unrelated recent source fixtures consume the bounded batch before
         # the requested target-season queue gets a turn. The normal live run
         # (without --season-ids) continues to combine source and target lanes.
-        selected = [] if season_ids else candidate_fixture_ids(conn, leagues, args.hours_back, args.limit, args.force)
+        selected = []
         if args.target_queue:
             selected.extend(candidate_target_fixture_ids(target_url, leagues, args.limit, args.force, season_ids or None))
+        if not season_ids:
+            selected.extend(candidate_fixture_ids(conn, leagues, args.hours_back, args.limit, args.force))
         fixture_ids = list(dict.fromkeys(selected))
         excluded = excluded_target_fixture_ids(target_url, fixture_ids)
         fixture_ids = [fixture_id for fixture_id in fixture_ids if fixture_id not in excluded][: max(args.limit, 0)]

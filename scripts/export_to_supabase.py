@@ -80,6 +80,25 @@ FALLBACK_REMOTE_COLUMNS: Dict[str, Set[str]] = {
         "lineup_detailed_position_code",
         "position_abbr",
     },
+    # GitHub REST export jobs may not have a direct database connection for
+    # information_schema discovery. Keep the deployed fixture-detail contract
+    # here so source-only fields cannot reach PostgREST after target cleanup.
+    "fixture_statistics": {
+        "fixture_id",
+        "team_id",
+        "type_id",
+        "value",
+        "provider_snapshot_id",
+    },
+    "fixture_player_statistics": {
+        "fixture_id",
+        "player_id",
+        "team_id",
+        "type_id",
+        "value",
+        "updated_at",
+        "provider_snapshot_id",
+    },
 }
 REMOTE_TABLE_COLUMNS_CACHE: Dict[str, Optional[Set[str]]] = {}
 REMOTE_TABLE_FILTER_LOGGED: Set[str] = set()
@@ -1286,6 +1305,16 @@ def main():
         players = fetch_players(conn, list(player_ids))
         player_team_history = fetch_player_team_history(conn, list(player_ids))
         sidelined_players = fetch_sidelined_players(conn, list(team_ids))
+
+        # Apply the target contract before any destructive fixture-scoped
+        # operation. upsert_table repeats this defensively, but doing it here
+        # prevents a payload mismatch from being discovered only after rows
+        # have been deleted.
+        fixture_players = filter_rows_for_remote_schema("fixture_players", fixture_players)
+        fixture_stats = filter_rows_for_remote_schema("fixture_statistics", fixture_stats)
+        fixture_player_stats = filter_rows_for_remote_schema(
+            "fixture_player_statistics", fixture_player_stats
+        )
 
     log.info("Payload counts: seasons=%s teams=%s fixtures=%s players=%s", len(seasons), len(teams), len(fixtures), len(players))
     log.info("Payload counts: rounds=%s", len(rounds))
