@@ -1301,6 +1301,18 @@ def refresh_player_projection(target_url: str, fixture_id: int) -> int:
             return int(row[0] or 0) if row else 0
 
 
+def refresh_player_projection_season(target_url: str, league_id: int, season_id: int) -> int:
+    """Refresh one affected season after a bulk fixture-detail backfill."""
+    with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
+        with target_conn.cursor() as cur:
+            cur.execute(
+                "select public.refresh_player_stats_season_eligible(%s, %s, null, null)",
+                (league_id, season_id),
+            )
+            row = cur.fetchone()
+            return int(row[0] or 0) if row else 0
+
+
 def _provider_status(data: dict[str, Any]) -> str | None:
     state = data.get("state") or {}
     if not isinstance(state, dict):
@@ -1762,6 +1774,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grace-minutes", type=int, default=int(os.environ.get("POSTMATCH_DETAIL_GRACE_MINUTES", str(DEFAULT_GRACE_MINUTES))))
     parser.add_argument("--force", action="store_true", help="Reprocess fixtures even when the ledger says verified.")
     parser.add_argument(
+        "--batch-projection",
+        action="store_true",
+        help="Refresh each affected player-stat season once after all fixture exports instead of once per fixture.",
+    )
+    parser.add_argument(
         "--target-queue",
         action=argparse.BooleanOptionalAction,
         default=os.environ.get("POSTMATCH_DETAIL_TARGET_QUEUE", "1").lower() not in {"0", "false", "no"},
@@ -1828,6 +1845,7 @@ def main() -> int:
         "sla_breaches": [],
         "provider_calls": 0,
         "projection_rows": 0,
+        "projection_seasons": [],
         "projection_failures": [],
     }
     if not fixture_ids:
@@ -1845,6 +1863,7 @@ def main() -> int:
     engine = source_engine(source_path)
     client = SportMonksClient()
     export_report_path = "/tmp/postmatch_fixture_detail_export_report.json"
+    projection_seasons: set[tuple[int, int]] = set()
 
     for fixture_id in fixture_ids:
         source_meta_row = conn.execute(
@@ -1934,11 +1953,14 @@ def main() -> int:
                     reason_code="excluded",
                 )
                 report["excluded"].append({"fixture_id": fixture_id, "next_review_at": review_at, "reason": reason})
-                try:
-                    report["projection_rows"] += refresh_player_projection(target_url, fixture_id)
-                except Exception as projection_exc:
-                    report["projection_failures"].append({"fixture_id": fixture_id, "error": str(projection_exc)[-4000:]})
-                    report["failed"].append({"fixture_id": fixture_id, "stage": "projection", "error": str(projection_exc)[-4000:]})
+                if args.batch_projection and league_id is not None and season_id is not None:
+                    projection_seasons.add((league_id, season_id))
+                else:
+                    try:
+                        report["projection_rows"] += refresh_player_projection(target_url, fixture_id)
+                    except Exception as projection_exc:
+                        report["projection_failures"].append({"fixture_id": fixture_id, "error": str(projection_exc)[-4000:]})
+                        report["failed"].append({"fixture_id": fixture_id, "stage": "projection", "error": str(projection_exc)[-4000:]})
                 continue
             terminal_sparse = stable_provider_sparse_assessment(assessment, stable_fetch_count)
             if terminal_sparse is not None:
@@ -2034,24 +2056,27 @@ def main() -> int:
                 report["failed"].append({"fixture_id": fixture_id, "stage": "verification", "error": message})
                 continue
 
-            try:
-                report["projection_rows"] += refresh_player_projection(target_url, fixture_id)
-            except Exception as projection_exc:
-                message = str(projection_exc)[-4000:]
-                update_ledger(
-                    conn,
-                    fixture_id,
-                    "projection_failed",
-                    attempt,
-                    assessment,
-                    source=source,
-                    target=target,
-                    error=message,
-                    next_attempt_at=backoff_time(attempt, utc_now()),
-                )
-                report["projection_failures"].append({"fixture_id": fixture_id, "error": message})
-                report["failed"].append({"fixture_id": fixture_id, "stage": "projection", "error": message})
-                continue
+            if args.batch_projection and league_id is not None and season_id is not None:
+                projection_seasons.add((league_id, season_id))
+            else:
+                try:
+                    report["projection_rows"] += refresh_player_projection(target_url, fixture_id)
+                except Exception as projection_exc:
+                    message = str(projection_exc)[-4000:]
+                    update_ledger(
+                        conn,
+                        fixture_id,
+                        "projection_failed",
+                        attempt,
+                        assessment,
+                        source=source,
+                        target=target,
+                        error=message,
+                        next_attempt_at=backoff_time(attempt, utc_now()),
+                    )
+                    report["projection_failures"].append({"fixture_id": fixture_id, "error": message})
+                    report["failed"].append({"fixture_id": fixture_id, "stage": "projection", "error": message})
+                    continue
 
             if snapshot_id is None:
                 raise RuntimeError(f"No provider snapshot ID for accepted fixture {fixture_id}")
@@ -2128,6 +2153,20 @@ def main() -> int:
                 except Exception:
                     LOG.exception("Could not record status projection failure for %s", fixture_id)
                 LOG.exception("Delivery status projection failed for %s", fixture_id)
+
+    if args.batch_projection:
+        report["projection_seasons"] = [
+            {"league_id": league_id, "season_id": season_id}
+            for league_id, season_id in sorted(projection_seasons)
+        ]
+        for league_id, season_id in sorted(projection_seasons):
+            try:
+                report["projection_rows"] += refresh_player_projection_season(target_url, league_id, season_id)
+            except Exception as projection_exc:
+                message = str(projection_exc)[-4000:]
+                failure = {"league_id": league_id, "season_id": season_id, "error": message}
+                report["projection_failures"].append(failure)
+                report["failed"].append({**failure, "stage": "batch_projection"})
 
     report["status"] = "failed" if report["failed"] else "success"
     if report["sla_breaches"] and not args.no_fail_on_sla_breach:
