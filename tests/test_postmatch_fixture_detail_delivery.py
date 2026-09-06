@@ -16,6 +16,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     delivery_reason_code,
     ensure_ledger,
     is_non_competitive_provider_assessment,
+    source_engine,
     source_ready,
     stable_provider_sparse_assessment,
     TRACKED_TEAM_STAT_TYPES,
@@ -187,6 +188,17 @@ def test_candidate_selection_prioritizes_recent_fixtures_over_old_revalidation()
     conn.commit()
 
     assert candidate_fixture_ids(conn, [8], 72, 1) == [2]
+
+
+def test_source_engine_uses_configured_busy_timeout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("JXD_SQLITE_BUSY_TIMEOUT_SECONDS", "12.5")
+    engine = source_engine(str(tmp_path / "source.sqlite"))
+    try:
+        with engine.connect() as connection:
+            timeout_ms = connection.exec_driver_sql("pragma busy_timeout").scalar_one()
+        assert timeout_ms == 12_500
+    finally:
+        engine.dispose()
 
 
 def test_snapshot_comparison_reports_value_and_row_differences() -> None:
