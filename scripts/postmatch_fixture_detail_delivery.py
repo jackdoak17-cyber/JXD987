@@ -259,6 +259,16 @@ def source_connection() -> sqlite3.Connection:
     return conn
 
 
+def source_engine(source_path: str):
+    """Create the ORM connection with the same lock tolerance as the queue connection."""
+    timeout_seconds = max(float(os.environ.get("JXD_SQLITE_BUSY_TIMEOUT_SECONDS", "30")), 1.0)
+    return create_engine(
+        f"sqlite:///{source_path}",
+        connect_args={"timeout": timeout_seconds},
+        future=True,
+    )
+
+
 def ensure_ledger(conn: sqlite3.Connection) -> None:
     conn.execute(
         f"""
@@ -1832,7 +1842,7 @@ def main() -> int:
     # the same source database even when JXD_DB_URL is configured for a
     # separate validation database.
     source_path = str(Path(SOURCE_DB).resolve())
-    engine = create_engine(f"sqlite:///{source_path}", future=True)
+    engine = source_engine(source_path)
     client = SportMonksClient()
     export_report_path = "/tmp/postmatch_fixture_detail_export_report.json"
 
