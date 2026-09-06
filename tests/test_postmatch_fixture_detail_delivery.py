@@ -10,6 +10,7 @@ from jxd.sync import SyncService
 from scripts.postmatch_fixture_detail_delivery import (
     DetailSnapshot,
     assess_provider_payload,
+    build_parser,
     candidate_fixture_ids,
     compare_snapshots,
     DERIVED_STAT_TYPE_IDS,
@@ -199,6 +200,11 @@ def test_source_engine_uses_configured_busy_timeout(tmp_path, monkeypatch) -> No
         assert timeout_ms == 12_500
     finally:
         engine.dispose()
+
+
+def test_batch_projection_flag_is_explicit() -> None:
+    assert build_parser().parse_args([]).batch_projection is False
+    assert build_parser().parse_args(["--batch-projection"]).batch_projection is True
 
 
 def test_snapshot_comparison_reports_value_and_row_differences() -> None:
