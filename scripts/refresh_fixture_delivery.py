@@ -520,6 +520,42 @@ def publish_release(
     )
 
 
+def finalize_release(
+    conn,
+    cur,
+    release_id: str,
+    counts: dict[str, int],
+    source_watermark: datetime | None,
+    report: dict[str, Any],
+) -> None:
+    """Publish durably before best-effort retention cleanup.
+
+    Garbage collection is operational housekeeping, not part of the customer
+    publication transaction. A large expired release must never roll back a
+    fully validated replacement and leave the website pinned to stale data.
+    """
+    publish_release(cur, release_id, counts, source_watermark)
+    report["release_id"] = release_id
+    report["published"] = True
+    conn.commit()
+
+    try:
+        cur.execute("select public.fixture_delivery_gc()")
+        report["garbage_collected_releases"] = int(cur.fetchone()[0] or 0)
+        report["garbage_collection_status"] = "succeeded"
+        conn.commit()
+    except Exception as error:
+        conn.rollback()
+        report["garbage_collected_releases"] = 0
+        report["garbage_collection_status"] = "degraded"
+        report["garbage_collection_error_class"] = type(error).__name__
+        LOG.warning(
+            "fixture delivery release %s remains published; retention cleanup failed",
+            release_id,
+            exc_info=True,
+        )
+
+
 def fail_release(release_id: str, error_message: str) -> None:
     """Persist failure state after the build transaction has rolled back."""
     conn = connection()
@@ -1175,12 +1211,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 standings,
             )
             source_watermark = max((row["starting_at"] for row in source), default=None)
-            publish_release(cur, release_id, counts, source_watermark)
-            cur.execute("select public.fixture_delivery_gc()")
-            report["garbage_collected_releases"] = int(cur.fetchone()[0] or 0)
-            report["release_id"] = release_id
-            report["published"] = True
-            conn.commit()
+            finalize_release(conn, cur, release_id, counts, source_watermark, report)
     except Exception as error:
         conn.rollback()
         if release_id is not None:
