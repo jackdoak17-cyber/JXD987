@@ -2,6 +2,7 @@ import sqlite3
 
 from scripts.export_to_supabase import fetch_players
 from scripts.sync_sparse_squads import select_team_batch
+from scripts.verify_squad_freshness import player_assignment_failures
 
 
 def test_select_team_batch_is_bounded_and_resumable():
@@ -62,3 +63,33 @@ def test_player_export_uses_latest_active_squad_assignment():
     assert rows[2]["team_id"] is None
 
     conn.close()
+
+
+def test_player_assignment_allows_multiple_active_squad_memberships():
+    failures = player_assignment_failures(
+        [7, 42],
+        {7: {1, 2}, 42: {1, 3}},
+        [
+            {"id": 1, "team_id": 42},
+            {"id": 2, "team_id": 7},
+            {"id": 3, "team_id": 42},
+        ],
+    )
+
+    assert failures == {"missing_player_rows": [], "invalid_player_assignment": []}
+
+
+def test_player_assignment_reports_missing_rows_and_invalid_compatibility_team():
+    failures = player_assignment_failures(
+        [7, 42],
+        {7: {1, 2}, 42: {3}},
+        [
+            {"id": 1, "team_id": 42},
+            {"id": 3, "team_id": 42},
+        ],
+    )
+
+    assert failures == {
+        "missing_player_rows": [{"player_id": 2}],
+        "invalid_player_assignment": [{"player_id": 1, "team_id": 42}],
+    }
