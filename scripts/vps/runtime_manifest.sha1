@@ -28,7 +28,7 @@ fab07d5e8b5f8735eddc53e0412ebbc2a5042384  scripts/vps/common.sh
 916a6612eedd078f07ae711fd1c9a4a2142718d9  scripts/vps/run_p2.sh
 34f87a4db3466a28324e658952e29b2c7b9b5975  scripts/vps/run_p3.sh
 d7060763122fce64afe12862a1e10acf39b04ba0  scripts/vps/run_p3_fixture_core.sh
-2f863d9af42b3f692ee6f82ff020bac7058fad9e  scripts/vps/run_postmatch_settlement.sh
+682b6c90887a993319bcfb1f89ed6e59fd36f336  scripts/vps/run_postmatch_settlement.sh
 6be24ddcdc916264fc0fed8357622ff2885de29c  scripts/vps/run_models.sh
 68f0ba013c6d96af3622a6320e7270e4419fa2fd  scripts/vps/run_sync.sh
 30d7b00595442e0909a4c35fd0ad66d0c7443fbf  scripts/sync_sparse_squads.py

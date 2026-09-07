@@ -34,6 +34,11 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('ODDS_SYNC_JOB_PRIORITY="settlement"', source)
         self.assertIn('ODDS_SYNC_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS}"', source)
         self.assertIn('SETTLEMENT_RUN_LOCK_FILE="${SETTLEMENT_RUN_LOCK_FILE:-/var/lock/odds-sync-settlement.lock}"', source)
+        self.assertIn('PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_settlement_delivery.json}"', source)
+        # Historical fixture-detail reconciliation has its own bounded worker,
+        # ledger and Operations heartbeat. Its backlog must not turn a
+        # successful score/result publication into a settlement failure.
+        self.assertNotIn("postmatch_fixture_detail_delivery.py", source)
 
     def test_fixture_core_refresh_cannot_overwrite_fixture_detail(self) -> None:
         wrapper = ROOT / "scripts/vps/run_p3_fixture_core.sh"
