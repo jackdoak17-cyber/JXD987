@@ -3,10 +3,31 @@ import unittest
 from scripts.validate_moneyline_coverage import (
     evaluate_failures,
     evaluate_provider_aware_failures,
+    validation_succeeded,
 )
 
 
 class ValidateMoneylineCoverageTests(unittest.TestCase):
+    def test_stale_supplemental_report_does_not_override_complete_fresh_evidence(self) -> None:
+        self.assertTrue(
+            validation_succeeded(
+                failures=[],
+                provider_evidence_errors=[
+                    "provider evidence report is stale: /tmp/odds_sync_report_p2.json"
+                ],
+            )
+        )
+
+    def test_missing_fixture_evidence_still_fails_closed(self) -> None:
+        self.assertFalse(
+            validation_succeeded(
+                failures=[{"reason": "missing fixture evidence"}],
+                provider_evidence_errors=[
+                    "provider evidence report is stale: /tmp/odds_sync_report_p2.json"
+                ],
+            )
+        )
+
     def test_passes_when_league_meets_threshold(self) -> None:
         failures = evaluate_failures(
             [
