@@ -16,8 +16,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/sync.py" \
   "scripts/reconcile_recent_fixtures.py" \
   "scripts/export_to_supabase.py" \
-  "scripts/refresh_fixture_delivery.py" \
-  "scripts/postmatch_fixture_detail_delivery.py"
+  "scripts/refresh_fixture_delivery.py"
 
 if [[ -f "${REPO_ROOT}/.env" ]]; then
   set -a
@@ -44,10 +43,7 @@ export SETTLEMENT_DELIVERY_DAYS_BACK="$(contract_value history_window_days)"
 # cannot publish a short snapshot that removes later fixture dates.
 export FIXTURE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"
 export SETTLEMENT_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD}"
-export POSTMATCH_DETAIL_HOURS_BACK="${POSTMATCH_DETAIL_HOURS_BACK:-72}"
-export POSTMATCH_DETAIL_LIMIT="${POSTMATCH_DETAIL_LIMIT:-25}"
-export POSTMATCH_DETAIL_GRACE_MINUTES="${POSTMATCH_DETAIL_GRACE_MINUTES:-60}"
-export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_fixture_detail_delivery_report.json}"
+export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_settlement_delivery.json}"
 # This chain shares the SQLite spool with P1/P2/P3, models, and historical
 # reconciliation. Use the single canonical pipeline lock for every writer.
 export FIXTURE_SETTLEMENT_LOCK_FILE="${FIXTURE_SETTLEMENT_LOCK_FILE:-/var/lock/odds-sync.lock}"
@@ -87,13 +83,6 @@ python scripts/refresh_fixture_delivery.py \
   --end-date "$(TZ=Europe/London date -d "+${SETTLEMENT_DELIVERY_DAYS_FORWARD} days" +%F)" \
   --leagues "${STATS_LEAGUES}" \
   --report-out "/tmp/postmatch_settlement_delivery.json"
-
-python scripts/postmatch_fixture_detail_delivery.py \
-  --leagues "${STATS_LEAGUES}" \
-  --hours-back "${POSTMATCH_DETAIL_HOURS_BACK}" \
-  --limit "${POSTMATCH_DETAIL_LIMIT}" \
-  --grace-minutes "${POSTMATCH_DETAIL_GRACE_MINUTES}" \
-  --report-json "/tmp/postmatch_fixture_detail_delivery_report.json"
 CHAIN
 )
 
