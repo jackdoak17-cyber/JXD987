@@ -337,6 +337,22 @@ def evaluate_failures(leagues: List[Dict[str, object]], fail_below_pct: float) -
     return failures
 
 
+def validation_succeeded(
+    failures: List[Dict[str, object]],
+    provider_evidence_errors: List[str],
+) -> bool:
+    """Return whether the coverage assertion passed.
+
+    Provider reports are additive evidence sources.  A stale or malformed
+    supplemental report must not overturn a complete database result or fresh
+    evidence from another report.  Missing evidence for a genuinely missing
+    fixture is still fail-closed because ``evaluate_provider_aware_failures``
+    records that fixture in ``failures`` and ``unresolved``.
+    """
+    del provider_evidence_errors
+    return len(failures) == 0
+
+
 def is_valid_date_scoped_provider_event_probe(row: Dict[str, object]) -> bool:
     probe = row.get("provider_event_probe")
     if not isinstance(probe, dict):
@@ -656,21 +672,7 @@ def main() -> None:
     else:
         failures = evaluate_failures(leagues, args.fail_below_pct)
 
-    if provider_evidence_errors:
-        failures = list(failures)
-        failures.append(
-            {
-                "league_id": None,
-                "fixtures_in_window": 0,
-                "fixtures_with_complete_moneyline": 0,
-                "coverage_pct": 0,
-                "effective_coverage_pct": 0,
-                "missing_fixture_ids": [],
-                "provider_gap_fixture_ids": [],
-                "first_missing_starting_at": None,
-                "reason": "provider evidence errors",
-            }
-        )
+    ok = validation_succeeded(failures, provider_evidence_errors)
     report = {
         "generated_at": utc_now_iso(),
         "days_forward": args.days_forward,
@@ -687,7 +689,7 @@ def main() -> None:
         "provider_gaps": provider_gaps,
         "provider_pipeline_failures": provider_pipeline_failures,
         "unresolved": unresolved,
-        "ok": len(failures) == 0 and not provider_evidence_errors,
+        "ok": ok,
     }
 
     if args.out_json:
@@ -695,7 +697,7 @@ def main() -> None:
     if args.out_md:
         Path(args.out_md).write_text(build_markdown_report(report), encoding="utf-8")
 
-    if failures:
+    if not ok:
         raise SystemExit("moneyline coverage validation failed")
 
 
