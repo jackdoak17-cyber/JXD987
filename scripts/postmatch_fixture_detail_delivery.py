@@ -587,59 +587,85 @@ def candidate_target_fixture_ids(
             # supported competition over time.
             "f.season_id desc, f.league_id, f.starting_at asc, f.id asc",
         )
-        retry_candidates = fetch_candidates(
+        recovery_candidates = fetch_candidates(
             target_conn,
             """
             d.fixture_id is not null
-            and (
-              (d.status in ('provider_pending', 'failed', 'export_failed', 'verification_failed', 'projection_failed')
-                and (d.next_attempt_at is null or d.next_attempt_at <= now()))
-              or (d.next_revalidation_at is not null and d.next_revalidation_at <= now())
-              or (d.status = 'verified' and d.next_revalidation_at is null)
-              or (
-                d.status in ('verified', 'provider_sparse')
-                and (
-                  coalesce(d.delivery_contract_version, 1) < 2
-                  or d.accepted_snapshot_id is null
-                  or d.player_stat_parity is distinct from true
-                  or d.lineup_parity is distinct from true
-                  or coalesce(d.target_player_stat_count, 0) <= 0
-                  or coalesce(d.target_lineup_count, 0) <= 0
-                )
-              )
-            )
+            and d.status in ('failed', 'export_failed', 'verification_failed', 'projection_failed')
+            and (d.next_attempt_at is null or d.next_attempt_at <= now())
             """,
             """
-            case
-              when d.status in ('verified', 'provider_sparse')
-               and (
-                 coalesce(d.delivery_contract_version, 1) < 2
-                 or d.accepted_snapshot_id is null
-                 or d.player_stat_parity is distinct from true
-                 or d.lineup_parity is distinct from true
-                 or coalesce(d.target_player_stat_count, 0) <= 0
-                 or coalesce(d.target_lineup_count, 0) <= 0
-               )
-              then 0
-              else 1
-            end,
-            case when d.accepted_snapshot_id is null then 0 else 1 end,
-            case
-              when d.status = 'provider_pending'
-               and d.last_error like 'Legacy provider_pending record%%'
-              then 0
-              when d.status = 'provider_pending'
-               and nullif(btrim(d.last_error), '') is null
-              then 0
-              else 1
-            end,
-            coalesce(d.next_attempt_at, d.next_revalidation_at, d.updated_at, f.starting_at),
+            coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
             f.season_id desc,
             f.league_id,
             f.starting_at asc,
             f.id asc
             """,
         )
+        pending_candidates = fetch_candidates(
+            target_conn,
+            """
+            d.fixture_id is not null
+            and d.status = 'provider_pending'
+            and (d.next_attempt_at is null or d.next_attempt_at <= now())
+            """,
+            """
+            case
+              when d.last_error like 'Legacy provider_pending record%%'
+              then 0
+              when nullif(btrim(d.last_error), '') is null
+              then 0
+              else 1
+            end,
+            coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
+            f.season_id desc,
+            f.league_id,
+            f.starting_at asc,
+            f.id asc
+            """,
+        )
+        revalidation_candidates = fetch_candidates(
+            target_conn,
+            """
+            d.fixture_id is not null
+            and d.status in ('verified', 'provider_sparse')
+            and (
+              (d.next_revalidation_at is not null and d.next_revalidation_at <= now())
+              or (d.status = 'verified' and d.next_revalidation_at is null)
+              or coalesce(d.delivery_contract_version, 1) < 2
+              or d.accepted_snapshot_id is null
+              or d.player_stat_parity is distinct from true
+              or d.lineup_parity is distinct from true
+              or coalesce(d.target_player_stat_count, 0) <= 0
+              or coalesce(d.target_lineup_count, 0) <= 0
+            )
+            """,
+            """
+            case when d.accepted_snapshot_id is null then 0 else 1 end,
+            coalesce(d.next_revalidation_at, d.updated_at, f.starting_at),
+            f.season_id desc,
+            f.league_id,
+            f.starting_at asc,
+            f.id asc
+            """,
+        )
+
+    recovery_quota, pending_quota, revalidation_quota = target_retry_lane_quotas(retry_quota)
+    retry_candidates = interleave_retry_lanes(
+        recovery_candidates[:recovery_quota],
+        pending_candidates[:pending_quota],
+        revalidation_candidates[:revalidation_quota],
+    )
+    allocated_ids = set(retry_candidates)
+    retry_candidates.extend(
+        fixture_id
+        for fixture_id in interleave_retry_lanes(
+            recovery_candidates[recovery_quota:],
+            pending_candidates[pending_quota:],
+            revalidation_candidates[revalidation_quota:],
+        )
+        if fixture_id not in allocated_ids
+    )
 
     selected = interleave_candidate_lanes(
         new_candidates[:new_quota],
@@ -659,6 +685,43 @@ def target_candidate_quotas(limit: int, new_share: float = TARGET_NEW_FIXTURE_SH
         return 0, 0
     new_quota = min(requested, max(1, math.ceil(requested * new_share)))
     return new_quota, requested - new_quota
+
+
+def target_retry_lane_quotas(limit: int) -> tuple[int, int, int]:
+    """Reserve progress for hard failures, provider waits, and revalidation."""
+
+    requested = max(int(limit), 0)
+    if requested == 0:
+        return 0, 0, 0
+    if requested == 1:
+        return 1, 0, 0
+    if requested == 2:
+        return 1, 1, 0
+    recovery = max(1, round(requested * 0.3))
+    revalidation = max(1, round(requested * 0.3))
+    pending = requested - recovery - revalidation
+    if pending < 1:
+        pending = 1
+        revalidation = requested - recovery - pending
+    return recovery, pending, revalidation
+
+
+def interleave_retry_lanes(
+    recovery_candidates: Sequence[int],
+    pending_candidates: Sequence[int],
+    revalidation_candidates: Sequence[int],
+) -> list[int]:
+    """Round-robin retry categories so a later cohort cap preserves each one."""
+
+    lanes = [list(recovery_candidates), list(pending_candidates), list(revalidation_candidates)]
+    combined: list[int] = []
+    index = 0
+    while any(index < len(lane) for lane in lanes):
+        for lane in lanes:
+            if index < len(lane):
+                combined.append(lane[index])
+        index += 1
+    return combined
 
 
 def interleave_candidate_lanes(
