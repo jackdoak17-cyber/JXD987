@@ -80,6 +80,7 @@ fi
 # run, branch evidence, candidates, and accepted rows are recorded in the
 # source that the health check actually certifies.
 if [[ "${MODELS_EXPERIMENTAL_ONLY}" == "true" || "${MODELS_EXPERIMENTAL_ONLY}" == "1" ]]; then
+  export MODELS_PLAYER_HIGH_PROB_MIN="${MODELS_EXPERIMENTAL_PLAYER_HIGH_PROB_MIN:-${MODELS_PLAYER_HIGH_PROB_MIN}}"
   ./scripts/run_experimental_models.sh "${MODELS_ENV_PATH}"
   exit 0
 fi
