@@ -77,6 +77,63 @@ def _remote_rows(table: str, team_ids: Sequence[int], select_columns: str, extra
     return rows
 
 
+def _remote_players_by_ids(player_ids: Sequence[int]) -> List[Dict]:
+    rows: List[Dict] = []
+    for chunk in _chunks(sorted(set(int(value) for value in player_ids))):
+        rows.extend(
+            _fetch_remote(
+                "players",
+                {
+                    "select": "id,team_id",
+                    "id": f"in.({','.join(str(value) for value in chunk)})",
+                    "limit": "1000",
+                    "order": "id.asc",
+                },
+            )
+        )
+    return rows
+
+
+def player_assignment_failures(
+    team_ids: Sequence[int],
+    active_members_by_team: Dict[int, Set[int]],
+    remote_players: Sequence[Dict],
+) -> Dict[str, List[Dict]]:
+    """Validate the compatibility assignment without rejecting valid loans.
+
+    A player can legitimately be active in more than one provider squad. The
+    legacy players.team_id column stores one deterministic current assignment,
+    while team_squad_memberships is the complete many-to-many contract.
+    """
+    scoped_team_ids = {int(value) for value in team_ids}
+    active_player_ids = {
+        player_id
+        for player_ids in active_members_by_team.values()
+        for player_id in player_ids
+    }
+    players_by_id = {
+        int(row["id"]): row
+        for row in remote_players
+        if row.get("id") is not None
+    }
+    missing_rows = [
+        {"player_id": player_id}
+        for player_id in sorted(active_player_ids - set(players_by_id))
+    ]
+    invalid_assignments: List[Dict] = []
+    for player_id, row in sorted(players_by_id.items()):
+        team_id = row.get("team_id")
+        if team_id is None or int(team_id) not in scoped_team_ids:
+            continue
+        parsed_team_id = int(team_id)
+        if player_id not in active_members_by_team.get(parsed_team_id, set()):
+            invalid_assignments.append({"player_id": player_id, "team_id": parsed_team_id})
+    return {
+        "missing_player_rows": missing_rows,
+        "invalid_player_assignment": invalid_assignments,
+    }
+
+
 def _latest_successful_snapshot(rows: Sequence[Dict], now: datetime) -> Dict[int, Dict]:
     return _latest_snapshots(rows, now, {"success"})
 
@@ -174,7 +231,7 @@ def main() -> None:
         remote_memberships = _remote_rows(
             "team_squad_memberships", team_ids, "team_id,player_id,is_active,last_snapshot_id"
         )
-        remote_players = _remote_rows("players", team_ids, "id,team_id")
+        assigned_remote_players = _remote_rows("players", team_ids, "id,team_id")
         remote_latest = _latest_snapshots(remote_snapshots, now)
         remote_latest_successful = _latest_successful_snapshot(remote_snapshots, now)
         failures.update({
@@ -182,7 +239,8 @@ def main() -> None:
             "stale_remote_snapshot": [],
             "remote_provider_failure": [],
             "snapshot_membership_count_mismatch": [],
-            "player_assignment_mismatch": [],
+            "missing_player_rows": [],
+            "invalid_player_assignment": [],
         })
         warnings["remote_provider_empty"] = []
         active_members_by_team: Dict[int, Set[int]] = {}
@@ -196,10 +254,24 @@ def main() -> None:
                     members_by_snapshot.setdefault((team_id, int(snapshot_id)), set()).add(player_id)
                 if row.get("is_active"):
                     active_members_by_team.setdefault(team_id, set()).add(player_id)
-        players_by_team: Dict[int, Set[int]] = {}
-        for row in remote_players:
-            if row.get("team_id") is not None and row.get("id") is not None:
-                players_by_team.setdefault(int(row["team_id"]), set()).add(int(row["id"]))
+        membership_player_ids = {
+            player_id
+            for player_ids in active_members_by_team.values()
+            for player_id in player_ids
+        }
+        membership_remote_players = _remote_players_by_ids(sorted(membership_player_ids))
+        remote_players_by_id = {
+            int(row["id"]): row
+            for row in [*assigned_remote_players, *membership_remote_players]
+            if row.get("id") is not None
+        }
+        failures.update(
+            player_assignment_failures(
+                team_ids,
+                active_members_by_team,
+                list(remote_players_by_id.values()),
+            )
+        )
         for team_id in team_ids:
             snapshot = remote_latest.get(team_id)
             if snapshot is None:
@@ -230,11 +302,6 @@ def main() -> None:
             if len(snapshot_member_ids) != expected_count:
                 failures["snapshot_membership_count_mismatch"].append(
                     {"team_id": team_id, "snapshot_id": snapshot["id"], "expected": expected_count, "actual": len(snapshot_member_ids)}
-                )
-            assigned_ids = players_by_team.get(team_id, set())
-            if assigned_ids != member_ids:
-                failures["player_assignment_mismatch"].append(
-                    {"team_id": team_id, "only_in_players": sorted(assigned_ids - member_ids), "only_in_membership": sorted(member_ids - assigned_ids)}
                 )
 
     failing_groups = {name: rows for name, rows in failures.items() if rows}

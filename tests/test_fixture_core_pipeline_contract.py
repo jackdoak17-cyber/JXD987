@@ -122,6 +122,11 @@ run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
         self.assertIn("STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS", source)
         self.assertIn('sleep "${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS}"', source)
 
+    def test_squad_cursor_advances_after_completed_batch_when_fleet_check_is_red(self) -> None:
+        source = (ROOT / "scripts/vps/run_squad_reconciliation.sh").read_text(encoding="utf-8")
+        self.assertIn(".next_team_offset | numbers", source)
+        self.assertNotIn('if [[ "${status}" -eq 0 ]]; then\n  next_offset=', source)
+
 
 if __name__ == "__main__":
     unittest.main()

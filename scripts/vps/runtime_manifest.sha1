@@ -32,5 +32,5 @@ d7060763122fce64afe12862a1e10acf39b04ba0  scripts/vps/run_p3_fixture_core.sh
 a60e30aa50d91c1e0ff65557e89040d3bd896890  scripts/vps/run_models.sh
 68f0ba013c6d96af3622a6320e7270e4419fa2fd  scripts/vps/run_sync.sh
 30d7b00595442e0909a4c35fd0ad66d0c7443fbf  scripts/sync_sparse_squads.py
-d234992ae2636bd0e98e7f88a3f9b44900b70d19  scripts/verify_squad_freshness.py
-8e092ae673729b11eef2ada8f4671949480ab508  scripts/vps/run_squad_reconciliation.sh
+d57a844a0f5ef11cd0bf6c84cfb0cce62bd885da  scripts/verify_squad_freshness.py
+2c20d8acf32137c96a173f15f2b6fe7314c01f5e  scripts/vps/run_squad_reconciliation.sh

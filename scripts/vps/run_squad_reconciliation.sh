@@ -96,7 +96,11 @@ run_recorded_pipeline_job \
   "Squad reconciliation" \
   "${CHAIN_COMMAND}" \
   "${PIPELINE_EVIDENCE_FILE}" || status=$?
-if [[ "${status}" -eq 0 ]]; then
+# The refresh report is written only after the selected batch was fetched and
+# exported successfully. Advance the durable cursor even when the end-of-cycle
+# fleet certification is red; otherwise one real residual mismatch pins the
+# worker to the final batch forever and prevents the repair cycle restarting.
+if [[ -f "${SQUAD_REPORT_FILE}" ]] && jq -e '.next_team_offset | numbers' "${SQUAD_REPORT_FILE}" >/dev/null; then
   next_offset="$(jq -r '.next_team_offset // 0' "${SQUAD_REPORT_FILE}")"
   if [[ ! "${next_offset}" =~ ^[0-9]+$ ]]; then
     log_error "squad report returned an invalid next offset: ${next_offset}"
