@@ -10,8 +10,9 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/vps/run_models.sh"
 
 # This wrapper publishes betting picks into Supabase (and optionally R2) by running the
-# publisher inside the Models repo. It intentionally shares the same global lock as the
-# odds sync pipeline, so it never overlaps with P3 ingestion.
+# publisher inside the Models repo. It reads and writes Supabase and does not
+# touch the SQLite ingestion spool, so it uses the Models lock rather than
+# consuming the short writer leases reserved between score-settlement ticks.
 #
 # Expected VPS layout (defaults):
 # - JXD987 repo:  /opt/odds-sync/JXD987
@@ -42,8 +43,10 @@ export MODELS_PUBLISH_R2="${MODELS_PUBLISH_R2:-true}"
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${MODELS_LOCK_RETRY_ATTEMPTS:-40}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${MODELS_LOCK_RETRY_DELAY_SECONDS:-15}"
 
-# Reuse the global lock helper, but allow a separate timeout for model publishing.
+# Reuse the verified timeout/recording helper with an independent overlap lock.
 export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${MODELS_MAX_DURATION_SECONDS:-900}"
+export ODDS_SYNC_LOCK_FILE="${MODELS_LOCK_FILE:-/var/lock/models-experimental.lock}"
+export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=false
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail

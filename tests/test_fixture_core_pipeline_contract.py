@@ -112,6 +112,11 @@ run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
         self.assertNotIn("--fixtureLimit", r2_command)
         self.assertNotIn("--playersLimit", r2_command)
 
+    def test_models_uses_its_own_lock_without_sqlite_settlement_leases(self) -> None:
+        source = (ROOT / "scripts/vps/run_models.sh").read_text(encoding="utf-8")
+        self.assertIn('ODDS_SYNC_LOCK_FILE="${MODELS_LOCK_FILE:-/var/lock/models-experimental.lock}"', source)
+        self.assertIn("ODDS_SYNC_LIVE_SCHEDULE_ENABLED=false", source)
+
     def test_historical_reconciliation_leaves_foreground_handoff(self) -> None:
         source = (ROOT / "scripts/vps/run_stats_reconciliation.sh").read_text(encoding="utf-8")
         self.assertIn("STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS", source)

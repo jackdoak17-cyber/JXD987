@@ -377,6 +377,7 @@ run_with_global_lock_and_timeout() {
   local live_reserve_seconds="${ODDS_SYNC_LIVE_RESERVE_SECONDS:-180}"
   local live_grace_seconds="${ODDS_SYNC_LIVE_GRACE_SECONDS:-120}"
   local min_normal_lease_seconds="${ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS:-0}"
+  local live_schedule_enabled="${ODDS_SYNC_LIVE_SCHEDULE_ENABLED:-true}"
 
   mkdir -p "$(dirname "${lock_file}")"
 
@@ -386,7 +387,7 @@ run_with_global_lock_and_timeout() {
     # settlement writer to wait for a writer that was already in flight.
     now_epoch="$(date -u +%s)"
     live_phase=$((now_epoch % live_tick_seconds))
-    if [[ "${job_priority}" != "settlement" ]] && {
+    if [[ "${live_schedule_enabled}" == "true" && "${job_priority}" != "settlement" ]] && {
       (( live_phase >= live_tick_seconds - live_reserve_seconds )) ||
       (( live_phase < live_grace_seconds ));
     }; then
@@ -409,7 +410,7 @@ run_with_global_lock_and_timeout() {
     done
 
     local effective_runtime="${max_runtime}"
-    if [[ "${job_priority}" != "settlement" ]]; then
+    if [[ "${live_schedule_enabled}" == "true" && "${job_priority}" != "settlement" ]]; then
       # A normal writer may start outside the reservation window but still
       # overrun the next settlement tick if it consumes its full timeout.
       # Cap the in-flight lease so the canonical lock is released before the
