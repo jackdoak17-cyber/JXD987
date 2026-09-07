@@ -40,6 +40,7 @@ export MODELS_PLAYER_HIGH_HIT_RATE_MIN="${MODELS_PLAYER_HIGH_HIT_RATE_MIN:-0.8}"
 export MODELS_SKIP_PLAYER_AI="${MODELS_SKIP_PLAYER_AI:-false}"
 export MODELS_SKIP_TEAM_AI="${MODELS_SKIP_TEAM_AI:-false}"
 export MODELS_PUBLISH_R2="${MODELS_PUBLISH_R2:-true}"
+export MODELS_EXPERIMENTAL_ONLY="${MODELS_EXPERIMENTAL_ONLY:-false}"
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${MODELS_LOCK_RETRY_ATTEMPTS:-40}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${MODELS_LOCK_RETRY_DELAY_SECONDS:-15}"
 
@@ -72,6 +73,15 @@ if [[ -f ./.env ]]; then
   # shellcheck disable=SC1091
   source ./.env
   set +a
+fi
+
+# Operations' experimental-only mode is a private research ledger, not the
+# public website picks feed. Run the Models-owned entrypoint so its pipeline
+# run, branch evidence, candidates, and accepted rows are recorded in the
+# source that the health check actually certifies.
+if [[ "${MODELS_EXPERIMENTAL_ONLY}" == "true" || "${MODELS_EXPERIMENTAL_ONLY}" == "1" ]]; then
+  ./scripts/run_experimental_models.sh "${MODELS_ENV_PATH}"
+  exit 0
 fi
 
 # Ensure the publisher tables exist and grants are applied.

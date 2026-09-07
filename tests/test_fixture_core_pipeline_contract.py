@@ -117,6 +117,11 @@ run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
         self.assertIn('ODDS_SYNC_LOCK_FILE="${MODELS_LOCK_FILE:-/var/lock/models-experimental.lock}"', source)
         self.assertIn("ODDS_SYNC_LIVE_SCHEDULE_ENABLED=false", source)
 
+    def test_experimental_models_use_the_private_ledger_entrypoint(self) -> None:
+        source = (ROOT / "scripts/vps/run_models.sh").read_text(encoding="utf-8")
+        self.assertIn('MODELS_EXPERIMENTAL_ONLY="${MODELS_EXPERIMENTAL_ONLY:-false}"', source)
+        self.assertIn('./scripts/run_experimental_models.sh "${MODELS_ENV_PATH}"', source)
+
     def test_historical_reconciliation_leaves_foreground_handoff(self) -> None:
         source = (ROOT / "scripts/vps/run_stats_reconciliation.sh").read_text(encoding="utf-8")
         self.assertIn("STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS", source)
