@@ -12,6 +12,7 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
     def test_runtime_entrypoints_have_valid_shell_syntax(self) -> None:
         for relative_path in (
             "scripts/vps/common.sh",
+            "scripts/vps/run_odds_p3.sh",
             "scripts/vps/run_p3.sh",
             "scripts/vps/run_p3_fixture_core.sh",
             "scripts/vps/run_postmatch_settlement.sh",
@@ -53,6 +54,24 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
         self.assertIn('export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"', p3)
         self.assertIn("run_recorded_pipeline_job", p3)
         self.assertNotIn("python scripts/reconcile_recent_fixtures.py", p3)
+
+    def test_odds_p3_preserves_explicit_runtime_overrides_across_env_load(self) -> None:
+        wrapper = (ROOT / "scripts/vps/run_odds_p3.sh").read_text(encoding="utf-8")
+
+        capture_db = wrapper.index('runtime_jxd_db_path="${JXD_DB_PATH:-}"')
+        capture_retries = wrapper.index(
+            'runtime_lock_retry_attempts="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-}"'
+        )
+        env_load = wrapper.index('source "${REPO_ROOT}/.env"')
+        restore_db = wrapper.index('export JXD_DB_PATH="${runtime_jxd_db_path}"')
+        restore_retries = wrapper.index(
+            'export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${runtime_lock_retry_attempts}"'
+        )
+
+        self.assertLess(capture_db, env_load)
+        self.assertLess(capture_retries, env_load)
+        self.assertGreater(restore_db, env_load)
+        self.assertGreater(restore_retries, env_load)
 
     def test_runtime_manifest_contains_contract_and_core_entrypoint(self) -> None:
         entries = {

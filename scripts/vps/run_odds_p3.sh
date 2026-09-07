@@ -24,11 +24,22 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/validate_moneyline_coverage.py"
 
 export REPO_ROOT
+# Cron/operator values are the runtime contract.  Capture them before loading
+# shared defaults so a value in .env cannot silently shorten a recovery run or
+# redirect an immutable release to a different SQLite spool.
+runtime_jxd_db_path="${JXD_DB_PATH:-}"
+runtime_lock_retry_attempts="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-}"
 if [[ -f "${REPO_ROOT}/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "${REPO_ROOT}/.env"
   set +a
+fi
+if [[ -n "${runtime_jxd_db_path}" ]]; then
+  export JXD_DB_PATH="${runtime_jxd_db_path}"
+fi
+if [[ -n "${runtime_lock_retry_attempts}" ]]; then
+  export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${runtime_lock_retry_attempts}"
 fi
 
 export FIXTURE_CORE_CONTRACT_PATH="${FIXTURE_CORE_CONTRACT_PATH:-${REPO_ROOT}/config/fixture_core_contract.json}"
