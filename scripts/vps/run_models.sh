@@ -39,6 +39,8 @@ export MODELS_PLAYER_HIGH_HIT_RATE_MIN="${MODELS_PLAYER_HIGH_HIT_RATE_MIN:-0.8}"
 export MODELS_SKIP_PLAYER_AI="${MODELS_SKIP_PLAYER_AI:-false}"
 export MODELS_SKIP_TEAM_AI="${MODELS_SKIP_TEAM_AI:-false}"
 export MODELS_PUBLISH_R2="${MODELS_PUBLISH_R2:-true}"
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${MODELS_LOCK_RETRY_ATTEMPTS:-40}"
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${MODELS_LOCK_RETRY_DELAY_SECONDS:-15}"
 
 # Reuse the global lock helper, but allow a separate timeout for model publishing.
 export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${MODELS_MAX_DURATION_SECONDS:-900}"
@@ -90,9 +92,7 @@ if [[ "${MODELS_PUBLISH_R2}" == "true" || "${MODELS_PUBLISH_R2}" == "1" ]]; then
     python3 ml/publish_betting_picks_to_r2.py \
       --bucket "${CLOUDFLARE_R2_BUCKET}" \
       --prefix betting-picks \
-      --top "${MODELS_TOP}" \
-      --fixtureLimit "${MODELS_FIXTURE_LIMIT}" \
-      --playersLimit "${MODELS_PLAYERS_LIMIT}"
+      --top "${MODELS_TOP}"
   else
     echo "Skipping R2 publish; missing CLOUDFLARE_R2_* env vars." >&2
   fi
@@ -101,5 +101,8 @@ CHAIN
 )
 
 status=0
-run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+run_recorded_pipeline_job \
+  "run_models" \
+  "Experimental model picks publish" \
+  "${CHAIN_COMMAND}" || status=$?
 finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_MODELS:-${HEALTHCHECK_PING_URL:-}}"

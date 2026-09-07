@@ -15,6 +15,10 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
             "scripts/vps/run_p3.sh",
             "scripts/vps/run_p3_fixture_core.sh",
             "scripts/vps/run_postmatch_settlement.sh",
+            "scripts/vps/run_models.sh",
+            "scripts/vps/run_p1.sh",
+            "scripts/vps/run_p2.sh",
+            "scripts/vps/run_stats_reconciliation.sh",
         ):
             result = subprocess.run(
                 ["bash", "-n", str(ROOT / relative_path)],
@@ -88,6 +92,29 @@ run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("[RETRY]", result.stdout)
+
+    def test_freshness_critical_wrappers_retry_and_record_lock_outcomes(self) -> None:
+        expected = {
+            "scripts/vps/run_p1.sh": "run_p1",
+            "scripts/vps/run_p2.sh": "run_p2",
+            "scripts/vps/run_models.sh": "run_models",
+        }
+        for relative_path, job_id in expected.items():
+            source = (ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertIn("ODDS_SYNC_LOCK_RETRY_ATTEMPTS", source, relative_path)
+            self.assertIn("run_recorded_pipeline_job", source, relative_path)
+            self.assertIn(f'"{job_id}"', source, relative_path)
+
+    def test_r2_publisher_receives_only_supported_arguments(self) -> None:
+        source = (ROOT / "scripts/vps/run_models.sh").read_text(encoding="utf-8")
+        r2_command = source.split("python3 ml/publish_betting_picks_to_r2.py", 1)[1].split("else", 1)[0]
+        self.assertNotIn("--fixtureLimit", r2_command)
+        self.assertNotIn("--playersLimit", r2_command)
+
+    def test_historical_reconciliation_leaves_foreground_handoff(self) -> None:
+        source = (ROOT / "scripts/vps/run_stats_reconciliation.sh").read_text(encoding="utf-8")
+        self.assertIn("STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS", source)
+        self.assertIn('sleep "${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS}"', source)
 
 
 if __name__ == "__main__":

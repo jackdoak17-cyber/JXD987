@@ -31,6 +31,10 @@ export STATS_RECONCILE_MAX_COHORTS="${STATS_RECONCILE_MAX_COHORTS:-5}"
 # Retry delay after a live writer owns the lock. The scheduler gate below
 # decides whether a new batch may begin; this delay is not the handoff policy.
 export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-60}"
+# A foreground job polls for the canonical lock while this historical worker
+# drains. Leave a short deterministic handoff after every successful batch so
+# the foreground waiter can acquire it instead of being starved by this loop.
+export STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS="${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS:-20}"
 export STATS_RECONCILE_LIVE_TICK_SECONDS="${STATS_RECONCILE_LIVE_TICK_SECONDS:-900}"
 # The live settlement normally owns the spool for several minutes after the
 # quarter-hour tick. Do not race that work; begin historical reconciliation
@@ -153,4 +157,5 @@ PY
   fi
 
   tail -n 8 "${STATS_RECONCILE_RUN_LOG}" || true
+  sleep "${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS}" 9>&-
 done
