@@ -120,6 +120,7 @@ run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
     def test_experimental_models_use_the_private_ledger_entrypoint(self) -> None:
         source = (ROOT / "scripts/vps/run_models.sh").read_text(encoding="utf-8")
         self.assertIn('MODELS_EXPERIMENTAL_ONLY="${MODELS_EXPERIMENTAL_ONLY:-false}"', source)
+        self.assertIn("MODELS_EXPERIMENTAL_PLAYER_HIGH_PROB_MIN", source)
         self.assertIn('./scripts/run_experimental_models.sh "${MODELS_ENV_PATH}"', source)
 
     def test_historical_reconciliation_leaves_foreground_handoff(self) -> None:
