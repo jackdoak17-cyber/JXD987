@@ -7,6 +7,7 @@ from unittest.mock import Mock
 from scripts.refresh_fixture_delivery import (
     build_season_scoped_history,
     compute_standings,
+    finalize_release,
     iso_date,
     publish_release,
 )
@@ -38,6 +39,55 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             iso_date(datetime(2026, 8, 22, 23, 30, tzinfo=UTC)),
             "2026-08-23",
         )
+
+    def test_retention_failure_does_not_roll_back_published_release(self) -> None:
+        connection = Mock()
+        cursor = Mock()
+        cursor.rowcount = 1
+
+        def execute(query, params=None):
+            if "fixture_delivery_gc" in query:
+                raise TimeoutError("retention timeout")
+
+        cursor.execute.side_effect = execute
+        report = {}
+
+        finalize_release(
+            connection,
+            cursor,
+            "00000000-0000-4000-8000-000000000001",
+            {"schedule": 1, "standings": 0, "metrics": 44, "odds": 0},
+            datetime(2026, 8, 22, tzinfo=UTC),
+            report,
+        )
+
+        self.assertEqual(connection.commit.call_count, 1)
+        connection.rollback.assert_called_once_with()
+        self.assertTrue(report["published"])
+        self.assertEqual(report["garbage_collection_status"], "degraded")
+        self.assertEqual(report["garbage_collection_error_class"], "TimeoutError")
+
+    def test_successful_retention_runs_after_publication_commit(self) -> None:
+        connection = Mock()
+        cursor = Mock()
+        cursor.rowcount = 1
+        cursor.fetchone.return_value = (3,)
+        report = {}
+
+        finalize_release(
+            connection,
+            cursor,
+            "00000000-0000-4000-8000-000000000001",
+            {"schedule": 1, "standings": 0, "metrics": 44, "odds": 0},
+            datetime(2026, 8, 22, tzinfo=UTC),
+            report,
+        )
+
+        self.assertEqual(connection.commit.call_count, 2)
+        connection.rollback.assert_not_called()
+        self.assertTrue(report["published"])
+        self.assertEqual(report["garbage_collected_releases"], 3)
+        self.assertEqual(report["garbage_collection_status"], "succeeded")
 
     def test_null_season_rows_are_not_used_as_season_scoped_history(self) -> None:
         history = build_season_scoped_history(
