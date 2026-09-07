@@ -38,7 +38,7 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
         self.assertIn("--skip-prune", wrapper)
         self.assertIn('"${FIXTURE_CORE_JOB_ID}"', wrapper)
         self.assertIn("run_recorded_pipeline_job", wrapper)
-        self.assertIn('ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-4}"', wrapper)
+        self.assertIn('ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-40}"', wrapper)
         self.assertIn('ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"', wrapper)
         self.assertIn("--no-refresh-squads-missing", wrapper)
         self.assertIn("--no-refresh-sidelined-window", wrapper)
@@ -98,6 +98,7 @@ run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
             "scripts/vps/run_p1.sh": "run_p1",
             "scripts/vps/run_p2.sh": "run_p2",
             "scripts/vps/run_models.sh": "run_models",
+            "scripts/vps/run_squad_reconciliation.sh": "run_squad_reconciliation",
         }
         for relative_path, job_id in expected.items():
             source = (ROOT / relative_path).read_text(encoding="utf-8")

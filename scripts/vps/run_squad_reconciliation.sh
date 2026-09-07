@@ -32,6 +32,9 @@ export SQUAD_SUPERVISOR_LOCK_FILE="${SQUAD_SUPERVISOR_LOCK_FILE:-/var/lock/odds-
 export SQUAD_REPORT_FILE="${SQUAD_REPORT_FILE:-/tmp/sparse_squad_reconciliation_report.json}"
 export SQUAD_FRESHNESS_REPORT_FILE="${SQUAD_FRESHNESS_REPORT_FILE:-/tmp/squad_freshness_report.json}"
 export SQUAD_RECONCILIATION_MAX_RUNTIME_SECONDS="${SQUAD_RECONCILIATION_MAX_RUNTIME_SECONDS:-2400}"
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${SQUAD_LOCK_RETRY_ATTEMPTS:-40}"
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${SQUAD_LOCK_RETRY_DELAY_SECONDS:-15}"
+export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-${SQUAD_REPORT_FILE}}"
 
 if [[ ! "${SQUAD_BATCH_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
   log_error "SQUAD_BATCH_SIZE must be a positive integer"
@@ -88,7 +91,11 @@ CHAIN
 )
 
 status=0
-run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+run_recorded_pipeline_job \
+  "run_squad_reconciliation" \
+  "Squad reconciliation" \
+  "${CHAIN_COMMAND}" \
+  "${PIPELINE_EVIDENCE_FILE}" || status=$?
 if [[ "${status}" -eq 0 ]]; then
   next_offset="$(jq -r '.next_team_offset // 0' "${SQUAD_REPORT_FILE}")"
   if [[ ! "${next_offset}" =~ ^[0-9]+$ ]]; then
