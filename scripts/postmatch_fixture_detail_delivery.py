@@ -641,7 +641,10 @@ def candidate_target_fixture_ids(
             """,
         )
 
-    selected = new_candidates[:new_quota] + retry_candidates[:retry_quota]
+    selected = interleave_candidate_lanes(
+        new_candidates[:new_quota],
+        retry_candidates[:retry_quota],
+    )
     if len(selected) < requested:
         selected.extend(new_candidates[new_quota : new_quota + requested - len(selected)])
     if len(selected) < requested:
@@ -656,6 +659,36 @@ def target_candidate_quotas(limit: int, new_share: float = TARGET_NEW_FIXTURE_SH
         return 0, 0
     new_quota = min(requested, max(1, math.ceil(requested * new_share)))
     return new_quota, requested - new_quota
+
+
+def interleave_candidate_lanes(
+    new_candidates: Sequence[int],
+    retry_candidates: Sequence[int],
+) -> list[int]:
+    """Preserve both queue lanes when a later projection-cohort cap applies.
+
+    Retries used to be appended after every new fixture. The cohort limiter
+    could truncate the batch before reaching the first retry, indefinitely
+    leaving recoverable `export_failed` rows red. Start each weighted group
+    with one retry, followed by the proportional number of new fixtures.
+    """
+
+    pending_new = list(new_candidates)
+    pending_retry = list(retry_candidates)
+    if not pending_retry:
+        return pending_new
+    if not pending_new:
+        return pending_retry
+
+    new_per_retry = max(1, math.ceil(len(pending_new) / len(pending_retry)))
+    combined: list[int] = []
+    new_index = 0
+    for retry_id in pending_retry:
+        combined.append(retry_id)
+        combined.extend(pending_new[new_index : new_index + new_per_retry])
+        new_index += new_per_retry
+    combined.extend(pending_new[new_index:])
+    return combined
 
 
 def excluded_target_fixture_ids(target_url: str, fixture_ids: Sequence[int]) -> set[int]:

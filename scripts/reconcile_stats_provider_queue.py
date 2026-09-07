@@ -216,13 +216,15 @@ def cohort_limited_fixture_ids(
         return fixture_ids
 
     seen: set[tuple[int | None, int | None]] = set()
-    for index, fixture_id in enumerate(fixture_ids):
+    selected: list[int] = []
+    for fixture_id in fixture_ids:
         meta = target_metadata[fixture_id]
         cohort = (meta[0], meta[1])
         if cohort not in seen and len(seen) >= max_cohorts:
-            return fixture_ids[:index]
+            continue
         seen.add(cohort)
-    return fixture_ids
+        selected.append(fixture_id)
+    return selected
 
 
 def fetch_provider_fixture(fixture_id: int) -> tuple[dict[str, Any] | None, Exception | None, int]:

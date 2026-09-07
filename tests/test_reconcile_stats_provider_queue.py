@@ -11,6 +11,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     ensure_ledger,
     recover_stale_running,
     repair_legacy_ledger,
+    interleave_candidate_lanes,
     target_candidate_quotas,
 )
 
@@ -36,6 +37,13 @@ def test_target_candidate_quotas_reserve_historical_progress() -> None:
     assert target_candidate_quotas(50) == (40, 10)
     assert target_candidate_quotas(1) == (1, 0)
     assert target_candidate_quotas(0) == (0, 0)
+
+
+def test_candidate_lanes_put_retries_before_a_later_cohort_cap() -> None:
+    assert interleave_candidate_lanes(
+        list(range(1, 9)),
+        [101, 102],
+    ) == [101, 1, 2, 3, 4, 102, 5, 6, 7, 8]
 
 
 def test_target_selection_requeues_legacy_accepted_rows_for_v2_evidence(
@@ -105,6 +113,7 @@ def test_cohort_limit_preserves_clustered_prefix() -> None:
     }
 
     assert queue.cohort_limited_fixture_ids([1, 2, 3, 4], metadata, 2) == [1, 2, 3]
+    assert queue.cohort_limited_fixture_ids([1, 4, 2, 3], metadata, 2) == [1, 4, 2]
     assert queue.cohort_limited_fixture_ids([1, 2, 3, 4], metadata, 0) == [1, 2, 3, 4]
 
 
