@@ -21,6 +21,9 @@ export REPO_ROOT
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${P1_LOCK_RETRY_ATTEMPTS:-40}"
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${P1_LOCK_RETRY_DELAY_SECONDS:-15}"
+export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/odds_sync_report_p1.json}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
@@ -46,5 +49,9 @@ CHAIN
 )
 
 status=0
-run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+run_recorded_pipeline_job \
+  "run_p1" \
+  "P1 imminent odds refresh" \
+  "${CHAIN_COMMAND}" \
+  "${PIPELINE_EVIDENCE_FILE}" || status=$?
 finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_P1:-${HEALTHCHECK_PING_URL:-}}"
