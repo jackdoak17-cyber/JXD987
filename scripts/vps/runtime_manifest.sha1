@@ -27,10 +27,10 @@ f37c0c21718fe55d629a36c45ce509e112936384  scripts/vps/common.sh
 431b2ab84dbd21e62bbe7b63031c7316e0ac2757  scripts/vps/run_p1.sh
 916a6612eedd078f07ae711fd1c9a4a2142718d9  scripts/vps/run_p2.sh
 34f87a4db3466a28324e658952e29b2c7b9b5975  scripts/vps/run_p3.sh
-e79624ed0199fba5afd712ba60066716ccc7912e  scripts/vps/run_p3_fixture_core.sh
+d7060763122fce64afe12862a1e10acf39b04ba0  scripts/vps/run_p3_fixture_core.sh
 2f863d9af42b3f692ee6f82ff020bac7058fad9e  scripts/vps/run_postmatch_settlement.sh
 904405ad52e8cbaf79ac7e09a13f3012726caa19  scripts/vps/run_models.sh
 68f0ba013c6d96af3622a6320e7270e4419fa2fd  scripts/vps/run_sync.sh
 30d7b00595442e0909a4c35fd0ad66d0c7443fbf  scripts/sync_sparse_squads.py
 d234992ae2636bd0e98e7f88a3f9b44900b70d19  scripts/verify_squad_freshness.py
-2be304031eb2f1ac5b794baba6c918fd97b4e432  scripts/vps/run_squad_reconciliation.sh
+8e092ae673729b11eef2ada8f4671949480ab508  scripts/vps/run_squad_reconciliation.sh
