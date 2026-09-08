@@ -478,27 +478,28 @@ run_with_dedicated_lock_and_timeout() {
   local chain_command="$1"
   local lock_file="${2:-/var/lock/models-experimental.lock}"
   local max_runtime="${3:-${MODELS_MAX_DURATION_SECONDS:-900}}"
+  local job_label="${4:-experimental model}"
 
   if [[ ! "${max_runtime}" =~ ^[1-9][0-9]*$ ]]; then
-    log_error "dedicated model lock timeout must be a positive integer"
+    log_error "${job_label} dedicated lock timeout must be a positive integer"
     return 1
   fi
 
   mkdir -p "$(dirname "${lock_file}")"
   (
     if ! flock --nonblock 9; then
-      log_info "[SKIPPED] dedicated model lock unavailable, will retry next tick"
+      log_info "[SKIPPED] ${job_label} dedicated lock unavailable, will retry next tick"
       exit 2
     fi
 
     local status=0
     timeout --signal=TERM --kill-after=5s "${max_runtime}" bash -lc "${chain_command}" || status=$?
     if [[ "${status}" -eq 124 || "${status}" -eq 137 ]]; then
-      log_error "experimental model process exceeded ${max_runtime}s bound"
+      log_error "${job_label} process exceeded ${max_runtime}s bound"
       exit 1
     fi
     if [[ "${status}" -eq 2 ]]; then
-      log_error "experimental model process exited with usage/status code 2"
+      log_error "${job_label} process exited with usage/status code 2"
       exit 1
     fi
     exit "${status}"
