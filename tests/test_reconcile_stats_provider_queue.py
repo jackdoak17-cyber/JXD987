@@ -101,6 +101,10 @@ def test_target_selection_requeues_legacy_accepted_rows_for_v2_evidence(
     assert any("d.lineup_parity is distinct from true" in query for query in queries)
     assert any("d.status in ('failed', 'export_failed'" in query for query in queries)
     assert any("d.status = 'provider_pending'" in query for query in queries)
+    pending_query = next(query for query in queries if "d.status = 'provider_pending'" in query)
+    assert "d.first_seen_at <= now() - interval '24 hours'" in pending_query
+    assert "f.starting_at >= date_trunc('day', now()) - interval '30 days'" in pending_query
+    assert pending_query.index("f.season_id desc") < pending_query.index("coalesce(d.next_attempt_at")
 
 
 def test_ledger_upgrade_does_not_promote_pre_contract_rows_to_v2() -> None:

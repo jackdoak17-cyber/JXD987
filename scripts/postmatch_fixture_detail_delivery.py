@@ -611,16 +611,35 @@ def candidate_target_fixture_ids(
             """,
             """
             case
+              -- Customer-visible recent fixtures have a 24-hour delivery
+              -- SLA in Operations.  Put breached and approaching-SLA work
+              -- ahead of historical backfill, while the surrounding retry
+              -- lane still reserves capacity for recovery and revalidation.
+              when f.starting_at >= date_trunc('day', now()) - interval '30 days'
+               and d.first_seen_at <= now() - interval '24 hours'
+              then 0
+              when f.starting_at >= date_trunc('day', now()) - interval '30 days'
+               and d.first_seen_at <= now() - interval '12 hours'
+              then 1
+              when f.starting_at >= date_trunc('day', now()) - interval '30 days'
+              then 2
+              else 3
+            end,
+            case
               when d.last_error like 'Legacy provider_pending record%%'
               then 0
               when nullif(btrim(d.last_error), '') is null
               then 0
               else 1
             end,
-            coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
+            -- Cluster the bounded candidate pool by projection cohort.  The
+            -- worker refreshes one read model per league-season pair, so this
+            -- turns the existing cohort cap into a throughput guard instead
+            -- of truncating a highly interleaved queue after a few fixtures.
             f.season_id desc,
             f.league_id,
-            f.starting_at asc,
+            coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
+            f.starting_at desc,
             f.id asc
             """,
         )
