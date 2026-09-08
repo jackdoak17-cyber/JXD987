@@ -83,6 +83,7 @@ DETAIL_INCLUDE = ";".join(
 )
 MAX_BULK_FIXTURE_IDS = 50
 DEFAULT_MAX_COHORTS = 8
+DEFAULT_CANDIDATE_POOL_MULTIPLIER = 5
 
 
 @dataclass(frozen=True)
@@ -446,6 +447,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"maximum league-season projection cohorts per batch (default: STATS_RECONCILE_MAX_COHORTS or {DEFAULT_MAX_COHORTS})",
     )
     parser.add_argument(
+        "--candidate-pool-multiplier",
+        type=int,
+        default=None,
+        help=(
+            "read-only queue candidates inspected per batch slot "
+            f"(default: STATS_RECONCILE_CANDIDATE_POOL_MULTIPLIER or {DEFAULT_CANDIDATE_POOL_MULTIPLIER})"
+        ),
+    )
+    parser.add_argument(
         "--fetch-concurrency",
         type=int,
         default=None,
@@ -488,6 +498,15 @@ def main() -> int:
             os.environ.get("STATS_RECONCILE_MAX_COHORTS", str(DEFAULT_MAX_COHORTS))
         )
     max_cohorts = max(0, configured_max_cohorts)
+    configured_candidate_pool_multiplier = args.candidate_pool_multiplier
+    if configured_candidate_pool_multiplier is None:
+        configured_candidate_pool_multiplier = int(
+            os.environ.get(
+                "STATS_RECONCILE_CANDIDATE_POOL_MULTIPLIER",
+                str(DEFAULT_CANDIDATE_POOL_MULTIPLIER),
+            )
+        )
+    candidate_pool_multiplier = max(1, min(configured_candidate_pool_multiplier, 10))
 
     target_url = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
     if not target_url:
@@ -543,6 +562,7 @@ def main() -> int:
         "fetch_concurrency": fetch_concurrency,
         "bulk_size": bulk_size,
         "max_cohorts": max_cohorts,
+        "candidate_pool_multiplier": candidate_pool_multiplier,
         "stage_seconds": {},
     }
     target_conn: Any | None = None
@@ -564,10 +584,11 @@ def main() -> int:
         while True:
             if args.max_batches and report["batches"] >= args.max_batches:
                 break
+            batch_size = max(args.batch_size, 1)
             fixture_ids = candidate_target_fixture_ids(
                 target_url,
                 leagues,
-                max(args.batch_size, 1),
+                batch_size * candidate_pool_multiplier,
                 args.force,
                 season_ids or None,
             )
@@ -576,6 +597,7 @@ def main() -> int:
             target_metadata = target_fixture_metadata(target_url, fixture_ids)
             original_fixture_count = len(fixture_ids)
             fixture_ids = cohort_limited_fixture_ids(fixture_ids, target_metadata, max_cohorts)
+            fixture_ids = fixture_ids[:batch_size]
             if len(fixture_ids) < original_fixture_count:
                 LOG.info(
                     "Capped batch from %s to %s fixtures to stay within %s projection cohorts",
