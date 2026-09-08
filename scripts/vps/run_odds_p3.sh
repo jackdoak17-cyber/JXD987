@@ -19,6 +19,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/sportmonks_client.py" \
   "jxd/sync.py" \
   "scripts/sync_odds.py" \
+  "scripts/validate_odds_api_market_catalog.py" \
   "scripts/export_odds_to_supabase_psql.py" \
   "scripts/odds_retention_psql.py" \
   "scripts/validate_moneyline_coverage.py"
@@ -61,8 +62,11 @@ export RETENTION_DAYS_FORWARD="$(contract_value odds_window_days)"
 export RETENTION_SNAPSHOT_DAYS="${RETENTION_SNAPSHOT_DAYS:-30}"
 export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
 export MONEYLINE_COVERAGE_MIN_PCT="${MONEYLINE_COVERAGE_MIN_PCT:-100}"
-export MONEYLINE_REPAIR_ATTEMPTS="${MONEYLINE_REPAIR_ATTEMPTS:-1}"
 export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/odds_ingest_report_p3.json}"
+export ODDS_P3_STAGE_DIR="${ODDS_P3_STAGE_DIR:-/var/lib/odds-sync/p3-staging}"
+export ODDS_P3_STAGE_MAX_AGE_MINUTES="${ODDS_P3_STAGE_MAX_AGE_MINUTES:-480}"
+export ODDS_P3_PIPELINE_MAX_DURATION_SECONDS="${ODDS_P3_PIPELINE_MAX_DURATION_SECONDS:-1800}"
+export ODDS_P3_PIPELINE_LOCK_FILE="${ODDS_P3_PIPELINE_LOCK_FILE:-/var/lock/odds-p3-pipeline.lock}"
 
 if ! [[ "${RETENTION_DAYS_BACK}" =~ ^[0-9]+$ ]]; then
   echo "RETENTION_DAYS_BACK must be a non-negative integer" >&2
@@ -72,21 +76,19 @@ if (( RETENTION_DAYS_BACK < SETTLED_HISTORY_DAYS )); then
   echo "RETENTION_DAYS_BACK=${RETENTION_DAYS_BACK} cannot be less than settled history window ${SETTLED_HISTORY_DAYS}" >&2
   exit 1
 fi
+if ! [[ "${ODDS_P3_STAGE_MAX_AGE_MINUTES}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ODDS_P3_STAGE_MAX_AGE_MINUTES must be a positive integer" >&2
+  exit 1
+fi
 
-# This is an odds-only lane. Fixture identity/detail publication has separate
-# owners, so the variable-cost detail worker cannot starve the +7d odds lane.
-# A finite retry budget makes a cron tick a bounded queue trigger while still
-# preserving settlement priority and truthful skipped/failure heartbeats.
-# The timeout covers the complete history sync, +7d sync, CSV build, Supabase
-# export, retention, and moneyline validation chain. Three hundred seconds was
-# shorter than a full provider sync on the current production fixture set, so
-# the process could be killed after fetching data but before committing it.
-# Keep the documented 600-second safety bound as the default while allowing a
-# controlled operator override for a larger production-shaped recovery run.
+# Provider fetch/parsing and Supabase publication do not need the shared SQLite
+# writer lock. They run under a dedicated P3 overlap lock. Only the complete,
+# validated mutation bundles are applied under the settlement-aware writer
+# lease, so a normal handoff never repeats an eight-minute provider fetch.
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-${ODDS_P3_LOCK_RETRY_ATTEMPTS:-60}}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-${ODDS_P3_LOCK_RETRY_DELAY_SECONDS:-15}}"
-export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${ODDS_P3_ODDS_MAX_RUNTIME_SECONDS:-600}"
-export ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS="${ODDS_P3_MIN_NORMAL_LEASE_SECONDS:-180}"
+export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${ODDS_P3_APPLY_MAX_RUNTIME_SECONDS:-300}"
+export ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS="${ODDS_P3_MIN_NORMAL_LEASE_SECONDS:-60}"
 
 if [[ "${RUN_COVERAGE:-false}" == "true" || "${RUN_COVERAGE:-false}" == "1" ]]; then
   export COVERAGE_ARGS=""
@@ -114,33 +116,75 @@ build_moneyline_provider_report_args() {
 cd "${REPO_ROOT}"
 source .venv/bin/activate
 export PYTHONPATH="${REPO_ROOT}"
+source "${REPO_ROOT}/scripts/vps/common.sh"
 
 export SUPABASE_DB_URL_SESSION="${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}"
 export PGSSLMODE="${PGSSLMODE:-require}"
+mkdir -p "${ODDS_P3_STAGE_DIR}"
+HISTORY_STAGE="${ODDS_P3_STAGE_DIR}/history.ndjson.gz"
+P3_STAGE="${ODDS_P3_STAGE_DIR}/p3.ndjson.gz"
+HISTORY_REPORT="${ODDS_P3_STAGE_DIR}/history-report.json"
+P3_REPORT="${ODDS_P3_STAGE_DIR}/p3-report.json"
 
-# Settled odds use the exact previous-calendar-day contract and are immutable.
-python scripts/sync_odds.py \
-  --leagues "${ODDS_LEAGUES}" \
-  --days-back "${SETTLED_HISTORY_DAYS}" \
-  --days-forward 0 \
-  --priority settled-history \
-  --refresh-history \
-  --bookmakers "${ODDS_BOOKMAKERS}" \
-  --report-out "/tmp/odds_sync_report_history_p3.json" \
-  --unmatched-out "/tmp/unmatched_players_history_p3.json"
+# Detect provider catalogue renames and response-shape changes explicitly,
+# before a missing market can be misreported as local data loss.
+python scripts/validate_odds_api_market_catalog.py \
+  --sport football \
+  --report-out "/tmp/odds_api_market_catalog_p3.json"
 
-# The fixture-core lane owns identity refresh. This lane consumes that
-# canonical fixture set and owns the long-range odds snapshots/outcomes.
-python scripts/sync_odds.py \
-  --leagues "${ODDS_LEAGUES}" \
-  --days-back "${ODDS_SYNC_DAYS_BACK}" \
-  --days-forward "${DAYS_FORWARD}" \
-  --priority p3 \
-  --bookmakers "${ODDS_BOOKMAKERS}" \
-  --report-out "/tmp/odds_sync_report_p3.json" \
-  --unmatched-out "/tmp/unmatched_players_p3.json"
+# A previous interrupted publish leaves complete stages in place. Reuse them
+# within the bounded age contract instead of charging the provider twice.
+stage_invalid=0
+for stage_path in "${HISTORY_STAGE}" "${P3_STAGE}"; do
+  if [[ -f "${stage_path}" ]]; then
+    gzip -t "${stage_path}" || stage_invalid=1
+    if [[ ! -f "${stage_path}.sha256" ]] || ! (cd "$(dirname "${stage_path}")" && sha256sum -c "$(basename "${stage_path}").sha256" >/dev/null); then
+      stage_invalid=1
+    fi
+    if [[ -n "$(find "${stage_path}" -mmin "+${ODDS_P3_STAGE_MAX_AGE_MINUTES}" -print -quit)" ]]; then
+      stage_invalid=1
+    fi
+  fi
+done
+if [[ "${stage_invalid}" -ne 0 ]]; then
+  log_info "discarding invalid or expired P3 stages before provider fetch"
+  rm -f "${HISTORY_STAGE}" "${P3_STAGE}" "${HISTORY_STAGE}.sha256" "${P3_STAGE}.sha256"
+fi
 
-export ODDS_SYNC_REPORT_PATH="/tmp/odds_sync_report_p3.json"
+if [[ ! -f "${HISTORY_STAGE}" || ! -f "${P3_STAGE}" || ! -f "${HISTORY_REPORT}" || ! -f "${P3_REPORT}" ]]; then
+  rm -f "${HISTORY_STAGE}" "${P3_STAGE}" "${HISTORY_STAGE}.sha256" "${P3_STAGE}.sha256" "${HISTORY_REPORT}" "${P3_REPORT}"
+  # Fixture-core and post-match settlement own fixture identity/status. This
+  # odds-only lane consumes their canonical snapshot and stages no SQLite write.
+  python scripts/sync_odds.py \
+    --leagues "${ODDS_LEAGUES}" \
+    --days-back "${SETTLED_HISTORY_DAYS}" \
+    --days-forward 0 \
+    --priority settled-history \
+    --bookmakers "${ODDS_BOOKMAKERS}" \
+    --stage-out "${HISTORY_STAGE}" \
+    --report-out "${HISTORY_REPORT}" \
+    --unmatched-out "/tmp/unmatched_players_history_p3.json"
+
+  python scripts/sync_odds.py \
+    --leagues "${ODDS_LEAGUES}" \
+    --days-back "${ODDS_SYNC_DAYS_BACK}" \
+    --days-forward "${DAYS_FORWARD}" \
+    --priority p3 \
+    --bookmakers "${ODDS_BOOKMAKERS}" \
+    --stage-out "${P3_STAGE}" \
+    --report-out "${P3_REPORT}" \
+    --unmatched-out "/tmp/unmatched_players_p3.json"
+else
+  log_info "reusing complete P3 stages after an interrupted publish"
+fi
+
+APPLY_COMMAND=$(printf \
+  'python scripts/sync_odds.py --apply-stage %q --stage-max-age-minutes %q && python scripts/sync_odds.py --apply-stage %q --stage-max-age-minutes %q' \
+  "${HISTORY_STAGE}" "${ODDS_P3_STAGE_MAX_AGE_MINUTES}" \
+  "${P3_STAGE}" "${ODDS_P3_STAGE_MAX_AGE_MINUTES}")
+run_with_global_lock_and_retry "${APPLY_COMMAND}"
+
+export ODDS_SYNC_REPORT_PATH="${P3_REPORT}"
 python scripts/export_odds_to_supabase_psql.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_EXPORT_DAYS_BACK}" \
@@ -163,8 +207,7 @@ python scripts/odds_retention_psql.py \
   --snapshot-days "${RETENTION_SNAPSHOT_DAYS}" \
   --report-out "/tmp/odds_retention_report_p3.json"
 
-set +e
-build_moneyline_provider_report_args "/tmp/odds_sync_report_p3.json"
+build_moneyline_provider_report_args "${P3_REPORT}"
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
@@ -172,71 +215,27 @@ python scripts/validate_moneyline_coverage.py \
   "${MONEYLINE_PROVIDER_REPORT_ARGS[@]}" \
   --out-json "/tmp/moneyline_coverage_report_p3.json" \
   --out-md "/tmp/moneyline_coverage_report_p3.md"
-MONEYLINE_VALIDATION_STATUS=$?
-set -e
 
-if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
-  echo "Moneyline fidelity is red; running the bounded P3 odds repair attempt." >&2
-  repair_attempt=0
-  while [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 && "${repair_attempt}" -lt "${MONEYLINE_REPAIR_ATTEMPTS}" ]]; do
-    repair_attempt=$((repair_attempt + 1))
-    set +e
-    python scripts/sync_odds.py \
-      --leagues "${ODDS_LEAGUES}" \
-      --days-back "${ODDS_SYNC_DAYS_BACK}" \
-      --days-forward "${DAYS_FORWARD}" \
-      --priority p3 \
-      --bookmakers "${ODDS_BOOKMAKERS}" \
-      --report-out "/tmp/odds_sync_report_p3_repair_${repair_attempt}.json" \
-      --unmatched-out "/tmp/unmatched_players_p3_repair_${repair_attempt}.json"
-    repair_sync_status=$?
-    if [[ "${repair_sync_status}" -eq 0 ]]; then
-      python scripts/export_odds_to_supabase_psql.py \
-        --leagues "${ODDS_LEAGUES}" \
-        --days-back "${ODDS_EXPORT_DAYS_BACK}" \
-        --days-forward "${DAYS_FORWARD}" \
-        --calendar-window \
-        --csv-out "/tmp/odds_outcomes_export_p3_repair_${repair_attempt}.csv" \
-        --no-include-fixture-leagues \
-        --progress-rows 10000 \
-        --progress-fixtures 100 \
-        --max-runtime-minutes "${INGEST_MAX_RUNTIME_MINUTES}" \
-        --report-out "/tmp/odds_ingest_report_p3_repair_${repair_attempt}.json" \
-        --skip-retention \
-        --skip-retention-snapshots \
-        ${COVERAGE_ARGS}
-      repair_export_status=$?
-    else
-      repair_export_status=${repair_sync_status}
-    fi
-    if [[ "${repair_sync_status}" -eq 0 && "${repair_export_status}" -eq 0 ]]; then
-      build_moneyline_provider_report_args "/tmp/odds_sync_report_p3_repair_${repair_attempt}.json"
-      python scripts/validate_moneyline_coverage.py \
-        --leagues "${ODDS_LEAGUES}" \
-        --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
-        --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
-        "${MONEYLINE_PROVIDER_REPORT_ARGS[@]}" \
-        --out-json "/tmp/moneyline_coverage_report_p3.json" \
-        --out-md "/tmp/moneyline_coverage_report_p3.md"
-      MONEYLINE_VALIDATION_STATUS=$?
-    else
-      MONEYLINE_VALIDATION_STATUS=1
-    fi
-    set -e
-  done
-fi
-
-if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
-  echo "Moneyline fidelity remains red after bounded repair attempts." >&2
-  exit "${MONEYLINE_VALIDATION_STATUS}"
-fi
+# Only discard resumable stages after publication and validation both succeed.
+rm -f "${HISTORY_STAGE}" "${P3_STAGE}" "${HISTORY_STAGE}.sha256" "${P3_STAGE}.sha256"
 CHAIN
 )
 
+started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+started_epoch="$(date -u +%s)"
 status=0
-run_recorded_pipeline_job \
+run_with_dedicated_lock_and_timeout \
+  "${CHAIN_COMMAND}" \
+  "${ODDS_P3_PIPELINE_LOCK_FILE}" \
+  "${ODDS_P3_PIPELINE_MAX_DURATION_SECONDS}" \
+  "P3 odds pipeline" || status=$?
+finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+finished_epoch="$(date -u +%s)"
+record_pipeline_job_run \
   "run_p3" \
   "P3 Supabase ingest" \
-  "${CHAIN_COMMAND}" \
-  "${PIPELINE_EVIDENCE_FILE}" || status=$?
+  "${status}" \
+  "${started_at}" \
+  "${finished_at}" \
+  "$(((finished_epoch - started_epoch) * 1000))"
 finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_P3:-${HEALTHCHECK_PING_URL:-}}"

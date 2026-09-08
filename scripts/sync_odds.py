@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import gzip
+import hashlib
 import json
 import logging
 import os
@@ -33,6 +35,8 @@ from jxd.odds_api_client import OddsApiClient, OddsApiError
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
+
+ODDS_STAGE_SCHEMA_VERSION = 1
 
 BOOKMAKER_NAME_TO_ID = {
     "bet365": 2,
@@ -1773,6 +1777,223 @@ def upsert_outcomes(session, rows: List[Dict], preserve_existing: bool = False) 
     session.execute(sql, rows)
 
 
+def _stage_json_row(row: Dict[str, object]) -> Dict[str, object]:
+    payload = dict(row)
+    updated_at = payload.get("last_updated_at")
+    if isinstance(updated_at, datetime):
+        payload["last_updated_at"] = updated_at.isoformat()
+    return payload
+
+
+def _stage_db_row(row: Dict[str, object]) -> Dict[str, object]:
+    payload = dict(row)
+    updated_at = payload.get("last_updated_at")
+    if isinstance(updated_at, str):
+        payload["last_updated_at"] = parse_timestamp(updated_at)
+    return payload
+
+
+class OddsStageWriter:
+    """Write a complete, atomic, line-delimited odds mutation bundle."""
+
+    def __init__(self, path: Path, *, priority: Optional[str], calendar_history: bool) -> None:
+        self.path = path
+        self.temp_path = path.with_name(f".{path.name}.tmp")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.temp_path.unlink(missing_ok=True)
+        opener = gzip.open if str(path).endswith(".gz") else open
+        self.handle = opener(self.temp_path, "wt", encoding="utf-8")
+        self.operation_count = 0
+        self.row_count = 0
+        self.handle.write(json.dumps({
+            "type": "header",
+            "schema_version": ODDS_STAGE_SCHEMA_VERSION,
+            "generated_at": utc_now_iso(),
+            "priority": priority,
+            "calendar_history": calendar_history,
+        }, separators=(",", ":")) + "\n")
+
+    def write_operation(
+        self,
+        *,
+        fixture_id: int,
+        bookmaker_id: int,
+        market_keys: Iterable[str],
+        rows: List[Dict[str, object]],
+    ) -> None:
+        serialized_rows = [_stage_json_row(row) for row in rows]
+        self.handle.write(json.dumps({
+            "type": "operation",
+            "fixture_id": int(fixture_id),
+            "bookmaker_id": int(bookmaker_id),
+            "market_keys": sorted({str(key) for key in market_keys if key}),
+            "rows": serialized_rows,
+        }, separators=(",", ":")) + "\n")
+        self.operation_count += 1
+        self.row_count += len(serialized_rows)
+
+    def complete(self) -> None:
+        self.handle.write(json.dumps({
+            "type": "trailer",
+            "complete": True,
+            "operation_count": self.operation_count,
+            "row_count": self.row_count,
+        }, separators=(",", ":")) + "\n")
+        self.handle.flush()
+        self.handle.close()
+        with self.temp_path.open("rb") as completed_stage:
+            os.fsync(completed_stage.fileno())
+        os.replace(self.temp_path, self.path)
+        digest = hashlib.sha256()
+        with self.path.open("rb") as stage_file:
+            for chunk in iter(lambda: stage_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        checksum_path = self.path.with_name(f"{self.path.name}.sha256")
+        checksum_temp = checksum_path.with_name(f".{checksum_path.name}.tmp")
+        checksum_temp.write_text(f"{digest.hexdigest()}  {self.path.name}\n", encoding="utf-8")
+        os.replace(checksum_temp, checksum_path)
+
+    def abort(self) -> None:
+        if not self.handle.closed:
+            self.handle.close()
+        self.temp_path.unlink(missing_ok=True)
+
+
+def _parse_stage_generated_at(value: object) -> datetime:
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _verify_stage_checksum(path: Path) -> None:
+    checksum_path = path.with_name(f"{path.name}.sha256")
+    if not checksum_path.is_file():
+        raise ValueError(f"odds stage checksum is missing: {checksum_path}")
+    expected = checksum_path.read_text(encoding="utf-8").strip().split()[0]
+    if len(expected) != 64:
+        raise ValueError("odds stage checksum is invalid")
+    digest = hashlib.sha256()
+    with path.open("rb") as stage_file:
+        for chunk in iter(lambda: stage_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected:
+        raise ValueError("odds stage checksum does not match")
+
+
+def apply_odds_stage(path: Path, max_age_minutes: int) -> Dict[str, int]:
+    """Apply one complete staged bundle in a single SQLite transaction."""
+    if not path.is_file():
+        raise SystemExit(f"Odds stage does not exist: {path}")
+    try:
+        _verify_stage_checksum(path)
+    except ValueError as exc:
+        raise SystemExit(f"Refusing odds stage apply: {exc}") from exc
+    opener = gzip.open if str(path).endswith(".gz") else open
+    engine = get_engine()
+    session = get_session(engine)
+    Base.metadata.create_all(engine)
+    header: Optional[Dict[str, object]] = None
+    trailer: Optional[Dict[str, object]] = None
+    operation_count = 0
+    row_count = 0
+    staged_row_count = 0
+    skipped_out_of_scope = 0
+    fixture_scope_cache: Dict[int, bool] = {}
+    now_utc = datetime.now(timezone.utc)
+    try:
+        with opener(path, "rt", encoding="utf-8") as handle:
+            for line_number, raw_line in enumerate(handle, start=1):
+                if not raw_line.strip():
+                    continue
+                record = json.loads(raw_line)
+                record_type = record.get("type")
+                if record_type == "header":
+                    if line_number != 1 or header is not None:
+                        raise ValueError("stage header must be the first and only header")
+                    if record.get("schema_version") != ODDS_STAGE_SCHEMA_VERSION:
+                        raise ValueError("unsupported odds stage schema version")
+                    generated_at = _parse_stage_generated_at(record.get("generated_at"))
+                    age_minutes = (now_utc - generated_at).total_seconds() / 60
+                    if age_minutes < -5 or age_minutes > max_age_minutes:
+                        raise ValueError(
+                            f"odds stage age {age_minutes:.1f}m is outside allowed range"
+                        )
+                    header = record
+                    continue
+                if record_type == "trailer":
+                    if header is None or trailer is not None:
+                        raise ValueError("stage has an invalid trailer")
+                    trailer = record
+                    continue
+                if record_type != "operation" or header is None or trailer is not None:
+                    raise ValueError(f"invalid odds stage record at line {line_number}")
+                fixture_id = int(record["fixture_id"])
+                bookmaker_id = int(record["bookmaker_id"])
+                market_keys = [str(key) for key in record.get("market_keys") or [] if key]
+                rows = [_stage_db_row(row) for row in record.get("rows") or []]
+                staged_row_count += len(rows)
+                if fixture_id <= 0 or bookmaker_id <= 0 or not market_keys or not rows:
+                    raise ValueError(f"invalid odds stage operation at line {line_number}")
+                if any(int(row.get("fixture_id") or 0) != fixture_id for row in rows):
+                    raise ValueError(f"mixed fixture ids in stage operation at line {line_number}")
+                if any(int(row.get("bookmaker_id") or 0) != bookmaker_id for row in rows):
+                    raise ValueError(f"mixed bookmaker ids in stage operation at line {line_number}")
+                if any(str(row.get("market_key") or "") not in market_keys for row in rows):
+                    raise ValueError(f"undeclared market key in stage operation at line {line_number}")
+
+                if header.get("priority") == "p3":
+                    owned = fixture_scope_cache.get(fixture_id)
+                    if owned is None:
+                        starting_at = session.execute(
+                            text("select starting_at from fixtures where id = :fixture_id"),
+                            {"fixture_id": fixture_id},
+                        ).scalar_one_or_none()
+                        if isinstance(starting_at, str):
+                            starting_at = parse_timestamp(starting_at)
+                        if isinstance(starting_at, datetime) and starting_at.tzinfo is not None:
+                            starting_at = starting_at.astimezone(timezone.utc).replace(tzinfo=None)
+                        owned = fixture_priority_bucket(
+                            starting_at if isinstance(starting_at, datetime) else None,
+                            now_utc.replace(tzinfo=None),
+                        ) == "p3"
+                        fixture_scope_cache[fixture_id] = owned
+                    if not owned:
+                        skipped_out_of_scope += 1
+                        continue
+
+                preserve_existing = bool(header.get("calendar_history"))
+                if not preserve_existing:
+                    delete_fixture_market_rows(
+                        session,
+                        fixture_id,
+                        bookmaker_id,
+                        market_keys,
+                    )
+                upsert_outcomes(session, rows, preserve_existing=preserve_existing)
+                operation_count += 1
+                row_count += len(rows)
+
+        if header is None or trailer is None or trailer.get("complete") is not True:
+            raise ValueError("odds stage is incomplete")
+        if int(trailer.get("operation_count", -1)) != operation_count + skipped_out_of_scope:
+            raise ValueError("odds stage operation count does not match trailer")
+        expected_rows = int(trailer.get("row_count", -1))
+        if expected_rows != staged_row_count:
+            raise ValueError("odds stage row count does not match trailer")
+        session.commit()
+    except Exception as exc:
+        session.rollback()
+        raise SystemExit(f"Refusing odds stage apply: {exc}") from exc
+    finally:
+        session.close()
+    return {
+        "operations_applied": operation_count,
+        "rows_applied": row_count,
+        "operations_skipped_out_of_scope": skipped_out_of_scope,
+    }
+
+
 def normalize_outcome_line(value: object) -> Optional[float]:
     parsed = parse_float(value)
     if parsed is None:
@@ -2568,6 +2789,22 @@ def refresh_settled_history_fixtures(
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--stage-out",
+        default="",
+        help="Write a complete odds mutation bundle without changing SQLite.",
+    )
+    parser.add_argument(
+        "--apply-stage",
+        default="",
+        help="Apply a previously completed odds mutation bundle and exit.",
+    )
+    parser.add_argument(
+        "--stage-max-age-minutes",
+        type=int,
+        default=480,
+        help="Reject an apply-stage bundle older than this many minutes.",
+    )
     parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
     parser.add_argument(
         "--include-excluded",
@@ -2658,6 +2895,14 @@ def main() -> None:
     )
     parser.set_defaults(refresh_squads_missing=True, refresh_sidelined_window=True)
     args = parser.parse_args()
+    if args.stage_out and args.apply_stage:
+        raise SystemExit("--stage-out and --apply-stage are mutually exclusive")
+    if args.apply_stage:
+        if args.stage_max_age_minutes <= 0:
+            raise SystemExit("--stage-max-age-minutes must be positive")
+        result = apply_odds_stage(Path(args.apply_stage), args.stage_max_age_minutes)
+        print(json.dumps(result, sort_keys=True))
+        return
     calendar_history = args.priority == "settled-history"
     window_start, window_end = fixture_window_bounds(
         args.days_back,
@@ -2689,10 +2934,6 @@ def main() -> None:
         raise SystemExit("No valid bookmakers provided")
     requested_bookmaker_keys = {normalize_bookmaker_key(b) for b in bookmakers}
 
-    engine = get_engine()
-    session = get_session(engine)
-    Base.metadata.create_all(engine)
-
     refresh_upcoming = bool(args.refresh_upcoming)
     refresh_history = bool(args.refresh_history)
     refresh_squads = bool(args.refresh_squads)
@@ -2707,6 +2948,19 @@ def main() -> None:
         refresh_squads = False
         refresh_squads_missing = False
         refresh_sidelined_window = False
+    if args.stage_out and (
+        refresh_history
+        or refresh_upcoming
+        or refresh_squads
+        or refresh_squads_missing
+        or refresh_sidelined_window
+    ):
+        raise SystemExit("--stage-out cannot run fixture, squad, or sidelined refresh writes")
+
+    engine = get_engine()
+    session = get_session(engine)
+    if not args.stage_out:
+        Base.metadata.create_all(engine)
 
     svc: Optional[SyncService] = None
     if refresh_history or refresh_upcoming or refresh_squads or refresh_squads_missing or refresh_sidelined_window:
@@ -2745,6 +2999,13 @@ def main() -> None:
         log.info("Priority filter=%s fixtures_in_scope=%s/%s", args.priority, len(fixtures), before)
     if not fixtures:
         log.info("No fixtures found for odds window")
+        if args.stage_out:
+            writer = OddsStageWriter(
+                Path(args.stage_out),
+                priority=args.priority,
+                calendar_history=calendar_history,
+            )
+            writer.complete()
         if args.report_out:
             report = {
                 "generated_at": utc_now_iso(),
@@ -2834,6 +3095,15 @@ def main() -> None:
     league_stats: Dict[int, Dict[str, int]] = {}
     moneyline_coverage: List[Dict[str, object]] = []
     fetch_errors: List[str] = []
+    stage_writer = (
+        OddsStageWriter(
+            Path(args.stage_out),
+            priority=args.priority,
+            calendar_history=calendar_history,
+        )
+        if args.stage_out
+        else None
+    )
 
     fixtures_by_id: Dict[int, Dict[str, object]] = {int(fixture["fixture_id"]): fixture for fixture in fixtures}
     leagues_with_fixtures: List[Tuple[int, str, List[Dict[str, object]]]] = []
@@ -2987,20 +3257,29 @@ def main() -> None:
                 if not rows:
                     continue
                 market_keys = {row.get("market_key") for row in rows if row.get("market_key")}
-                if not calendar_history:
-                    delete_fixture_market_rows(
-                        session,
-                        fixture_id,
-                        BOOKMAKER_NAME_TO_ID[book_key],
-                        market_keys,
+                if stage_writer is not None:
+                    stage_writer.write_operation(
+                        fixture_id=fixture_id,
+                        bookmaker_id=BOOKMAKER_NAME_TO_ID[book_key],
+                        market_keys=market_keys,
+                        rows=rows,
                     )
-                upsert_outcomes(session, rows, preserve_existing=calendar_history)
+                else:
+                    if not calendar_history:
+                        delete_fixture_market_rows(
+                            session,
+                            fixture_id,
+                            BOOKMAKER_NAME_TO_ID[book_key],
+                            market_keys,
+                        )
+                    upsert_outcomes(session, rows, preserve_existing=calendar_history)
                 outcomes_total += len(rows)
                 bookmaker_names_saved.add(canonical_name)
-            session.commit()
+            if stage_writer is None:
+                session.commit()
 
     removed_invalid = 0
-    if args.priority is None:
+    if args.priority is None and stage_writer is None:
         removed_invalid = delete_invalid_goals_over_under(
             session,
             league_ids,
@@ -3083,7 +3362,17 @@ def main() -> None:
         Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     if fetch_errors:
+        if stage_writer is not None:
+            stage_writer.abort()
         raise SystemExit("One or more league fetches failed.")
+    if stage_writer is not None:
+        stage_writer.complete()
+        log.info(
+            "Wrote complete odds stage %s operations=%s rows=%s",
+            stage_writer.path,
+            stage_writer.operation_count,
+            stage_writer.row_count,
+        )
 
 
 if __name__ == "__main__":
