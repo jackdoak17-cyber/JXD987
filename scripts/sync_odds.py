@@ -464,6 +464,14 @@ def load_default_bookmakers() -> List[str]:
 
 DEFAULT_BOOKMAKERS = load_default_bookmakers()
 
+# P2 runs every two hours.  Its upper edge deliberately overlaps P3 by three
+# hours so a fixture cannot disappear from all fresh provider reports while it
+# crosses the 24-hour ownership boundary between scheduled runs.  P2 also
+# observes the P1 window.  Overlap fixtures are evidence-only, preserving the
+# existing single-writer ownership contract while giving the coverage validator
+# continuous evidence at kickoff.
+P2_EVIDENCE_MAX_HOURS = 27.0
+
 
 def canonicalize_bookmakers(raw_items: Iterable[str]) -> Tuple[List[str], List[str]]:
     canonical: List[str] = []
@@ -942,6 +950,31 @@ def fixture_priority_bucket(starting_at: Optional[datetime], now_utc: datetime) 
     return None
 
 
+def fixture_priority_in_scope(
+    starting_at: Optional[datetime],
+    now_utc: datetime,
+    priority: str,
+) -> bool:
+    """Return whether a lane should observe a fixture.
+
+    ``fixture_priority_bucket`` remains the single-writer ownership contract.
+    This scope adds a bounded read/fetch overlap for the faster P2 lane so
+    provider evidence remains continuous as fixtures move between cadences.
+    """
+    if starting_at is None:
+        return False
+    hours_to_kickoff = (starting_at - now_utc).total_seconds() / 3600.0
+    if hours_to_kickoff < 0:
+        return False
+    if priority == "p1":
+        return hours_to_kickoff <= 2
+    if priority == "p2":
+        return hours_to_kickoff <= P2_EVIDENCE_MAX_HOURS
+    if priority == "p3":
+        return fixture_priority_bucket(starting_at, now_utc) == "p3"
+    return False
+
+
 def filter_fixtures_by_priority(
     fixtures: List[Dict[str, object]],
     priority: Optional[str],
@@ -957,8 +990,10 @@ def filter_fixtures_by_priority(
             # from the historical provider lookup.
             filtered.append(fixture)
             continue
-        bucket = fixture_priority_bucket(fixture.get("starting_at"), now_utc)
-        if bucket == priority:
+        if fixture_priority_in_scope(fixture.get("starting_at"), now_utc, priority):
+            fixture["_priority_write_owned"] = (
+                fixture_priority_bucket(fixture.get("starting_at"), now_utc) == priority
+            )
             filtered.append(fixture)
     return filtered
 
@@ -3226,6 +3261,10 @@ def main() -> None:
             event_id = int(odds_record["event_id"])
             fixture = fixtures_by_id.get(fixture_id)
             if fixture is None:
+                continue
+            # P2 deliberately fetches a small boundary overlap to emit fresh
+            # provider evidence.  Only the owning lane may mutate odds rows.
+            if args.priority and not fixture.get("_priority_write_owned", True):
                 continue
             bookmakers_payload = odds_record.get("bookmakers_payload") or {}
             if args.debug_odds_out:
