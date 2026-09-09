@@ -104,6 +104,7 @@ DEFAULT_RECENT_REVALIDATION_HOURS = 6
 DEFAULT_DAILY_REVALIDATION_HOURS = 24
 DEFAULT_HISTORICAL_REVALIDATION_HOURS = 168
 DEFAULT_PROVIDER_UNAVAILABLE_REVIEW_DAYS = 7
+DEFAULT_STABLE_CONFIRMATION_MINUTES = 15
 TARGET_NEW_FIXTURE_SHARE = 0.8
 
 
@@ -460,6 +461,35 @@ def due(value: object, now: datetime) -> bool:
     return parsed is None or parsed <= now
 
 
+def stable_confirmation_due(
+    status: str,
+    reason_code: str | None,
+    stable_fetch_count: int,
+    last_attempted_at: object,
+    now: datetime,
+) -> bool:
+    """Return whether a first sparse/shrink revision needs its safety fetch.
+
+    General delivery failures use exponential backoff. A structurally usable
+    provider response awaiting one identical confirmation is different: long
+    backoff only delays a safety verdict and can keep an otherwise valid
+    fixture pending for a day. Keep that second observation bounded without
+    weakening the requirement for two identical normalized payloads.
+    """
+    if status != "provider_pending" or stable_fetch_count != 1:
+        return False
+    if reason_code not in {
+        "provider_pending_optional_metrics",
+        "provider_pending_identity",
+        "provider_pending_shrink",
+    }:
+        return False
+    attempted = parse_iso(last_attempted_at)
+    return attempted is not None and now - attempted >= timedelta(
+        minutes=DEFAULT_STABLE_CONFIRMATION_MINUTES
+    )
+
+
 def candidate_fixture_ids(
     conn: sqlite3.Connection,
     league_ids: Sequence[int],
@@ -478,7 +508,8 @@ def candidate_fixture_ids(
     rows = conn.execute(
         f"""
         select f.id, f.starting_at, d.status, d.next_attempt_at, d.updated_at,
-               d.next_revalidation_at
+               d.next_revalidation_at, d.reason_code, d.stable_fetch_count,
+               d.last_attempted_at
           from fixtures f
           left join {LEDGER_TABLE} d on d.fixture_id = f.id
          where ((f.starting_at >= ? and f.starting_at <= ?)
@@ -511,7 +542,13 @@ def candidate_fixture_ids(
                     continue
             elif status == "provider_sparse" and not due(row[3], now):
                 continue
-            elif row[3] is not None and not due(row[3], now):
+            elif row[3] is not None and not due(row[3], now) and not stable_confirmation_due(
+                status,
+                str(row[6]) if row[6] is not None else None,
+                int(row[7] or 0),
+                row[8] or row[4],
+                now,
+            ):
                 continue
         selected.append(int(row[0]))
         if len(selected) >= max(limit, 0):
@@ -615,7 +652,20 @@ def candidate_target_fixture_ids(
             """
             d.fixture_id is not null
             and d.status = 'provider_pending'
-            and (d.next_attempt_at is null or d.next_attempt_at <= now())
+            and (
+              d.next_attempt_at is null
+              or d.next_attempt_at <= now()
+              or (
+                d.reason_code in (
+                  'provider_pending_optional_metrics',
+                  'provider_pending_identity',
+                  'provider_pending_shrink'
+                )
+                and d.stable_fetch_count = 1
+                and coalesce(d.last_attempted_at, d.updated_at)
+                    <= now() - interval '15 minutes'
+              )
+            )
             """,
             """
             case
@@ -940,6 +990,11 @@ def ledger_attempt_start(
 def backoff_time(attempt: int, now: datetime) -> str:
     minutes = (15, 30, 60, 180, 360, 720, 1440)[min(max(attempt - 1, 0), 6)]
     return iso(now + timedelta(minutes=minutes))
+
+
+def stable_confirmation_time(now: datetime) -> str:
+    """Schedule the second identical-payload observation without backoff."""
+    return iso(now + timedelta(minutes=DEFAULT_STABLE_CONFIRMATION_MINUTES))
 
 
 def delivery_reason_code(
@@ -2160,7 +2215,20 @@ def main() -> int:
                 )
             if assessment.status == "provider_pending":
                 now = utc_now()
-                next_at = backoff_time(attempt, now)
+                needs_stable_confirmation = (
+                    stable_fetch_count < 2
+                    and (
+                        assessment.error == "optional provider stat types are absent; awaiting stable confirmation"
+                        or (assessment.error or "").startswith(
+                            "provider lineup/player identity detail incomplete"
+                        )
+                    )
+                )
+                next_at = (
+                    stable_confirmation_time(now)
+                    if needs_stable_confirmation
+                    else backoff_time(attempt, now)
+                )
                 update_ledger(
                     conn,
                     fixture_id,
@@ -2195,7 +2263,7 @@ def main() -> int:
                 and stable_fetch_count < 2
             ):
                 now = utc_now()
-                next_at = backoff_time(attempt, now)
+                next_at = stable_confirmation_time(now)
                 message = (
                     "provider detail collection shrank "
                     f"(team_stats {prior_team_count}->{assessment.team_stat_count}, "
