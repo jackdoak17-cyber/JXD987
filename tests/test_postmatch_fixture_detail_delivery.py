@@ -157,6 +157,30 @@ def test_only_explicit_non_competitive_provider_status_is_excluded() -> None:
     assert not is_non_competitive_provider_assessment(assess_provider_payload(in_progress))
 
 
+def test_provider_assessment_prefers_canonical_state_over_short_name() -> None:
+    penalties = provider_payload()
+    penalties["state"] = {
+        "state": "FT_PEN",
+        "short_name": "FTP",
+        "developer_name": "FT_PEN",
+    }
+    assessment = assess_provider_payload(penalties)
+    assert assessment.fixture_status == "FT_PEN"
+    assert assessment.finished
+    assert assessment.status == "ready"
+
+
+def test_documented_short_state_aliases_are_classified_safely() -> None:
+    penalties = provider_payload()
+    penalties["state"] = {"short_name": "FTP"}
+    assert assess_provider_payload(penalties).finished
+
+    for short_name in ("CANC", "POST", "AWAR"):
+        payload = provider_payload()
+        payload["state"] = {"short_name": short_name}
+        assert is_non_competitive_provider_assessment(assess_provider_payload(payload))
+
+
 def test_provider_revision_hash_is_stable_for_collection_order() -> None:
     from scripts.postmatch_fixture_detail_delivery import normalized_provider_hash, provider_payload_hash
 
@@ -237,6 +261,22 @@ def test_candidate_selection_does_not_leave_confirmation_behind_long_backoff() -
         "values (1,8,'provider_pending','provider_pending_optional_metrics',1,"
         "datetime('now', '-2 hours'),datetime('now', '-16 minutes'),"
         "datetime('now', '+23 hours'),datetime('now', '-16 minutes'))"
+    )
+    conn.commit()
+
+    assert candidate_fixture_ids(conn, [8], 72, 10) == [1]
+
+
+def test_candidate_selection_rechecks_expired_exclusion_outside_recent_window() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("create table fixtures (id integer, league_id integer, starting_at text)")
+    conn.execute("insert into fixtures values (1, 8, datetime('now', '-20 days'))")
+    ensure_ledger(conn)
+    conn.execute(
+        "insert into fixture_detail_deliveries("
+        "fixture_id,league_id,status,first_seen_at,next_attempt_at,updated_at) "
+        "values (1,8,'excluded',datetime('now', '-20 days'),"
+        "datetime('now', '-1 minute'),datetime('now', '-7 days'))"
     )
     conn.commit()
 

@@ -38,12 +38,15 @@ class FakeSportMonksClient:
 
 def test_target_candidate_quotas_reserve_historical_progress() -> None:
     assert target_candidate_quotas(50) == (40, 10)
+    assert target_candidate_quotas(50, urgent_retry_count=30) == (20, 30)
+    assert target_candidate_quotas(50, urgent_retry_count=100) == (10, 40)
     assert target_candidate_quotas(1) == (1, 0)
     assert target_candidate_quotas(0) == (0, 0)
 
 
 def test_retry_lane_quotas_reserve_each_failure_category() -> None:
     assert target_retry_lane_quotas(10) == (3, 4, 3)
+    assert target_retry_lane_quotas(10, urgent_pending_count=7) == (1, 8, 1)
     assert target_retry_lane_quotas(2) == (1, 1, 0)
     assert target_retry_lane_quotas(0) == (0, 0, 0)
 
@@ -103,6 +106,8 @@ def test_target_selection_requeues_legacy_accepted_rows_for_v2_evidence(
     assert any("d.status in ('failed', 'export_failed'" in query for query in queries)
     assert any("d.status = 'running'" in query for query in queries)
     assert any("now() - interval '30 minutes'" in query for query in queries)
+    assert any("d.status = 'excluded'" in query for query in queries)
+    assert any("d.next_attempt_at <= now()" in query for query in queries)
     assert any("d.status = 'provider_pending'" in query for query in queries)
     pending_query = next(query for query in queries if "d.status = 'provider_pending'" in query)
     assert "d.stable_fetch_count = 1" in pending_query
