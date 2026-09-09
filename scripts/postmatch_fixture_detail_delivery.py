@@ -39,8 +39,26 @@ from jxd.models import FixturePlayer, FixturePlayerStatistic, FixtureStatistic
 LOG = logging.getLogger("postmatch_fixture_detail_delivery")
 UTC = timezone.utc
 SOURCE_DB = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
-FINISHED_STATUSES = {"FT", "AET", "PEN", "FT_PEN", "FINISHED", "ENDED"}
-NON_COMPETITIVE_STATUSES = {"ABAN", "ABANDONED", "CANCELLED", "CANCELED", "POSTPONED"}
+FINISHED_STATUSES = {"FT", "AET", "FT_PEN", "FTP", "PEN", "FINISHED", "ENDED"}
+# SportMonks' canonical fixture states are preferred by ``_provider_status``.
+# Keep the documented short names as compatibility aliases for stored/legacy
+# payloads which contain only ``short_name``. These states must not be treated
+# as missing post-match detail: they either did not produce a played match or
+# need a later provider review (for example POSTPONED -> NS after rescheduling).
+NON_COMPETITIVE_STATUSES = {
+    "ABAN",
+    "ABANDONED",
+    "AWAR",
+    "AWARDED",
+    "CANC",
+    "CANCELLED",
+    "CANCELED",
+    "DEL",
+    "DELETED",
+    "POST",
+    "POSTPONED",
+    "WO",
+}
 
 # These are the provider-backed metrics consumed by the Team Stats surface.
 # They describe metric coverage, not fixture validity. SportMonks legitimately
@@ -106,6 +124,7 @@ DEFAULT_HISTORICAL_REVALIDATION_HOURS = 168
 DEFAULT_PROVIDER_UNAVAILABLE_REVIEW_DAYS = 7
 DEFAULT_STABLE_CONFIRMATION_MINUTES = 15
 TARGET_NEW_FIXTURE_SHARE = 0.8
+TARGET_MIN_NEW_FIXTURE_SHARE_DURING_INCIDENT = 0.2
 
 
 @dataclass(frozen=True)
@@ -513,7 +532,8 @@ def candidate_fixture_ids(
           from fixtures f
           left join {LEDGER_TABLE} d on d.fixture_id = f.id
          where ((f.starting_at >= ? and f.starting_at <= ?)
-            or d.next_revalidation_at is not null)
+            or d.next_revalidation_at is not null
+            or d.next_attempt_at is not null)
            {league_clause}
          order by
            case when f.starting_at >= ? then 0 else 1 end,
@@ -613,7 +633,6 @@ def candidate_target_fixture_ids(
                 "f.starting_at desc, f.id desc",
             )
 
-        new_quota, retry_quota = target_candidate_quotas(requested)
         new_candidates = fetch_candidates(
             target_conn,
             "d.fixture_id is null",
@@ -636,6 +655,11 @@ def candidate_target_fixture_ids(
               or (
                 d.status = 'running'
                 and coalesce(d.last_attempted_at, d.updated_at) < now() - interval '30 minutes'
+              )
+              or (
+                d.status = 'excluded'
+                and d.next_attempt_at is not null
+                and d.next_attempt_at <= now()
               )
             )
             """,
@@ -701,6 +725,36 @@ def candidate_target_fixture_ids(
             f.id asc
             """,
         )
+        urgent_pending_candidates = fetch_candidates(
+            target_conn,
+            """
+            d.fixture_id is not null
+            and d.status = 'provider_pending'
+            and f.starting_at >= date_trunc('day', now()) - interval '30 days'
+            and d.first_seen_at <= now() - interval '24 hours'
+            and (
+              d.next_attempt_at is null
+              or d.next_attempt_at <= now()
+              or (
+                d.reason_code in (
+                  'provider_pending_optional_metrics',
+                  'provider_pending_identity',
+                  'provider_pending_shrink'
+                )
+                and d.stable_fetch_count = 1
+                and coalesce(d.last_attempted_at, d.updated_at)
+                    <= now() - interval '15 minutes'
+              )
+            )
+            """,
+            """
+            f.season_id desc,
+            f.league_id,
+            coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
+            f.starting_at desc,
+            f.id asc
+            """,
+        )
         revalidation_candidates = fetch_candidates(
             target_conn,
             """
@@ -727,7 +781,19 @@ def candidate_target_fixture_ids(
             """,
         )
 
-    recovery_quota, pending_quota, revalidation_quota = target_retry_lane_quotas(retry_quota)
+    # A customer-visible SLA incident is not ordinary backlog. Temporarily
+    # expand the retry lane enough to drain every eligible breach in the
+    # candidate pool, while retaining a minimum historical lane and one slot
+    # each for hard-failure recovery and revalidation.
+    urgent_pending_count = len(urgent_pending_candidates)
+    new_quota, retry_quota = target_candidate_quotas(
+        requested,
+        urgent_retry_count=urgent_pending_count,
+    )
+    recovery_quota, pending_quota, revalidation_quota = target_retry_lane_quotas(
+        retry_quota,
+        urgent_pending_count=urgent_pending_count,
+    )
     retry_candidates = interleave_retry_lanes(
         recovery_candidates[:recovery_quota],
         pending_candidates[:pending_quota],
@@ -755,16 +821,29 @@ def candidate_target_fixture_ids(
     return selected[:requested]
 
 
-def target_candidate_quotas(limit: int, new_share: float = TARGET_NEW_FIXTURE_SHARE) -> tuple[int, int]:
+def target_candidate_quotas(
+    limit: int,
+    new_share: float = TARGET_NEW_FIXTURE_SHARE,
+    urgent_retry_count: int = 0,
+) -> tuple[int, int]:
     """Return the reserved new-fixture and retry slots for one target batch."""
     requested = max(int(limit), 0)
     if requested == 0:
         return 0, 0
-    new_quota = min(requested, max(1, math.ceil(requested * new_share)))
+    default_new = min(requested, max(1, math.ceil(requested * new_share)))
+    minimum_new = min(
+        requested,
+        max(1, math.ceil(requested * TARGET_MIN_NEW_FIXTURE_SHARE_DURING_INCIDENT)),
+    )
+    urgent_retry = min(max(int(urgent_retry_count), 0), requested - minimum_new)
+    new_quota = min(default_new, requested - urgent_retry)
     return new_quota, requested - new_quota
 
 
-def target_retry_lane_quotas(limit: int) -> tuple[int, int, int]:
+def target_retry_lane_quotas(
+    limit: int,
+    urgent_pending_count: int = 0,
+) -> tuple[int, int, int]:
     """Reserve progress for hard failures, provider waits, and revalidation."""
 
     requested = max(int(limit), 0)
@@ -774,6 +853,9 @@ def target_retry_lane_quotas(limit: int) -> tuple[int, int, int]:
         return 1, 0, 0
     if requested == 2:
         return 1, 1, 0
+    urgent_pending = min(max(int(urgent_pending_count), 0), requested - 2)
+    if urgent_pending > 0:
+        return 1, max(urgent_pending, requested - 2), 1
     recovery = max(1, round(requested * 0.3))
     revalidation = max(1, round(requested * 0.3))
     pending = requested - recovery - revalidation
@@ -1560,9 +1642,9 @@ def _provider_status(data: dict[str, Any]) -> str | None:
     if not isinstance(state, dict):
         state = {}
     for value in (
-        state.get("short_name"),
         state.get("developer_name"),
         state.get("state"),
+        state.get("short_name"),
         data.get("status"),
         data.get("status_code"),
     ):
