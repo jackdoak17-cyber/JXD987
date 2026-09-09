@@ -9,6 +9,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     HANDOFF_REQUEUE_REASON,
     LEGACY_PENDING_REASON,
     ensure_ledger,
+    hydrate_missing_source_delivery_history,
     recover_stale_running,
     repair_legacy_ledger,
     interleave_candidate_lanes,
@@ -100,6 +101,8 @@ def test_target_selection_requeues_legacy_accepted_rows_for_v2_evidence(
     assert any("d.player_stat_parity is distinct from true" in query for query in queries)
     assert any("d.lineup_parity is distinct from true" in query for query in queries)
     assert any("d.status in ('failed', 'export_failed'" in query for query in queries)
+    assert any("d.status = 'running'" in query for query in queries)
+    assert any("now() - interval '30 minutes'" in query for query in queries)
     assert any("d.status = 'provider_pending'" in query for query in queries)
     pending_query = next(query for query in queries if "d.status = 'provider_pending'" in query)
     assert "d.first_seen_at <= now() - interval '24 hours'" in pending_query
@@ -167,6 +170,42 @@ def test_stale_running_rows_are_requeued_with_a_reason() -> None:
     assert "requeued" in stale[2]
     assert stale[3] == "provider_pending_structure"
     assert fresh[0] == "running"
+
+
+def test_missing_source_ledger_preserves_target_retry_age_and_attempts() -> None:
+    conn = sqlite3.connect(":memory:")
+    ensure_ledger(conn)
+    target_meta = (
+        567,
+        28479,
+        "2026-09-05 16:30:00+00:00",
+        12,
+        40,
+        4,
+        "2026-09-05 16:52:05+00:00",
+        "2026-09-06 19:44:56+00:00",
+    )
+
+    assert hydrate_missing_source_delivery_history(
+        conn,
+        19745097,
+        target_meta,
+        now=datetime(2026, 9, 9, 4, 0, tzinfo=timezone.utc),
+    )
+    row = conn.execute(
+        "select league_id,season_id,status,attempts,first_seen_at,last_attempted_at,reason_code "
+        "from fixture_detail_deliveries where fixture_id=19745097"
+    ).fetchone()
+    assert row == (
+        567,
+        28479,
+        "provider_pending",
+        4,
+        "2026-09-05 16:52:05+00:00",
+        "2026-09-06 19:44:56+00:00",
+        "legacy_unclassified",
+    )
+    assert not hydrate_missing_source_delivery_history(conn, 19745097, target_meta)
 
 
 def test_legacy_provider_pending_rows_are_repaired_and_due() -> None:

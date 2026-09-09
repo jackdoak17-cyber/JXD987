@@ -57,6 +57,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     mark_provider_unavailable,
     clear_provider_unavailable_exclusion,
     recover_stale_running,
+    hydrate_missing_source_delivery_history,
     repair_legacy_ledger,
 )
 from scripts.fixture_detail_export_policy import (
@@ -625,6 +626,12 @@ def main() -> int:
                     "select provider_team_stat_count,provider_player_stat_count,last_normalized_hash,stable_fetch_count from fixture_detail_deliveries where fixture_id = ?",
                     (fixture_id,),
                 ).fetchone()
+                if prior is None and target_meta:
+                    hydrate_missing_source_delivery_history(conn, fixture_id, target_meta)
+                    prior = conn.execute(
+                        "select provider_team_stat_count,provider_player_stat_count,last_normalized_hash,stable_fetch_count from fixture_detail_deliveries where fixture_id = ?",
+                        (fixture_id,),
+                    ).fetchone()
                 prior_team_count = int(prior[0] or 0) if prior else 0
                 prior_player_count = int(prior[1] or 0) if prior else 0
                 prior_hash = str(prior[2]) if prior and prior[2] else None

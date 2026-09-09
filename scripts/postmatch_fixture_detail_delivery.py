@@ -591,8 +591,16 @@ def candidate_target_fixture_ids(
             target_conn,
             """
             d.fixture_id is not null
-            and d.status in ('failed', 'export_failed', 'verification_failed', 'projection_failed')
-            and (d.next_attempt_at is null or d.next_attempt_at <= now())
+            and (
+              (
+                d.status in ('failed', 'export_failed', 'verification_failed', 'projection_failed')
+                and (d.next_attempt_at is null or d.next_attempt_at <= now())
+              )
+              or (
+                d.status = 'running'
+                and coalesce(d.last_attempted_at, d.updated_at) < now() - interval '30 minutes'
+              )
+            )
             """,
             """
             coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
@@ -790,7 +798,10 @@ def excluded_target_fixture_ids(target_url: str, fixture_ids: Sequence[int]) -> 
 def target_fixture_metadata(
     target_url: str,
     fixture_ids: Sequence[int],
-) -> dict[int, tuple[int | None, int | None, str | None, int, int]]:
+) -> dict[
+    int,
+    tuple[int | None, int | None, str | None, int, int, int, str | None, str | None],
+]:
     """Load serving identity metadata for target-queue fixtures.
 
     Historical target rows can be absent from the SQLite spool. Keeping their
@@ -812,8 +823,12 @@ def target_fixture_metadata(
                        (select count(distinct (fps.player_id, fps.team_id, fps.type_id))
                           from public.fixture_player_statistics fps
                          where fps.fixture_id = f.id
-                           and fps.type_id <> all(%s)) as player_stat_count
+                           and fps.type_id <> all(%s)) as player_stat_count,
+                       coalesce(d.attempts, 0),
+                       d.first_seen_at,
+                       d.last_attempted_at
                   from public.fixtures f
+                  left join public.fixture_detail_delivery_status d on d.fixture_id = f.id
                  where f.id = any(%s)
                 """,
                 (list(DERIVED_STAT_TYPE_IDS), list(DERIVED_STAT_TYPE_IDS), ids),
@@ -825,9 +840,66 @@ def target_fixture_metadata(
                     str(row[3]) if row[3] is not None else None,
                     int(row[4] or 0),
                     int(row[5] or 0),
+                    int(row[6] or 0),
+                    str(row[7]) if row[7] is not None else None,
+                    str(row[8]) if row[8] is not None else None,
                 )
                 for row in cur.fetchall()
             }
+
+
+def hydrate_missing_source_delivery_history(
+    conn: sqlite3.Connection,
+    fixture_id: int,
+    target_meta: tuple[
+        int | None,
+        int | None,
+        str | None,
+        int,
+        int,
+        int,
+        str | None,
+        str | None,
+    ],
+    now: datetime | None = None,
+) -> bool:
+    """Restore target retry history after a local spool loss or rollback.
+
+    The serving projection can outlive the SQLite spool. Recreating a missing
+    source row with a new first-seen timestamp would hide an existing SLA
+    breach and reset backoff. Preserve only durable timing/attempt metadata;
+    provider payload evidence is re-fetched and revalidated normally.
+    """
+    existing = conn.execute(
+        f"select 1 from {LEDGER_TABLE} where fixture_id = ?",
+        (fixture_id,),
+    ).fetchone()
+    first_seen_at = target_meta[6]
+    if existing is not None or first_seen_at is None:
+        return False
+    current_text = iso(now or utc_now())
+    conn.execute(
+        f"""
+        insert into {LEDGER_TABLE} (
+          fixture_id, league_id, season_id, status, attempts, first_seen_at,
+          last_attempted_at, next_attempt_at, last_error, release_id,
+          updated_at, reason_code
+        ) values (?, ?, ?, 'provider_pending', ?, ?, ?, ?, ?, ?, ?, 'legacy_unclassified')
+        """,
+        (
+            fixture_id,
+            target_meta[0],
+            target_meta[1],
+            max(int(target_meta[5] or 0), 0),
+            first_seen_at,
+            target_meta[7],
+            current_text,
+            "Recovered retry history from the serving ledger; provider revalidation required",
+            release_id(),
+            current_text,
+        ),
+    )
+    return True
 
 
 def ledger_attempt_start(
