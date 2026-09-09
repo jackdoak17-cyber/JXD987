@@ -49,6 +49,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     source_snapshot,
     is_non_competitive_provider_assessment,
     stable_provider_sparse_assessment,
+    stable_confirmation_time,
     store_provider_detail,
     target_fixture_metadata,
     target_snapshot,
@@ -201,7 +202,10 @@ def record_export_failure(
 
 def cohort_limited_fixture_ids(
     fixture_ids: list[int],
-    target_metadata: dict[int, tuple[int | None, int | None, str | None, int, int]],
+    target_metadata: dict[
+        int,
+        tuple[int | None, int | None, str | None, int, int, int, str | None, str | None],
+    ],
     max_cohorts: int,
 ) -> list[int]:
     """Keep a batch within a bounded number of projection cohorts.
@@ -735,7 +739,21 @@ def main() -> int:
                             error="optional provider stat types are absent; awaiting stable confirmation",
                         )
                     if assessment.status == "provider_pending":
-                        next_at = backoff_time(attempt, datetime.now(timezone.utc))
+                        now = datetime.now(timezone.utc)
+                        needs_stable_confirmation = (
+                            stable_count < 2
+                            and (
+                                assessment.error == "optional provider stat types are absent; awaiting stable confirmation"
+                                or (assessment.error or "").startswith(
+                                    "provider lineup/player identity detail incomplete"
+                                )
+                            )
+                        )
+                        next_at = (
+                            stable_confirmation_time(now)
+                            if needs_stable_confirmation
+                            else backoff_time(attempt, now)
+                        )
                         update_ledger(conn, fixture_id, assessment.status, attempt, assessment, error=assessment.error, next_attempt_at=next_at, payload_hash=payload_hash, normalized_hash=normalized_hash, stable_fetch_count=stable_count)
                         publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                         report["provider_pending"].append({"fixture_id": fixture_id, "reason": assessment.error})
@@ -745,7 +763,7 @@ def main() -> int:
                         or (prior_player_count > 0 and assessment.player_stat_count < prior_player_count)
                     )
                     if not args.force and candidate_shrank and prior_hash != normalized_hash and stable_count < 2:
-                        next_at = backoff_time(attempt, datetime.now(timezone.utc))
+                        next_at = stable_confirmation_time(datetime.now(timezone.utc))
                         message = (
                             "provider detail collection shrank "
                             f"(team_stats {prior_team_count}->{assessment.team_stat_count}, "

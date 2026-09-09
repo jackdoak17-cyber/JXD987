@@ -113,6 +113,40 @@ def test_stable_incomplete_player_identity_becomes_provider_sparse() -> None:
     assert "identical finished payloads" in (terminal.error or "")
 
 
+def test_sparse_confirmation_is_due_after_bounded_delay() -> None:
+    from datetime import datetime, timezone
+
+    from scripts.postmatch_fixture_detail_delivery import (
+        stable_confirmation_due,
+        stable_confirmation_time,
+    )
+
+    now = datetime(2026, 9, 9, 4, 0, tzinfo=timezone.utc)
+    attempted = "2026-09-09T03:45:00Z"
+    assert stable_confirmation_due(
+        "provider_pending",
+        "provider_pending_optional_metrics",
+        1,
+        attempted,
+        now,
+    )
+    assert not stable_confirmation_due(
+        "provider_pending",
+        "provider_pending_structure",
+        1,
+        attempted,
+        now,
+    )
+    assert not stable_confirmation_due(
+        "provider_pending",
+        "provider_pending_optional_metrics",
+        2,
+        attempted,
+        now,
+    )
+    assert stable_confirmation_time(now) == "2026-09-09T04:15:00Z"
+
+
 def test_only_explicit_non_competitive_provider_status_is_excluded() -> None:
     abandoned = provider_payload()
     abandoned["state"] = {"short_name": "ABAN"}
@@ -189,6 +223,24 @@ def test_candidate_selection_prioritizes_recent_fixtures_over_old_revalidation()
     conn.commit()
 
     assert candidate_fixture_ids(conn, [8], 72, 1) == [2]
+
+
+def test_candidate_selection_does_not_leave_confirmation_behind_long_backoff() -> None:
+    conn = sqlite3.connect(":memory:")
+    conn.execute("create table fixtures (id integer, league_id integer, starting_at text)")
+    conn.execute("insert into fixtures values (1, 8, datetime('now', '-3 hours'))")
+    ensure_ledger(conn)
+    conn.execute(
+        "insert into fixture_detail_deliveries("
+        "fixture_id,league_id,status,reason_code,stable_fetch_count,first_seen_at,"
+        "last_attempted_at,next_attempt_at,updated_at) "
+        "values (1,8,'provider_pending','provider_pending_optional_metrics',1,"
+        "datetime('now', '-2 hours'),datetime('now', '-16 minutes'),"
+        "datetime('now', '+23 hours'),datetime('now', '-16 minutes'))"
+    )
+    conn.commit()
+
+    assert candidate_fixture_ids(conn, [8], 72, 10) == [1]
 
 
 def test_source_engine_uses_configured_busy_timeout(tmp_path, monkeypatch) -> None:
