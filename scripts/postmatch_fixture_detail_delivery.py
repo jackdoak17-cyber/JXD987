@@ -716,13 +716,12 @@ def candidate_target_fixture_ids(
               then 0
               else 1
             end,
-            -- Cluster the bounded candidate pool by projection cohort.  The
-            -- worker refreshes one read model per league-season pair, so this
-            -- turns the existing cohort cap into a throughput guard instead
-            -- of truncating a highly interleaved queue after a few fixtures.
+            -- Oldest due confirmation wins before season numbering. The
+            -- downstream cohort cap still bounds projection work, but a newer
+            -- season must not repeatedly displace an older overdue retry.
+            coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
             f.season_id desc,
             f.league_id,
-            coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
             f.starting_at desc,
             f.id asc
             """,
@@ -750,9 +749,9 @@ def candidate_target_fixture_ids(
             )
             """,
             """
+            coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
             f.season_id desc,
             f.league_id,
-            coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
             f.starting_at desc,
             f.id asc
             """,
@@ -878,18 +877,13 @@ def target_retry_lane_quotas(
         return 1, 0, 0
     if requested == 2:
         return 1, 1, 0
+    if urgent_pending_count > 0:
+        # Finish overdue confirmations before opening more revalidation work.
+        # Demand-proportional shares let a large accepted backlog continually
+        # create new pending rows faster than their second fetches could clear.
+        return 1, requested - 2, 1
     if urgent_revalidation_count > 0:
-        # Keep one hard-recovery slot and at least one slot in each other lane.
-        # Divide the rest by actual recent demand instead of a fixed 3/10 share.
-        pending_demand = max(int(urgent_pending_count), 1)
-        revalidation_demand = max(int(urgent_revalidation_count), 1)
-        pending = max(1, min(requested - 2, round(
-            (requested - 1) * pending_demand / (pending_demand + revalidation_demand)
-        )))
-        return 1, pending, requested - 1 - pending
-    urgent_pending = min(max(int(urgent_pending_count), 0), requested - 2)
-    if urgent_pending > 0:
-        return 1, max(urgent_pending, requested - 2), 1
+        return 1, 1, requested - 2
     recovery = max(1, round(requested * 0.3))
     revalidation = max(1, round(requested * 0.3))
     pending = requested - recovery - revalidation
