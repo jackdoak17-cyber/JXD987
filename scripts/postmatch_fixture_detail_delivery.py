@@ -119,7 +119,9 @@ DEFAULT_LIMIT = 25
 DEFAULT_GRACE_MINUTES = 60
 DEFAULT_SOURCE_BUSY_TIMEOUT_MS = 30_000
 DEFAULT_RECENT_REVALIDATION_HOURS = 6
-DEFAULT_DAILY_REVALIDATION_HOURS = 24
+# Start well before the 24-hour freshness deadline: sparse payload changes
+# require a second independent fetch and the shared worker needs queue headroom.
+DEFAULT_DAILY_REVALIDATION_HOURS = 12
 DEFAULT_HISTORICAL_REVALIDATION_HOURS = 168
 DEFAULT_PROVIDER_UNAVAILABLE_REVIEW_DAYS = 7
 DEFAULT_STABLE_CONFIRMATION_MINUTES = 15
@@ -762,6 +764,10 @@ def candidate_target_fixture_ids(
             and d.status in ('verified', 'provider_sparse')
             and (
               (d.next_revalidation_at is not null and d.next_revalidation_at <= now())
+              or (
+                f.starting_at >= date_trunc('day', now()) - interval '30 days'
+                and d.last_successful_at <= now() - interval '12 hours'
+              )
               or (d.status = 'verified' and d.next_revalidation_at is null)
               or coalesce(d.delivery_contract_version, 1) < 2
               or d.accepted_snapshot_id is null
@@ -772,13 +778,30 @@ def candidate_target_fixture_ids(
             )
             """,
             """
+            case when f.starting_at >= date_trunc('day', now()) - interval '30 days'
+              then 0 else 1 end,
             case when d.accepted_snapshot_id is null then 0 else 1 end,
-            coalesce(d.next_revalidation_at, d.updated_at, f.starting_at),
+            coalesce(d.last_successful_at, d.updated_at, f.starting_at),
             f.season_id desc,
             f.league_id,
             f.starting_at asc,
             f.id asc
             """,
+        )
+
+        # Count recent rechecks separately so historical backfill cannot consume
+        # the capacity needed to confirm data before its freshness deadline.
+        # The age clause also advances schedules written by the old 24h policy
+        # without rewriting ledger timestamps or accepted evidence.
+        urgent_revalidation_candidates = fetch_candidates(
+            target_conn,
+            """
+            d.status in ('verified', 'provider_sparse')
+            and f.starting_at >= date_trunc('day', now()) - interval '30 days'
+            and (d.last_successful_at is null
+                 or d.last_successful_at <= now() - interval '12 hours')
+            """,
+            "coalesce(d.last_successful_at, d.updated_at, f.starting_at), f.id",
         )
 
     # A customer-visible SLA incident is not ordinary backlog. Temporarily
@@ -788,11 +811,12 @@ def candidate_target_fixture_ids(
     urgent_pending_count = len(urgent_pending_candidates)
     new_quota, retry_quota = target_candidate_quotas(
         requested,
-        urgent_retry_count=urgent_pending_count,
+        urgent_retry_count=urgent_pending_count + len(urgent_revalidation_candidates),
     )
     recovery_quota, pending_quota, revalidation_quota = target_retry_lane_quotas(
         retry_quota,
         urgent_pending_count=urgent_pending_count,
+        urgent_revalidation_count=len(urgent_revalidation_candidates),
     )
     retry_candidates = interleave_retry_lanes(
         recovery_candidates[:recovery_quota],
@@ -843,6 +867,7 @@ def target_candidate_quotas(
 def target_retry_lane_quotas(
     limit: int,
     urgent_pending_count: int = 0,
+    urgent_revalidation_count: int = 0,
 ) -> tuple[int, int, int]:
     """Reserve progress for hard failures, provider waits, and revalidation."""
 
@@ -853,6 +878,15 @@ def target_retry_lane_quotas(
         return 1, 0, 0
     if requested == 2:
         return 1, 1, 0
+    if urgent_revalidation_count > 0:
+        # Keep one hard-recovery slot and at least one slot in each other lane.
+        # Divide the rest by actual recent demand instead of a fixed 3/10 share.
+        pending_demand = max(int(urgent_pending_count), 1)
+        revalidation_demand = max(int(urgent_revalidation_count), 1)
+        pending = max(1, min(requested - 2, round(
+            (requested - 1) * pending_demand / (pending_demand + revalidation_demand)
+        )))
+        return 1, pending, requested - 1 - pending
     urgent_pending = min(max(int(urgent_pending_count), 0), requested - 2)
     if urgent_pending > 0:
         return 1, max(urgent_pending, requested - 2), 1

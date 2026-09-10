@@ -302,3 +302,29 @@ def test_bulk_omission_falls_back_to_single_fixture(monkeypatch) -> None:
     assert errors == {}
     assert calls == 2
     assert sorted(FakeSportMonksClient.calls) == ["fixtures/202", "fixtures/multi/101,202"]
+
+
+def test_recent_revalidation_starts_with_confirmation_headroom() -> None:
+    from datetime import timedelta
+    now = datetime(2026, 9, 10, 2, 0, tzinfo=timezone.utc)
+    scheduled = postmatch.parse_iso(postmatch.revalidation_time(now - timedelta(days=12), now))
+    assert scheduled == now + timedelta(hours=12)
+    assert scheduled + timedelta(minutes=15) < now + timedelta(hours=24)
+    assert postmatch.parse_iso(postmatch.revalidation_time(now - timedelta(hours=24), now)) == now + timedelta(hours=6)
+    assert postmatch.parse_iso(postmatch.revalidation_time(now - timedelta(days=60), now)) == now + timedelta(days=7)
+
+
+def test_due_rechecks_receive_capacity_without_starving_other_work() -> None:
+    new, retry = target_candidate_quotas(50, urgent_retry_count=100)
+    assert new >= 10
+    recovery, pending, revalidation = target_retry_lane_quotas(
+        retry, urgent_pending_count=2, urgent_revalidation_count=98,
+    )
+    assert recovery >= 1 and pending >= 1
+    assert revalidation > retry * 0.8
+    assert recovery + pending + revalidation == retry
+    for size in range(3, 51):
+        for pending_count, revalidation_count in [(0, 100), (100, 1), (50, 50)]:
+            quotas = target_retry_lane_quotas(size, pending_count, revalidation_count)
+            assert sum(quotas) == size
+            assert min(quotas) >= 1
