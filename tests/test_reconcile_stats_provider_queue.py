@@ -114,7 +114,7 @@ def test_target_selection_requeues_legacy_accepted_rows_for_v2_evidence(
     assert "now() - interval '15 minutes'" in pending_query
     assert "d.first_seen_at <= now() - interval '24 hours'" in pending_query
     assert "f.starting_at >= date_trunc('day', now()) - interval '30 days'" in pending_query
-    assert pending_query.index("f.season_id desc") < pending_query.index("coalesce(d.next_attempt_at")
+    assert pending_query.index("coalesce(d.next_attempt_at") < pending_query.index("f.season_id desc")
 
 
 def test_ledger_upgrade_does_not_promote_pre_contract_rows_to_v2() -> None:
@@ -321,10 +321,24 @@ def test_due_rechecks_receive_capacity_without_starving_other_work() -> None:
         retry, urgent_pending_count=2, urgent_revalidation_count=98,
     )
     assert recovery >= 1 and pending >= 1
-    assert revalidation > retry * 0.8
+    assert pending > retry * 0.8
     assert recovery + pending + revalidation == retry
+    assert target_retry_lane_quotas(retry, 0, 98)[2] > retry * 0.8
     for size in range(3, 51):
         for pending_count, revalidation_count in [(0, 100), (100, 1), (50, 50)]:
             quotas = target_retry_lane_quotas(size, pending_count, revalidation_count)
             assert sum(quotas) == size
             assert min(quotas) >= 1
+
+
+def test_due_confirmations_survive_large_revalidation_backlog_and_cohort_cap() -> None:
+    recovery, pending, revalidation = target_retry_lane_quotas(200, 55, 250)
+    due_ids = list(range(1, 56))
+    recheck_ids = list(range(101, 351))
+    selected = interleave_retry_lanes([], due_ids[:pending], recheck_ids[:revalidation])
+    selected += recheck_ids[revalidation:]
+    metadata = {i: (8 + (i % 4), 2026, None, 0, 0) for i in due_ids}
+    metadata.update({i: (82, 2026, None, 0, 0) for i in recheck_ids})
+    batch = queue.cohort_limited_fixture_ids(selected, metadata, 5)[:50]
+    assert sum(i in due_ids for i in batch) == 49
+    assert len(set(batch)) == 50
