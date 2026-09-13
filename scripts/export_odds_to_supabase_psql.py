@@ -969,8 +969,8 @@ select 'deleted_missing_markets', count(*)::bigint from deleted;
     if use_advisory_lock:
         sql_lines.append(f"select pg_advisory_xact_lock({advisory_lock_key});")
     sql_lines += [
-        "create temp table odds_outcomes_stage",
-        "  (like public.odds_outcomes including defaults) on commit drop;",
+        "create temp table odds_outcomes_stage on commit drop as",
+        f"  select {cols_sql} from public.odds_outcomes with no data;",
         copy_line,
         "",
         "select 'stage_count', count(*)::bigint from odds_outcomes_stage;",
@@ -1028,8 +1028,8 @@ select 'deleted_existing', count(*)::bigint from deleted;
             if use_advisory_lock:
                 cur.execute(f"select pg_advisory_xact_lock({advisory_lock_key});")
             cur.execute(
-                "create temp table odds_outcomes_stage "
-                "(like public.odds_outcomes including defaults) on commit drop;"
+                "create temp table odds_outcomes_stage on commit drop as "
+                f"select {cols_sql} from public.odds_outcomes with no data;"
             )
             copy_sql = (
                 f"COPY odds_outcomes_stage ({cols_sql}) "
@@ -1752,7 +1752,7 @@ def main() -> None:
     except Exception as exc:
         ingest_ok = False
         error_stage = "stage_upsert"
-        error_message = str(exc)
+        error_message = re.sub(r"postgres(?:ql)?://[^\s\"\']+", "[redacted database URL]", str(exc))
         psql_err_tail = tail_text(err_path)
         psql_out_tail = tail_text(out_path)
         print(f"Stage upsert failed: {error_message}", flush=True)
