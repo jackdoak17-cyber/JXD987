@@ -22,7 +22,7 @@ export ODDS_STATEMENT_TIMEOUT=180000
 export ODDS_IDLE_TX_TIMEOUT=180000
 export ODDS_USE_ADVISORY_LOCK=true
 # Do not perform retention or fill from unrelated fixture leagues in this job.
-python scripts/export_odds_to_supabase_psql.py \
+python "${ODDS_DELIVERY_EXPORTER:-scripts/export_odds_to_supabase_psql.py}" \
   --leagues "${ODDS_LEAGUES}" --days-back 0 --days-forward 14 \
   --calendar-window --no-include-fixture-leagues \
   --csv-out /tmp/odds_outcomes_delivery.csv \
