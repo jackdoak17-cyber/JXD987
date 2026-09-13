@@ -8,7 +8,7 @@ verify_runtime_manifest_or_exit "${ODDS_DELIVERY_RUNTIME}/scripts/vps/run_odds_p
 require_runtime_manifest_entries_or_exit "$0" "scripts/export_odds_to_supabase_psql.py"
 export REPO_ROOT
 export ODDS_LEAGUES="$(odds_league_csv)"
-export ODDS_SYNC_LOCK_RETRY_ATTEMPTS=8
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS=20
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS=15
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
