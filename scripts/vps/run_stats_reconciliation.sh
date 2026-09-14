@@ -26,15 +26,15 @@ export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(supported_league_cs
 # plus the cohort cap keeps the larger batch within a bounded projection
 # fan-out. The global wrapper still refuses to start when the remaining lease
 # is too short.
-export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-50}"
-export STATS_RECONCILE_MAX_COHORTS="${STATS_RECONCILE_MAX_COHORTS:-5}"
+export STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-20}"
+export STATS_RECONCILE_MAX_COHORTS="${STATS_RECONCILE_MAX_COHORTS:-2}"
 # Retry delay after a live writer owns the lock. The scheduler gate below
 # decides whether a new batch may begin; this delay is not the handoff policy.
 export STATS_RECONCILE_SLEEP_SECONDS="${STATS_RECONCILE_SLEEP_SECONDS:-60}"
 # A foreground job polls for the canonical lock while this historical worker
 # drains. Leave a short deterministic handoff after every successful batch so
 # the foreground waiter can acquire it instead of being starved by this loop.
-export STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS="${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS:-20}"
+export STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS="${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS:-75}"
 export STATS_RECONCILE_LIVE_TICK_SECONDS="${STATS_RECONCILE_LIVE_TICK_SECONDS:-900}"
 # The live settlement normally owns the spool for several minutes after the
 # quarter-hour tick. Do not race that work; begin historical reconciliation
@@ -43,9 +43,10 @@ export STATS_RECONCILE_LIVE_TICK_SECONDS="${STATS_RECONCILE_LIVE_TICK_SECONDS:-9
 export STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS="${STATS_RECONCILE_LIVE_SETTLEMENT_GUARD_SECONDS:-420}"
 export STATS_RECONCILE_LIVE_GRACE_SECONDS="${STATS_RECONCILE_LIVE_GRACE_SECONDS:-60}"
 export STATS_RECONCILE_MAX_HOLD_SECONDS="${STATS_RECONCILE_MAX_HOLD_SECONDS:-600}"
-# A cohort-clustered 50-fixture batch has measured at up to roughly four
-# minutes in the production path. Do not start a new batch when the live
-# handoff window cannot accommodate that bounded attempt with a real buffer.
+# Production evidence showed a 50-fixture batch could exceed the available
+# lease and repeatedly reacquire the spool before a waiting P3 publisher. A
+# 20-fixture, two-cohort batch fits the measured live window, and the handoff
+# is longer than four foreground 15-second retry intervals.
 export ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS="${STATS_RECONCILE_MIN_LEASE_SECONDS:-270}"
 export STATS_RECONCILE_REPORT="${STATS_RECONCILE_REPORT:-/tmp/stats_reconcile_provider_batch.json}"
 export STATS_RECONCILE_RUN_LOG="${STATS_RECONCILE_RUN_LOG:-/tmp/stats_reconcile_provider_batch.log}"
