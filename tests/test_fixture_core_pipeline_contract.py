@@ -125,7 +125,12 @@ run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
 
     def test_historical_reconciliation_leaves_foreground_handoff(self) -> None:
         source = (ROOT / "scripts/vps/run_stats_reconciliation.sh").read_text(encoding="utf-8")
-        self.assertIn("STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS", source)
+        self.assertIn('STATS_RECONCILE_BATCH_SIZE="${STATS_RECONCILE_BATCH_SIZE:-20}"', source)
+        self.assertIn('STATS_RECONCILE_MAX_COHORTS="${STATS_RECONCILE_MAX_COHORTS:-2}"', source)
+        self.assertIn(
+            'STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS="${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS:-75}"',
+            source,
+        )
         self.assertIn('sleep "${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS}"', source)
 
     def test_squad_cursor_advances_after_completed_batch_when_fleet_check_is_red(self) -> None:
