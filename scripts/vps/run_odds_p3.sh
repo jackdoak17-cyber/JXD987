@@ -130,6 +130,7 @@ P3_REPORT="${ODDS_P3_STAGE_DIR}/p3-report.json"
 # before a missing market can be misreported as local data loss.
 python scripts/validate_odds_api_market_catalog.py \
   --sport football \
+  --allow-provider-missing \
   --report-out "/tmp/odds_api_market_catalog_p3.json"
 
 # A previous interrupted publish leaves complete stages in place. Reuse them
