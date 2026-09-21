@@ -94,6 +94,7 @@ def validate_catalog(items: Iterable[object]) -> dict[str, object]:
     retired_present = sorted(RETIRED_FOOTBALL_MARKETS.intersection(catalog))
     return {
         "ok": not missing and not shape_mismatches and not parser_mismatches,
+        "provider_degraded": bool(missing) and not shape_mismatches and not parser_mismatches,
         "market_count": len(catalog),
         "required_market_count": len(REQUIRED_MARKETS),
         "missing_required_markets": missing,
@@ -104,10 +105,24 @@ def validate_catalog(items: Iterable[object]) -> dict[str, object]:
     }
 
 
+def catalog_allows_sync(report: dict[str, object], *, allow_provider_missing: bool) -> bool:
+    if report.get("ok") is True:
+        return True
+    return allow_provider_missing and report.get("provider_degraded") is True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sport", default="football")
     parser.add_argument("--report-out", default="")
+    parser.add_argument(
+        "--allow-provider-missing",
+        action="store_true",
+        help=(
+            "Continue when the provider catalogue temporarily omits known markets. "
+            "Shape and parser mismatches still fail closed."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -130,7 +145,7 @@ def main() -> None:
     if args.report_out:
         Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(json.dumps(report, sort_keys=True))
-    if not report["ok"]:
+    if not catalog_allows_sync(report, allow_provider_missing=args.allow_provider_missing):
         raise SystemExit(1)
 
 
