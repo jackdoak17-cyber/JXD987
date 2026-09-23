@@ -40,6 +40,28 @@ class FixtureSettlementContractTests(unittest.TestCase):
         # successful score/result publication into a settlement failure.
         self.assertNotIn("postmatch_fixture_detail_delivery.py", source)
 
+    def test_delivery_refresh_does_not_extend_the_shared_spool_lock(self) -> None:
+        wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
+        source = wrapper.read_text(encoding="utf-8")
+
+        local_start = source.index("LOCAL_SETTLEMENT_COMMAND=")
+        refresh_start = source.index("DELIVERY_REFRESH_COMMAND=")
+        lock_call = source.index('run_with_global_lock_and_timeout "${LOCAL_SETTLEMENT_COMMAND}"')
+        refresh_call = source.index('bash -lc "${DELIVERY_REFRESH_COMMAND}"')
+
+        local_phase = source[local_start:refresh_start]
+        refresh_phase = source[refresh_start:]
+        self.assertIn("reconcile_recent_fixtures.py", local_phase)
+        self.assertIn("export_to_supabase.py", local_phase)
+        self.assertNotIn("refresh_fixture_delivery.py", local_phase)
+        self.assertIn("refresh_fixture_delivery.py", refresh_phase)
+        self.assertIn('cd "${REPO_ROOT}"', refresh_phase)
+        self.assertIn("source .venv/bin/activate", refresh_phase)
+        self.assertIn('export PYTHONPATH="${REPO_ROOT}"', refresh_phase)
+        self.assertLess(lock_call, refresh_call)
+        self.assertIn("fixture_delivery_refresh advisory lock", source)
+        self.assertIn('ODDS_SYNC_JOB_PRIORITY="settlement"', source)
+
     def test_fixture_core_refresh_cannot_overwrite_fixture_detail(self) -> None:
         wrapper = ROOT / "scripts/vps/run_p3_fixture_core.sh"
         result = subprocess.run(["bash", "-n", str(wrapper)], capture_output=True, text=True)
