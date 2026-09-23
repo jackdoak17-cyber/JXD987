@@ -57,7 +57,7 @@ if ! flock --nonblock 8; then
   finalize_with_healthcheck 2 "${HEALTHCHECK_PING_URL_SETTLEMENT:-${HEALTHCHECK_PING_URL:-}}"
 fi
 
-CHAIN_COMMAND=$(cat <<'CHAIN'
+LOCAL_SETTLEMENT_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
 
 cd "${REPO_ROOT}"
@@ -77,6 +77,18 @@ python scripts/export_to_supabase.py \
   --fixture-core-only \
   --skip-prune \
   --report-json "/tmp/postmatch_settlement_export.json"
+CHAIN
+)
+
+# This phase uses only the Supabase/Postgres connection.  It does not open the
+# local JXD SQLite spool; refresh_fixture_delivery serializes its own release
+# build and publication with the fixture_delivery_refresh advisory lock.
+DELIVERY_REFRESH_COMMAND=$(cat <<'CHAIN'
+set -euo pipefail
+
+cd "${REPO_ROOT}"
+source .venv/bin/activate
+export PYTHONPATH="${REPO_ROOT}"
 
 python scripts/refresh_fixture_delivery.py \
   --start-date "$(TZ=Europe/London date -d "-${SETTLEMENT_DELIVERY_DAYS_BACK} days" +%F)" \
@@ -89,11 +101,22 @@ CHAIN
 status=0
 RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RUN_STARTED_EPOCH="$(date -u +"%s")"
+rm -f "${PIPELINE_EVIDENCE_FILE}"
 ODDS_SYNC_LOCK_FILE="${FIXTURE_SETTLEMENT_LOCK_FILE}" \
 ODDS_SYNC_JOB_PRIORITY="settlement" \
 ODDS_SYNC_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS}" \
 ODDS_SYNC_P3_MAX_DURATION_SECONDS="${SETTLEMENT_MAX_RUNTIME_SECONDS}" \
-  run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+  run_with_global_lock_and_timeout "${LOCAL_SETTLEMENT_COMMAND}" || status=$?
+
+# Do not hold the shared SQLite spool lock while rebuilding the independent
+# Supabase fixture-delivery read model.  The local settlement/export phase
+# above remains lock-protected and this phase retains its own Postgres
+# transaction/advisory publication lock.
+if [[ "${status}" -eq 0 ]]; then
+  timeout --signal=TERM --kill-after=5s "${SETTLEMENT_MAX_RUNTIME_SECONDS}" \
+    bash -lc "${DELIVERY_REFRESH_COMMAND}" || status=$?
+fi
+
 RUN_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RUN_FINISHED_EPOCH="$(date -u +"%s")"
 record_pipeline_job_run \
