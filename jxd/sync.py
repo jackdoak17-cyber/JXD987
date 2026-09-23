@@ -983,7 +983,7 @@ class SyncService:
         return count
 
     # --- fixtures ---
-    def _store_fixture_season(self, raw: Dict) -> None:
+    def _store_fixture_season(self, raw: Dict, retain_raw: bool = True) -> None:
         """Persist season metadata discovered through a team fixture feed.
 
         Team-scoped fixture history can cross competitions that are not part of
@@ -1014,7 +1014,10 @@ class SyncService:
             "start_date": parse_dt(season_raw.get("start_date") or season_raw.get("starting_at")),
             "end_date": parse_dt(season_raw.get("end_date") or season_raw.get("ending_at")),
             "is_current": bool(season_raw.get("is_current") or season_raw.get("current")),
-            "extra": season_raw or raw,
+            # Post-match detail delivery only needs normalized season fields.
+            # Retaining the complete fixture payload here can write hundreds
+            # of kilobytes into one season row for every fixture attempt.
+            "extra": season_raw or raw if retain_raw else None,
         }
         if existing is None:
             self.session.add(Season(**payload))
@@ -1025,7 +1028,7 @@ class SyncService:
             if key in {"id", "league_id"} or value is not None:
                 setattr(existing, key, value)
 
-    def _map_fixture(self, raw: Dict) -> Dict:
+    def _map_fixture(self, raw: Dict, retain_raw: bool = True) -> Dict:
         home_score, away_score = self._extract_scores(raw.get("scores") or raw.get("score"))
         status, status_code = _fixture_status_values(raw)
         has_lineup_confirmed, lineup_confirmed = _fixture_lineup_confirmed(raw)
@@ -1056,7 +1059,9 @@ class SyncService:
             "away_team_id": raw.get("away_team_id"),
             "home_score": home_score,
             "away_score": away_score,
-            "extra": raw,
+            # The exporter reads half-time scores from fixture.extra; keep
+            # only that small projection in compact detail mode.
+            "extra": raw if retain_raw else {"scores": raw.get("scores")},
         }
         if has_lineup_confirmed:
             payload["lineup_confirmed"] = lineup_confirmed
@@ -1101,13 +1106,18 @@ class SyncService:
             away_score = _safe_int(scores_raw.get("visitorteam_score") or scores_raw.get("away"))
         return home_score, away_score
 
-    def _store_participants(self, fixture_id: int, participants: Iterable[Dict]) -> Dict[str, Dict]:
+    def _store_participants(
+        self,
+        fixture_id: int,
+        participants: Iterable[Dict],
+        retain_raw: bool = True,
+    ) -> Dict[str, Dict]:
         loc_map: Dict[str, Dict] = {}
         for p in participants or []:
             team_id = p.get("id") or p.get("team_id")
             if team_id is None:
                 continue
-            self._upsert_team_from_participant(p)
+            self._upsert_team_from_participant(p, retain_raw=retain_raw)
             meta = p.get("meta") or {}
             location = (meta.get("location") or meta.get("venue") or meta.get("side") or "").lower()
             score_val = _safe_int(meta.get("score") or meta.get("outcome"))
@@ -1116,7 +1126,7 @@ class SyncService:
                 "team_id": team_id,
                 "location": location or None,
                 "score": score_val,
-                "extra": p,
+                "extra": p if retain_raw else None,
             }
             obj = self.session.get(FixtureParticipant, (fixture_id, team_id))
             if obj:
@@ -1128,11 +1138,11 @@ class SyncService:
                 loc_map[location] = {"team_id": team_id, "score": score_val}
         return loc_map
 
-    def _upsert_team_from_participant(self, participant: Dict) -> None:
+    def _upsert_team_from_participant(self, participant: Dict, retain_raw: bool = True) -> None:
         team_id = participant.get("id") or participant.get("team_id")
         if team_id is None:
             return
-        data: Dict[str, object] = {"id": team_id, "extra": participant}
+        data: Dict[str, object] = {"id": team_id, "extra": participant if retain_raw else None}
         name = participant.get("name") or participant.get("team_name") or participant.get("display_name")
         short_code = participant.get("short_code") or participant.get("code")
         image_path = participant.get("image_path") or participant.get("logo_path") or participant.get("logo")
@@ -1149,6 +1159,7 @@ class SyncService:
         fixture_id: int,
         stats: Iterable[Dict],
         log_changes: bool = False,
+        retain_raw: bool = True,
     ) -> None:
         team_stat_values: Dict[int, Dict[int, float]] = {}
         for s in stats or []:
@@ -1179,7 +1190,7 @@ class SyncService:
                 "name": name,
                 "location": location,
                 "value": value,
-                "extra": s,
+                "extra": s if retain_raw else None,
             }
             if log_changes and value is not None:
                 old_value = obj.value if obj else None
@@ -1250,6 +1261,7 @@ class SyncService:
         fixture_id: int,
         lineups: Iterable[Dict],
         log_changes: bool = False,
+        retain_raw: bool = True,
     ) -> None:
         for l in lineups or []:
             player_id = l.get("player_id") or (l.get("player") or {}).get("id")
@@ -1271,7 +1283,7 @@ class SyncService:
                 "short_name": player.get("short_name") or player.get("short_code"),
                 "common_name": player.get("common_name"),
                 "team_id": team_id,
-                "extra": player or l,
+                "extra": (player or l) if retain_raw else None,
             }
             if player_image:
                 player_payload["image_path"] = player_image
@@ -1284,6 +1296,7 @@ class SyncService:
                 team_id,
                 details,
                 log_changes=log_changes,
+                retain_raw=retain_raw,
             )
             minutes_played = _extract_minutes(
                 l,
@@ -1344,7 +1357,7 @@ class SyncService:
                 "lineup_detailed_position_name": str(dp_name) if dp_name is not None else None,
                 "lineup_detailed_position_code": str(dp_code) if dp_code is not None else None,
                 "position_abbr": position_abbr,
-                "extra": l,
+                "extra": l if retain_raw else None,
             }
             obj = self.session.get(FixturePlayer, (fixture_id, player_id))
             if obj:
@@ -1370,7 +1383,7 @@ class SyncService:
                         "code": code,
                         "name": name,
                         "value": value,
-                        "extra": d,
+                        "extra": d if retain_raw else None,
                     }
                     if obj_stat:
                         for k, v in payload_stat.items():
@@ -1452,6 +1465,7 @@ class SyncService:
         team_id: Optional[int],
         details: Iterable[Dict],
         log_changes: bool = False,
+        retain_raw: bool = True,
     ) -> None:
         for d in details or []:
             type_info = d.get("type") or {}
@@ -1473,7 +1487,7 @@ class SyncService:
                 "code": code,
                 "name": name,
                 "value": value,
-                "extra": d,
+                "extra": d if retain_raw else None,
             }
             if log_changes:
                 old_value = obj.value if obj else None
@@ -1528,9 +1542,10 @@ class SyncService:
         raw: Dict,
         log_changes: bool = False,
         full_detail: bool = False,
+        retain_raw: bool = True,
     ) -> None:
-        self._store_fixture_season(raw)
-        data = self._map_fixture(raw)
+        self._store_fixture_season(raw, retain_raw=retain_raw)
+        data = self._map_fixture(raw, retain_raw=retain_raw)
         fixture = self.session.get(Fixture, data["id"])
         if fixture:
             for k, v in data.items():
@@ -1553,17 +1568,23 @@ class SyncService:
         elif isinstance(lineups, list) and lineups:
             self._replace_fixture_lineup_rows(fixture.id)
 
-        loc_map = self._store_participants(fixture.id, raw.get("participants") or [])
+        loc_map = self._store_participants(
+            fixture.id,
+            raw.get("participants") or [],
+            retain_raw=retain_raw,
+        )
         self._apply_participant_derivations(fixture, loc_map)
         self._store_statistics(
             fixture.id,
             stats or [],
             log_changes=log_changes,
+            retain_raw=retain_raw,
         )
         self._store_lineups(
             fixture.id,
             lineups or [],
             log_changes=log_changes,
+            retain_raw=retain_raw,
         )
 
     def _chunks_newest_first(self, start: date, end: date, span_days: int = 90):

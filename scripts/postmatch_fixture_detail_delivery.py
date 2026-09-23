@@ -2029,7 +2029,16 @@ def store_provider_detail(
         # The worker already persists row counts and parity evidence.  Avoid
         # emitting one log line per provider stat/player detail on every
         # 15-minute run.
-        service._store_fixture_raw(data, log_changes=False, full_detail=True)
+        # This worker only needs normalized fields for its source snapshot and
+        # the downstream exporter. Avoid persisting the complete provider JSON
+        # into every fixture/detail row; that redundant payload was exhausting
+        # the VPS SQLite filesystem during repeated retries.
+        service._store_fixture_raw(
+            data,
+            log_changes=False,
+            full_detail=True,
+            retain_raw=False,
+        )
         session.flush()
         # Flush the SQLAlchemy session, then use its bind through a direct
         # connection so the validation sees exactly the rows being committed.

@@ -346,3 +346,33 @@ def test_lineup_only_storage_preserves_player_statistics(tmp_path) -> None:
     assert session.query(FixturePlayerStatistic).filter_by(fixture_id=9001, player_id=11, type_id=119).count() >= 1
     assert session.query(FixtureStatistic).filter_by(fixture_id=9001).count() == 1
     session.close()
+
+
+def test_compact_fixture_detail_storage_keeps_export_fields_without_raw_payloads(tmp_path) -> None:
+    engine = create_engine(f"sqlite:///{tmp_path / 'source.sqlite'}", future=True)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, future=True)
+    session = Session()
+
+    payload = provider_payload()
+    payload["scores"] = [
+        {"description": "1ST_HALF", "score": {"participant": "home", "goals": 1}},
+        {"description": "1ST_HALF", "score": {"participant": "away", "goals": 0}},
+    ]
+    service = SyncService(client=object(), session=session)
+    service._store_fixture_raw(payload, full_detail=True, retain_raw=False)
+    session.commit()
+
+    fixture = session.get(Fixture, 9001)
+    assert fixture is not None
+    assert fixture.extra == {"scores": payload["scores"]}
+    assert all(row.extra is None for row in session.query(FixturePlayer).filter_by(fixture_id=9001))
+    assert all(
+        row.extra is None
+        for row in session.query(FixturePlayerStatistic).filter_by(fixture_id=9001)
+    )
+    assert all(
+        row.extra is None or row.extra.get("source") == "derived"
+        for row in session.query(FixtureStatistic).filter_by(fixture_id=9001)
+    )
+    session.close()
