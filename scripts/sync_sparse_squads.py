@@ -128,6 +128,14 @@ def defer_stale_squad_teams(
     return team_offset + min(stale_indexes), True
 
 
+def publishable_squad_team_ids(
+    refresh_team_ids: Sequence[int], stale_team_ids: Sequence[int]
+) -> List[int]:
+    """Exclude teams whose provider snapshot was discarded as stale."""
+    stale = set(stale_team_ids)
+    return [int(team_id) for team_id in refresh_team_ids if team_id not in stale]
+
+
 def team_player_counts(session, team_ids: Sequence[int]) -> Dict[int, int]:
     if not team_ids:
         return {}
@@ -579,24 +587,28 @@ def main() -> None:
     refresh_team_ids = select_team_batch(sparse_team_ids, args.team_offset, args.max_teams)
     has_more_teams = args.team_offset + len(refresh_team_ids) < len(sparse_team_ids)
     next_team_offset = args.team_offset + len(refresh_team_ids) if has_more_teams else 0
-    previously_assigned_player_ids = [
-        int(row["id"])
-        for row in fetch_players_for_teams(refresh_team_ids)
-        if row.get("id")
-    ]
+    previously_assigned_players = fetch_players_for_teams(refresh_team_ids)
 
     if not args.dry_run:
         service.sync_squads_for_teams(refresh_team_ids)
     stale_team_ids = list(service.skipped_stale_squad_team_ids)
+    publishable_team_ids = publishable_squad_team_ids(
+        refresh_team_ids, stale_team_ids
+    )
     next_team_offset, has_more_teams = defer_stale_squad_teams(
         args.team_offset,
         refresh_team_ids,
         stale_team_ids,
         next_team_offset,
     )
-    after_counts = team_player_counts(session, refresh_team_ids)
+    previously_assigned_player_ids = [
+        int(row["id"])
+        for row in previously_assigned_players
+        if row.get("id") and row.get("team_id") in publishable_team_ids
+    ]
+    after_counts = team_player_counts(session, publishable_team_ids)
 
-    current_players = fetch_players_for_teams(refresh_team_ids)
+    current_players = fetch_players_for_teams(publishable_team_ids)
     players = fetch_players_by_ids(
         unique_ordered([
             *previously_assigned_player_ids,
@@ -614,10 +626,10 @@ def main() -> None:
             player["team_updated_at"] = assignment["last_seen_at"]
     # Re-read after normalization so remote stale-player cleanup uses the
     # same compatibility projection as the export payload.
-    current_players = fetch_players_for_teams(refresh_team_ids)
+    current_players = fetch_players_for_teams(publishable_team_ids)
     player_team_history = fetch_player_team_history(player_ids)
-    squad_snapshots = fetch_team_squad_snapshots(refresh_team_ids)
-    squad_memberships = fetch_team_squad_memberships(refresh_team_ids)
+    squad_snapshots = fetch_team_squad_snapshots(publishable_team_ids)
+    squad_memberships = fetch_team_squad_memberships(publishable_team_ids)
 
     players_exported = 0
     history_exported = 0
@@ -639,17 +651,20 @@ def main() -> None:
                 "team_squad_memberships", squad_memberships, "team_id,player_id", args.dry_run
             )
         )
-    remote_memberships_deactivated = deactivate_remote_squad_memberships_missing(
-        refresh_team_ids,
-        squad_memberships,
-        args.dry_run,
-    )
-    remote_players_detached = detach_remote_players_missing_from_squads(
-        refresh_team_ids,
-        current_players,
-        args.dry_run,
-        squad_memberships,
-    )
+    remote_memberships_deactivated = 0
+    remote_players_detached = 0
+    if publishable_team_ids:
+        remote_memberships_deactivated = deactivate_remote_squad_memberships_missing(
+            publishable_team_ids,
+            squad_memberships,
+            args.dry_run,
+        )
+        remote_players_detached = detach_remote_players_missing_from_squads(
+            publishable_team_ids,
+            current_players,
+            args.dry_run,
+            squad_memberships,
+        )
 
     report = {
         "league_ids": league_ids,
@@ -663,11 +678,13 @@ def main() -> None:
         "max_teams": args.max_teams,
         "has_more_teams": has_more_teams,
         "next_team_offset": next_team_offset,
-        "teams_refreshed": len(refresh_team_ids),
-        "team_ids_refreshed": refresh_team_ids,
+        "teams_attempted": len(refresh_team_ids),
+        "team_ids_attempted": refresh_team_ids,
+        "teams_refreshed": len(publishable_team_ids),
+        "team_ids_refreshed": publishable_team_ids,
         "stale_team_ids_deferred": stale_team_ids,
-        "before_counts": {str(team_id): before_counts.get(team_id, 0) for team_id in refresh_team_ids},
-        "after_counts": {str(team_id): after_counts.get(team_id, 0) for team_id in refresh_team_ids},
+        "before_counts": {str(team_id): before_counts.get(team_id, 0) for team_id in publishable_team_ids},
+        "after_counts": {str(team_id): after_counts.get(team_id, 0) for team_id in publishable_team_ids},
         "players_exported": players_exported,
         "player_team_history_exported": history_exported,
         "squad_snapshots_exported": snapshots_exported,

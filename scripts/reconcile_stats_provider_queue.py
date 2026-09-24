@@ -343,7 +343,7 @@ def fetch_and_assess_provider_fixtures_without_shared_lock(
     fixture_ids: list[int],
     fetch_concurrency: int,
     bulk_size: int,
-    still_due_candidates: Callable[[], list[int]],
+    still_due_candidates: Callable[[list[int]], list[int]],
 ) -> tuple[
     dict[int, dict[str, Any]],
     dict[int, Exception],
@@ -351,7 +351,7 @@ def fetch_and_assess_provider_fixtures_without_shared_lock(
     dict[int, tuple[Any, str, str]],
     set[int],
 ]:
-    """Fetch and analyze payloads, and check queue eligibility unlocked."""
+    """Fetch and analyze unlocked, then recheck queue eligibility under lock."""
     with release_shared_writer_lock():
         fetched, errors, http_calls = fetch_provider_fixtures(
             fixture_ids, fetch_concurrency, bulk_size
@@ -368,7 +368,7 @@ def fetch_and_assess_provider_fixtures_without_shared_lock(
                 )
             except Exception as exc:
                 errors[fixture_id] = exc
-        still_due = set(still_due_candidates())
+    still_due = set(still_due_candidates(fixture_ids))
     return fetched, errors, http_calls, assessments, still_due
 
 
@@ -407,7 +407,8 @@ def fixture_source_fingerprint(conn: sqlite3.Connection, fixture_id: int) -> str
     fixture = conn.execute(
         """
         select league_id, season_id, starting_at, status, status_code,
-               home_team_id, away_team_id, home_score, away_score, lineup_confirmed
+               home_team_id, away_team_id, home_score, away_score,
+               lineup_confirmed, extra
           from fixtures where id = ?
         """,
         (fixture_id,),
@@ -828,9 +829,10 @@ def main() -> int:
                     lambda: candidate_target_fixture_ids(
                         target_url,
                         leagues,
-                        batch_size * candidate_pool_multiplier,
+                        len(fixture_ids),
                         args.force,
                         season_ids or None,
+                        fixture_ids=fixture_ids,
                     ),
                 )
             )

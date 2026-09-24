@@ -333,7 +333,73 @@ def test_squad_discards_response_if_team_state_changes_during_fetch(tmp_path, mo
         os.close(fd)
 
 
-def test_stats_provider_fetch_runs_outside_shared_writer_lock(tmp_path, monkeypatch):
+def test_squad_discards_response_if_incoming_player_assignment_changes_during_fetch(
+    tmp_path, monkeypatch
+):
+    lock_path = tmp_path / "shared.lock"
+    fd = _hold_lock(lock_path, monkeypatch)
+    engine, session = _sqlite_session(tmp_path / "jxd.sqlite")
+    session.add_all(
+        [
+            Team(id=7, name="Prior team"),
+            Team(id=42, name="Requested team"),
+            Player(id=83, name="Transferred player", team_id=7),
+        ]
+    )
+    session.add(
+        TeamSquadMembership(
+            team_id=7,
+            player_id=83,
+            is_active=True,
+            first_seen_at=datetime(2025, 1, 1),
+            last_seen_at=datetime(2026, 1, 1),
+            provider_started_at=datetime(2025, 1, 1),
+            source="sportmonks",
+        )
+    )
+    session.add(
+        PlayerTeamHistory(
+            player_id=83,
+            team_id=7,
+            source="test",
+            effective_from=datetime(2025, 1, 1),
+        )
+    )
+    session.commit()
+
+    class Client:
+        def fetch_collection(self, endpoint, includes=None, per_page=200):
+            assert not _is_locked(lock_path)
+            membership = session.get(TeamSquadMembership, (7, 83))
+            membership.last_seen_at = datetime(2026, 9, 24)
+            session.add(
+                PlayerTeamHistory(
+                    player_id=83,
+                    team_id=7,
+                    source="concurrent-transfer",
+                    effective_from=datetime(2026, 9, 24),
+                )
+            )
+            session.commit()
+            return [{"player": {"id": 83, "name": "Transferred player"}, "start": "2025-01-01"}]
+
+    service = SyncService(Client(), session)
+    service.ensure_schema()
+    try:
+        assert service.sync_squads_for_teams([42]) == 0
+        assert service.skipped_stale_squad_team_ids == [42]
+        assert session.get(TeamSquadMembership, (42, 83)) is None
+        assert session.get(TeamSquadMembership, (7, 83)).is_active
+        assert session.get(Player, 83).team_id == 7
+    finally:
+        session.close()
+        engine.dispose()
+        os.close(fd)
+
+
+def test_stats_provider_fetch_runs_unlocked_and_due_recheck_runs_locked(
+    tmp_path, monkeypatch
+):
     lock_path = tmp_path / "shared.lock"
     fd = _hold_lock(lock_path, monkeypatch)
 
@@ -349,8 +415,9 @@ def test_stats_provider_fetch_runs_outside_shared_writer_lock(tmp_path, monkeypa
         assert not _is_locked(lock_path)
         return "hash"
 
-    def fake_due_candidates():
-        assert not _is_locked(lock_path)
+    def fake_due_candidates(fixture_ids):
+        assert _is_locked(lock_path)
+        assert fixture_ids == [1]
         return [1]
 
     try:
@@ -449,12 +516,20 @@ def test_stats_source_fingerprint_covers_player_metadata_and_team_history(
     try:
         before = stats_queue.fixture_source_fingerprint(conn, 704)
         conn.execute(
+            "update fixtures set extra = ? where id = ?",
+            ('{"source":"changed"}', 704),
+        )
+        conn.commit()
+        fixture_changed = stats_queue.fixture_source_fingerprint(conn, 704)
+        assert fixture_changed != before
+
+        conn.execute(
             "update players set extra = ? where id = ?",
             ('{"source":"after"}', 84),
         )
         conn.commit()
         player_changed = stats_queue.fixture_source_fingerprint(conn, 704)
-        assert player_changed != before
+        assert player_changed != fixture_changed
 
         conn.execute(
             "insert into player_team_history "

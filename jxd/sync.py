@@ -3,8 +3,10 @@ from __future__ import annotations
 import logging
 import hashlib
 import json
+import sqlite3
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, date
+from pathlib import Path
 from typing import Dict, Iterable, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import func, select
@@ -644,6 +646,69 @@ class SyncService:
         ]
         return hashlib.sha256("|".join(state).encode("ascii")).hexdigest()
 
+    def _fetch_and_prepare_squad_rows(
+        self, endpoint: str, sync_run_at: datetime
+    ) -> tuple[list[tuple[int, Dict, datetime]], bool]:
+        """Fetch outside the lock and detect any concurrent SQLite commit."""
+        bind = self.session.get_bind()
+        database = bind.url.database if bind.dialect.name == "sqlite" else None
+        monitor = None
+        if database and database != ":memory:":
+            if database.startswith("file:"):
+                separator = "&" if "?" in database else "?"
+                database_uri = f"{database}{separator}mode=ro"
+            else:
+                database_uri = f"{Path(database).resolve().as_uri()}?mode=ro"
+            monitor = sqlite3.connect(database_uri, uri=True, timeout=2)
+
+        try:
+            data_version = (
+                int(monitor.execute("PRAGMA data_version").fetchone()[0])
+                if monitor is not None
+                else None
+            )
+            with release_shared_writer_lock():
+                squad_rows = list(
+                    self.client.fetch_collection(
+                        endpoint, includes=["player"], per_page=200
+                    )
+                )
+                prepared_squad_rows: list[tuple[int, Dict, datetime]] = []
+                for item in squad_rows:
+                    player = item.get("player") or {}
+                    player_id = player.get("id") or item.get("player_id")
+                    if not player_id:
+                        continue
+                    player_id = int(player_id)
+                    player_name = player.get("name")
+                    display_name = player.get("display_name")
+                    payload = {
+                        "id": player_id,
+                        "name": player_name or display_name,
+                        "display_name": display_name or player_name,
+                        "common_name": player.get("common_name"),
+                        "short_name": player.get("short_name"),
+                        "image_path": player.get("image_path"),
+                        "extra": player,
+                    }
+                    provider_started_at = (
+                        parse_dt(item.get("start") or item.get("joined_at"))
+                        or sync_run_at
+                    )
+                    prepared_squad_rows.append(
+                        (player_id, payload, provider_started_at)
+                    )
+            self.session.commit()
+            changed_during_fetch = (
+                monitor is not None
+                and int(monitor.execute("PRAGMA data_version").fetchone()[0])
+                != data_version
+            )
+            return prepared_squad_rows, changed_during_fetch
+        finally:
+            if monitor is not None:
+                monitor.close()
+
     def _track_player_team_history(self, player_id: int, team_id: int, sync_run_at: datetime) -> None:
         if not player_id or not team_id:
             return
@@ -788,43 +853,20 @@ class SyncService:
             try:
                 # Do not mutate current membership while paging.  Only a fully
                 # successful, non-empty response is authoritative enough to remove
-                # somebody from a squad.
-                with release_shared_writer_lock():
-                    squad_rows = list(
-                        self.client.fetch_collection(endpoint, includes=["player"], per_page=200)
-                    )
-                    prepared_squad_rows: list[tuple[int, Dict, datetime]] = []
-                    for item in squad_rows:
-                        player = item.get("player") or {}
-                        player_id = player.get("id") or item.get("player_id")
-                        if not player_id:
-                            continue
-                        player_id = int(player_id)
-                        player_name = player.get("name")
-                        display_name = player.get("display_name")
-                        payload = {
-                            "id": player_id,
-                            "name": player_name or display_name,
-                            "display_name": display_name or player_name,
-                            "common_name": player.get("common_name"),
-                            "short_name": player.get("short_name"),
-                            "image_path": player.get("image_path"),
-                            "extra": player,
-                        }
-                        provider_started_at = (
-                            parse_dt(
-                                item.get("start") or item.get("joined_at")
-                            )
-                            or sync_run_at
-                        )
-                        prepared_squad_rows.append(
-                            (player_id, payload, provider_started_at)
-                        )
-                    squad_player_ids = {
-                        player_id for player_id, _, _ in prepared_squad_rows
-                    }
-                self.session.commit()
-                if baseline_signature != self._squad_reconciliation_signature(team_id):
+                # somebody from a squad.  The SQLite data-version fence also
+                # catches another team's membership/history changes, even when
+                # the incoming player was not on this team's baseline roster.
+                prepared_squad_rows, sqlite_changed_during_fetch = (
+                    self._fetch_and_prepare_squad_rows(endpoint, sync_run_at)
+                )
+                squad_player_ids = {
+                    player_id for player_id, _, _ in prepared_squad_rows
+                }
+                if (
+                    sqlite_changed_during_fetch
+                    or baseline_signature
+                    != self._squad_reconciliation_signature(team_id)
+                ):
                     self.skipped_stale_squad_team_ids.append(team_id)
                     log.warning(
                         "Discarding stale provider squad response for team %s; shared state changed during fetch",
