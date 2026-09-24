@@ -115,6 +115,19 @@ def select_team_batch(team_ids: Sequence[int], offset: int = 0, max_teams: int =
     return [int(team_id) for team_id in team_ids[offset:end]]
 
 
+def defer_stale_squad_teams(
+    team_offset: int,
+    refresh_team_ids: Sequence[int],
+    stale_team_ids: Sequence[int],
+    next_team_offset: int,
+) -> tuple[int, bool]:
+    """Keep the resumable cursor on the earliest response discarded as stale."""
+    if not stale_team_ids:
+        return next_team_offset, next_team_offset != 0
+    stale_indexes = [refresh_team_ids.index(team_id) for team_id in stale_team_ids]
+    return team_offset + min(stale_indexes), True
+
+
 def team_player_counts(session, team_ids: Sequence[int]) -> Dict[int, int]:
     if not team_ids:
         return {}
@@ -574,6 +587,13 @@ def main() -> None:
 
     if not args.dry_run:
         service.sync_squads_for_teams(refresh_team_ids)
+    stale_team_ids = list(service.skipped_stale_squad_team_ids)
+    next_team_offset, has_more_teams = defer_stale_squad_teams(
+        args.team_offset,
+        refresh_team_ids,
+        stale_team_ids,
+        next_team_offset,
+    )
     after_counts = team_player_counts(session, refresh_team_ids)
 
     current_players = fetch_players_for_teams(refresh_team_ids)
@@ -645,6 +665,7 @@ def main() -> None:
         "next_team_offset": next_team_offset,
         "teams_refreshed": len(refresh_team_ids),
         "team_ids_refreshed": refresh_team_ids,
+        "stale_team_ids_deferred": stale_team_ids,
         "before_counts": {str(team_id): before_counts.get(team_id, 0) for team_id in refresh_team_ids},
         "after_counts": {str(team_id): after_counts.get(team_id, 0) for team_id in refresh_team_ids},
         "players_exported": players_exported,

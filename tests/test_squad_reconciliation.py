@@ -1,7 +1,7 @@
 import sqlite3
 
 from scripts.export_to_supabase import fetch_players
-from scripts.sync_sparse_squads import select_team_batch
+from scripts.sync_sparse_squads import defer_stale_squad_teams, select_team_batch
 from scripts.verify_squad_freshness import player_assignment_failures
 
 
@@ -25,6 +25,12 @@ def test_select_team_batch_rejects_invalid_bounds():
             pass
         else:
             raise AssertionError("invalid batch bounds must raise ValueError")
+
+
+def test_stale_squad_response_keeps_cursor_on_that_team():
+    assert defer_stale_squad_teams(50, [101, 102, 103], [102], 0) == (51, True)
+    assert defer_stale_squad_teams(50, [101, 102, 103], [], 100) == (100, True)
+    assert defer_stale_squad_teams(100, [101, 102], [], 0) == (0, False)
 
 
 def test_player_export_uses_latest_active_squad_assignment():

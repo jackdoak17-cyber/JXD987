@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from .sportmonks_client import SportMonksClient, SportMonksError
+from .shared_writer_lock import release_shared_writer_lock
 from .models import (
     Base,
     Season,
@@ -551,6 +552,7 @@ class SyncService:
     def __init__(self, client: SportMonksClient, session: Session) -> None:
         self.client = client
         self.session = session
+        self.skipped_stale_squad_team_ids: list[int] = []
 
     def ensure_schema(self) -> None:
         Base.metadata.create_all(self.session.get_bind())
@@ -558,6 +560,62 @@ class SyncService:
         _ensure_fixture_player_columns(self.session.get_bind())
         _ensure_team_player_columns(self.session.get_bind())
         _ensure_team_squad_columns(self.session.get_bind())
+
+    def _model_state_signature(self, model, **filters: object) -> str:
+        primary_key = list(model.__table__.primary_key.columns)
+        query = self.session.query(model).filter_by(**filters)
+        if primary_key:
+            query = query.order_by(*(getattr(model, column.name) for column in primary_key))
+        rows = [
+            {column.name: getattr(row, column.name) for column in model.__table__.columns}
+            for row in query.all()
+        ]
+        return hashlib.sha256(
+            json.dumps(rows, default=str, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _fixture_reconciliation_signature(self, fixture_id: int, includes: Sequence[str]) -> str:
+        models = [
+            (Fixture, {"id": fixture_id}),
+            (FixtureParticipant, {"fixture_id": fixture_id}),
+        ]
+        fixture = self.session.get(Fixture, fixture_id)
+        team_ids = {
+            int(team_id)
+            for team_id in (
+                fixture.home_team_id if fixture else None,
+                fixture.away_team_id if fixture else None,
+            )
+            if team_id is not None
+        }
+        team_ids.update(
+            int(row.team_id)
+            for row in self.session.query(FixtureParticipant.team_id)
+            .filter(FixtureParticipant.fixture_id == fixture_id)
+            .all()
+            if row.team_id is not None
+        )
+        models.extend((Team, {"id": team_id}) for team_id in sorted(team_ids))
+        if fixture and fixture.season_id is not None:
+            models.append((Season, {"id": fixture.season_id}))
+        if "statistics" in includes:
+            models.extend(
+                [
+                    (FixtureStatistic, {"fixture_id": fixture_id}),
+                    (FixturePlayer, {"fixture_id": fixture_id}),
+                    (FixturePlayerStatistic, {"fixture_id": fixture_id}),
+                ]
+            )
+        state = [self._model_state_signature(model, **filters) for model, filters in models]
+        return hashlib.sha256("|".join(state).encode("ascii")).hexdigest()
+
+    def _squad_reconciliation_signature(self, team_id: int) -> str:
+        state = [
+            self._model_state_signature(TeamSquadSnapshot, team_id=team_id),
+            self._model_state_signature(TeamSquadMembership, team_id=team_id),
+            self._model_state_signature(Player, team_id=team_id),
+        ]
+        return hashlib.sha256("|".join(state).encode("ascii")).hexdigest()
 
     def _track_player_team_history(self, player_id: int, team_id: int, sync_run_at: datetime) -> None:
         if not player_id or not team_id:
@@ -686,17 +744,36 @@ class SyncService:
             return 0
         count = 0
         seen: Set[int] = set()
+        self.skipped_stale_squad_team_ids = []
         sync_run_at = datetime.utcnow()
         for team_id in team_ids:
             if not team_id or team_id in seen:
                 continue
             seen.add(team_id)
             endpoint = f"squads/teams/{team_id}"
+            # Flush any previous team's transaction before yielding the global
+            # writer lock for this team's provider request. The response is
+            # applied only if no other writer changed this team's squad state
+            # while the lock was yielded.
+            self.session.commit()
+            baseline_signature = self._squad_reconciliation_signature(team_id)
+            self.session.commit()
             try:
                 # Do not mutate current membership while paging.  Only a fully
                 # successful, non-empty response is authoritative enough to remove
                 # somebody from a squad.
-                squad_rows = list(self.client.fetch_collection(endpoint, includes=["player"], per_page=200))
+                with release_shared_writer_lock():
+                    squad_rows = list(
+                        self.client.fetch_collection(endpoint, includes=["player"], per_page=200)
+                    )
+                self.session.commit()
+                if baseline_signature != self._squad_reconciliation_signature(team_id):
+                    self.skipped_stale_squad_team_ids.append(team_id)
+                    log.warning(
+                        "Discarding stale provider squad response for team %s; shared state changed during fetch",
+                        team_id,
+                    )
+                    continue
                 squad_player_ids: Set[int] = {
                     int((item.get("player") or {}).get("id") or item.get("player_id"))
                     for item in squad_rows
@@ -832,6 +909,14 @@ class SyncService:
                 self.session.commit()
             except SportMonksError as exc:
                 self.session.rollback()
+                self.session.commit()
+                if baseline_signature != self._squad_reconciliation_signature(team_id):
+                    self.skipped_stale_squad_team_ids.append(team_id)
+                    log.warning(
+                        "Discarding stale provider error for team %s; shared state changed during fetch",
+                        team_id,
+                    )
+                    continue
                 self.session.add(
                     TeamSquadSnapshot(
                         team_id=team_id,
@@ -1683,14 +1768,29 @@ class SyncService:
         commit_every = 10
         for fixture_id in fixture_ids:
             endpoint = f"fixtures/{fixture_id}"
+            # Provider I/O is not a conflicting write. End any previous
+            # transaction, snapshot the rows this reconcile can replace, then
+            # yield the shared lock while waiting for SportMonks. A concurrent
+            # writer causes this response to be discarded after reacquisition.
+            self.session.commit()
+            baseline_signature = self._fixture_reconciliation_signature(fixture_id, includes)
+            self.session.commit()
             try:
-                payload = self.client.request(
-                    "GET",
-                    endpoint,
-                    params={"include": ";".join(includes)},
-                )
+                with release_shared_writer_lock():
+                    payload = self.client.request(
+                        "GET",
+                        endpoint,
+                        params={"include": ";".join(includes)},
+                    )
             except SportMonksError as exc:
                 log.warning("Reconcile failed for fixture %s: %s", fixture_id, exc)
+                continue
+            self.session.commit()
+            if baseline_signature != self._fixture_reconciliation_signature(fixture_id, includes):
+                log.warning(
+                    "Discarding stale provider response for fixture %s; shared state changed during fetch",
+                    fixture_id,
+                )
                 continue
             data = payload.get("data") or {}
             if not data:
