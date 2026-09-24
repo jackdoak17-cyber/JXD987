@@ -57,12 +57,12 @@ def _try_reacquire_shared_writer_lock(fd: int) -> bool:
 
 @contextmanager
 def release_shared_writer_lock() -> Iterator[None]:
-    """Release an inherited wrapper lock while doing non-mutating external I/O.
+    """Yield the global lock for non-conflicting I/O or independent writes.
 
     Production wrappers pass their already-held lock descriptor to child
     processes. Calls made outside those wrappers remain unchanged. The lock is
     always reacquired before returning to code that may read-modify-write the
-    shared SQLite spool or publish overlapping serving rows.
+    shared SQLite spool or publish rows that overlap another writer's contract.
     """
 
     raw_fd = os.environ.get("ODDS_SYNC_LOCK_FD")

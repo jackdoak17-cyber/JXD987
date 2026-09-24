@@ -17,6 +17,7 @@ from sqlalchemy import bindparam, text
 
 from jxd import SportMonksClient, SyncService
 from jxd.db import get_engine, get_session
+from jxd.shared_writer_lock import release_shared_writer_lock
 from scripts.export_to_supabase import (
     REST_PATH,
     SUPABASE_URL,
@@ -513,6 +514,45 @@ def exported_count(result: object) -> int:
     return int(result or 0)
 
 
+def export_independent_squad_tables(
+    team_ids: Sequence[int],
+    snapshots: Sequence[Dict],
+    memberships: Sequence[Dict],
+    dry_run: bool,
+) -> tuple[int, int, Dict[str, int]]:
+    """Publish squad-only tables without occupying the shared data-writer lock.
+
+    The squad supervisor lock serializes this publisher. The shared pipeline
+    lock remains held for the overlapping ``players`` and
+    ``player_team_history`` writes; only squad snapshots/memberships and their
+    stale-membership cleanup are yielded to other data writers.
+    """
+    snapshots_exported = 0
+    memberships_exported = 0
+    deactivated: Dict[str, int] = {}
+    with release_shared_writer_lock():
+        if snapshots:
+            snapshots_exported = exported_count(
+                upsert_table("team_squad_snapshots", snapshots, "id", dry_run)
+            )
+        if memberships:
+            memberships_exported = exported_count(
+                upsert_table(
+                    "team_squad_memberships",
+                    memberships,
+                    "team_id,player_id",
+                    dry_run,
+                )
+            )
+        if team_ids:
+            deactivated = deactivate_remote_squad_memberships_missing(
+                team_ids,
+                memberships,
+                dry_run,
+            )
+    return snapshots_exported, memberships_exported, deactivated
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--leagues", default=os.environ.get("LEAGUE_IDS", ""))
@@ -641,24 +681,18 @@ def main() -> None:
         history_exported = exported_count(
             upsert_table("player_team_history", player_team_history, "id", args.dry_run)
         )
-    if squad_snapshots:
-        snapshots_exported = exported_count(
-            upsert_table("team_squad_snapshots", squad_snapshots, "id", args.dry_run)
-        )
-    if squad_memberships:
-        memberships_exported = exported_count(
-            upsert_table(
-                "team_squad_memberships", squad_memberships, "team_id,player_id", args.dry_run
-            )
-        )
-    remote_memberships_deactivated = 0
+    (
+        snapshots_exported,
+        memberships_exported,
+        remote_memberships_deactivated,
+    ) = export_independent_squad_tables(
+        publishable_team_ids,
+        squad_snapshots,
+        squad_memberships,
+        args.dry_run,
+    )
     remote_players_detached = 0
     if publishable_team_ids:
-        remote_memberships_deactivated = deactivate_remote_squad_memberships_missing(
-            publishable_team_ids,
-            squad_memberships,
-            args.dry_run,
-        )
         remote_players_detached = detach_remote_players_missing_from_squads(
             publishable_team_ids,
             current_players,

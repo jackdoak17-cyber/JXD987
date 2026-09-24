@@ -26,6 +26,7 @@ from jxd import shared_writer_lock
 from jxd.shared_writer_lock import SharedWriterLockUnavailable, release_shared_writer_lock
 from jxd.sync import SyncService
 from scripts import reconcile_stats_provider_queue as stats_queue
+from scripts import sync_sparse_squads as squad_sync
 from scripts.reconcile_stats_provider_queue import (
     fetch_and_assess_provider_fixtures_without_shared_lock as fetch_provider_batch,
 )
@@ -297,6 +298,47 @@ def test_squad_provider_fetch_is_unlocked_but_mutation_remains_locked(tmp_path, 
     finally:
         session.close()
         engine.dispose()
+        os.close(fd)
+
+
+def test_squad_only_serving_table_writes_yield_shared_lock(
+    tmp_path, monkeypatch
+):
+    lock_path = tmp_path / "shared.lock"
+    fd = _hold_lock(lock_path, monkeypatch)
+    calls = []
+
+    def upsert(table, rows, conflict_columns, dry_run):
+        assert not _is_locked(lock_path)
+        calls.append((table, conflict_columns))
+        return len(rows), []
+
+    def deactivate(team_ids, memberships, dry_run):
+        assert not _is_locked(lock_path)
+        calls.append(("deactivate", tuple(team_ids)))
+        return {"42": 1}
+
+    monkeypatch.setattr(squad_sync, "upsert_table", upsert)
+    monkeypatch.setattr(
+        squad_sync,
+        "deactivate_remote_squad_memberships_missing",
+        deactivate,
+    )
+    try:
+        result = squad_sync.export_independent_squad_tables(
+            [42],
+            [{"id": 7}],
+            [{"team_id": 42, "player_id": 81, "is_active": True}],
+            False,
+        )
+        assert _is_locked(lock_path)
+        assert result == (1, 1, {"42": 1})
+        assert calls == [
+            ("team_squad_snapshots", "id"),
+            ("team_squad_memberships", "team_id,player_id"),
+            ("deactivate", (42,)),
+        ]
+    finally:
         os.close(fd)
 
 
