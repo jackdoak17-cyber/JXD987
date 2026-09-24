@@ -584,6 +584,7 @@ def candidate_target_fixture_ids(
     limit: int,
     force: bool = False,
     season_ids: Sequence[int] | None = None,
+    fixture_ids: Sequence[int] | None = None,
 ) -> list[int]:
     """Select completed target fixtures missing or due for provider detail.
 
@@ -606,6 +607,11 @@ def candidate_target_fixture_ids(
     if season_ids:
         clauses.append("f.season_id = any(%s)")
         params.append(list(season_ids))
+    if fixture_ids is not None:
+        if not fixture_ids:
+            return []
+        clauses.append("f.id = any(%s)")
+        params.append([int(fixture_id) for fixture_id in fixture_ids])
     requested = max(int(limit), 0)
     if requested == 0:
         return []

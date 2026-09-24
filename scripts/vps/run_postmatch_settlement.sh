@@ -12,6 +12,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/__init__.py" \
   "jxd/db.py" \
   "jxd/models.py" \
+  "jxd/shared_writer_lock.py" \
   "jxd/sportmonks_client.py" \
   "jxd/sync.py" \
   "scripts/reconcile_recent_fixtures.py" \

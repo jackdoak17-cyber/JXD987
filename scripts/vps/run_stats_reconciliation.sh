@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
 require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
+  "jxd/shared_writer_lock.py" \
   "scripts/reconcile_stats_provider_queue.py"
 
 if [[ -f "${REPO_ROOT}/.env" ]]; then

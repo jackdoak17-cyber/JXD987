@@ -13,6 +13,7 @@ import argparse
 import atexit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -23,12 +24,13 @@ import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import create_engine
 import psycopg2
 
 from jxd import SportMonksClient
+from jxd.shared_writer_lock import release_shared_writer_lock
 from scripts.postmatch_fixture_detail_delivery import (
     TRACKED_PLAYER_STAT_TYPES,
     activate_provider_snapshot,
@@ -337,6 +339,39 @@ def fetch_provider_fixtures(
     return fetched, errors, http_calls
 
 
+def fetch_and_assess_provider_fixtures_without_shared_lock(
+    fixture_ids: list[int],
+    fetch_concurrency: int,
+    bulk_size: int,
+    still_due_candidates: Callable[[list[int]], list[int]],
+) -> tuple[
+    dict[int, dict[str, Any]],
+    dict[int, Exception],
+    int,
+    dict[int, tuple[Any, str, str]],
+    set[int],
+]:
+    """Fetch and analyze unlocked, then recheck queue eligibility under lock."""
+    with release_shared_writer_lock():
+        fetched, errors, http_calls = fetch_provider_fixtures(
+            fixture_ids, fetch_concurrency, bulk_size
+        )
+        assessments: dict[int, tuple[Any, str, str]] = {}
+        for fixture_id, data in fetched.items():
+            if not isinstance(data, dict) or not data:
+                continue
+            try:
+                assessments[fixture_id] = (
+                    assess_provider_payload(data),
+                    provider_payload_hash(data),
+                    normalized_provider_hash(data),
+                )
+            except Exception as exc:
+                errors[fixture_id] = exc
+    still_due = set(still_due_candidates(fixture_ids))
+    return fetched, errors, http_calls, assessments, still_due
+
+
 def acquire_process_lock() -> int | None:
     """Prevent concurrent workers from writing the shared SQLite spool."""
     # The VPS supervisor acquires the canonical lock around this worker so it
@@ -358,12 +393,157 @@ def acquire_process_lock() -> int | None:
         return None
     os.ftruncate(fd, 0)
     os.write(fd, f"pid={os.getpid()}\n".encode())
+    os.environ.setdefault("ODDS_SYNC_LOCK_FD", str(fd))
     atexit.register(os.close, fd)
     return fd
 
 
 def parse_csv_ints(value: str | None) -> list[int]:
     return [int(token.strip()) for token in (value or "").split(",") if token.strip()]
+
+
+def fixture_source_fingerprint(conn: sqlite3.Connection, fixture_id: int) -> str:
+    """Fence provider responses against a concurrent fixture/detail writer."""
+    fixture = conn.execute(
+        """
+        select league_id, season_id, starting_at, status, status_code,
+               home_team_id, away_team_id, home_score, away_score,
+               lineup_confirmed, extra
+          from fixtures where id = ?
+        """,
+        (fixture_id,),
+    ).fetchone()
+    participants = conn.execute(
+        "select team_id, location, score, extra from fixture_participants "
+        "where fixture_id = ? order by team_id",
+        (fixture_id,),
+    ).fetchall()
+    detail_rows = {
+        "fixture_statistics": [
+            list(row)
+            for row in conn.execute(
+                "select * from fixture_statistics where fixture_id = ? "
+                "order by team_id, type_id, code, location",
+                (fixture_id,),
+            ).fetchall()
+        ],
+        "fixture_players": [
+            list(row)
+            for row in conn.execute(
+                "select * from fixture_players where fixture_id = ? order by player_id",
+                (fixture_id,),
+            ).fetchall()
+        ],
+        "fixture_player_statistics": [
+            list(row)
+            for row in conn.execute(
+                "select * from fixture_player_statistics where fixture_id = ? "
+                "order by player_id, type_id, code",
+                (fixture_id,),
+            ).fetchall()
+        ],
+    }
+    team_ids = {
+        int(team_id)
+        for team_id in (
+            (fixture[5], fixture[6]) if fixture else ()
+        )
+        if team_id is not None
+    }
+    team_ids.update(int(row[0]) for row in participants if row[0] is not None)
+    teams: list[tuple[Any, ...]] = []
+    if team_ids:
+        team_values = sorted(team_ids)
+        placeholders = ",".join("?" for _ in team_values)
+        teams = [
+            tuple(row)
+            for row in conn.execute(
+                "select id, name, short_code, image_path, extra from teams "
+                f"where id in ({placeholders}) order by id",
+                team_values,
+            ).fetchall()
+        ]
+    seasons = []
+    if fixture and fixture[1] is not None:
+        season = conn.execute(
+            "select id, league_id, name, start_date, end_date, is_current, extra "
+            "from seasons where id = ?",
+            (fixture[1],),
+        ).fetchone()
+        seasons = [list(season)] if season else []
+    lineup_players = [
+        int(row[0])
+        for row in conn.execute(
+            "select player_id from fixture_players where fixture_id = ? order by player_id",
+            (fixture_id,),
+        ).fetchall()
+    ]
+    players: list[tuple[Any, ...]] = []
+    for offset in range(0, len(lineup_players), 500):
+        player_ids = lineup_players[offset : offset + 500]
+        placeholders = ",".join("?" for _ in player_ids)
+        players.extend(
+            tuple(row)
+            for row in conn.execute(
+                "select id, team_id, team_updated_at, name, display_name, common_name, "
+                "short_name, image_path, extra from players "
+                f"where id in ({placeholders}) order by id",
+                player_ids,
+            ).fetchall()
+        )
+    player_history: list[tuple[Any, ...]] = []
+    for offset in range(0, len(lineup_players), 500):
+        player_ids = lineup_players[offset:offset + 500]
+        placeholders = ",".join("?" for _ in player_ids)
+        player_history.extend(
+            tuple(row)
+            for row in conn.execute(
+                "select * from player_team_history "
+                f"where player_id in ({placeholders}) "
+                "order by player_id, effective_from, id",
+                player_ids,
+            ).fetchall()
+        )
+    state = {
+        "fixture": list(fixture) if fixture else None,
+        "participants": [list(row) for row in participants],
+        "teams": [list(row) for row in teams],
+        "seasons": seasons,
+        "detail_rows": detail_rows,
+        "source_detail": asdict(source_snapshot(conn, fixture_id)),
+        "players": [list(row) for row in players],
+        "player_team_history": [list(row) for row in player_history],
+    }
+    serialized = json.dumps(state, default=str, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def revalidate_provider_fetch(
+    conn: sqlite3.Connection,
+    fixture_ids: list[int],
+    source_fingerprints: dict[int, str],
+    still_due_ids: set[int],
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Keep only fetched fixtures still due and unchanged while the lock was yielded."""
+    eligible: list[int] = []
+    discarded: list[dict[str, Any]] = []
+    for fixture_id in fixture_ids:
+        if fixture_id not in still_due_ids:
+            discarded.append({"fixture_id": fixture_id, "reason": "no longer due after provider fetch"})
+        elif fixture_source_fingerprint(conn, fixture_id) != source_fingerprints[fixture_id]:
+            discarded.append(
+                {"fixture_id": fixture_id, "reason": "shared source state changed during provider fetch"}
+            )
+        else:
+            eligible.append(fixture_id)
+    return eligible, discarded
+
+
+def should_handoff_after_stale_provider_batch(
+    discarded: list[dict[str, Any]],
+) -> bool:
+    """Yield whenever contention invalidated any fetched row."""
+    return bool(discarded)
 
 
 def export_batch(
@@ -564,6 +744,7 @@ def main() -> int:
         "provider_calls": 0,
         "provider_fixture_attempts": 0,
         "provider_http_calls": 0,
+        "stale_fetch_discarded": [],
         "fetch_concurrency": fetch_concurrency,
         "bulk_size": bulk_size,
         "max_cohorts": max_cohorts,
@@ -590,6 +771,9 @@ def main() -> int:
             if args.max_batches and report["batches"] >= args.max_batches:
                 break
             batch_size = max(args.batch_size, 1)
+            conn.commit()
+            if target_conn is not None and not target_conn.closed:
+                target_conn.commit()
             fixture_ids = candidate_target_fixture_ids(
                 target_url,
                 leagues,
@@ -601,8 +785,9 @@ def main() -> int:
                 break
             target_metadata = target_fixture_metadata(target_url, fixture_ids)
             original_fixture_count = len(fixture_ids)
-            fixture_ids = cohort_limited_fixture_ids(fixture_ids, target_metadata, max_cohorts)
-            fixture_ids = fixture_ids[:batch_size]
+            fixture_ids = cohort_limited_fixture_ids(
+                fixture_ids, target_metadata, max_cohorts
+            )[:batch_size]
             if len(fixture_ids) < original_fixture_count:
                 LOG.info(
                     "Capped batch from %s to %s fixtures to stay within %s projection cohorts",
@@ -610,14 +795,72 @@ def main() -> int:
                     len(fixture_ids),
                     max_cohorts,
                 )
-                target_metadata = {fixture_id: target_metadata[fixture_id] for fixture_id in fixture_ids}
+                target_metadata = {
+                    fixture_id: target_metadata[fixture_id]
+                    for fixture_id in fixture_ids
+                }
             report["batches"] += 1
-            report["fixtures_selected"] += len(fixture_ids)
             LOG.info("Processing stats reconciliation batch %s: %s fixtures", report["batches"], len(fixture_ids))
 
-            # Mark the complete batch as running before fetching so a worker
-            # handoff cannot leave a subset looking untouched.  The source
-            # ledger is still updated serially because it is SQLite-backed.
+            # Capture the exact source state, end any read transaction, then
+            # release the global writer while SportMonks responds. Attempts are
+            # marked only after reacquiring the lock and confirming the fixture
+            # is still due and unchanged.
+            source_fingerprints = {
+                fixture_id: fixture_source_fingerprint(conn, fixture_id)
+                for fixture_id in fixture_ids
+            }
+            conn.commit()
+            if target_conn is not None and not target_conn.closed:
+                target_conn.commit()
+
+            stage_started = time.perf_counter()
+            (
+                fetched,
+                fetch_errors,
+                http_calls,
+                prepared_assessments,
+                still_due,
+            ) = (
+                fetch_and_assess_provider_fixtures_without_shared_lock(
+                    fixture_ids,
+                    fetch_concurrency,
+                    bulk_size,
+                    lambda: candidate_target_fixture_ids(
+                        target_url,
+                        leagues,
+                        len(fixture_ids),
+                        args.force,
+                        season_ids or None,
+                        fixture_ids=fixture_ids,
+                    ),
+                )
+            )
+            report["stage_seconds"]["provider_fetch"] = round(time.perf_counter() - stage_started, 3)
+            report["provider_calls"] += len(fixture_ids)
+            report["provider_fixture_attempts"] += len(fixture_ids)
+            report["provider_http_calls"] += http_calls
+
+            fixture_ids, discarded = revalidate_provider_fetch(
+                conn, fixture_ids, source_fingerprints, still_due
+            )
+            report["stale_fetch_discarded"].extend(discarded)
+            stop_after_stale_batch = should_handoff_after_stale_provider_batch(
+                discarded
+            )
+            if not fixture_ids:
+                LOG.info(
+                    "Discarded stale provider batch; no fixture "
+                    "remained safe to apply"
+                )
+                break
+
+            target_metadata = {
+                fixture_id: target_metadata[fixture_id]
+                for fixture_id in fixture_ids
+                if fixture_id in target_metadata
+            }
+            report["fixtures_selected"] += len(fixture_ids)
             contexts: dict[int, dict[str, Any]] = {}
             for fixture_id in fixture_ids:
                 source_meta_row = conn.execute(
@@ -659,17 +902,6 @@ def main() -> int:
                     "prior_stable": prior_stable,
                 }
 
-            stage_started = time.perf_counter()
-            fetched, fetch_errors, http_calls = fetch_provider_fixtures(
-                fixture_ids,
-                fetch_concurrency,
-                bulk_size,
-            )
-            report["stage_seconds"]["provider_fetch"] = round(time.perf_counter() - stage_started, 3)
-            report["provider_calls"] += len(fixture_ids)
-            report["provider_fixture_attempts"] += len(fixture_ids)
-            report["provider_http_calls"] += http_calls
-
             accepted: list[dict[str, Any]] = []
             excluded_seasons: set[tuple[int, int]] = set()
             for fixture_id in fixture_ids:
@@ -693,9 +925,8 @@ def main() -> int:
                         if attempt >= 3:
                             raise ProviderFixtureUnavailableError(message)
                         raise RuntimeError(message)
-                    assessment = assess_provider_payload(data)
-                    payload_hash = provider_payload_hash(data)
-                    normalized_hash = normalized_provider_hash(data)
+                    prepared = prepared_assessments[fixture_id]
+                    assessment, payload_hash, normalized_hash = prepared
                     snapshot_id = persist_provider_snapshot(
                         target_url,
                         fixture_id,
@@ -814,6 +1045,8 @@ def main() -> int:
                     report["projection_rows"][key] = report["projection_rows"].get(key, 0) + count
 
             if not accepted:
+                if stop_after_stale_batch:
+                    break
                 continue
             stage_started = time.perf_counter()
             export_result = export_candidates(
@@ -974,6 +1207,12 @@ def main() -> int:
                 if status == "provider_sparse":
                     report["provider_sparse"].append({"fixture_id": fixture_id})
             report["stage_seconds"]["activation"] = round(time.perf_counter() - stage_started, 3)
+            if stop_after_stale_batch:
+                LOG.info(
+                    "Stopping after stale provider batch "
+                    "to hand off contended fixtures"
+                )
+                break
     finally:
         if target_conn is not None and not target_conn.closed:
             target_conn.close()

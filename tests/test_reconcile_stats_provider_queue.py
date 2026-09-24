@@ -117,6 +117,52 @@ def test_target_selection_requeues_legacy_accepted_rows_for_v2_evidence(
     assert pending_query.index("coalesce(d.next_attempt_at") < pending_query.index("f.season_id desc")
 
 
+def test_target_selection_can_recheck_only_the_fetched_fixture_ids(monkeypatch) -> None:
+    executions: list[tuple[str, list[object]]] = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, statement, params):
+            executions.append((statement, params))
+
+        def fetchall(self):
+            return []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setattr(
+        postmatch.psycopg2,
+        "connect",
+        lambda *args, **kwargs: Connection(),
+    )
+
+    assert postmatch.candidate_target_fixture_ids(
+        "postgres://target", [8], 2, fixture_ids=[31, 32]
+    ) == []
+    assert executions
+    assert all("f.id = any(%s)" in query for query, _ in executions)
+    assert all([31, 32] in params for _, params in executions)
+
+    execution_count = len(executions)
+    assert postmatch.candidate_target_fixture_ids(
+        "postgres://target", [8], 2, fixture_ids=[]
+    ) == []
+    assert len(executions) == execution_count
+
+
 def test_ledger_upgrade_does_not_promote_pre_contract_rows_to_v2() -> None:
     conn = sqlite3.connect(":memory:")
     conn.execute(

@@ -373,6 +373,7 @@ run_with_global_lock_and_timeout() {
   local job_priority="${ODDS_SYNC_JOB_PRIORITY:-normal}"
   local lock_wait_seconds="${ODDS_SYNC_LOCK_WAIT_SECONDS:-0}"
   local lock_poll_seconds="${ODDS_SYNC_LOCK_POLL_SECONDS:-5}"
+  local settlement_priority_file="${ODDS_SYNC_SETTLEMENT_PRIORITY_FILE:-${lock_file}.settlement-priority}"
   local live_tick_seconds="${ODDS_SYNC_LIVE_TICK_SECONDS:-900}"
   local live_reserve_seconds="${ODDS_SYNC_LIVE_RESERVE_SECONDS:-180}"
   local live_grace_seconds="${ODDS_SYNC_LIVE_GRACE_SECONDS:-120}"
@@ -382,6 +383,27 @@ run_with_global_lock_and_timeout() {
   mkdir -p "$(dirname "${lock_file}")"
 
   (
+    # Coordinate the short lock-acquisition handoff with normal writers. The
+    # settlement single-run lock also covers its independent Postgres tail and
+    # is intentionally not used as this signal.
+    mkdir -p "$(dirname "${settlement_priority_file}")"
+    exec 10>>"${settlement_priority_file}"
+    if [[ "${job_priority}" == "settlement" ]]; then
+      # Only another settlement invocation can hold this singleton marker.
+      # Normal writers hold a shared marker only while trying to get FD 9, so
+      # waiting here preserves settlement priority without extending the data
+      # writer's critical section.
+      flock 10
+    else
+      # A shared marker closes the race between checking for settlement and
+      # acquiring the data lock: settlement cannot announce priority between
+      # these two operations.
+      if ! flock --shared --nonblock 10; then
+        log_info "[SKIPPED] settlement shared-lock priority is active"
+        exit 2
+      fi
+    fi
+
     # The quarter-hour settlement is the critical stats writer. Keep normal
     # writers from starting shortly before/after its tick, while allowing the
     # settlement writer to wait for a writer that was already in flight.
@@ -408,6 +430,13 @@ run_with_global_lock_and_timeout() {
       fi
       sleep "${lock_poll_seconds}" 9>&-
     done
+
+    if [[ "${job_priority}" != "settlement" ]]; then
+      # Settlement may now announce priority and wait for the writer already
+      # holding FD 9. No normal writer can jump ahead of that waiter.
+      flock -u 10
+      exec 10>&-
+    fi
 
     local effective_runtime="${max_runtime}"
     if [[ "${live_schedule_enabled}" == "true" && "${job_priority}" != "settlement" ]]; then
@@ -436,6 +465,11 @@ run_with_global_lock_and_timeout() {
     fi
 
     # The full chain must execute as one subshell so timeout covers every step.
+    # Child Python workers may yield the shared lock during provider I/O and
+    # reacquire it before entering any source/publication write phase.
+    export ODDS_SYNC_LOCK_FD=9
+    export ODDS_SYNC_JOB_PRIORITY="${job_priority}"
+    export ODDS_SYNC_SETTLEMENT_PRIORITY_FILE="${settlement_priority_file}"
     timeout --signal=TERM --kill-after=5s "${effective_runtime}" bash -lc "${chain_command}"
     local status=$?
     if [[ ${status} -eq 124 || ${status} -eq 137 ]]; then
@@ -445,6 +479,10 @@ run_with_global_lock_and_timeout() {
       fi
       log_error "process killed after ${max_runtime}s overrun"
       exit 1
+    fi
+    if [[ ${status} -eq 75 ]]; then
+      log_info "[SKIPPED] shared writer lock was not reacquired before its bounded wait"
+      exit 2
     fi
     if [[ ${status} -eq 2 ]]; then
       log_error "process exited with usage/status code 2"
