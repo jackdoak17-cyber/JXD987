@@ -24,7 +24,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import create_engine
 import psycopg2
@@ -339,14 +339,37 @@ def fetch_provider_fixtures(
     return fetched, errors, http_calls
 
 
-def fetch_provider_fixtures_without_shared_lock(
+def fetch_and_assess_provider_fixtures_without_shared_lock(
     fixture_ids: list[int],
     fetch_concurrency: int,
     bulk_size: int,
-) -> tuple[dict[int, dict[str, Any]], dict[int, Exception], int]:
-    """Perform bounded provider I/O without monopolizing the shared writer."""
+    still_due_candidates: Callable[[], list[int]],
+) -> tuple[
+    dict[int, dict[str, Any]],
+    dict[int, Exception],
+    int,
+    dict[int, tuple[Any, str, str]],
+    set[int],
+]:
+    """Fetch and analyze payloads, and check queue eligibility unlocked."""
     with release_shared_writer_lock():
-        return fetch_provider_fixtures(fixture_ids, fetch_concurrency, bulk_size)
+        fetched, errors, http_calls = fetch_provider_fixtures(
+            fixture_ids, fetch_concurrency, bulk_size
+        )
+        assessments: dict[int, tuple[Any, str, str]] = {}
+        for fixture_id, data in fetched.items():
+            if not isinstance(data, dict) or not data:
+                continue
+            try:
+                assessments[fixture_id] = (
+                    assess_provider_payload(data),
+                    provider_payload_hash(data),
+                    normalized_provider_hash(data),
+                )
+            except Exception as exc:
+                errors[fixture_id] = exc
+        still_due = set(still_due_candidates())
+    return fetched, errors, http_calls, assessments, still_due
 
 
 def acquire_process_lock() -> int | None:
@@ -462,8 +485,21 @@ def fixture_source_fingerprint(conn: sqlite3.Connection, fixture_id: int) -> str
             tuple(row)
             for row in conn.execute(
                 "select id, team_id, team_updated_at, name, display_name, common_name, "
-                "short_name, image_path from players "
+                "short_name, image_path, extra from players "
                 f"where id in ({placeholders}) order by id",
+                player_ids,
+            ).fetchall()
+        )
+    player_history: list[tuple[Any, ...]] = []
+    for offset in range(0, len(lineup_players), 500):
+        player_ids = lineup_players[offset:offset + 500]
+        placeholders = ",".join("?" for _ in player_ids)
+        player_history.extend(
+            tuple(row)
+            for row in conn.execute(
+                "select * from player_team_history "
+                f"where player_id in ({placeholders}) "
+                "order by player_id, effective_from, id",
                 player_ids,
             ).fetchall()
         )
@@ -475,6 +511,7 @@ def fixture_source_fingerprint(conn: sqlite3.Connection, fixture_id: int) -> str
         "detail_rows": detail_rows,
         "source_detail": asdict(source_snapshot(conn, fixture_id)),
         "players": [list(row) for row in players],
+        "player_team_history": [list(row) for row in player_history],
     }
     serialized = json.dumps(state, default=str, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
@@ -499,6 +536,13 @@ def revalidate_provider_fetch(
         else:
             eligible.append(fixture_id)
     return eligible, discarded
+
+
+def should_handoff_after_stale_provider_batch(
+    discarded: list[dict[str, Any]],
+) -> bool:
+    """Yield whenever contention invalidated any fetched row."""
+    return bool(discarded)
 
 
 def export_batch(
@@ -726,6 +770,9 @@ def main() -> int:
             if args.max_batches and report["batches"] >= args.max_batches:
                 break
             batch_size = max(args.batch_size, 1)
+            conn.commit()
+            if target_conn is not None and not target_conn.closed:
+                target_conn.commit()
             fixture_ids = candidate_target_fixture_ids(
                 target_url,
                 leagues,
@@ -737,8 +784,9 @@ def main() -> int:
                 break
             target_metadata = target_fixture_metadata(target_url, fixture_ids)
             original_fixture_count = len(fixture_ids)
-            fixture_ids = cohort_limited_fixture_ids(fixture_ids, target_metadata, max_cohorts)
-            fixture_ids = fixture_ids[:batch_size]
+            fixture_ids = cohort_limited_fixture_ids(
+                fixture_ids, target_metadata, max_cohorts
+            )[:batch_size]
             if len(fixture_ids) < original_fixture_count:
                 LOG.info(
                     "Capped batch from %s to %s fixtures to stay within %s projection cohorts",
@@ -746,7 +794,10 @@ def main() -> int:
                     len(fixture_ids),
                     max_cohorts,
                 )
-                target_metadata = {fixture_id: target_metadata[fixture_id] for fixture_id in fixture_ids}
+                target_metadata = {
+                    fixture_id: target_metadata[fixture_id]
+                    for fixture_id in fixture_ids
+                }
             report["batches"] += 1
             LOG.info("Processing stats reconciliation batch %s: %s fixtures", report["batches"], len(fixture_ids))
 
@@ -763,34 +814,50 @@ def main() -> int:
                 target_conn.commit()
 
             stage_started = time.perf_counter()
-            fetched, fetch_errors, http_calls = fetch_provider_fixtures_without_shared_lock(
-                fixture_ids,
-                fetch_concurrency,
-                bulk_size,
+            (
+                fetched,
+                fetch_errors,
+                http_calls,
+                prepared_assessments,
+                still_due,
+            ) = (
+                fetch_and_assess_provider_fixtures_without_shared_lock(
+                    fixture_ids,
+                    fetch_concurrency,
+                    bulk_size,
+                    lambda: candidate_target_fixture_ids(
+                        target_url,
+                        leagues,
+                        batch_size * candidate_pool_multiplier,
+                        args.force,
+                        season_ids or None,
+                    ),
+                )
             )
             report["stage_seconds"]["provider_fetch"] = round(time.perf_counter() - stage_started, 3)
             report["provider_calls"] += len(fixture_ids)
             report["provider_fixture_attempts"] += len(fixture_ids)
             report["provider_http_calls"] += http_calls
 
-            still_due = set(
-                candidate_target_fixture_ids(
-                    target_url,
-                    leagues,
-                    batch_size * candidate_pool_multiplier,
-                    args.force,
-                    season_ids or None,
-                )
-            )
             fixture_ids, discarded = revalidate_provider_fetch(
                 conn, fixture_ids, source_fingerprints, still_due
             )
             report["stale_fetch_discarded"].extend(discarded)
+            stop_after_stale_batch = should_handoff_after_stale_provider_batch(
+                discarded
+            )
             if not fixture_ids:
-                LOG.info("Discarded stale provider batch; no fixture remained safe to apply")
-                continue
+                LOG.info(
+                    "Discarded stale provider batch; no fixture "
+                    "remained safe to apply"
+                )
+                break
 
-            target_metadata = target_fixture_metadata(target_url, fixture_ids)
+            target_metadata = {
+                fixture_id: target_metadata[fixture_id]
+                for fixture_id in fixture_ids
+                if fixture_id in target_metadata
+            }
             report["fixtures_selected"] += len(fixture_ids)
             contexts: dict[int, dict[str, Any]] = {}
             for fixture_id in fixture_ids:
@@ -856,9 +923,8 @@ def main() -> int:
                         if attempt >= 3:
                             raise ProviderFixtureUnavailableError(message)
                         raise RuntimeError(message)
-                    assessment = assess_provider_payload(data)
-                    payload_hash = provider_payload_hash(data)
-                    normalized_hash = normalized_provider_hash(data)
+                    prepared = prepared_assessments[fixture_id]
+                    assessment, payload_hash, normalized_hash = prepared
                     snapshot_id = persist_provider_snapshot(
                         target_url,
                         fixture_id,
@@ -977,6 +1043,8 @@ def main() -> int:
                     report["projection_rows"][key] = report["projection_rows"].get(key, 0) + count
 
             if not accepted:
+                if stop_after_stale_batch:
+                    break
                 continue
             stage_started = time.perf_counter()
             export_result = export_candidates(
@@ -1137,6 +1205,12 @@ def main() -> int:
                 if status == "provider_sparse":
                     report["provider_sparse"].append({"fixture_id": fixture_id})
             report["stage_seconds"]["activation"] = round(time.perf_counter() - stage_started, 3)
+            if stop_after_stale_batch:
+                LOG.info(
+                    "Stopping after stale provider batch "
+                    "to hand off contended fixtures"
+                )
+                break
     finally:
         if target_conn is not None and not target_conn.closed:
             target_conn.close()

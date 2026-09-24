@@ -5,17 +5,30 @@ import fcntl
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 from unittest.mock import patch
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from jxd.models import Base, Fixture, Player, TeamSquadMembership, TeamSquadSnapshot
+from jxd.models import (
+    Base,
+    Fixture,
+    FixturePlayer,
+    Player,
+    PlayerTeamHistory,
+    Team,
+    TeamSquadMembership,
+    TeamSquadSnapshot,
+)
 from jxd import shared_writer_lock
 from jxd.shared_writer_lock import SharedWriterLockUnavailable, release_shared_writer_lock
 from jxd.sync import SyncService
 from scripts import reconcile_stats_provider_queue as stats_queue
+from scripts.reconcile_stats_provider_queue import (
+    fetch_and_assess_provider_fixtures_without_shared_lock as fetch_provider_batch,
+)
 
 
 def _is_locked(path: Path) -> bool:
@@ -86,16 +99,69 @@ def test_zero_wait_still_reacquires_an_available_lock(tmp_path, monkeypatch):
         os.close(fd)
 
 
-def test_normal_writer_recognizes_active_settlement_lock(tmp_path, monkeypatch):
+def test_normal_reacquire_respects_settlement_priority_gate(
+    tmp_path, monkeypatch
+):
+    lock_path = tmp_path / "shared.lock"
+    settlement_path = tmp_path / "settlement.lock"
+    writer_fd = _hold_lock(lock_path, monkeypatch)
+    settlement_fd = os.open(settlement_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(settlement_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setenv(
+        "ODDS_SYNC_SETTLEMENT_PRIORITY_FILE", str(settlement_path)
+    )
+    monkeypatch.setenv("ODDS_SYNC_JOB_PRIORITY", "normal")
+    try:
+        fcntl.flock(writer_fd, fcntl.LOCK_UN)
+        assert not shared_writer_lock._try_reacquire_shared_writer_lock(
+            writer_fd
+        )
+        assert not _is_locked(lock_path)
+        fcntl.flock(settlement_fd, fcntl.LOCK_UN)
+        assert shared_writer_lock._try_reacquire_shared_writer_lock(writer_fd)
+        assert _is_locked(lock_path)
+    finally:
+        try:
+            fcntl.flock(settlement_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(settlement_fd)
+        os.close(writer_fd)
+
+
+def test_normal_wrapper_skips_while_settlement_priority_is_active(tmp_path):
+    lock_path = tmp_path / "shared.lock"
     settlement_path = tmp_path / "settlement.lock"
     settlement_fd = os.open(settlement_path, os.O_CREAT | os.O_RDWR, 0o600)
     fcntl.flock(settlement_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    monkeypatch.setenv("ODDS_SYNC_SETTLEMENT_PRIORITY_FILE", str(settlement_path))
-    monkeypatch.setenv("ODDS_SYNC_JOB_PRIORITY", "normal")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "ODDS_SYNC_LOCK_FILE": str(lock_path),
+            "ODDS_SYNC_SETTLEMENT_PRIORITY_FILE": str(settlement_path),
+            "ODDS_SYNC_JOB_PRIORITY": "normal",
+            "ODDS_SYNC_LIVE_SCHEDULE_ENABLED": "false",
+            "ODDS_SYNC_P3_MAX_DURATION_SECONDS": "5",
+        }
+    )
+    common_path = Path(__file__).parents[1] / "scripts/vps/common.sh"
     try:
-        assert shared_writer_lock._settlement_writer_is_waiting()
-        monkeypatch.setenv("ODDS_SYNC_JOB_PRIORITY", "settlement")
-        assert not shared_writer_lock._settlement_writer_is_waiting()
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                'source "$1"; run_with_global_lock_and_timeout "true"',
+                "test",
+                str(common_path),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 2
+        assert "settlement shared-lock priority is active" in result.stdout
     finally:
         fcntl.flock(settlement_fd, fcntl.LOCK_UN)
         os.close(settlement_fd)
@@ -111,7 +177,13 @@ def test_settlement_provider_fetch_is_unlocked_but_apply_remains_locked(tmp_path
     class Client:
         def request(self, method, endpoint, params=None):
             assert not _is_locked(lock_path)
-            return {"data": {"id": 701}}
+
+            class Payload(dict):
+                def get(self, key, default=None):
+                    assert not _is_locked(lock_path)
+                    return super().get(key, default)
+
+            return Payload(data={"id": 701})
 
     service = SyncService(Client(), session)
     service.ensure_schema()
@@ -128,18 +200,49 @@ def test_settlement_provider_fetch_is_unlocked_but_apply_remains_locked(tmp_path
         os.close(fd)
 
 
-def test_settlement_discards_provider_response_if_source_changed_during_fetch(tmp_path, monkeypatch):
+@pytest.mark.parametrize("changed_state", ["player", "player_team_history"])
+def test_settlement_discards_provider_response_if_player_state_changes(
+    tmp_path, monkeypatch, changed_state
+):
     lock_path = tmp_path / "shared.lock"
     fd = _hold_lock(lock_path, monkeypatch)
     engine, session = _sqlite_session(tmp_path / "jxd.sqlite")
-    session.add(Fixture(id=702, status="FT", home_score=0, away_score=0))
+    session.add_all(
+        [
+            Team(id=42, name="Home"),
+            Fixture(
+                id=702,
+                status="FT",
+                home_score=0,
+                away_score=0,
+                home_team_id=42,
+            ),
+            Player(id=83, name="Before", team_id=42),
+            FixturePlayer(
+                fixture_id=702, player_id=83, team_id=42, name="Before"
+            ),
+            PlayerTeamHistory(
+                player_id=83,
+                team_id=42,
+                source="test",
+                effective_from=datetime(2025, 1, 1),
+            ),
+        ]
+    )
     session.commit()
 
     class Client:
         def request(self, method, endpoint, params=None):
             assert not _is_locked(lock_path)
-            row = session.get(Fixture, 702)
-            row.home_score = 1
+            if changed_state == "player":
+                session.get(Player, 83).extra = {"during_fetch": True}
+            else:
+                history = (
+                    session.query(PlayerTeamHistory)
+                    .filter_by(player_id=83)
+                    .one()
+                )
+                history.effective_to = datetime(2025, 6, 1)
             session.commit()
             return {"data": {"id": 702, "home_score": 2}}
 
@@ -148,7 +251,7 @@ def test_settlement_discards_provider_response_if_source_changed_during_fetch(tm
     applied = []
     service._store_fixture_raw = lambda *args, **kwargs: applied.append(args[0])
     try:
-        assert service.reconcile_fixtures([702], includes=["participants", "scores", "state"]) == 0
+        assert service.reconcile_fixtures([702], includes=["statistics"]) == 0
         assert applied == []
     finally:
         session.close()
@@ -166,7 +269,18 @@ def test_squad_provider_fetch_is_unlocked_but_mutation_remains_locked(tmp_path, 
     class Client:
         def fetch_collection(self, endpoint, includes=None, per_page=200):
             assert not _is_locked(lock_path)
-            return [{"player": {"id": 81, "name": "Player 81"}, "start": "2026-01-01"}]
+
+            class UnlockedMapping(dict):
+                def get(self, key, default=None):
+                    assert not _is_locked(lock_path)
+                    return super().get(key, default)
+
+            return [
+                UnlockedMapping(
+                    player=UnlockedMapping(id=81, name="Player 81"),
+                    start="2026-01-01",
+                )
+            ]
 
     service = SyncService(Client(), session)
     service.ensure_schema()
@@ -227,12 +341,49 @@ def test_stats_provider_fetch_runs_outside_shared_writer_lock(tmp_path, monkeypa
         assert not _is_locked(lock_path)
         return ({fixture_id: {"id": fixture_id} for fixture_id in fixture_ids}, {}, 1)
 
+    def fake_assess(data):
+        assert not _is_locked(lock_path)
+        return "assessment"
+
+    def fake_hash(data):
+        assert not _is_locked(lock_path)
+        return "hash"
+
+    def fake_due_candidates():
+        assert not _is_locked(lock_path)
+        return [1]
+
     try:
-        with patch.object(stats_queue, "fetch_provider_fixtures", side_effect=fake_fetch):
-            fetched, errors, calls = stats_queue.fetch_provider_fixtures_without_shared_lock([1], 2, 50)
+        with (
+            patch.object(
+                stats_queue,
+                "fetch_provider_fixtures",
+                side_effect=fake_fetch,
+            ),
+            patch.object(
+                stats_queue,
+                "assess_provider_payload",
+                side_effect=fake_assess,
+            ),
+            patch.object(
+                stats_queue,
+                "provider_payload_hash",
+                side_effect=fake_hash,
+            ),
+            patch.object(
+                stats_queue,
+                "normalized_provider_hash",
+                side_effect=fake_hash,
+            ),
+        ):
+            fetched, errors, calls, assessments, still_due = (
+                fetch_provider_batch([1], 2, 50, fake_due_candidates)
+            )
         assert fetched == {1: {"id": 1}}
         assert errors == {}
         assert calls == 1
+        assert assessments == {1: ("assessment", "hash", "hash")}
+        assert still_due == {1}
         assert _is_locked(lock_path)
     finally:
         os.close(fd)
@@ -267,3 +418,73 @@ def test_stats_source_fingerprint_changes_when_fixture_detail_changes(tmp_path):
         conn.close()
         session.close()
         engine.dispose()
+
+
+def test_stats_source_fingerprint_covers_player_metadata_and_team_history(
+    tmp_path,
+):
+    db_path = tmp_path / "jxd.sqlite"
+    engine, session = _sqlite_session(db_path)
+    session.add_all(
+        [
+            Team(id=42, name="Home"),
+            Fixture(id=704, status="FT", home_team_id=42),
+            Player(
+                id=84,
+                name="Player",
+                team_id=42,
+                extra={"source": "before"},
+            ),
+            FixturePlayer(fixture_id=704, player_id=84, team_id=42),
+            PlayerTeamHistory(
+                player_id=84,
+                team_id=42,
+                source="test",
+                effective_from=datetime(2025, 1, 1),
+            ),
+        ]
+    )
+    session.commit()
+    conn = sqlite3.connect(db_path)
+    try:
+        before = stats_queue.fixture_source_fingerprint(conn, 704)
+        conn.execute(
+            "update players set extra = ? where id = ?",
+            ('{"source":"after"}', 84),
+        )
+        conn.commit()
+        player_changed = stats_queue.fixture_source_fingerprint(conn, 704)
+        assert player_changed != before
+
+        conn.execute(
+            "insert into player_team_history "
+            "(player_id, team_id, source, effective_from, "
+            "created_at, updated_at) "
+            "values (?, ?, ?, ?, ?, ?)",
+            (
+                84,
+                42,
+                "test",
+                "2026-01-01 00:00:00",
+                "2026-01-01 00:00:00",
+                "2026-01-01 00:00:00",
+            ),
+        )
+        conn.commit()
+        history_changed = stats_queue.fixture_source_fingerprint(conn, 704)
+        assert history_changed != player_changed
+    finally:
+        conn.close()
+        session.close()
+        engine.dispose()
+
+
+def test_stats_stale_provider_batch_hands_off_after_safe_survivors():
+    stale = [
+        {
+            "fixture_id": 1,
+            "reason": "shared source state changed during provider fetch",
+        }
+    ]
+    assert stats_queue.should_handoff_after_stale_provider_batch(stale)
+    assert not stats_queue.should_handoff_after_stale_provider_batch([])

@@ -20,25 +20,39 @@ class SharedWriterLockUnavailable(SystemExit):
         return self.message
 
 
-def _settlement_writer_is_waiting() -> bool:
-    if os.environ.get("ODDS_SYNC_JOB_PRIORITY") == "settlement":
-        return False
-    path = os.environ.get("ODDS_SYNC_SETTLEMENT_PRIORITY_FILE")
-    if not path:
-        return False
-    try:
-        probe_fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError:
-        return False
+def _try_reacquire_shared_writer_lock(fd: int) -> bool:
+    """Acquire the data lock without jumping ahead of settlement priority."""
+    priority_path = os.environ.get("ODDS_SYNC_SETTLEMENT_PRIORITY_FILE")
+    is_settlement = os.environ.get("ODDS_SYNC_JOB_PRIORITY") == "settlement"
+    priority_fd: int | None = None
+    if priority_path and not is_settlement:
+        try:
+            priority_fd = os.open(priority_path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError as exc:
+            raise SharedWriterLockUnavailable(
+                "settlement priority gate is unavailable"
+            ) from exc
+        try:
+            fcntl.flock(priority_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(priority_fd)
+            return False
+        except OSError as exc:
+            os.close(priority_fd)
+            raise SharedWriterLockUnavailable(
+                "settlement priority gate could not be acquired"
+            ) from exc
+
     try:
         try:
-            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
-        fcntl.flock(probe_fd, fcntl.LOCK_UN)
-        return False
+        except BlockingIOError:
+            return False
     finally:
-        os.close(probe_fd)
+        if priority_fd is not None:
+            fcntl.flock(priority_fd, fcntl.LOCK_UN)
+            os.close(priority_fd)
 
 
 @contextmanager
@@ -80,19 +94,10 @@ def release_shared_writer_lock() -> Iterator[None]:
         deadline = time.monotonic() + wait_seconds
         while True:
             remaining = deadline - time.monotonic()
-            if _settlement_writer_is_waiting():
-                if remaining <= 0:
-                    raise SharedWriterLockUnavailable(
-                        "shared writer lock was not reacquired before the bounded wait"
-                    )
-                time.sleep(min(0.25, remaining))
-                continue
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if _try_reacquire_shared_writer_lock(fd):
                 return
-            except BlockingIOError:
-                if remaining <= 0:
-                    raise SharedWriterLockUnavailable(
-                        "shared writer lock was not reacquired before the bounded wait"
-                    )
-                time.sleep(min(0.25, max(0.01, remaining)))
+            if remaining <= 0:
+                raise SharedWriterLockUnavailable(
+                    "shared writer lock reacquisition timed out"
+                )
+            time.sleep(min(0.25, max(0.01, remaining)))

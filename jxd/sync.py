@@ -606,6 +606,33 @@ class SyncService:
                     (FixturePlayerStatistic, {"fixture_id": fixture_id}),
                 ]
             )
+            player_ids = {
+                int(row.player_id)
+                for row in self.session.query(FixturePlayer.player_id)
+                .filter(FixturePlayer.fixture_id == fixture_id)
+                .all()
+            }
+            player_ids.update(
+                int(row.player_id)
+                for row in self.session.query(FixturePlayerStatistic.player_id)
+                .filter(FixturePlayerStatistic.fixture_id == fixture_id)
+                .all()
+            )
+            player_ids.update(
+                int(row.id)
+                for row in self.session.query(Player.id)
+                .filter(Player.team_id.in_(team_ids))
+                .all()
+            )
+            for player_id in sorted(player_ids):
+                models.extend(
+                    [
+                        (Player, {"id": player_id}),
+                        (PlayerTeamHistory, {"player_id": player_id}),
+                    ]
+                )
+            for team_id in sorted(team_ids):
+                models.append((TeamSquadMembership, {"team_id": team_id}))
         state = [self._model_state_signature(model, **filters) for model, filters in models]
         return hashlib.sha256("|".join(state).encode("ascii")).hexdigest()
 
@@ -766,6 +793,36 @@ class SyncService:
                     squad_rows = list(
                         self.client.fetch_collection(endpoint, includes=["player"], per_page=200)
                     )
+                    prepared_squad_rows: list[tuple[int, Dict, datetime]] = []
+                    for item in squad_rows:
+                        player = item.get("player") or {}
+                        player_id = player.get("id") or item.get("player_id")
+                        if not player_id:
+                            continue
+                        player_id = int(player_id)
+                        player_name = player.get("name")
+                        display_name = player.get("display_name")
+                        payload = {
+                            "id": player_id,
+                            "name": player_name or display_name,
+                            "display_name": display_name or player_name,
+                            "common_name": player.get("common_name"),
+                            "short_name": player.get("short_name"),
+                            "image_path": player.get("image_path"),
+                            "extra": player,
+                        }
+                        provider_started_at = (
+                            parse_dt(
+                                item.get("start") or item.get("joined_at")
+                            )
+                            or sync_run_at
+                        )
+                        prepared_squad_rows.append(
+                            (player_id, payload, provider_started_at)
+                        )
+                    squad_player_ids = {
+                        player_id for player_id, _, _ in prepared_squad_rows
+                    }
                 self.session.commit()
                 if baseline_signature != self._squad_reconciliation_signature(team_id):
                     self.skipped_stale_squad_team_ids.append(team_id)
@@ -774,11 +831,6 @@ class SyncService:
                         team_id,
                     )
                     continue
-                squad_player_ids: Set[int] = {
-                    int((item.get("player") or {}).get("id") or item.get("player_id"))
-                    for item in squad_rows
-                    if (item.get("player") or {}).get("id") or item.get("player_id")
-                }
                 if not squad_player_ids:
                     snapshot = TeamSquadSnapshot(
                         team_id=team_id,
@@ -810,22 +862,7 @@ class SyncService:
                 self.session.add(snapshot)
                 self.session.flush()
 
-                for item in squad_rows:
-                    player = item.get("player") or {}
-                    player_id = player.get("id") or item.get("player_id")
-                    if not player_id:
-                        continue
-                    player_id = int(player_id)
-                    payload = {
-                        "id": player_id,
-                        "name": player.get("name") or player.get("display_name"),
-                        "display_name": player.get("display_name") or player.get("name"),
-                        "common_name": player.get("common_name"),
-                        "short_name": player.get("short_name"),
-                        "image_path": player.get("image_path"),
-                        "extra": player,
-                    }
-                    provider_started_at = parse_dt(item.get("start") or item.get("joined_at")) or sync_run_at
+                for player_id, payload, provider_started_at in prepared_squad_rows:
                     # Some provider records overlap while a transfer is being
                     # processed.  The newer effective squad record wins; the
                     # older membership is closed so one player cannot appear in
@@ -1782,6 +1819,7 @@ class SyncService:
                         endpoint,
                         params={"include": ";".join(includes)},
                     )
+                    data = payload.get("data") or {}
             except SportMonksError as exc:
                 log.warning("Reconcile failed for fixture %s: %s", fixture_id, exc)
                 continue
@@ -1792,7 +1830,6 @@ class SyncService:
                     fixture_id,
                 )
                 continue
-            data = payload.get("data") or {}
             if not data:
                 log.warning("Reconcile missing data for fixture %s", fixture_id)
                 continue

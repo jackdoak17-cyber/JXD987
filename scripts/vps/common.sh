@@ -383,14 +383,23 @@ run_with_global_lock_and_timeout() {
   mkdir -p "$(dirname "${lock_file}")"
 
   (
-    # Advertise a settlement waiter only while it is waiting for or using the
-    # shared spool lock. The settlement single-run lock also covers its
-    # independent Postgres tail and is intentionally not used as this signal.
+    # Coordinate the short lock-acquisition handoff with normal writers. The
+    # settlement single-run lock also covers its independent Postgres tail and
+    # is intentionally not used as this signal.
+    mkdir -p "$(dirname "${settlement_priority_file}")"
+    exec 10>>"${settlement_priority_file}"
     if [[ "${job_priority}" == "settlement" ]]; then
-      mkdir -p "$(dirname "${settlement_priority_file}")"
-      exec 10>"${settlement_priority_file}"
-      if ! flock --nonblock 10; then
-        log_info "[SKIPPED] settlement shared-lock priority marker unavailable"
+      # Only another settlement invocation can hold this singleton marker.
+      # Normal writers hold a shared marker only while trying to get FD 9, so
+      # waiting here preserves settlement priority without extending the data
+      # writer's critical section.
+      flock 10
+    else
+      # A shared marker closes the race between checking for settlement and
+      # acquiring the data lock: settlement cannot announce priority between
+      # these two operations.
+      if ! flock --shared --nonblock 10; then
+        log_info "[SKIPPED] settlement shared-lock priority is active"
         exit 2
       fi
     fi
@@ -421,6 +430,13 @@ run_with_global_lock_and_timeout() {
       fi
       sleep "${lock_poll_seconds}" 9>&-
     done
+
+    if [[ "${job_priority}" != "settlement" ]]; then
+      # Settlement may now announce priority and wait for the writer already
+      # holding FD 9. No normal writer can jump ahead of that waiter.
+      flock -u 10
+      exec 10>&-
+    fi
 
     local effective_runtime="${max_runtime}"
     if [[ "${live_schedule_enabled}" == "true" && "${job_priority}" != "settlement" ]]; then
