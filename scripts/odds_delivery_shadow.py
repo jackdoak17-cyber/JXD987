@@ -306,6 +306,7 @@ def run_shadow_validation(
     started_at = datetime.now(timezone.utc).isoformat()
     timeout = os.environ.get("ODDS_SHADOW_STATEMENT_TIMEOUT", "45000")
     lock_timeout = os.environ.get("ODDS_SHADOW_LOCK_TIMEOUT", "15000")
+    connect_timeout = int(os.environ.get("ODDS_SHADOW_CONNECT_TIMEOUT", "8"))
     advisory_lock_key = os.environ.get("ODDS_ADVISORY_LOCK_KEY", "982374")
     use_lock = os.environ.get("ODDS_USE_ADVISORY_LOCK", "").lower() in {"1", "true", "yes"}
     digest = hashlib.sha256()
@@ -336,7 +337,11 @@ def run_shadow_validation(
             if previous is None or (normalized["last_updated_at"] or "") > (previous["last_updated_at"] or ""):
                 stage_map[key] = normalized
 
-    conn = psycopg2.connect(db_url)
+    conn = psycopg2.connect(
+        db_url,
+        connect_timeout=connect_timeout,
+        application_name="odds_delivery_shadow",
+    )
     try:
         conn.autocommit = False
         cur = conn.cursor()
