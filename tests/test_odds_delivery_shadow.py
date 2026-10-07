@@ -46,6 +46,7 @@ class ShadowEquivalenceTest(unittest.TestCase):
         cases = {
             "unchanged": ([base], [dict(base)]),
             "price_change": ([base], [row(decimal="2.20", american=120)]),
+            "new_outcome": ([base], [base, row(selection="away")]),
             "new_market": ([base], [base, row(market="btts", selection="yes")]),
             "removed_outcome": ([base, row(selection="away")], [base]),
             "whole_market_absent": ([base, row(market="btts", selection="yes")], [base]),
@@ -61,6 +62,7 @@ class ShadowEquivalenceTest(unittest.TestCase):
                 [row(participant_type=None, participant_id=None)],
             ),
             "postponed_fixture_untouched": ([base], []),
+            "cancelled_fixture_touched": ([base], [row(decimal="2.20", american=120)]),
             "overlapping_sources": (
                 [base],
                 [base, row(decimal="2.20", american=120, updated="2026-10-07T09:01:00+00:00")],
@@ -143,6 +145,22 @@ class ShadowEquivalenceTest(unittest.TestCase):
         self.assertEqual(metrics["predicted_current_persistent_writes"], 1)
         self.assertEqual(metrics["predicted_diff_persistent_writes"], 1)
         self.assertEqual(comparison["differing_canonical_rows"], 0)
+
+    def test_incremental_sql_is_bounded_and_preserves_exact_null_semantics(self):
+        exporter = (
+            Path(__file__).resolve().parents[1]
+            / "scripts/export_odds_to_supabase_psql.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("create temp table odds_outcomes_scopes", exporter)
+        self.assertIn("create temp table odds_outcomes_src", exporter)
+        self.assertIn("from odds_outcomes_src src", exporter)
+        self.assertIn("participant_type = excluded.participant_type", exporter)
+        self.assertIn("participant_id = excluded.participant_id", exporter)
+        self.assertIn("last_updated_at = excluded.last_updated_at", exporter)
+        self.assertNotIn(
+            "participant_type = coalesce(excluded.participant_type, o.participant_type)",
+            exporter,
+        )
 
 
 if __name__ == "__main__":

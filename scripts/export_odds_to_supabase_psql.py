@@ -25,11 +25,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-try:
-    from odds_delivery_shadow import append_shadow_log, run_shadow_validation
-except ModuleNotFoundError:  # Package import used by the repository test suite.
-    from scripts.odds_delivery_shadow import append_shadow_log, run_shadow_validation
-
 DB_PATH = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
 DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL_SESSION")
 ODDS_MIN_PRICE = float(os.environ.get("ODDS_MIN_PRICE", "1.0"))
@@ -67,6 +62,20 @@ LINE_MARKET_KEYS = {
     "team_shots_on_target",
     "team_total_goals",
 }
+SETTLED_FIXTURE_STATUSES = (
+    "SETTLED",
+    "FINISHED",
+    "FINAL",
+    "ENDED",
+    "COMPLETED",
+    "FT",
+    "AET",
+    "PEN",
+    "FT_PEN",
+)
+SETTLED_FIXTURE_STATUSES_SQL = ", ".join(
+    f"'{status}'" for status in SETTLED_FIXTURE_STATUSES
+)
 
 
 def normalize_market_key(value: str) -> str:
@@ -140,24 +149,50 @@ def market_clause_and_params(market_allowlist: Optional[Iterable[str]]) -> Tuple
     return f"and o.market_key in ({placeholders})", market_list
 
 
-def sqlite_window_bounds(days_back: int, days_forward: int) -> Tuple[str, str]:
+def sqlite_window_bounds(
+    days_back: int,
+    days_forward: int,
+    calendar_window: bool = False,
+) -> Tuple[str, str]:
     now_utc = datetime.utcnow()
+    if calendar_window:
+        today_start = datetime.combine(now_utc.date(), datetime.min.time())
+        start_dt = today_start - timedelta(days=max(0, days_back))
+        end_dt = today_start + timedelta(days=max(0, days_forward) + 1)
+        fmt = "%Y-%m-%d %H:%M:%S"
+        return start_dt.strftime(fmt), end_dt.strftime(fmt)
     start_dt = now_utc - timedelta(days=max(0, days_back))
     end_dt = now_utc + timedelta(days=days_forward)
     fmt = "%Y-%m-%d %H:%M:%S"
     return start_dt.strftime(fmt), end_dt.strftime(fmt)
 
 
-def postgres_window_predicate(days_back: int, days_forward: int, table_alias: str = "f") -> str:
+def postgres_window_predicate(
+    days_back: int,
+    days_forward: int,
+    table_alias: str = "f",
+    calendar_window: bool = False,
+) -> str:
     prefix = f"{table_alias}." if table_alias else ""
+    if calendar_window:
+        today_start = "date_trunc('day', now() at time zone 'utc')"
+        return (
+            f"{prefix}starting_at >= {today_start} - interval '{days_back} days'\n"
+            f"    and {prefix}starting_at < {today_start} + interval '{max(0, days_forward) + 1} days'"
+        )
     return (
         f"{prefix}starting_at >= (now() at time zone 'utc') - interval '{days_back} days'\n"
         f"    and {prefix}starting_at < (now() at time zone 'utc') + interval '{days_forward} days'"
     )
 
 
-def fetch_fixture_league_ids(conn: sqlite3.Connection, days_back: int, days_forward: int) -> List[int]:
-    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward)
+def fetch_fixture_league_ids(
+    conn: sqlite3.Connection,
+    days_back: int,
+    days_forward: int,
+    calendar_window: bool = False,
+) -> List[int]:
+    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward, calendar_window)
     cur = conn.cursor()
     cur.execute(
         """
@@ -318,8 +353,9 @@ def build_outcomes_csv(
     total_fixtures_estimate: int,
     max_runtime_seconds: int,
     line_market_keys: Iterable[str],
+    calendar_window: bool = False,
 ) -> Tuple[int, bool, Optional[int]]:
-    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward)
+    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward, calendar_window)
     params: List[object] = [start_dt, end_dt]
     league_clause = ""
     if league_ids:
@@ -513,8 +549,9 @@ def count_invalid_goals_over_under(
     league_ids: Iterable[int],
     days_back: int,
     days_forward: int,
+    calendar_window: bool = False,
 ) -> int:
-    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward)
+    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward, calendar_window)
     params: List[object] = [start_dt, end_dt]
     league_clause = ""
     if league_ids:
@@ -544,8 +581,9 @@ def fetch_sqlite_bookmaker_counts(
     days_back: int,
     days_forward: int,
     market_allowlist: Optional[Iterable[str]],
+    calendar_window: bool = False,
 ) -> Dict[str, int]:
-    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward)
+    start_dt, end_dt = sqlite_window_bounds(days_back, days_forward, calendar_window)
     params: List[object] = [start_dt, end_dt]
     league_clause = ""
     if league_ids:
@@ -582,6 +620,7 @@ def stage_and_upsert(
     keep_sql: bool,
     err_path: Optional[str],
     out_path: Optional[str],
+    calendar_window: bool = False,
 ) -> Dict[str, int]:
     cols = [
         "fixture_id",
@@ -613,14 +652,25 @@ def stage_and_upsert(
     allowlist_array = sql_text_array(sorted(allowlist_items)) if allowlist_items else ""
     fixture_window_sql = (
         f"with fixture_window as (\n"
-        f"  select f.id, f.home_team_id, f.away_team_id\n"
+        f"  select f.id, f.home_team_id, f.away_team_id,\n"
+        f"         (\n"
+        f"           upper(regexp_replace(coalesce(f.status, ''), '[^A-Z0-9]+', '_', 'g')) in ({SETTLED_FIXTURE_STATUSES_SQL})\n"
+        f"           or upper(regexp_replace(coalesce(f.status_code, ''), '[^A-Z0-9]+', '_', 'g')) in ({SETTLED_FIXTURE_STATUSES_SQL})\n"
+        f"           or (f.home_score is not null and f.away_score is not null and f.starting_at < (now() at time zone 'utc'))\n"
+        f"         ) as is_settled\n"
         f"  from public.fixtures f\n"
-        f"  where {postgres_window_predicate(days_back, days_forward, 'f')}\n"
+        f"  where {postgres_window_predicate(days_back, days_forward, 'f', calendar_window)}\n"
         f"    {league_filter}\n"
         f")"
     )
-    src_cte = f"""
-with src as (
+    create_source_tables_sql = f"""
+create temp table odds_outcomes_scopes on commit drop as
+select distinct fixture_id, bookmaker_id, market_key
+from odds_outcomes_stage;
+create unique index on odds_outcomes_scopes (fixture_id, bookmaker_id, market_key);
+
+create temp table odds_outcomes_src on commit drop as
+{fixture_window_sql}
   -- The database uniqueness rule treats NULL lines as the -9999 sentinel.
   -- Normalize the same way here or a feed containing both NULL and -9999
   -- produces two source rows that collide during the insert.
@@ -630,12 +680,69 @@ with src as (
   )
     fixture_id, bookmaker_id, market_key, selection_key, line,
     price_decimal, price_american, participant_type, participant_id, last_updated_at
-  from odds_outcomes_stage
+  from odds_outcomes_stage s
+  join fixture_window fw on fw.id = s.fixture_id
   where price_decimal is null or (price_decimal > {ODDS_MIN_PRICE} and price_decimal <= {ODDS_MAX_PRICE})
   order by fixture_id, bookmaker_id, market_key, selection_key,
            coalesce(line, -9999),
-           last_updated_at desc nulls last
+           last_updated_at desc nulls last;
+create unique index on odds_outcomes_src (
+  fixture_id, bookmaker_id, market_key, selection_key, (coalesce(line, -9999))
+);
+analyze odds_outcomes_scopes;
+analyze odds_outcomes_src;
+"""
+    src_cte = f"""
+{fixture_window_sql}, src as (
+  select * from odds_outcomes_src
 )
+"""
+    change_counts_sql = f"""{src_cte}, classified as (
+  select
+    case
+      when o.id is null then 'inserted'
+      when fw.is_settled then 'unchanged'
+      when o.price_decimal is distinct from s.price_decimal
+        or o.price_american is distinct from s.price_american then 'price_changed'
+      when o.participant_type is distinct from s.participant_type
+        or o.participant_id is distinct from s.participant_id then 'participant_changed'
+      when o.last_updated_at is distinct from s.last_updated_at then 'timestamp_only'
+      else 'unchanged'
+    end as change_kind,
+    (
+      not fw.is_settled
+      and (
+        o.price_decimal is distinct from s.price_decimal
+        or o.price_american is distinct from s.price_american
+        or o.participant_type is distinct from s.participant_type
+        or o.participant_id is distinct from s.participant_id
+        or o.last_updated_at is distinct from s.last_updated_at
+      )
+    ) as will_update,
+    (
+      not fw.is_settled
+      and (
+        o.participant_type is distinct from s.participant_type
+        or o.participant_id is distinct from s.participant_id
+      )
+    ) as participant_changed
+  from src s
+  join fixture_window fw on fw.id = s.fixture_id
+  left join public.odds_outcomes o
+    on o.fixture_id = s.fixture_id
+   and o.bookmaker_id = s.bookmaker_id
+   and o.market_key = s.market_key
+   and o.selection_key = s.selection_key
+   and coalesce(o.line, -9999) = coalesce(s.line, -9999)
+)
+select
+  count(*) filter (where change_kind = 'inserted')::bigint as inserted,
+  count(*) filter (where will_update)::bigint as updated,
+  count(*) filter (where change_kind = 'price_changed')::bigint as price_changed,
+  count(*) filter (where participant_changed)::bigint as participant_changed,
+  count(*) filter (where change_kind = 'timestamp_only')::bigint as timestamp_only,
+  count(*) filter (where change_kind = 'unchanged')::bigint as unchanged
+from classified;
 """
     upsert_sql = f"""{src_cte}
 insert into public.odds_outcomes as o (
@@ -646,53 +753,33 @@ select
   fixture_id, bookmaker_id, market_key, selection_key, line,
   price_decimal, price_american, participant_type, participant_id, last_updated_at
 from src
-on conflict (fixture_id, bookmaker_id, market_key, selection_key, line)
-do update set
+on conflict (
+  fixture_id,
+  bookmaker_id,
+  market_key,
+  selection_key,
+  (coalesce(line, -9999))
+) do update set
   price_decimal = excluded.price_decimal,
   price_american = excluded.price_american,
-  participant_type = coalesce(excluded.participant_type, o.participant_type),
-  participant_id = coalesce(excluded.participant_id, o.participant_id),
-  last_updated_at = coalesce(excluded.last_updated_at, o.last_updated_at)
+  participant_type = excluded.participant_type,
+  participant_id = excluded.participant_id,
+  last_updated_at = excluded.last_updated_at
 where
-  o.price_decimal is distinct from excluded.price_decimal
+  not exists (
+    select 1 from fixture_window fw
+    where fw.id = o.fixture_id and fw.is_settled
+  )
+  and (
+    o.price_decimal is distinct from excluded.price_decimal
   or o.price_american is distinct from excluded.price_american
-  or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
-  or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
-  or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at);
+  or o.participant_type is distinct from excluded.participant_type
+  or o.participant_id is distinct from excluded.participant_id
+  or o.last_updated_at is distinct from excluded.last_updated_at
+  );
 """
     src_count_sql = f"""{src_cte}
-select count(*)::bigint from src;
-"""
-    upsert_counts_sql = f"""{src_cte},
-upserted as (
-  insert into public.odds_outcomes as o (
-    fixture_id, bookmaker_id, market_key, selection_key, line,
-    price_decimal, price_american, participant_type, participant_id, last_updated_at
-  )
-  select
-    fixture_id, bookmaker_id, market_key, selection_key, line,
-    price_decimal, price_american, participant_type, participant_id, last_updated_at
-  from src
-  on conflict (fixture_id, bookmaker_id, market_key, selection_key, line)
-  do update set
-    price_decimal = excluded.price_decimal,
-    price_american = excluded.price_american,
-    participant_type = coalesce(excluded.participant_type, o.participant_type),
-    participant_id = coalesce(excluded.participant_id, o.participant_id),
-    last_updated_at = coalesce(excluded.last_updated_at, o.last_updated_at)
-  where
-    o.price_decimal is distinct from excluded.price_decimal
-    or o.price_american is distinct from excluded.price_american
-    or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
-    or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
-    or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at)
-  returning (xmax = 0) as inserted
-)
-select
-  count(*)::bigint as upserted_total,
-  coalesce(sum(case when inserted then 1 else 0 end), 0)::bigint as inserted,
-  coalesce(sum(case when not inserted then 1 else 0 end), 0)::bigint as updated
-from upserted;
+select 'src_count', count(*)::bigint from src;
 """
     match_delete_sql = f"""
 {fixture_window_sql},
@@ -709,7 +796,8 @@ parsed_match as (
     o.last_updated_at
   from public.odds_outcomes o
   join fixture_window fw on fw.id = o.fixture_id
-  where o.market_key in ('match_shots','match_shots_on_target')
+  where not fw.is_settled
+    and o.market_key in ('match_shots','match_shots_on_target')
     and o.line is null
     and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)$'
   union all
@@ -725,7 +813,8 @@ parsed_match as (
     o.last_updated_at
   from public.odds_outcomes o
   join fixture_window fw on fw.id = o.fixture_id
-  where o.market_key in ('match_shots','match_shots_on_target')
+  where not fw.is_settled
+    and o.market_key in ('match_shots','match_shots_on_target')
     and o.line is null
     and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+$'
 ),
@@ -768,7 +857,8 @@ parsed_match as (
     regexp_replace(o.selection_key, '^([0-9]+)_([0-9]+)_(over|under)$', '\\1.\\2')::numeric as new_line
   from public.odds_outcomes o
   join fixture_window fw on fw.id = o.fixture_id
-  where o.market_key in ('match_shots','match_shots_on_target')
+  where not fw.is_settled
+    and o.market_key in ('match_shots','match_shots_on_target')
     and o.line is null
     and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)$'
   union all
@@ -778,7 +868,8 @@ parsed_match as (
     regexp_replace(o.selection_key, '^(over|under)_([0-9]+)_([0-9]+)$', '\\2.\\3')::numeric as new_line
   from public.odds_outcomes o
   join fixture_window fw on fw.id = o.fixture_id
-  where o.market_key in ('match_shots','match_shots_on_target')
+  where not fw.is_settled
+    and o.market_key in ('match_shots','match_shots_on_target')
     and o.line is null
     and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+$'
 )
@@ -809,7 +900,8 @@ parsed_team as (
     o.last_updated_at
   from public.odds_outcomes o
   join fixture_window fw on fw.id = o.fixture_id
-  where o.market_key in ('team_shots','team_shots_on_target')
+  where not fw.is_settled
+    and o.market_key in ('team_shots','team_shots_on_target')
     and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+_(?:team_)?[12]$'
   union all
   select
@@ -828,7 +920,8 @@ parsed_team as (
     o.last_updated_at
   from public.odds_outcomes o
   join fixture_window fw on fw.id = o.fixture_id
-  where o.market_key in ('team_shots','team_shots_on_target')
+  where not fw.is_settled
+    and o.market_key in ('team_shots','team_shots_on_target')
     and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)_(?:team_)?[12]$'
 ),
 team_merge as (
@@ -874,7 +967,8 @@ parsed_team as (
     end as new_participant_id
   from public.odds_outcomes o
   join fixture_window fw on fw.id = o.fixture_id
-  where o.market_key in ('team_shots','team_shots_on_target')
+  where not fw.is_settled
+    and o.market_key in ('team_shots','team_shots_on_target')
     and o.selection_key ~ '^(over|under)_[0-9]+_[0-9]+_(?:team_)?[12]$'
   union all
   select
@@ -887,7 +981,8 @@ parsed_team as (
     end as new_participant_id
   from public.odds_outcomes o
   join fixture_window fw on fw.id = o.fixture_id
-  where o.market_key in ('team_shots','team_shots_on_target')
+  where not fw.is_settled
+    and o.market_key in ('team_shots','team_shots_on_target')
     and o.selection_key ~ '^[0-9]+_[0-9]+_(over|under)_(?:team_)?[12]$'
 )
 update public.odds_outcomes o
@@ -904,6 +999,7 @@ where o.ctid = p.ctid
 delete from public.odds_outcomes o
 using fixture_window fw
 where o.fixture_id = fw.id
+  and not fw.is_settled
   and o.market_key in ('match_shots','match_shots_on_target')
   and o.line is null
   and o.selection_key in ('over','under');
@@ -913,6 +1009,7 @@ where o.fixture_id = fw.id
 delete from public.odds_outcomes o
 using fixture_window fw
 where o.fixture_id = fw.id
+  and not fw.is_settled
   and o.market_key in ('goals_over_under','goals_over_under_first_half')
   and (o.selection_key not in ('over','under') or o.line is null);
 """
@@ -921,6 +1018,7 @@ where o.fixture_id = fw.id
 delete from public.odds_outcomes o
 using fixture_window fw
 where o.fixture_id = fw.id
+  and not fw.is_settled
   and o.market_key in ('team_shots','team_shots_on_target')
   and o.line in (1,2)
   and o.selection_key in ('over','under');
@@ -933,7 +1031,7 @@ where o.fixture_id = fw.id
     missing_markets_sql = ""
     if allowlist_items and delete_missing_markets:
         missing_markets_sql = f"""
-with stage_markets as (
+{fixture_window_sql}, stage_markets as (
   select distinct fixture_id, bookmaker_id, market_key
   from odds_outcomes_stage
 ),
@@ -947,12 +1045,14 @@ allowlist as (
 missing as (
   select fb.fixture_id, fb.bookmaker_id, al.market_key
   from fixture_bookmakers fb
+  join fixture_window fw on fw.id = fb.fixture_id
   cross join allowlist al
   left join stage_markets sm
     on sm.fixture_id = fb.fixture_id
    and sm.bookmaker_id = fb.bookmaker_id
    and sm.market_key = al.market_key
   where sm.market_key is null
+    and not fw.is_settled
 ),
 deleted as (
   delete from public.odds_outcomes o
@@ -963,6 +1063,28 @@ deleted as (
   returning 1
 )
 select 'deleted_missing_markets', count(*)::bigint from deleted;
+"""
+    deleted_existing_sql = f"""
+{fixture_window_sql}, deleted as (
+  delete from public.odds_outcomes o
+  using odds_outcomes_scopes s
+  join fixture_window fw on fw.id = s.fixture_id
+  where o.fixture_id = s.fixture_id
+    and o.bookmaker_id = s.bookmaker_id
+    and o.market_key = s.market_key
+    and not fw.is_settled
+    and not exists (
+      select 1
+      from odds_outcomes_src src
+      where src.fixture_id = o.fixture_id
+        and src.bookmaker_id = o.bookmaker_id
+        and src.market_key = o.market_key
+        and src.selection_key = o.selection_key
+        and coalesce(src.line, -9999) = coalesce(o.line, -9999)
+    )
+  returning 1
+)
+select 'deleted_existing', count(*)::bigint from deleted;
 """
     sql_lines = [
         "\\set ON_ERROR_STOP on",
@@ -978,22 +1100,15 @@ select 'deleted_missing_markets', count(*)::bigint from deleted;
         f"  select {cols_sql} from public.odds_outcomes with no data;",
         copy_line,
         "",
+        create_source_tables_sql,
+        "",
         "select 'stage_count', count(*)::bigint from odds_outcomes_stage;",
         "",
-        """
-with deleted as (
-  delete from public.odds_outcomes o
-  using (
-    select distinct fixture_id, bookmaker_id, market_key
-    from odds_outcomes_stage
-  ) s
-  where o.fixture_id = s.fixture_id
-    and o.bookmaker_id = s.bookmaker_id
-    and o.market_key = s.market_key
-  returning 1
-)
-select 'deleted_existing', count(*)::bigint from deleted;
-""",
+        deleted_existing_sql,
+        "",
+        src_count_sql,
+        "",
+        change_counts_sql,
         "",
     ]
     if missing_markets_sql:
@@ -1022,6 +1137,10 @@ select 'deleted_existing', count(*)::bigint from deleted;
             "upserted_total": 0,
             "inserted": 0,
             "updated": 0,
+            "price_changed": 0,
+            "participant_changed": 0,
+            "timestamp_only": 0,
+            "unchanged": 0,
         }
         conn = psycopg2.connect(db_url)
         try:
@@ -1042,43 +1161,35 @@ select 'deleted_existing', count(*)::bigint from deleted;
             )
             with csv_path.open("r", encoding="utf-8") as f:
                 cur.copy_expert(copy_sql, f)
+            cur.execute(create_source_tables_sql)
             cur.execute("select count(*)::bigint from odds_outcomes_stage;")
             row = cur.fetchone()
             if row:
                 counts["stage_count"] = int(row[0])
-            deleted_existing_sql = """
-with deleted as (
-  delete from public.odds_outcomes o
-  using (
-    select distinct fixture_id, bookmaker_id, market_key
-    from odds_outcomes_stage
-  ) s
-  where o.fixture_id = s.fixture_id
-    and o.bookmaker_id = s.bookmaker_id
-    and o.market_key = s.market_key
-  returning 1
-)
-select count(*)::bigint from deleted;
-"""
             cur.execute(deleted_existing_sql)
             row = cur.fetchone()
             if row:
-                counts["deleted_existing"] = int(row[0])
+                counts["deleted_existing"] = int(row[-1])
             if missing_markets_sql:
                 cur.execute(missing_markets_sql)
                 row = cur.fetchone()
                 if row:
                     counts["deleted_missing_markets"] = int(row[-1])
+            cur.execute(change_counts_sql)
+            row = cur.fetchone()
+            if row and len(row) >= 6:
+                counts["inserted"] = int(row[0])
+                counts["updated"] = int(row[1])
+                counts["price_changed"] = int(row[2])
+                counts["participant_changed"] = int(row[3])
+                counts["timestamp_only"] = int(row[4])
+                counts["unchanged"] = int(row[5])
             cur.execute(src_count_sql)
             row = cur.fetchone()
             if row:
-                counts["src_count"] = int(row[0])
-            cur.execute(upsert_counts_sql)
-            row = cur.fetchone()
-            if row and len(row) >= 3:
-                counts["upserted_total"] = int(row[0])
-                counts["inserted"] = int(row[1])
-                counts["updated"] = int(row[2])
+                counts["src_count"] = int(row[-1])
+            cur.execute(upsert_sql)
+            counts["upserted_total"] = counts["inserted"] + counts["updated"]
             cur.execute(match_delete_sql)
             cur.execute(match_update_sql)
             cur.execute(team_delete_sql)
@@ -1093,7 +1204,6 @@ select count(*)::bigint from deleted;
 
     if not shutil.which("psql"):
         counts = stage_and_upsert_psycopg()
-        counts["unchanged"] = max(0, counts["src_count"] - counts["upserted_total"])
         return counts
 
     sql = "\n".join(sql_lines)
@@ -1164,13 +1274,21 @@ select count(*)::bigint from deleted;
         "upserted_total": 0,
         "inserted": 0,
         "updated": 0,
+        "price_changed": 0,
+        "participant_changed": 0,
+        "timestamp_only": 0,
+        "unchanged": 0,
     }
     for line in output.splitlines():
         parts = line.split("\t")
-        if len(parts) >= 3 and all(part.strip().isdigit() for part in parts[:3]):
-            counts["upserted_total"] = int(parts[0])
-            counts["inserted"] = int(parts[1])
-            counts["updated"] = int(parts[2])
+        if len(parts) >= 6 and all(part.strip().isdigit() for part in parts[:6]):
+            counts["inserted"] = int(parts[0])
+            counts["updated"] = int(parts[1])
+            counts["price_changed"] = int(parts[2])
+            counts["participant_changed"] = int(parts[3])
+            counts["timestamp_only"] = int(parts[4])
+            counts["unchanged"] = int(parts[5])
+            counts["upserted_total"] = counts["inserted"] + counts["updated"]
             continue
         if len(parts) >= 2 and parts[0] in counts:
             try:
@@ -1179,11 +1297,15 @@ select count(*)::bigint from deleted;
                 counts[parts[0]] = 0
     if counts["src_count"] == 0 and counts["stage_count"] > 0:
         counts["src_count"] = counts["stage_count"]
-    counts["unchanged"] = max(0, counts["src_count"] - counts["upserted_total"])
     return counts
 
 
-def coverage_query(days_back: int, days_forward: int, league_ids: List[int]) -> str:
+def coverage_query(
+    days_back: int,
+    days_forward: int,
+    league_ids: List[int],
+    calendar_window: bool = False,
+) -> str:
     league_filter = ""
     if league_ids:
         league_filter = f"league_id = any({sql_array(league_ids)}) and"
@@ -1192,7 +1314,7 @@ with fixtures_in_range as (
   select id
   from public.fixtures
   where {league_filter}
-    {postgres_window_predicate(days_back, days_forward, '')}
+    {postgres_window_predicate(days_back, days_forward, '', calendar_window)}
 ), scoped as (
   select o.participant_id
   from public.odds_outcomes o
@@ -1207,7 +1329,12 @@ from scoped;
 """
 
 
-def bookmaker_counts_query(days_back: int, days_forward: int, league_ids: List[int]) -> str:
+def bookmaker_counts_query(
+    days_back: int,
+    days_forward: int,
+    league_ids: List[int],
+    calendar_window: bool = False,
+) -> str:
     league_filter = ""
     if league_ids:
         league_filter = f"league_id = any({sql_array(league_ids)}) and"
@@ -1218,7 +1345,7 @@ select
 from public.odds_outcomes o
 join public.fixtures f on f.id = o.fixture_id
 where {league_filter}
-  {postgres_window_predicate(days_back, days_forward, 'f')}
+  {postgres_window_predicate(days_back, days_forward, 'f', calendar_window)}
 group by o.bookmaker_id
 order by o.bookmaker_id;
 """
@@ -1307,7 +1434,11 @@ def _hours_bucket(hours: float) -> str:
     return "168h+"
 
 
-def verification_queries(days_back: int, days_forward: int) -> List[str]:
+def verification_queries(
+    days_back: int,
+    days_forward: int,
+    calendar_window: bool = False,
+) -> List[str]:
     queries = []
     queries.append(
         f"""
@@ -1316,7 +1447,7 @@ select
   count(*) filter (where participant_type='player' and participant_id is not null) as mapped_players
 from public.odds_outcomes o
 join public.fixtures f on f.id=o.fixture_id
-where {postgres_window_predicate(days_back, days_forward, 'f')};
+where {postgres_window_predicate(days_back, days_forward, 'f', calendar_window)};
 """
     )
     queries.append(
@@ -1326,7 +1457,7 @@ select market_key, line,
 from public.odds_outcomes o
 join public.fixtures f on f.id=o.fixture_id
 where market_key in ('player_shots','player_shots_on_target')
-  and {postgres_window_predicate(days_back, days_forward, 'f')}
+  and {postgres_window_predicate(days_back, days_forward, 'f', calendar_window)}
 group by market_key, line
 order by market_key, distinct_players desc
 limit 20;
@@ -1335,15 +1466,29 @@ limit 20;
     return queries
 
 
-def retention_cleanup_query(days_back: int, days_forward: int) -> str:
+def retention_cleanup_query(
+    days_back: int,
+    days_forward: int,
+    calendar_window: bool = False,
+) -> str:
+    start_expr = (
+        f"date_trunc('day', now() at time zone 'utc') - interval '{days_back} days'"
+        if calendar_window
+        else f"(now() at time zone 'utc') - interval '{days_back} days'"
+    )
+    end_expr = (
+        f"date_trunc('day', now() at time zone 'utc') + interval '{max(0, days_forward) + 1} days'"
+        if calendar_window
+        else f"(now() at time zone 'utc') + interval '{days_forward} days'"
+    )
     return f"""
 with deleted as (
   delete from public.odds_outcomes o
   using public.fixtures f
   where f.id = o.fixture_id
     and (
-      f.starting_at < (now() at time zone 'utc') - interval '{days_back} days'
-      or f.starting_at >= (now() at time zone 'utc') + interval '{days_forward} days'
+      f.starting_at < {start_expr}
+      or f.starting_at >= {end_expr}
     )
   returning 1
 )
@@ -1351,7 +1496,22 @@ select count(*)::bigint from deleted;
 """
 
 
-def retention_snapshots_query(days_back: int, days_forward: int, max_age_days: int) -> str:
+def retention_snapshots_query(
+    days_back: int,
+    days_forward: int,
+    max_age_days: int,
+    calendar_window: bool = False,
+) -> str:
+    start_expr = (
+        f"date_trunc('day', now() at time zone 'utc') - interval '{days_back} days'"
+        if calendar_window
+        else f"(now() at time zone 'utc') - interval '{days_back} days'"
+    )
+    end_expr = (
+        f"date_trunc('day', now() at time zone 'utc') + interval '{max(0, days_forward) + 1} days'"
+        if calendar_window
+        else f"(now() at time zone 'utc') + interval '{days_forward} days'"
+    )
     return f"""
 with deleted as (
   delete from public.odds_snapshots s
@@ -1361,8 +1521,8 @@ with deleted as (
        from public.fixtures f
        where f.id = s.fixture_id
          and (
-           f.starting_at < (now() at time zone 'utc') - interval '{days_back} days'
-           or f.starting_at >= (now() at time zone 'utc') + interval '{days_forward} days'
+           f.starting_at < {start_expr}
+           or f.starting_at >= {end_expr}
          )
      )
   returning 1
@@ -1376,6 +1536,11 @@ def main() -> None:
     parser.add_argument("--leagues", default="8,384", help="Comma-separated league IDs")
     parser.add_argument("--days-back", type=int, default=int(os.environ.get("ODDS_EXPORT_DAYS_BACK", "2")))
     parser.add_argument("--days-forward", type=int, default=14)
+    parser.add_argument(
+        "--calendar-window",
+        action="store_true",
+        help="Use complete UTC calendar days for the export window.",
+    )
     parser.add_argument("--db", default=DB_PATH)
     parser.add_argument("--csv-out", default="/tmp/odds_outcomes_export.csv")
     parser.add_argument("--report-out", default="/tmp/odds_ingest_report.json")
@@ -1427,7 +1592,7 @@ def main() -> None:
         print(f"Market allowlist bypassed (ODDS_MARKET_ALLOWLIST={raw_allowlist or 'unset'})", flush=True)
     league_ids = parse_league_ids(args.leagues)
     fixture_league_ids = (
-        fetch_fixture_league_ids(conn, args.days_back, args.days_forward)
+        fetch_fixture_league_ids(conn, args.days_back, args.days_forward, args.calendar_window)
         if args.include_fixture_leagues
         else []
     )
@@ -1438,7 +1603,7 @@ def main() -> None:
     shot_market_keys = ("team_shots", "team_shots_on_target", "match_shots", "match_shots_on_target")
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
-        start_dt, end_dt = sqlite_window_bounds(args.days_back, args.days_forward)
+        start_dt, end_dt = sqlite_window_bounds(args.days_back, args.days_forward, args.calendar_window)
         fixture_count = conn.execute(
             f"""
             select count(*)
@@ -1454,7 +1619,7 @@ def main() -> None:
     sqlite_bookmaker_counts: Dict[str, int] = {}
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
-        start_dt, end_dt = sqlite_window_bounds(args.days_back, args.days_forward)
+        start_dt, end_dt = sqlite_window_bounds(args.days_back, args.days_forward, args.calendar_window)
         total_rows_all = conn.execute(
             f"""
             select count(*)
@@ -1483,6 +1648,7 @@ def main() -> None:
             args.days_back,
             args.days_forward,
             market_allowlist,
+            args.calendar_window,
         )
 
     market_stats: List[Dict[str, object]] = []
@@ -1494,7 +1660,7 @@ def main() -> None:
     warnings: List[str] = []
     if effective_leagues:
         placeholders = ",".join("?" for _ in effective_leagues)
-        start_dt, end_dt = sqlite_window_bounds(args.days_back, args.days_forward)
+        start_dt, end_dt = sqlite_window_bounds(args.days_back, args.days_forward, args.calendar_window)
         market_clause, market_params = market_clause_and_params(market_allowlist)
         rows = conn.execute(
             f"""
@@ -1675,6 +1841,7 @@ def main() -> None:
         fixture_count,
         max_runtime_seconds,
         LINE_MARKET_KEYS,
+        args.calendar_window,
     )
     conn.close()
 
@@ -1694,6 +1861,7 @@ def main() -> None:
                 effective_leagues,
                 args.days_back,
                 args.days_forward,
+                args.calendar_window,
             )
         finally:
             validation_conn.close()
@@ -1728,6 +1896,9 @@ def main() -> None:
         "upserted_total": 0,
         "inserted": 0,
         "updated": 0,
+        "price_changed": 0,
+        "participant_changed": 0,
+        "timestamp_only": 0,
         "unchanged": 0,
     }
     ingest_ok = True
@@ -1735,46 +1906,6 @@ def main() -> None:
     error_message: Optional[str] = None
     psql_err_tail = ""
     psql_out_tail = ""
-    shadow_validation: Optional[Dict[str, object]] = None
-    shadow_enabled = os.environ.get("ODDS_SHADOW_VALIDATION", "").lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-    if shadow_enabled:
-        try:
-            shadow_validation = run_shadow_validation(
-                DB_URL,
-                Path(args.csv_out),
-                partial_run=partial_run,
-                min_price=ODDS_MIN_PRICE,
-                max_price=ODDS_MAX_PRICE,
-                league_ids=effective_leagues,
-                days_back=args.days_back,
-                days_forward=args.days_forward,
-                calendar_window=args.calendar_window,
-            )
-            print(
-                "Shadow validation complete "
-                f"runtime_sec={shadow_validation.get('runtime_seconds')} "
-                f"differences={shadow_validation.get('differing_canonical_rows')}",
-                flush=True,
-            )
-        except Exception as exc:
-            shadow_validation = {
-                "ok": False,
-                "partial_run": partial_run,
-                "error": re.sub(
-                    r"postgres(?:ql)?://[^\s\"\']+",
-                    "[redacted database URL]",
-                    str(exc),
-                ),
-            }
-            print(
-                f"Shadow validation failed without blocking delivery: {shadow_validation['error']}",
-                flush=True,
-            )
-
     try:
         counts = stage_and_upsert(
             DB_URL,
@@ -1787,6 +1918,7 @@ def main() -> None:
             args.keep_sql,
             err_path,
             out_path,
+            args.calendar_window,
         )
         print(
             f"Stage count={counts['stage_count']} src_count={counts['src_count']} inserted={counts['inserted']} "
@@ -1806,6 +1938,7 @@ def main() -> None:
         retention_sql = retention_cleanup_query(
             args.retention_days_back,
             args.retention_days_forward,
+            args.calendar_window,
         )
         try:
             retention_out = run_psql(
@@ -1827,6 +1960,7 @@ def main() -> None:
             args.retention_days_back,
             args.retention_days_forward,
             args.retention_snapshots_days,
+            args.calendar_window,
         )
         try:
             snapshots_out = run_psql(
@@ -1847,7 +1981,12 @@ def main() -> None:
         try:
             bookmaker_out = run_psql(
                 DB_URL,
-                bookmaker_counts_query(args.days_back, args.days_forward, effective_leagues),
+                bookmaker_counts_query(
+                    args.days_back,
+                    args.days_forward,
+                    effective_leagues,
+                    args.calendar_window,
+                ),
                 label="bookmaker_counts",
                 err_path=err_path,
                 out_path=out_path,
@@ -1860,7 +1999,12 @@ def main() -> None:
     coverage_mapped = 0
     coverage_pct = 0.0
     if ingest_ok and not args.skip_coverage:
-        coverage_sql = coverage_query(args.days_back, args.days_forward, effective_leagues)
+        coverage_sql = coverage_query(
+            args.days_back,
+            args.days_forward,
+            effective_leagues,
+            args.calendar_window,
+        )
         try:
             coverage_out = run_psql(
                 DB_URL,
@@ -1910,7 +2054,10 @@ def main() -> None:
 
     verification_outputs: List[str] = []
     if ingest_ok and not args.skip_verification:
-        for idx, query in enumerate(verification_queries(args.days_back, args.days_forward), start=1):
+        for idx, query in enumerate(
+            verification_queries(args.days_back, args.days_forward, args.calendar_window),
+            start=1,
+        ):
             print(f"Verification query {idx} output:", flush=True)
             try:
                 out = run_psql(
@@ -1960,6 +2107,7 @@ def main() -> None:
         "runtime_seconds": round(end_time - start_time, 2),
         "days_back": args.days_back,
         "window_days": args.days_forward,
+        "window_kind": "calendar" if args.calendar_window else "rolling",
         "fixture_count": fixture_count,
         "fixtures_in_window": fixture_count,
         "market_stats": market_stats,
@@ -1990,6 +2138,9 @@ def main() -> None:
         "rows_inserted": counts.get("inserted", 0),
         "updated_rows": counts.get("updated", 0),
         "rows_updated": counts.get("updated", 0),
+        "price_changed_rows": counts.get("price_changed", 0),
+        "participant_changed_rows": counts.get("participant_changed", 0),
+        "timestamp_only_changed_rows": counts.get("timestamp_only", 0),
         "unchanged_rows": counts.get("unchanged", 0),
         "rows_unchanged_skipped": counts.get("unchanged", 0),
         "partial_run": partial_run,
@@ -2017,22 +2168,9 @@ def main() -> None:
         "rest_ok": os.environ.get("REST_OK"),
         "rest_http": os.environ.get("REST_HTTP"),
         "verification": verification_outputs,
-        "shadow_validation": shadow_validation,
     }
 
     Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
-    shadow_log_path = os.environ.get("ODDS_SHADOW_LOG_PATH")
-    if shadow_validation is not None and shadow_log_path:
-        append_shadow_log(
-            Path(shadow_log_path),
-            {
-                "delivery_start_time": start_iso,
-                "delivery_end_time": end_iso,
-                "delivery_ok": ingest_ok,
-                "delivery_runtime_seconds": report["runtime_seconds"],
-                "shadow_validation": shadow_validation,
-            },
-        )
 
     print(
         "Ingest summary: rows_exported="
