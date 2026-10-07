@@ -710,7 +710,8 @@ analyze odds_outcomes_src;
       else 'unchanged'
     end as change_kind,
     (
-      not fw.is_settled
+      o.id is not null
+      and not fw.is_settled
       and (
         o.price_decimal is distinct from s.price_decimal
         or o.price_american is distinct from s.price_american
@@ -720,7 +721,8 @@ analyze odds_outcomes_src;
       )
     ) as will_update,
     (
-      not fw.is_settled
+      o.id is not null
+      and not fw.is_settled
       and (
         o.participant_type is distinct from s.participant_type
         or o.participant_id is distinct from s.participant_id
