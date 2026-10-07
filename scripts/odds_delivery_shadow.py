@@ -13,6 +13,7 @@ import hashlib
 import io
 import json
 import os
+import tempfile
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -455,13 +456,16 @@ def run_shadow_validation(
         }
 
         target_map: Dict[Tuple[object, ...], Dict[str, object]] = {}
-        target_cur = conn.cursor(name="odds_shadow_target")
-        target_cur.itersize = 10000
-        target_cur.execute(build_target_snapshot_sql())
-        for values in target_cur:
-            normalized = normalize_row(dict(zip(ODDS_COLUMNS, values)))
-            target_map[canonical_key(normalized)] = normalized
-        target_cur.close()
+        target_query = build_target_snapshot_sql().strip().rstrip(";")
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", newline="") as target_file:
+            cur.copy_expert(
+                f"COPY ({target_query}) TO STDOUT WITH (FORMAT csv, HEADER true)",
+                target_file,
+            )
+            target_file.seek(0)
+            for raw in csv.DictReader(target_file):
+                normalized = normalize_row(raw)
+                target_map[canonical_key(normalized)] = normalized
         target_rows_outside_window = sum(
             1 for key in target_map if int(key[0]) not in known_fixture_ids
         )
