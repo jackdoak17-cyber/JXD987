@@ -34,6 +34,17 @@ ODDS_COLUMNS = (
 )
 KEY_COLUMNS = ODDS_COLUMNS[:5]
 MUTABLE_COLUMNS = ODDS_COLUMNS[5:]
+SETTLED_FIXTURE_STATUSES = (
+    "SETTLED",
+    "FINISHED",
+    "FINAL",
+    "ENDED",
+    "COMPLETED",
+    "FT",
+    "AET",
+    "PEN",
+    "FT_PEN",
+)
 
 
 def _line_key(value: object) -> str:
@@ -133,6 +144,43 @@ join odds_outcomes_shadow_scopes s
 """
 
 
+def build_fixture_state_sql(
+    league_ids: Optional[Sequence[int]] = None,
+    days_back: int = 0,
+    days_forward: int = 14,
+    calendar_window: bool = True,
+) -> str:
+    statuses = ", ".join(f"'{value}'" for value in SETTLED_FIXTURE_STATUSES)
+    league_filter = ""
+    if league_ids:
+        league_filter = "and f.league_id in (" + ",".join(str(int(value)) for value in league_ids) + ")"
+    if calendar_window:
+        today_start = "date_trunc('day', now() at time zone 'utc')"
+        window = (
+            f"f.starting_at >= {today_start} - interval '{max(0, int(days_back))} days'\n"
+            f"  and f.starting_at < {today_start} + interval '{max(0, int(days_forward)) + 1} days'"
+        )
+    else:
+        window = (
+            f"f.starting_at >= (now() at time zone 'utc') - interval '{max(0, int(days_back))} days'\n"
+            f"  and f.starting_at < (now() at time zone 'utc') + interval '{max(0, int(days_forward))} days'"
+        )
+    return f"""
+select distinct
+  f.id,
+  (
+    upper(regexp_replace(coalesce(f.status, ''), '[^A-Z0-9]+', '_', 'g')) in ({statuses})
+    or upper(regexp_replace(coalesce(f.status_code, ''), '[^A-Z0-9]+', '_', 'g')) in ({statuses})
+    or (f.home_score is not null and f.away_score is not null
+        and f.starting_at < (now() at time zone 'utc'))
+  ) as is_settled
+from public.fixtures f
+join odds_outcomes_shadow_scopes s on s.fixture_id = f.id
+where {window}
+  {league_filter};
+"""
+
+
 def _optional_int(value: object) -> Optional[int]:
     return None if value in (None, "") else int(value)
 
@@ -211,13 +259,16 @@ def compare_canonical_maps(
     raw_count: int,
     invalid_count: int,
     touched_scope_count: int,
+    settled_fixture_ids: Optional[set] = None,
 ) -> Dict[str, object]:
     """Classify field changes and independently apply the proposed diff."""
+    settled_fixture_ids = settled_fixture_ids or set()
+    is_settled = lambda key: int(key[0]) in settled_fixture_ids
     stage_keys = set(stage_map)
     target_keys = set(target_map)
     common_keys = stage_keys & target_keys
     new_keys = stage_keys - target_keys
-    removed_keys = target_keys - stage_keys
+    removed_keys = {key for key in target_keys - stage_keys if not is_settled(key)}
     price_changes = set()
     participant_changes = set()
     timestamp_changes = set()
@@ -237,11 +288,20 @@ def compare_canonical_maps(
             timestamp_changes.add(key)
         if _row_values(source) == _row_values(target):
             unchanged.add(key)
-    updated_keys = price_changes | participant_changes | timestamp_changes
+    observed_changed_keys = price_changes | participant_changes | timestamp_changes
+    updated_keys = {key for key in observed_changed_keys if not is_settled(key)}
     timestamp_only = timestamp_changes - price_changes - participant_changes
     participant_only = participant_changes - price_changes
 
-    current_result = dict(stage_map)
+    # Current production semantics replace active touched scopes. Settled rows
+    # remain immutable on conflict, but a genuinely absent key can still insert.
+    current_result = dict(target_map)
+    for key in removed_keys:
+        current_result.pop(key, None)
+    for key in stage_keys:
+        if not is_settled(key) or key not in current_result:
+            current_result[key] = stage_map[key]
+
     proposed_result = dict(target_map)
     for key in removed_keys:
         proposed_result.pop(key, None)
@@ -274,10 +334,17 @@ def compare_canonical_maps(
         "last_updated_at_changes": len(timestamp_changes),
         "timestamp_only_changes": len(timestamp_only),
         "participant_only_changes": len(participant_only),
+        "settled_existing_changes_ignored": len(
+            {key for key in observed_changed_keys if is_settled(key)}
+        ),
         "other_mutable_field_changes": 0,
         "completely_unchanged": len(unchanged),
         "updated_keys": len(updated_keys),
-        "predicted_current_persistent_writes": len(target_map) + len(stage_map),
+        "predicted_current_persistent_writes": (
+            len({key for key in target_keys if not is_settled(key)})
+            + len({key for key in stage_keys if not is_settled(key)})
+            + len({key for key in new_keys if is_settled(key)})
+        ),
         "predicted_diff_persistent_writes": len(new_keys) + len(removed_keys) + len(updated_keys),
     }
     return {
@@ -298,6 +365,10 @@ def run_shadow_validation(
     partial_run: bool,
     min_price: float = 1.0,
     max_price: float = 500.0,
+    league_ids: Optional[Sequence[int]] = None,
+    days_back: int = 0,
+    days_forward: int = 14,
+    calendar_window: bool = True,
 ) -> Dict[str, object]:
     """Run bounded read-only shadow analysis and return JSON-safe telemetry."""
     import psycopg2
@@ -365,6 +436,24 @@ def run_shadow_validation(
         )
         cur.execute("analyze odds_outcomes_shadow_scopes;")
 
+        cur.execute(
+            build_fixture_state_sql(
+                league_ids=league_ids,
+                days_back=days_back,
+                days_forward=days_forward,
+                calendar_window=calendar_window,
+            )
+        )
+        fixture_state_rows = cur.fetchall()
+        known_fixture_ids = {int(row[0]) for row in fixture_state_rows}
+        settled_fixture_ids = {int(row[0]) for row in fixture_state_rows if bool(row[1])}
+        missing_fixture_stage_rows = sum(
+            1 for key in stage_map if int(key[0]) not in known_fixture_ids
+        )
+        stage_map = {
+            key: value for key, value in stage_map.items() if int(key[0]) in known_fixture_ids
+        }
+
         target_map: Dict[Tuple[object, ...], Dict[str, object]] = {}
         target_cur = conn.cursor(name="odds_shadow_target")
         target_cur.itersize = 10000
@@ -373,6 +462,12 @@ def run_shadow_validation(
             normalized = normalize_row(dict(zip(ODDS_COLUMNS, values)))
             target_map[canonical_key(normalized)] = normalized
         target_cur.close()
+        target_rows_outside_window = sum(
+            1 for key in target_map if int(key[0]) not in known_fixture_ids
+        )
+        target_map = {
+            key: value for key, value in target_map.items() if int(key[0]) in known_fixture_ids
+        }
 
         comparison = compare_canonical_maps(
             stage_map,
@@ -380,7 +475,10 @@ def run_shadow_validation(
             raw_count=raw_count,
             invalid_count=invalid_count,
             touched_scope_count=len(touched_scopes),
+            settled_fixture_ids=settled_fixture_ids,
         )
+        comparison["metrics"]["stage_rows_outside_fixture_window"] = missing_fixture_stage_rows
+        comparison["metrics"]["target_rows_outside_fixture_window"] = target_rows_outside_window
         result.update(
             {
                 "ok": True,

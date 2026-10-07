@@ -89,6 +89,10 @@ class ShadowEquivalenceTest(unittest.TestCase):
         self.assertNotIn("update public.odds_outcomes", sql)
         self.assertNotIn("delete from public.odds_outcomes", sql)
         self.assertIn("join odds_outcomes_shadow_scopes", sql)
+        fixture_sql = shadow.build_fixture_state_sql([8, 384], 0, 14, True).lower()
+        self.assertIn("is_settled", fixture_sql)
+        self.assertIn("date_trunc('day'", fixture_sql)
+        self.assertIn("f.league_id in (8,384)", fixture_sql)
 
     def test_touched_scope_precedes_price_filter(self):
         self.assert_equivalent([row(), row(selection="away")], [row(decimal="1.0")])
@@ -115,6 +119,30 @@ class ShadowEquivalenceTest(unittest.TestCase):
         self.assertEqual(comparison["differing_canonical_rows"], 0)
         self.assertEqual(comparison["differing_fixture_hashes"], 0)
         self.assertEqual(comparison["differing_scope_hashes"], 0)
+
+    def test_settled_existing_rows_are_immutable_but_missing_keys_insert(self):
+        target_rows = [shadow.normalize_row(row(selection="home"))]
+        stage_rows = [
+            shadow.normalize_row(row(selection="home", decimal="2.20", american=120)),
+            shadow.normalize_row(row(selection="away")),
+        ]
+        target = {shadow.canonical_key(item): item for item in target_rows}
+        stage = {shadow.canonical_key(item): item for item in stage_rows}
+        comparison = shadow.compare_canonical_maps(
+            stage,
+            target,
+            raw_count=2,
+            invalid_count=0,
+            touched_scope_count=1,
+            settled_fixture_ids={1},
+        )
+        metrics = comparison["metrics"]
+        self.assertEqual(metrics["new_keys"], 1)
+        self.assertEqual(metrics["updated_keys"], 0)
+        self.assertEqual(metrics["settled_existing_changes_ignored"], 1)
+        self.assertEqual(metrics["predicted_current_persistent_writes"], 1)
+        self.assertEqual(metrics["predicted_diff_persistent_writes"], 1)
+        self.assertEqual(comparison["differing_canonical_rows"], 0)
 
 
 if __name__ == "__main__":

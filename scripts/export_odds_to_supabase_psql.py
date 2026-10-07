@@ -1749,6 +1749,10 @@ def main() -> None:
                 partial_run=partial_run,
                 min_price=ODDS_MIN_PRICE,
                 max_price=ODDS_MAX_PRICE,
+                league_ids=effective_leagues,
+                days_back=args.days_back,
+                days_forward=args.days_forward,
+                calendar_window=args.calendar_window,
             )
             print(
                 "Shadow validation complete "
