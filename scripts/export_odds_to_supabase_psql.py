@@ -25,6 +25,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+try:
+    from odds_delivery_shadow import append_shadow_log, run_shadow_validation
+except ModuleNotFoundError:  # Package import used by the repository test suite.
+    from scripts.odds_delivery_shadow import append_shadow_log, run_shadow_validation
+
 DB_PATH = os.environ.get("JXD_DB_PATH", "data/jxd.sqlite")
 DB_URL = os.environ.get("SUPABASE_DB_URL") or os.environ.get("SUPABASE_DB_URL_SESSION")
 ODDS_MIN_PRICE = float(os.environ.get("ODDS_MIN_PRICE", "1.0"))
@@ -1730,6 +1735,41 @@ def main() -> None:
     error_message: Optional[str] = None
     psql_err_tail = ""
     psql_out_tail = ""
+    shadow_validation: Optional[Dict[str, object]] = None
+    shadow_enabled = os.environ.get("ODDS_SHADOW_VALIDATION", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if shadow_enabled:
+        try:
+            shadow_validation = run_shadow_validation(
+                DB_URL,
+                Path(args.csv_out),
+                partial_run=partial_run,
+                min_price=ODDS_MIN_PRICE,
+                max_price=ODDS_MAX_PRICE,
+            )
+            print(
+                "Shadow validation complete "
+                f"runtime_sec={shadow_validation.get('runtime_seconds')} "
+                f"differences={shadow_validation.get('differing_canonical_rows')}",
+                flush=True,
+            )
+        except Exception as exc:
+            shadow_validation = {
+                "ok": False,
+                "partial_run": partial_run,
+                "error": re.sub(
+                    r"postgres(?:ql)?://[^\s\"\']+",
+                    "[redacted database URL]",
+                    str(exc),
+                ),
+            }
+            print(
+                f"Shadow validation failed without blocking delivery: {shadow_validation['error']}",
+                flush=True,
+            )
 
     try:
         counts = stage_and_upsert(
@@ -1973,9 +2013,22 @@ def main() -> None:
         "rest_ok": os.environ.get("REST_OK"),
         "rest_http": os.environ.get("REST_HTTP"),
         "verification": verification_outputs,
+        "shadow_validation": shadow_validation,
     }
 
     Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    shadow_log_path = os.environ.get("ODDS_SHADOW_LOG_PATH")
+    if shadow_validation is not None and shadow_log_path:
+        append_shadow_log(
+            Path(shadow_log_path),
+            {
+                "delivery_start_time": start_iso,
+                "delivery_end_time": end_iso,
+                "delivery_ok": ingest_ok,
+                "delivery_runtime_seconds": report["runtime_seconds"],
+                "shadow_validation": shadow_validation,
+            },
+        )
 
     print(
         "Ingest summary: rows_exported="
