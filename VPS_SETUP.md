@@ -120,8 +120,14 @@ Use this schedule while the production Supabase project is on Micro compute or w
 7,37 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
 
 # Post-match fixture settlement (the stats-critical live writer). The worker polls
-# SportMonks detail until it is complete, then publishes only parity-verified rows.
+# SportMonks detail until it is complete, then marks fixture delivery dirty when
+# fixture-core data changed. It does not run the full fixture-delivery publisher inline.
 */15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_postmatch_settlement.sh >> /var/log/odds-sync-settlement.log 2>&1
+
+# Guarded complete fixture-delivery publisher. Keep this cadence configurable by cron/env;
+# :11 avoids the quarter-hour settlement ticks, odds delivery at :04/:19/:34/:49,
+# squads at :20/:50, P1 at :17, P2 at :37, and models at :22/:32.
+11 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_fixture_delivery_publisher.sh >> /var/log/fixture-delivery-publisher.log 2>&1
 
 # Historical stats reconciliation safety net. The wrapper owns a separate
 # supervisor lock, then takes the canonical data lock for one bounded batch at

@@ -24,43 +24,36 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("--completed-hours-back", result.stdout)
         self.assertIn("--report-json", result.stdout)
 
-    def test_settlement_wrapper_is_shell_valid_and_publishes_delivery(self) -> None:
+    def test_settlement_wrapper_is_shell_valid_and_marks_delivery_dirty(self) -> None:
         wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
         result = subprocess.run(["bash", "-n", str(wrapper)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         source = wrapper.read_text(encoding="utf-8")
         self.assertIn("odds-sync.lock", source)
-        self.assertIn("refresh_fixture_delivery.py", source)
+        self.assertNotIn("DELIVERY_REFRESH_COMMAND=", source)
+        self.assertNotIn("python scripts/refresh_fixture_delivery.py", source)
+        self.assertIn("fixture_delivery_dirty_state.py", source)
         self.assertIn('ODDS_SYNC_JOB_PRIORITY="settlement"', source)
         self.assertIn('ODDS_SYNC_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS}"', source)
         self.assertIn('SETTLEMENT_RUN_LOCK_FILE="${SETTLEMENT_RUN_LOCK_FILE:-/var/lock/odds-sync-settlement.lock}"', source)
-        self.assertIn('PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_settlement_delivery.json}"', source)
+        self.assertIn('PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_settlement_dirty_report.json}"', source)
+        self.assertIn('/var/lib/oddssearch/fixture-delivery/dirty-state.json', source)
         # Historical fixture-detail reconciliation has its own bounded worker,
         # ledger and Operations heartbeat. Its backlog must not turn a
         # successful score/result publication into a settlement failure.
         self.assertNotIn("postmatch_fixture_detail_delivery.py", source)
 
-    def test_delivery_refresh_does_not_extend_the_shared_spool_lock(self) -> None:
+    def test_settlement_success_is_independent_of_full_delivery_publication(self) -> None:
         wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
         source = wrapper.read_text(encoding="utf-8")
 
         local_start = source.index("LOCAL_SETTLEMENT_COMMAND=")
-        refresh_start = source.index("DELIVERY_REFRESH_COMMAND=")
-        lock_call = source.index('run_with_global_lock_and_timeout "${LOCAL_SETTLEMENT_COMMAND}"')
-        refresh_call = source.index('bash -lc "${DELIVERY_REFRESH_COMMAND}"')
-
-        local_phase = source[local_start:refresh_start]
-        refresh_phase = source[refresh_start:]
+        local_phase = source[local_start:source.index("status=0")]
         self.assertIn("reconcile_recent_fixtures.py", local_phase)
         self.assertIn("export_to_supabase.py", local_phase)
+        self.assertIn("fixture_delivery_dirty_state.py", local_phase)
         self.assertNotIn("refresh_fixture_delivery.py", local_phase)
-        self.assertIn("refresh_fixture_delivery.py", refresh_phase)
-        self.assertIn('cd "${REPO_ROOT}"', refresh_phase)
-        self.assertIn("source .venv/bin/activate", refresh_phase)
-        self.assertIn('export PYTHONPATH="${REPO_ROOT}"', refresh_phase)
-        self.assertLess(lock_call, refresh_call)
-        self.assertIn("fixture_delivery_refresh advisory lock", source)
-        self.assertIn('ODDS_SYNC_JOB_PRIORITY="settlement"', source)
+        self.assertIn("Full fixture-delivery publication is intentionally decoupled", source)
 
     def test_fixture_core_refresh_cannot_overwrite_fixture_detail(self) -> None:
         wrapper = ROOT / "scripts/vps/run_p3_fixture_core.sh"
@@ -78,16 +71,14 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('export FIXTURE_CORE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"', source)
         self.assertIn('--start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)"', source)
 
-    def test_settlement_delivery_refresh_preserves_the_rolling_horizon(self) -> None:
-        wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
+    def test_guarded_publisher_preserves_the_rolling_horizon(self) -> None:
+        wrapper = ROOT / "scripts/vps/run_fixture_delivery_publisher.sh"
         source = wrapper.read_text(encoding="utf-8")
-        self.assertIn('export SETTLEMENT_EXPORT_DAYS_BACK="$(contract_value history_window_days)"', source)
-        self.assertIn('export SETTLEMENT_DELIVERY_DAYS_BACK="$(contract_value history_window_days)"', source)
-        self.assertIn('export FIXTURE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"', source)
-        self.assertIn(
-            'SETTLEMENT_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD}"',
-            source,
-        )
+        self.assertIn('export FIXTURE_DELIVERY_DAYS_BACK="${FIXTURE_DELIVERY_DAYS_BACK:-$(contract_value history_window_days)}"', source)
+        self.assertIn('export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-$(contract_value delivery_window_days)}"', source)
+        self.assertIn("--skip-if-publication-active", source)
+        self.assertIn("--min-publish-interval-seconds", source)
+        self.assertIn('FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS="${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS:-3600}"', source)
 
     def test_supported_league_helper_excludes_cups(self) -> None:
         excluded = set(json.loads((ROOT / "config/odds_api_sync_excluded_leagues.json").read_text()))
@@ -157,8 +148,10 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn('TARGET_REPO_ROOT="${2:-${VPS_REPO_ROOT:-}}"', source)
         self.assertNotIn('/opt/odds-sync/JXD987}}', source)
         self.assertIn('"scripts/refresh_fixture_delivery.py"', source)
+        self.assertIn('"scripts/fixture_delivery_dirty_state.py"', source)
         self.assertIn('"scripts/vps/run_p3.sh"', source)
         self.assertIn('"scripts/vps/run_postmatch_settlement.sh"', source)
+        self.assertIn('"scripts/vps/run_fixture_delivery_publisher.sh"', source)
         self.assertIn("scripts/reconcile_stats_provider_queue.py", source)
 
     def test_heartbeat_report_truncation_cannot_abort_under_pipefail(self) -> None:

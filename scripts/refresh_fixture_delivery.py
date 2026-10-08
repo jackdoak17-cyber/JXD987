@@ -151,6 +151,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--leagues", default=None, help="Comma-separated supported league IDs")
     parser.add_argument("--report-out", default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--skip-if-publication-active",
+        action="store_true",
+        help="Exit with a guarded skip instead of waiting when another fixture-delivery publisher owns the advisory lock.",
+    )
+    parser.add_argument(
+        "--min-publish-interval-seconds",
+        type=int,
+        default=0,
+        help="Guarded publisher only: skip when the latest complete publication is newer than this many seconds.",
+    )
     return parser
 
 
@@ -287,6 +298,34 @@ def create_release(cur, start: date, end: date) -> str:
 def lock_refresh_publication(cur) -> None:
     """Serialize refresh builds so an older run cannot publish after a newer run."""
     cur.execute("select pg_advisory_xact_lock(hashtextextended('fixture_delivery_refresh', 0))")
+
+
+def try_lock_refresh_publication(cur) -> bool:
+    """Try to own the existing fixture-delivery publication lock without waiting."""
+    cur.execute("select pg_try_advisory_lock(hashtextextended('fixture_delivery_refresh', 0))")
+    return bool(cur.fetchone()[0])
+
+
+def latest_publication_age_seconds(cur) -> int | None:
+    cur.execute(
+        """
+        select extract(epoch from (now() - published_at))::integer
+          from public.fixture_delivery_releases
+         where status = 'published' and published_at is not null
+         order by published_at desc
+         limit 1
+        """
+    )
+    row = cur.fetchone()
+    if row is None or row[0] is None:
+        return None
+    return int(row[0])
+
+
+def guarded_skip_report(report: dict[str, Any], reason: str, **extra: Any) -> dict[str, Any]:
+    report.update({"published": False, "skipped": True, "skip_reason": reason})
+    report.update(extra)
+    return report
 
 
 def validate_release_components(
@@ -1155,6 +1194,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     conn.autocommit = False
     release_id: str | None = None
     try:
+        if args.skip_if_publication_active:
+            with conn.cursor() as cur:
+                if not try_lock_refresh_publication(cur):
+                    return guarded_skip_report(report, "publication_active")
+                min_interval = max(int(args.min_publish_interval_seconds or 0), 0)
+                if min_interval:
+                    age_seconds = latest_publication_age_seconds(cur)
+                    if age_seconds is not None and age_seconds < min_interval:
+                        return guarded_skip_report(
+                            report,
+                            "recent_publication_satisfies_guard",
+                            latest_publication_age_seconds=age_seconds,
+                            min_publish_interval_seconds=min_interval,
+                        )
+
         with conn.cursor() as cur:
             validate_delivery_schema(cur)
             release_id = create_release(cur, start, end)
@@ -1233,6 +1287,9 @@ def main() -> int:
     if args.report_out:
         with open(args.report_out, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2, default=str)
+    if report.get("skipped"):
+        LOG.info("fixtures delivery refresh skipped: %s", json.dumps(report, default=str))
+        return 2
     LOG.info("fixtures delivery refresh complete: %s", json.dumps(report, default=str))
     return 0
 

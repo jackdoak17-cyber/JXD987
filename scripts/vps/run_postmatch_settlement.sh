@@ -16,7 +16,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/sync.py" \
   "scripts/reconcile_recent_fixtures.py" \
   "scripts/export_to_supabase.py" \
-  "scripts/refresh_fixture_delivery.py"
+  "scripts/fixture_delivery_dirty_state.py"
 
 if [[ -f "${REPO_ROOT}/.env" ]]; then
   set -a
@@ -37,13 +37,10 @@ validate_supported_leagues "${STATS_LEAGUES}"
 export SETTLEMENT_HOURS_BACK="${SETTLEMENT_HOURS_BACK:-48}"
 export SETTLEMENT_MAX_RUNTIME_SECONDS="${SETTLEMENT_MAX_RUNTIME_SECONDS:-1200}"
 export SETTLEMENT_EXPORT_DAYS_BACK="$(contract_value history_window_days)"
-export SETTLEMENT_DELIVERY_DAYS_BACK="$(contract_value history_window_days)"
-# Atomic publication replaces the complete customer-visible release. Keep
-# settlement on the same rolling horizon as P3 so a 15-minute result refresh
-# cannot publish a short snapshot that removes later fixture dates.
-export FIXTURE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"
-export SETTLEMENT_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD}"
-export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_settlement_delivery.json}"
+export SETTLEMENT_DELIVERY_DIRTY_STATE_PATH="${FIXTURE_DELIVERY_DIRTY_STATE_PATH:-/var/lib/oddssearch/fixture-delivery/dirty-state.json}"
+export SETTLEMENT_RECONCILE_REPORT="${SETTLEMENT_RECONCILE_REPORT:-/tmp/postmatch_settlement_reconcile.json}"
+export SETTLEMENT_EXPORT_REPORT="${SETTLEMENT_EXPORT_REPORT:-/tmp/postmatch_settlement_export.json}"
+export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/postmatch_settlement_dirty_report.json}"
 # This chain shares the SQLite spool with P1/P2/P3, models, and historical
 # reconciliation. Use the single canonical pipeline lock for every writer.
 export FIXTURE_SETTLEMENT_LOCK_FILE="${FIXTURE_SETTLEMENT_LOCK_FILE:-/var/lock/odds-sync.lock}"
@@ -67,7 +64,7 @@ export PYTHONPATH="${REPO_ROOT}"
 python scripts/reconcile_recent_fixtures.py \
   --leagues "${STATS_LEAGUES}" \
   --completed-hours-back "${SETTLEMENT_HOURS_BACK}" \
-  --report-json "/tmp/postmatch_settlement_reconcile.json"
+  --report-json "${SETTLEMENT_RECONCILE_REPORT}"
 
 python scripts/export_to_supabase.py \
   --strict \
@@ -76,27 +73,21 @@ python scripts/export_to_supabase.py \
   --upcoming-days 0 \
   --fixture-core-only \
   --skip-prune \
-  --report-json "/tmp/postmatch_settlement_export.json"
+  --report-json "${SETTLEMENT_EXPORT_REPORT}"
+
+python scripts/fixture_delivery_dirty_state.py \
+  --state-path "${SETTLEMENT_DELIVERY_DIRTY_STATE_PATH}" \
+  mark-from-reports \
+  --reconcile-report "${SETTLEMENT_RECONCILE_REPORT}" \
+  --export-report "${SETTLEMENT_EXPORT_REPORT}" \
+  --source "postmatch-settlement" \
+  --report-out "${PIPELINE_EVIDENCE_FILE}"
 CHAIN
 )
 
-# This phase uses only the Supabase/Postgres connection.  It does not open the
-# local JXD SQLite spool; refresh_fixture_delivery serializes its own release
-# build and publication with the fixture_delivery_refresh advisory lock.
-DELIVERY_REFRESH_COMMAND=$(cat <<'CHAIN'
-set -euo pipefail
-
-cd "${REPO_ROOT}"
-source .venv/bin/activate
-export PYTHONPATH="${REPO_ROOT}"
-
-python scripts/refresh_fixture_delivery.py \
-  --start-date "$(TZ=Europe/London date -d "-${SETTLEMENT_DELIVERY_DAYS_BACK} days" +%F)" \
-  --end-date "$(TZ=Europe/London date -d "+${SETTLEMENT_DELIVERY_DAYS_FORWARD} days" +%F)" \
-  --leagues "${STATS_LEAGUES}" \
-  --report-out "/tmp/postmatch_settlement_delivery.json"
-CHAIN
-)
+# Full fixture-delivery publication is intentionally decoupled from the
+# 15-minute settlement path. Settlement marks durable dirty state above; the
+# guarded publisher builds the existing complete atomic release later.
 
 status=0
 RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -108,14 +99,6 @@ ODDS_SYNC_LOCK_WAIT_SECONDS="${SETTLEMENT_LOCK_WAIT_SECONDS}" \
 ODDS_SYNC_P3_MAX_DURATION_SECONDS="${SETTLEMENT_MAX_RUNTIME_SECONDS}" \
   run_with_global_lock_and_timeout "${LOCAL_SETTLEMENT_COMMAND}" || status=$?
 
-# Do not hold the shared SQLite spool lock while rebuilding the independent
-# Supabase fixture-delivery read model.  The local settlement/export phase
-# above remains lock-protected and this phase retains its own Postgres
-# transaction/advisory publication lock.
-if [[ "${status}" -eq 0 ]]; then
-  timeout --signal=TERM --kill-after=5s "${SETTLEMENT_MAX_RUNTIME_SECONDS}" \
-    bash -lc "${DELIVERY_REFRESH_COMMAND}" || status=$?
-fi
 
 RUN_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RUN_FINISHED_EPOCH="$(date -u +"%s")"
