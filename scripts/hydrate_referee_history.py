@@ -20,7 +20,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 import psycopg2
 from psycopg2.extras import Json, execute_values
@@ -31,6 +31,15 @@ DEFAULT_BASE_URL = "https://api.sportmonks.com/v3/football"
 logger = logging.getLogger("hydrate_referee_history")
 
 MAIN_REF_TYPE_IDS = {6}
+
+
+class MutationCounts(NamedTuple):
+    inserted: int
+    updated: int
+
+    @property
+    def total(self) -> int:
+        return self.inserted + self.updated
 
 
 class ProviderRateLimited(RuntimeError):
@@ -247,7 +256,7 @@ def parse_referee_fixture_links(
 def upsert_assignments(
     conn: psycopg2.extensions.connection,
     rows: Iterable[Dict[str, Any]],
-) -> int:
+) -> MutationCounts:
     values: List[Tuple[Any, ...]] = []
     for row in rows:
         values.append(
@@ -261,7 +270,7 @@ def upsert_assignments(
             )
         )
     if not values:
-        return 0
+        return MutationCounts(inserted=0, updated=0)
 
     sql = """
       insert into public.fixture_referees
@@ -274,11 +283,22 @@ def upsert_assignments(
         extra = coalesce(excluded.extra, public.fixture_referees.extra),
         updated_at = now(),
         last_synced_at = now()
+      where (
+        public.fixture_referees.is_primary,
+        public.fixture_referees.source,
+        public.fixture_referees.extra
+      ) is distinct from (
+        excluded.is_primary,
+        excluded.source,
+        coalesce(excluded.extra, public.fixture_referees.extra)
+      )
+      returning (xmax = 0) as inserted
     """
     with conn.cursor() as cur:
-        execute_values(cur, sql, values, page_size=500)
+        changed_rows = execute_values(cur, sql, values, page_size=500, fetch=True)
     conn.commit()
-    return len(values)
+    inserted = sum(1 for row in changed_rows if row[0])
+    return MutationCounts(inserted=inserted, updated=len(changed_rows) - inserted)
 
 
 def write_report(path: str, report: Dict[str, Any]) -> None:
@@ -325,7 +345,9 @@ def main() -> int:
 
     total_rows_raw = 0
     referees_failed = 0
-    upserted_assignments_total = 0
+    inserted_assignments_total = 0
+    updated_assignments_total = 0
+    assignments_considered_total = 0
     rate_limited = False
     rate_limited_retry_after_seconds = 0
     conn_write = None if args.dry_run else psycopg2.connect(db_url)
@@ -355,8 +377,11 @@ def main() -> int:
                 main_only=args.main_only,
             )
             total_rows_raw += len(links)
+            assignments_considered_total += len(links)
             if conn_write is not None:
-                upserted_assignments_total += upsert_assignments(conn_write, links)
+                mutations = upsert_assignments(conn_write, links)
+                inserted_assignments_total += mutations.inserted
+                updated_assignments_total += mutations.updated
 
             if args.sleep_seconds > 0 and idx < len(seed_referees):
                 time.sleep(args.sleep_seconds)
@@ -374,7 +399,14 @@ def main() -> int:
         "main_only": bool(args.main_only),
         "referees_failed": referees_failed,
         "rows_raw": total_rows_raw,
-        "upserted_assignments": upserted_assignments_total,
+        "assignments_considered": assignments_considered_total,
+        "inserted_assignments": inserted_assignments_total,
+        "updated_assignments": updated_assignments_total,
+        "upserted_assignments": inserted_assignments_total + updated_assignments_total,
+        "unchanged_assignments": max(
+            0,
+            assignments_considered_total - inserted_assignments_total - updated_assignments_total,
+        ),
         "rate_limited": rate_limited,
         "rate_limited_retry_after_seconds": rate_limited_retry_after_seconds,
         "sample_referees": seed_referees[:10],

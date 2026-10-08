@@ -17,7 +17,8 @@ import argparse
 import json
 import logging
 import os
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Tuple
 
 import psycopg2
 from psycopg2.extras import Json, execute_values
@@ -27,10 +28,31 @@ FINISHED_STATUSES = ["FT", "AET", "PEN"]
 logger = logging.getLogger("sync_fixture_referee_stats")
 
 
+class MutationCounts(NamedTuple):
+    inserted: int
+    updated: int
+
+    @property
+    def total(self) -> int:
+        return self.inserted + self.updated
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Sync fixture_referee_stats from database card history")
     parser.add_argument("--days-back", type=int, default=30)
     parser.add_argument("--days-forward", type=int, default=31)
+    parser.add_argument(
+        "--refresh-mode",
+        choices=("full", "frequent"),
+        default="full",
+        help="Full reconciles every target; frequent selects only missing, reassigned, or recently affected targets",
+    )
+    parser.add_argument(
+        "--recent-history-hours",
+        type=int,
+        default=48,
+        help="Frequent-mode lookback for completed fixtures that can change referee snapshots",
+    )
     parser.add_argument(
         "--fixture-id",
         type=int,
@@ -89,16 +111,26 @@ def fetch_fixture_referee_metrics(
     days_forward: int,
     fixture_id: int,
     limit_fixtures: int,
+    refresh_mode: str = "full",
+    recent_history_hours: int = 48,
 ) -> List[Dict[str, Any]]:
     limit_clause = ""
-    params: List[Any] = [max(0, days_back), max(0, days_forward), max(0, fixture_id), max(0, fixture_id)]
+    params: List[Any] = [
+        max(0, days_back),
+        max(0, days_forward),
+        max(0, fixture_id),
+        max(0, fixture_id),
+        refresh_mode,
+        max(1, recent_history_hours),
+        FINISHED_STATUSES,
+    ]
     if limit_fixtures > 0:
         limit_clause = "\n          limit %s"
         params.append(limit_fixtures)
     params.append(FINISHED_STATUSES)
 
     sql = f"""
-      with target as (
+      with candidate_target as (
         select
           f.id::bigint as fixture_id,
           f.starting_at as fixture_starting_at,
@@ -120,7 +152,33 @@ def fetch_fixture_referee_metrics(
         where f.starting_at >= (now() - make_interval(days => %s))
           and f.starting_at <= (now() + make_interval(days => %s))
           and (%s = 0 or f.id = %s)
-        order by f.starting_at asc
+      ),
+      target as (
+        select candidate.*
+        from candidate_target candidate
+        left join public.fixture_referee_stats current_stats
+          on current_stats.fixture_id = candidate.fixture_id
+        where %s = 'full'
+           or current_stats.fixture_id is null
+           or current_stats.referee_id is distinct from candidate.referee_id
+           or exists (
+             select 1
+             from public.fixture_referees recent_assignment
+             join public.fixtures recent_fixture
+               on recent_fixture.id = recent_assignment.fixture_id
+              and recent_fixture.starting_at < candidate.fixture_starting_at
+              and recent_fixture.starting_at >= (now() - make_interval(hours => %s))
+              and (
+                recent_fixture.status = any(%s::text[])
+                or (recent_fixture.home_score is not null and recent_fixture.away_score is not null)
+              )
+             where recent_assignment.referee_id = candidate.referee_id
+               and (
+                 recent_assignment.is_primary = true
+                 or lower(coalesce(recent_assignment.role, '')) in ('main', 'referee')
+               )
+           )
+        order by candidate.fixture_starting_at asc
         {limit_clause}
       ),
       referee_history as (
@@ -271,7 +329,10 @@ def build_windows_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def upsert_fixture_referee_stats(conn: psycopg2.extensions.connection, rows: Iterable[Dict[str, Any]]) -> int:
+def upsert_fixture_referee_stats(
+    conn: psycopg2.extensions.connection,
+    rows: Iterable[Dict[str, Any]],
+) -> MutationCounts:
     values: List[Tuple[Any, ...]] = []
 
     for row in rows:
@@ -312,7 +373,7 @@ def upsert_fixture_referee_stats(conn: psycopg2.extensions.connection, rows: Ite
         )
 
     if not values:
-        return 0
+        return MutationCounts(inserted=0, updated=0)
 
     sql = """
       insert into public.fixture_referee_stats (
@@ -360,12 +421,55 @@ def upsert_fixture_referee_stats(conn: psycopg2.extensions.connection, rows: Ite
         data_status = excluded.data_status,
         windows = excluded.windows,
         updated_at = now()
+      where (
+        public.fixture_referee_stats.referee_id,
+        public.fixture_referee_stats.referee_name,
+        public.fixture_referee_stats.avg_yellow_cards,
+        public.fixture_referee_stats.avg_fouls,
+        public.fixture_referee_stats.games_with_3plus_cards_pct,
+        public.fixture_referee_stats.games_with_red_card_pct,
+        public.fixture_referee_stats.avg_corners,
+        public.fixture_referee_stats.sample,
+        public.fixture_referee_stats.source,
+        public.fixture_referee_stats.avg_total_cards,
+        public.fixture_referee_stats.games_with_4plus_cards_pct,
+        public.fixture_referee_stats.games_with_5plus_cards_pct,
+        public.fixture_referee_stats.sample_5,
+        public.fixture_referee_stats.sample_10,
+        public.fixture_referee_stats.sample_20,
+        public.fixture_referee_stats.history_through,
+        public.fixture_referee_stats.calculation_version,
+        public.fixture_referee_stats.data_status,
+        public.fixture_referee_stats.windows
+      ) is distinct from (
+        excluded.referee_id,
+        excluded.referee_name,
+        excluded.avg_yellow_cards,
+        excluded.avg_fouls,
+        excluded.games_with_3plus_cards_pct,
+        excluded.games_with_red_card_pct,
+        excluded.avg_corners,
+        excluded.sample,
+        excluded.source,
+        excluded.avg_total_cards,
+        excluded.games_with_4plus_cards_pct,
+        excluded.games_with_5plus_cards_pct,
+        excluded.sample_5,
+        excluded.sample_10,
+        excluded.sample_20,
+        excluded.history_through,
+        excluded.calculation_version,
+        excluded.data_status,
+        excluded.windows
+      )
+      returning (xmax = 0) as inserted
     """
 
     with conn.cursor() as cur:
-        execute_values(cur, sql, values, page_size=500)
+        changed_rows = execute_values(cur, sql, values, page_size=500, fetch=True)
     conn.commit()
-    return len(values)
+    inserted = sum(1 for row in changed_rows if row[0])
+    return MutationCounts(inserted=inserted, updated=len(changed_rows) - inserted)
 
 
 def main() -> int:
@@ -381,6 +485,8 @@ def main() -> int:
             days_forward=args.days_forward,
             fixture_id=args.fixture_id,
             limit_fixtures=args.limit_fixtures,
+            refresh_mode=args.refresh_mode,
+            recent_history_hours=args.recent_history_hours,
         )
     finally:
         conn.close()
@@ -388,6 +494,9 @@ def main() -> int:
     report: Dict[str, Any] = {
         "ok": True,
         "dry_run": bool(args.dry_run),
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "refresh_mode": args.refresh_mode,
+        "recent_history_hours": max(1, args.recent_history_hours),
         "rows_to_upsert": len(rows),
         "fixtures_with_ref_assignment": sum(1 for row in rows if to_int(row.get("referee_id")) > 0),
         "fixtures_with_history_sample_5": sum(1 for row in rows if to_int(row.get("sample_5")) > 0),
@@ -404,11 +513,14 @@ def main() -> int:
 
     conn_write = psycopg2.connect(db_url)
     try:
-        upserted = upsert_fixture_referee_stats(conn_write, rows)
+        mutations = upsert_fixture_referee_stats(conn_write, rows)
     finally:
         conn_write.close()
 
-    report["upserted"] = upserted
+    report["inserted"] = mutations.inserted
+    report["updated"] = mutations.updated
+    report["upserted"] = mutations.total
+    report["unchanged"] = max(0, len(rows) - mutations.total)
     print(json.dumps(report, indent=2, ensure_ascii=False))
     write_report(args.report_json, report)
     return 0
