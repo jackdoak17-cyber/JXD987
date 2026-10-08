@@ -8,7 +8,8 @@ fe1a70408f58e99c4f41584f0b91c0cf492c8286  jxd/models.py
 4b98c844a9928718d8badb8662d0aac37fb94491  jxd/odds_api_client.py
 7bd8e750f7adc8917e705f517d076f3121ca11a3  jxd/sportmonks_client.py
 6386628d31ee4b19804daab6ec700f35dc01b173  jxd/sync.py
-ca23ef1e22d344a753a6e8e8599e8681906ef3ed  scripts/export_odds_to_supabase_psql.py
+b01be76fd5802b079e27ab553d6dd68caa518d85  scripts/export_odds_to_supabase_psql.py
+1e6eff1af5574c3fa68e05c749e4de1e858bbe75  scripts/reconcile_fixture_delivery_odds.py
 6facc29f4eb6622248976f22af98de6beecbb05d  scripts/export_to_supabase.py
 aa70601da9c295d2fcda026c08888aa02faa1cb6  scripts/fixture_detail_export_policy.py
 1ac7a6a190ea25917360a6d977b3c90a5e4590b8  scripts/refresh_fixture_delivery.py
@@ -25,6 +26,7 @@ a1b2e580c78cc5cbc26705c9144fd6b4d2d2b05b  scripts/rest_preflight.py
 17f2cfe733ecd33826066d5292bece91c02831ee  scripts/sync_odds.py
 fa3c102f14664a9d38ac677ea5a967183e58dd8f  scripts/fixture_core_contract.py
 fab07d5e8b5f8735eddc53e0412ebbc2a5042384  scripts/vps/common.sh
+9f863fecb7d7bf1c1279ab377d96993dca6ccb4e  scripts/vps/run_odds_delivery.sh
 431b2ab84dbd21e62bbe7b63031c7316e0ac2757  scripts/vps/run_p1.sh
 916a6612eedd078f07ae711fd1c9a4a2142718d9  scripts/vps/run_p2.sh
 34f87a4db3466a28324e658952e29b2c7b9b5975  scripts/vps/run_p3.sh
