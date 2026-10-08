@@ -25,17 +25,28 @@ run_recorded_pipeline_job() {
 }
 ''')
             fake = root / '.venv/bin/python'
-            fake.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "${REPO_ROOT}/args"\nexit "${TEST_EXIT}"\n')
+            fake.write_text('''#!/bin/bash
+printf '%q ' "$@" >> "${REPO_ROOT}/calls"
+printf '\n' >> "${REPO_ROOT}/calls"
+if [[ "$1" == "scripts/export_odds_to_supabase_psql.py" ]]; then
+  exit "${TEST_EXIT}"
+fi
+exit 0
+''')
             fake.chmod(0o755)
             result = subprocess.run(['bash', str(RUNNER)], env={**os.environ, 'ODDS_DELIVERY_RUNTIME': str(root), 'TEST_EXIT': str(status)}, capture_output=True)
             self.assertEqual(result.returncode, status, result.stderr.decode())
             self.assertEqual((root / 'job').read_text(), 'run_odds_delivery')
-            args = (root / 'args').read_text().splitlines()
+            calls = (root / 'calls').read_text().splitlines()
+            self.assertEqual(len(calls), 2 if status == 0 else 1)
+            args = calls[0].split()
             self.assertEqual(args[0], 'scripts/export_odds_to_supabase_psql.py')
             for flag in ['--skip-retention', '--skip-retention-snapshots', '--no-include-fixture-leagues']:
                 self.assertIn(flag, args)
             self.assertEqual(args[args.index('--days-forward') + 1], '14')
             self.assertNotIn('--skip-verification', args)
+            if status == 0:
+                self.assertTrue(calls[1].startswith('scripts/reconcile_fixture_delivery_odds.py '))
     def test_success(self): self.run_case(0)
     def test_export_failure_propagates(self): self.run_case(7)
 

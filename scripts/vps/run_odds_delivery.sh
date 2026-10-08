@@ -6,6 +6,7 @@ ODDS_DELIVERY_RUNTIME="${ODDS_DELIVERY_RUNTIME:-/opt/odds-sync/JXD987-odds-match
 source "${ODDS_DELIVERY_RUNTIME}/scripts/vps/common.sh"
 verify_runtime_manifest_or_exit "${ODDS_DELIVERY_RUNTIME}/scripts/vps/run_odds_p3.sh"
 require_runtime_manifest_entries_or_exit "$0" "scripts/export_odds_to_supabase_psql.py"
+require_runtime_manifest_entries_or_exit "$0" "scripts/reconcile_fixture_delivery_odds.py"
 export REPO_ROOT
 export ODDS_LEAGUES="$(odds_league_csv)"
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS=20
@@ -28,6 +29,11 @@ python "${ODDS_DELIVERY_EXPORTER:-scripts/export_odds_to_supabase_psql.py}" \
   --csv-out /tmp/odds_outcomes_delivery.csv \
   --report-out /tmp/odds_delivery_report.json \
   --max-runtime-minutes 5 --skip-retention --skip-retention-snapshots
+# Only a successfully committed canonical odds delivery reaches this step.
+# A busy fixture publisher lock defers reconciliation until the next run.
+python scripts/reconcile_fixture_delivery_odds.py \
+  --report-out /tmp/fixture_delivery_odds_sync_report.json \
+  --delivery-report /tmp/odds_delivery_report.json
 CHAIN
 )
 run_recorded_pipeline_job "run_odds_delivery" "Website odds delivery" \
