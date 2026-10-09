@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from copy import deepcopy
+from datetime import date, datetime, timezone
 import inspect
 
 from scripts.refresh_fixture_delivery import (
+    COMPLETED_SEMANTIC_FIELDS,
+    SCHEDULE_SEMANTIC_FIELDS,
     add_metrics_provenance,
     all_completed_fixtures,
     build_season_scoped_history,
     calculate_metrics,
     compute_standings,
+    fingerprints_match,
     history_rows_for_fixture,
+    semantic_projection_fingerprint,
     strict_current_season_rank,
     validate_delivery_schema,
     validate_source_fixture_identity,
@@ -35,6 +40,126 @@ class SchemaCursor:
 
 
 class FixtureDeliveryMetricsTests(unittest.TestCase):
+    @staticmethod
+    def changed_value(value):
+        if isinstance(value, datetime):
+            return value.replace(minute=(value.minute + 1) % 60)
+        if isinstance(value, int):
+            return value + 1
+        if value is None:
+            return "now-present"
+        return f"{value}-changed"
+
+    def semantic_fixture(self, fixture_id: int = 1) -> dict:
+        return {
+            "id": fixture_id,
+            "starting_at": datetime(2026, 10, 9, 14, 0, tzinfo=UTC),
+            "status": "NS",
+            "status_code": "NS",
+            "league_id": 8,
+            "season_id": 28083,
+            "home_team_id": 10,
+            "away_team_id": 20,
+            "home_score": None,
+            "away_score": None,
+            "home_ht_score": None,
+            "away_ht_score": None,
+            "league_name": "Premier League",
+            "league_logo": "league.png",
+            "home_team_name": "Home",
+            "home_team_short_code": "HOM",
+            "home_team_image_path": "home.png",
+            "away_team_name": "Away",
+            "away_team_short_code": "AWY",
+            "away_team_image_path": "away.png",
+        }
+
+    def completed_fixture(self, fixture_id: int = 99) -> dict:
+        row = self.semantic_fixture(fixture_id)
+        row.update({
+            "starting_at": datetime(2026, 10, 1, 14, 0, tzinfo=UTC),
+            "status": "FT",
+            "status_code": "FT",
+            "home_score": 2,
+            "away_score": 1,
+            "home_ht_score": 1,
+            "away_ht_score": 0,
+        })
+        return row
+
+    def fingerprint(self, schedule=None, completed=None, **kwargs):
+        return semantic_projection_fingerprint(
+            schedule if schedule is not None else [self.semantic_fixture()],
+            completed if completed is not None else [self.completed_fixture()],
+            kwargs.pop("start", date(2026, 10, 7)),
+            kwargs.pop("end", date(2026, 11, 21)),
+            kwargs.pop("leagues", [8]),
+            **kwargs,
+        )
+
+    def test_identical_semantic_snapshots_reuse_projection(self) -> None:
+        first = self.fingerprint()
+        second = self.fingerprint()
+        self.assertEqual(first, second)
+        self.assertTrue(fingerprints_match(first, second))
+
+    def test_real_score_and_historical_correction_force_publication(self) -> None:
+        baseline = self.fingerprint()
+        changed_schedule = self.semantic_fixture()
+        changed_schedule.update({"status": "FT", "status_code": "FT", "home_score": 1, "away_score": 0})
+        corrected_history = self.completed_fixture()
+        corrected_history["away_score"] = 2
+
+        self.assertNotEqual(baseline["sha256"], self.fingerprint(schedule=[changed_schedule])["sha256"])
+        self.assertNotEqual(baseline["sha256"], self.fingerprint(completed=[corrected_history])["sha256"])
+
+    def test_cancelled_postponed_or_rescheduled_fixture_forces_publication(self) -> None:
+        baseline = self.fingerprint()
+        for status in ("CANCELLED", "POSTPONED"):
+            changed = self.semantic_fixture()
+            changed["status"] = status
+            self.assertNotEqual(baseline["sha256"], self.fingerprint(schedule=[changed])["sha256"])
+        rescheduled = self.semantic_fixture()
+        rescheduled["starting_at"] = datetime(2026, 10, 10, 14, 0, tzinfo=UTC)
+        self.assertNotEqual(baseline["sha256"], self.fingerprint(schedule=[rescheduled])["sha256"])
+
+    def test_midnight_window_and_algorithm_changes_force_publication(self) -> None:
+        baseline = self.fingerprint()
+        next_window = self.fingerprint(start=date(2026, 10, 8), end=date(2026, 11, 22))
+        next_algorithm = self.fingerprint(algorithm_version="fixture-delivery-v2")
+
+        self.assertFalse(fingerprints_match(baseline, next_window))
+        self.assertFalse(fingerprints_match(baseline, next_algorithm))
+
+    def test_missing_or_incompatible_fingerprint_forces_publication(self) -> None:
+        candidate = self.fingerprint()
+        self.assertFalse(fingerprints_match(None, candidate))
+        incompatible = deepcopy(candidate)
+        incompatible["version"] += 1
+        self.assertFalse(fingerprints_match(incompatible, candidate))
+
+    def test_every_schedule_semantic_field_is_fingerprinted(self) -> None:
+        baseline = self.fingerprint()
+        for field in SCHEDULE_SEMANTIC_FIELDS:
+            changed = self.semantic_fixture()
+            changed[field] = self.changed_value(changed[field])
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    baseline["sha256"],
+                    self.fingerprint(schedule=[changed])["sha256"],
+                )
+
+    def test_every_completed_semantic_field_is_fingerprinted(self) -> None:
+        baseline = self.fingerprint()
+        for field in COMPLETED_SEMANTIC_FIELDS:
+            changed = self.completed_fixture()
+            changed[field] = self.changed_value(changed[field])
+            with self.subTest(field=field):
+                self.assertNotEqual(
+                    baseline["sha256"],
+                    self.fingerprint(completed=[changed])["sha256"],
+                )
+
     def test_delivery_schema_contract_accepts_live_primary_keys(self) -> None:
         cursor = SchemaCursor([
             ("fixture_delivery_schedule", ["release_id", "fixture_id"]),

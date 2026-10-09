@@ -10,6 +10,7 @@ never performs these historical scans during a request.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,48 @@ MONEYLINE_MARKETS = {
     "h2h",
 }
 MIN_FORM_SAMPLE = 5
+SEMANTIC_FINGERPRINT_VERSION = 1
+PROJECTION_ALGORITHM_VERSION = "fixture-delivery-v1"
+METRIC_WINDOWS = tuple(range(5, 16))
+METRIC_MODES = ("overall", "venue")
+METRIC_SEASON_SCOPES = ("all", "current")
+
+SCHEDULE_SEMANTIC_FIELDS = (
+    "id",
+    "starting_at",
+    "status",
+    "status_code",
+    "league_id",
+    "season_id",
+    "home_team_id",
+    "away_team_id",
+    "home_score",
+    "away_score",
+    "home_ht_score",
+    "away_ht_score",
+    "league_name",
+    "league_logo",
+    "home_team_name",
+    "home_team_short_code",
+    "home_team_image_path",
+    "away_team_name",
+    "away_team_short_code",
+    "away_team_image_path",
+)
+COMPLETED_SEMANTIC_FIELDS = (
+    "id",
+    "starting_at",
+    "status",
+    "status_code",
+    "league_id",
+    "season_id",
+    "home_team_id",
+    "away_team_id",
+    "home_score",
+    "away_score",
+    "home_ht_score",
+    "away_ht_score",
+)
 
 
 def as_float(value: Any) -> float | None:
@@ -63,6 +106,86 @@ def as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def canonical_semantic_value(value: Any) -> Any:
+    if isinstance(value, datetime):
+        aware = value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+        return aware.astimezone(UTC).isoformat(timespec="microseconds")
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): canonical_semantic_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [canonical_semantic_value(item) for item in value]
+    if isinstance(value, set):
+        return [canonical_semantic_value(item) for item in sorted(value, key=str)]
+    return value
+
+
+def semantic_projection_fingerprint(
+    schedule: list[dict[str, Any]],
+    completed: list[dict[str, Any]],
+    start: date,
+    end: date,
+    leagues: list[int],
+    *,
+    algorithm_version: str = PROJECTION_ALGORITHM_VERSION,
+) -> dict[str, Any]:
+    """Hash every stable input that can affect schedule, standings, or metrics."""
+    payload = {
+        "fingerprint_version": SEMANTIC_FINGERPRINT_VERSION,
+        "algorithm_version": algorithm_version,
+        "scope": {
+            "start_date": start,
+            "end_date": end,
+            "leagues": leagues,
+            "excluded_cups": sorted(EXCLUDED_CUPS),
+            "hidden_statuses": sorted(HIDDEN_STATUSES),
+            "finished_statuses": sorted(FINISHED_STATUSES),
+            "historical_score_statuses": sorted(HISTORICAL_SCORE_STATUSES),
+            "historical_score_grace_hours": 48,
+            "metric_windows": METRIC_WINDOWS,
+            "metric_modes": METRIC_MODES,
+            "metric_season_scopes": METRIC_SEASON_SCOPES,
+            "min_form_sample": MIN_FORM_SAMPLE,
+        },
+        "schedule": [
+            {field: row.get(field) for field in SCHEDULE_SEMANTIC_FIELDS}
+            for row in schedule
+        ],
+        "completed": [
+            {field: row.get(field) for field in COMPLETED_SEMANTIC_FIELDS}
+            for row in completed
+        ],
+    }
+    canonical = json.dumps(
+        canonical_semantic_value(payload),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return {
+        "version": SEMANTIC_FINGERPRINT_VERSION,
+        "algorithm_version": algorithm_version,
+        "sha256": hashlib.sha256(canonical).hexdigest(),
+        "schedule_rows": len(schedule),
+        "completed_rows": len(completed),
+        "requested_start": start.isoformat(),
+        "requested_end": end.isoformat(),
+    }
+
+
+def fingerprints_match(stored: Any, candidate: dict[str, Any]) -> bool:
+    if not isinstance(stored, dict):
+        return False
+    required = ("version", "algorithm_version", "sha256", "requested_start", "requested_end")
+    return all(stored.get(key) == candidate.get(key) for key in required)
 
 
 def iso_date(value: datetime | date) -> str:
@@ -328,6 +451,79 @@ def guarded_skip_report(report: dict[str, Any], reason: str, **extra: Any) -> di
     return report
 
 
+def current_publication_semantic_state(cur) -> tuple[str | None, dict[str, Any] | None]:
+    cur.execute(
+        """
+        select r.id, r.metadata
+          from public.fixture_delivery_current_publication p
+          join public.fixture_delivery_releases r on r.id = p.release_id
+         where p.publication_key = 'fixtures' and r.status = 'published'
+         limit 1
+        """
+    )
+    row = cur.fetchone()
+    if not row:
+        return None, None
+    metadata = row[1] if isinstance(row[1], dict) else {}
+    return str(row[0]), metadata.get("semantic_projection_fingerprint")
+
+
+def record_verified_noop(
+    cur,
+    release_id: str,
+    start: date,
+    end: date,
+    source_rows: int,
+    completed_rows: int,
+    fingerprint: dict[str, Any],
+    report: dict[str, Any],
+) -> None:
+    """Record fresh verification evidence without rewriting projection rows."""
+    component_reads = {
+        "schedule": source_rows,
+        "standings": completed_rows,
+        "metrics": completed_rows,
+        "odds": 0,
+    }
+    for component in DELIVERY_COMPONENTS:
+        run_id = start_run(cur, component, start, end, release_id)
+        stats = {
+            "rows_read": component_reads[component],
+            "rows_written": 0,
+            "semantic_noop": True,
+            "projection_reused": True,
+            "odds_managed_by": "root-1a-targeted-reconciliation" if component == "odds" else None,
+            "semantic_projection_fingerprint": fingerprint,
+        }
+        finish_run(cur, run_id, "succeeded", stats)
+        report["components"][component] = stats
+
+    cur.execute(
+        """
+        update public.fixture_delivery_releases
+           set health_checked_at = now(),
+               metadata = coalesce(metadata, '{}'::jsonb) || %s::jsonb
+         where id = %s and status = 'published'
+        """,
+        (
+            json.dumps({
+                "semantic_projection_fingerprint": fingerprint,
+                "last_semantic_noop_verified_at": datetime.now(UTC).isoformat(),
+            }),
+            release_id,
+        ),
+    )
+    if cur.rowcount != 1:
+        raise RuntimeError(f"current fixture delivery release {release_id} is not published")
+    report.update({
+        "release_id": release_id,
+        "published": False,
+        "verified_noop": True,
+        "projection_rows_written": 0,
+        "semantic_projection_fingerprint": fingerprint,
+    })
+
+
 def validate_release_components(
     cur,
     release_id: str,
@@ -444,7 +640,7 @@ def validate_metric_identity_set(
     fixture_ids = {int(value) for value in schedule_fixture_ids}
     rows = list(metric_rows)
     has_scope = any("season_scope" in row for row in rows)
-    scopes: tuple[str | None, ...] = ("all", "current") if has_scope else (None,)
+    scopes: tuple[str | None, ...] = METRIC_SEASON_SCOPES if has_scope else (None,)
     expected = {
         (
             fixture_id,
@@ -456,8 +652,8 @@ def validate_metric_identity_set(
         )
         for fixture_id in fixture_ids
         for side in ("home", "away")
-        for window in range(5, 16)
-        for mode in ("overall", "venue")
+        for window in METRIC_WINDOWS
+        for mode in METRIC_MODES
         for season_scope in scopes
     }
     actual = {
@@ -524,6 +720,7 @@ def publish_release(
     release_id: str,
     counts: dict[str, int],
     source_watermark: datetime | None,
+    semantic_fingerprint: dict[str, Any] | None = None,
 ) -> None:
     """Switch the sole customer-visible pointer inside the caller's transaction."""
     cur.execute(
@@ -534,7 +731,8 @@ def publish_release(
                pin_expires_at = now() + interval '2 hours',
                source_watermark = %s,
                schedule_rows = %s, standings_rows = %s,
-               metrics_rows = %s, odds_rows = %s
+               metrics_rows = %s, odds_rows = %s,
+               metadata = coalesce(metadata, '{}'::jsonb) || %s::jsonb
          where id = %s and status = 'building'
         """,
         (
@@ -543,6 +741,8 @@ def publish_release(
             counts.get("standings", 0),
             counts.get("metrics", 0),
             counts.get("odds", 0),
+            json.dumps({"semantic_projection_fingerprint": semantic_fingerprint})
+            if semantic_fingerprint is not None else "{}",
             release_id,
         ),
     )
@@ -566,6 +766,7 @@ def finalize_release(
     counts: dict[str, int],
     source_watermark: datetime | None,
     report: dict[str, Any],
+    semantic_fingerprint: dict[str, Any] | None = None,
 ) -> None:
     """Publish durably before best-effort retention cleanup.
 
@@ -573,9 +774,11 @@ def finalize_release(
     publication transaction. A large expired release must never roll back a
     fully validated replacement and leave the website pinned to stale data.
     """
-    publish_release(cur, release_id, counts, source_watermark)
+    publish_release(cur, release_id, counts, source_watermark, semantic_fingerprint)
     report["release_id"] = release_id
     report["published"] = True
+    if semantic_fingerprint is not None:
+        report["semantic_projection_fingerprint"] = semantic_fingerprint
     conn.commit()
 
     try:
@@ -1049,8 +1252,8 @@ def write_metrics(
         "venue_complete": 0,
         "venue_empty_overall_available": 0,
     }
-    for season_scope in ("all", "current"):
-        for mode in ("overall", "venue"):
+    for season_scope in METRIC_SEASON_SCOPES:
+        for mode in METRIC_MODES:
             for status in ("none", "partial", "complete"):
                 coverage[f"{season_scope}_{mode}_{status}"] = 0
         coverage[f"{season_scope}_venue_empty_overall_available"] = 0
@@ -1072,7 +1275,7 @@ def write_metrics(
                 prior = history_rows_for_fixture(
                     history.get(history_key, []) if history_key is not None else [], fixture, now
                 )
-                for window in range(5, 16):
+                for window in METRIC_WINDOWS:
                     samples: dict[str, int] = {}
                     for mode, venue in (("overall", None), ("venue", side)):
                         metrics, max_source = calculate_metrics(prior, team_id, window, venue)
@@ -1191,7 +1394,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         return report
 
     conn = connection()
-    conn.autocommit = False
+    conn.set_session(isolation_level="REPEATABLE READ", readonly=False, autocommit=False)
     release_id: str | None = None
     try:
         if args.skip_if_publication_active:
@@ -1211,17 +1414,49 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         with conn.cursor() as cur:
             validate_delivery_schema(cur)
+            lock_refresh_publication(cur)
+            source = source_fixtures(cur, start, end, leagues)
+            validate_source_fixture_identity(source)
+            valid_schedule = [
+                row
+                for row in source
+                if row["league_id"] not in EXCLUDED_CUPS and not is_hidden(row)
+            ]
+            completed = all_completed_fixtures(cur, leagues)
+            semantic_fingerprint = semantic_projection_fingerprint(
+                valid_schedule,
+                completed,
+                start,
+                end,
+                leagues,
+            )
+            report["semantic_projection_fingerprint"] = semantic_fingerprint
+            current_release_id, stored_fingerprint = current_publication_semantic_state(cur)
+            if current_release_id and fingerprints_match(stored_fingerprint, semantic_fingerprint):
+                record_verified_noop(
+                    cur,
+                    current_release_id,
+                    start,
+                    end,
+                    len(source),
+                    len(completed),
+                    semantic_fingerprint,
+                    report,
+                )
+                conn.commit()
+                return report
+
+            # A missing, incompatible, or changed fingerprint preserves the
+            # complete atomic publication path.
             release_id = create_release(cur, start, end)
         # Keep the build marker durable so a failed build can be marked failed
-        # after its data transaction is rolled back.
+        # after its data transaction is rolled back. The source rows above stay
+        # in memory and came from one repeatable-read snapshot.
         conn.commit()
 
         with conn.cursor() as cur:
             lock_refresh_publication(cur)
             schedule_run = start_run(cur, "schedule", start, end, release_id)
-            source = source_fixtures(cur, start, end, leagues)
-            validate_source_fixture_identity(source)
-            valid_schedule = [row for row in source if row["league_id"] not in EXCLUDED_CUPS and not is_hidden(row)]
             rejected_cups = sum(row["league_id"] in EXCLUDED_CUPS for row in source)
             schedule_written = upsert_schedule(cur, valid_schedule, start, end, release_id)
             validate_schedule_projection(cur, valid_schedule, release_id)
@@ -1232,7 +1467,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             })
             report["components"]["schedule"] = {"rows_read": len(source), "rows_written": schedule_written, "rejected_cup_rows": rejected_cups}
 
-            completed = all_completed_fixtures(cur, leagues)
             standings = compute_standings(completed)
             standings_run = start_run(cur, "standings", start, end, release_id)
             standings_written = write_standings(cur, standings, completed, release_id)
@@ -1265,7 +1499,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 standings,
             )
             source_watermark = max((row["starting_at"] for row in source), default=None)
-            finalize_release(conn, cur, release_id, counts, source_watermark, report)
+            finalize_release(
+                conn,
+                cur,
+                release_id,
+                counts,
+                source_watermark,
+                report,
+                semantic_fingerprint,
+            )
     except Exception as error:
         conn.rollback()
         if release_id is not None:

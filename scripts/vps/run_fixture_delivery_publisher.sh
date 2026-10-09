@@ -53,7 +53,14 @@ with open(sys.argv[1], "w", encoding="utf-8") as fh:
 PY
   publisher_status=2
 else
-  python scripts/fixture_delivery_dirty_state.py attempt >/tmp/fixture_delivery_dirty_attempt.json || true
+  python scripts/fixture_delivery_dirty_state.py attempt >/tmp/fixture_delivery_dirty_attempt.json
+  dirty_revision="$(python3 - <<'PY'
+import json
+with open('/tmp/fixture_delivery_dirty_attempt.json', encoding='utf-8') as handle:
+    payload = json.load(handle)
+print(int(payload['state']['revision']))
+PY
+)"
   if timeout --signal=TERM --kill-after=5s "${FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS}" \
     python scripts/refresh_fixture_delivery.py \
       --start-date "$(TZ=Europe/London date -d "-${FIXTURE_DELIVERY_DAYS_BACK} days" +%F)" \
@@ -62,7 +69,9 @@ else
       --report-out "${PIPELINE_EVIDENCE_FILE}" \
       --skip-if-publication-active \
       --min-publish-interval-seconds "${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS}"; then
-    python scripts/fixture_delivery_dirty_state.py clear >/tmp/fixture_delivery_dirty_clear.json
+    python scripts/fixture_delivery_dirty_state.py clear \
+      --expected-revision "${dirty_revision}" \
+      >/tmp/fixture_delivery_dirty_clear.json
     publisher_status=0
   else
     publisher_status=$?

@@ -102,8 +102,10 @@ def fixture_delivery_relevant_change(reconcile: dict[str, Any], export: dict[str
 def mark(path: Path, reason: str, source: str, metadata: dict[str, Any]) -> dict[str, Any]:
     previous = read_state(path)
     timestamp = now_iso()
+    previous_revision = int(previous.get("revision", previous.get("mark_count", 0))) if previous else 0
     payload = {
         "dirty": True,
+        "revision": previous_revision + 1,
         "first_marked_at": previous.get("first_marked_at") if previous else timestamp,
         "last_marked_at": timestamp,
         "mark_count": int(previous.get("mark_count", 0)) + 1 if previous else 1,
@@ -123,6 +125,7 @@ def note_attempt(path: Path) -> dict[str, Any] | None:
     payload = read_state(path)
     if not payload:
         return None
+    payload.setdefault("revision", int(payload.get("mark_count", 1) or 1))
     payload["last_publish_attempt_at"] = now_iso()
     write_state(path, payload)
     return payload
@@ -172,8 +175,34 @@ def command_status(args: argparse.Namespace) -> int:
 def command_clear(args: argparse.Namespace) -> int:
     path = state_path(args.state_path)
     with locked(path):
+        payload = read_state(path)
+        observed_revision = (
+            int(payload.get("revision", payload.get("mark_count", 0)))
+            if payload else None
+        )
+        if (
+            payload
+            and args.expected_revision is not None
+            and observed_revision != args.expected_revision
+        ):
+            report = {
+                "dirty": True,
+                "cleared": False,
+                "reason": "revision_changed",
+                "expected_revision": args.expected_revision,
+                "observed_revision": observed_revision,
+                "state_path": str(path),
+            }
+            print(json.dumps(report, sort_keys=True))
+            return 0
         remove_state(path)
-    print(json.dumps({"dirty": False, "cleared": True, "state_path": str(path)}, sort_keys=True))
+    print(json.dumps({
+        "dirty": False,
+        "cleared": bool(payload),
+        "expected_revision": args.expected_revision,
+        "observed_revision": observed_revision,
+        "state_path": str(path),
+    }, sort_keys=True))
     return 0
 
 
@@ -209,6 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.set_defaults(func=command_status)
 
     clear = sub.add_parser("clear")
+    clear.add_argument("--expected-revision", type=int, default=None)
     clear.set_defaults(func=command_clear)
 
     attempt = sub.add_parser("attempt")
