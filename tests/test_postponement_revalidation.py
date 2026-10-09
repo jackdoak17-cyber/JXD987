@@ -4,6 +4,11 @@ import copy
 import concurrent.futures
 import json
 import multiprocessing
+import os
+import fcntl
+import signal
+import subprocess
+import selectors
 import sqlite3
 import socket
 import sys
@@ -15,6 +20,7 @@ import requests
 
 from scripts import postmatch_fixture_detail_delivery as delivery
 from scripts import reconcile_stats_provider_queue as queue
+from scripts import review_postponement_status as checker
 
 
 NOW = datetime(2026, 10, 9, 16, tzinfo=timezone.utc)
@@ -203,7 +209,7 @@ def run_read_only(monkeypatch, tmp_path, evidence, *, repeats=1, extra_flags=())
                  "activate_provider_snapshot", "update_ledger",
                  "publish_delivery_status", "mark_provider_unavailable", "refresh_player_projection"):
         monkeypatch.setattr(delivery, name, forbidden(name))
-    monkeypatch.setattr(queue, "acquire_process_lock", forbidden("lock"))
+    monkeypatch.setattr(delivery, "acquire_postponement_lock", forbidden("lock"))
     class Target:
         def __enter__(self): return self
         def __exit__(self, *a): pass
@@ -228,7 +234,7 @@ def run_read_only(monkeypatch, tmp_path, evidence, *, repeats=1, extra_flags=())
     path.write_text(json.dumps([evidence]))
     monkeypatch.setattr(sys, "argv", ["delivery", "--postponement-status-evidence", str(path),
                                     *extra_flags])
-    results = [delivery.main() for _ in range(repeats)]
+    results = [checker.main() for _ in range(repeats)]
     assert state == before
     assert all(call == "SELECT" for call in calls)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["capture.json"]
@@ -260,8 +266,9 @@ def test_read_only_bad_evidence_fails_closed_without_mutation(monkeypatch, tmp_p
 
 
 def test_review_only_rejects_report_file_before_any_side_effect(monkeypatch, tmp_path):
-    with pytest.raises(SystemExit, match="report files"):
+    with pytest.raises(SystemExit) as rejected:
         run_read_only(monkeypatch, tmp_path, capture(), extra_flags=("--report-json", str(tmp_path / "report.json")))
+    assert rejected.value.code == 2
     assert not (tmp_path / "report.json").exists()
 
 
@@ -396,7 +403,8 @@ def run_observation(monkeypatch, tmp_path, payload, *, captures=None, budget=1, 
         connection.set_trace_callback(sql.append)
         return connection
     monkeypatch.setattr(delivery, "source_connection", source)
-    monkeypatch.setattr(queue, "acquire_process_lock", lambda: calls.append("lock") or 0)
+    monkeypatch.setattr(delivery, "acquire_postponement_lock", lambda: calls.append("lock") or
+                        os.open(tmp_path / "test.lock", os.O_CREAT | os.O_RDWR, 0o600))
     monkeypatch.setattr(delivery, "utc_now", lambda: NOW)
     class Target:
         def __enter__(self): return self
@@ -438,7 +446,7 @@ def run_observation(monkeypatch, tmp_path, payload, *, captures=None, budget=1, 
     evidence_file.write_text(json.dumps(captures))
     monkeypatch.setattr(sys, "argv", ["delivery", "--postponement-status-evidence", str(evidence_file),
                                     "--postponement-observe-status", "--postponement-provider-budget", str(budget)])
-    results = [delivery.main() for _ in range(repeats)]
+    results = [checker.main() for _ in range(repeats)]
     with sqlite3.connect(path) as check:
         tables = {row[0] for row in check.execute("select name from sqlite_master where type='table'")}
         rows = check.execute("select fixture_id,attempt,outcome,observation from fixture_postponement_reviews order by fixture_id").fetchall() if "fixture_postponement_reviews" in tables else []
@@ -538,7 +546,7 @@ def test_ineligible_active_input_cannot_claim_or_request(monkeypatch, tmp_path, 
         evidence["payload"]["state"] = {"short_name": {"unknown": "UNKNOWN", "postponed": "POST", "cancelled": "CANC", "abandoned": "ABAN"}[case]}
     evidence["payload_sha256"] = delivery.provider_payload_hash(evidence["payload"])
     _, calls, rows, state = run_observation(monkeypatch, tmp_path, full_detail(), captures=[evidence])
-    assert "mock_HTTP" not in calls and rows == [] and state["quarantines"][19745046] == quarantine()
+    assert calls == [] and rows == [] and state["quarantines"][19745046] == quarantine()
     report = json.loads(capsys.readouterr().out)
     assert report["postponement_revalidation"]["rejections"] and not report["postponement_revalidation"]["observations"]
 
@@ -569,15 +577,158 @@ def test_observation_busy_lock_prevents_claim_or_request(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["delivery", "--postponement-status-evidence", str(evidence),
         "--postponement-observe-status", "--postponement-provider-budget", "1"])
     monkeypatch.setenv("SUPABASE_DB_URL_SESSION", "offline")
-    monkeypatch.setattr(queue, "acquire_process_lock", lambda: None)
+    monkeypatch.setattr(delivery, "acquire_postponement_lock", lambda: None)
     monkeypatch.setattr(delivery, "source_connection", lambda: pytest.fail("Unexpected source access"))
-    with pytest.raises(SystemExit, match="lock is busy"): delivery.main()
+    with pytest.raises(SystemExit, match="lock is busy"): checker.main()
 
 
 def test_feature_disabled_by_default():
     args = delivery.build_parser().parse_args([])
     assert args.postponement_status_evidence is None and args.postponement_provider_budget == 0
     assert not args.postponement_observe_status and not args.postponement_publish_details
+
+
+@pytest.mark.parametrize("flags", [
+    ["--postponement-status-evidence="],
+    ["--postponement-status-evidence", "   "],
+    ["--postponement-status-evidence", "missing-file"],
+    ["--postponement-status-evidence", "{malformed}"],
+    [], ["--postponement-observe-status"],
+    ["--postponement-status-evidence", "unused", "--force"],
+    ["--postponement-status-evidence", "unused", "--postponement-publish-details"],
+    ["--postponement-status-evidence", "unused", "--postponement-provider-budget", "1"],
+    ["--postponement-status-evidence", "unused", "--postponement-observe-status", "--postponement-provider-budget", "0"],
+    ["--postponement-status-evidence", "unused", "--postponement-observe-status", "--postponement-provider-budget", "4"],
+    ["--postponement-status-evidence", "unused", "--execution-seconds", "121"],
+])
+def test_dedicated_invalid_command_rejects_before_all_access(monkeypatch, tmp_path, flags):
+    if "{malformed}" in flags:
+        path = tmp_path / "malformed.json"
+        path.write_text("{malformed}")
+        flags = [str(path) if arg == "{malformed}" else arg for arg in flags]
+    deny = lambda *a, **kw: pytest.fail("Invalid invocation reached a side-effect boundary")
+    for name in ("source_connection", "ensure_ledger", "acquire_postponement_lock", "SportMonksClient"):
+        monkeypatch.setattr(delivery, name, deny)
+    monkeypatch.setattr(delivery.psycopg2, "connect", deny)
+    monkeypatch.setenv("SUPABASE_DB_URL_SESSION", "offline")
+    monkeypatch.setattr(sys, "argv", ["status", *flags])
+    try:
+        assert checker.main() != 0
+    except SystemExit as exc:
+        assert exc.code != 0
+
+
+@pytest.mark.parametrize("flag", ["--postponement-status-evidence=", "--postponement-provider-budget=0",
+                                  "--postponement-publish-details", "--postponement-observe-status"])
+def test_ingestion_rejects_status_arguments_before_write_path(monkeypatch, flag):
+    monkeypatch.setattr(sys, "argv", ["delivery", flag, "--leagues", "567"])
+    monkeypatch.setattr(delivery, "source_connection", lambda: pytest.fail("Ordinary write path reached"))
+    with pytest.raises(SystemExit, match="status-only"):
+        delivery.main()
+
+
+def test_normal_ingestion_entry_is_unchanged(monkeypatch):
+    class OrdinaryPath(Exception): pass
+    def source(): raise OrdinaryPath()
+    monkeypatch.setattr(sys, "argv", ["delivery", "--leagues", "567"])
+    monkeypatch.setattr(delivery, "source_connection", source)
+    monkeypatch.setattr(delivery, "run_postponement_revalidation", lambda *a: pytest.fail("Wrong entry point"))
+    with pytest.raises(OrdinaryPath): delivery.main()
+
+
+def test_inherited_lock_observation_rejected_before_access(monkeypatch):
+    monkeypatch.setenv("STATS_RECONCILE_LOCK_HELD", "1")
+    monkeypatch.setattr(sys, "argv", ["status", "--postponement-status-evidence", "unused",
+        "--postponement-observe-status", "--postponement-provider-budget", "1"])
+    monkeypatch.setattr(delivery, "run_postponement_revalidation", lambda *a: pytest.fail("Worker reached"))
+    with pytest.raises(SystemExit) as rejected: checker.main()
+    assert rejected.value.code == 2
+
+
+HUNG_COMMAND = r'''
+import json, os, socket, sqlite3, sys, time
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from scripts import postmatch_fixture_detail_delivery as d
+from scripts import review_postponement_status as command
+deny=lambda *a,**kw: (_ for _ in ()).throw(AssertionError('Real network/publication forbidden'))
+socket.socket.connect=socket.create_connection=deny
+d.requests.request=deny
+for name in ('store_provider_detail','export_fixture','clear_provider_unavailable_exclusion',
+             'persist_provider_snapshot','activate_provider_snapshot','refresh_player_projection',
+             'publish_delivery_status','ensure_ledger','source_engine','update_ledger'):
+    setattr(d,name,deny)
+d.utc_now=lambda: datetime(2026,10,9,16,tzinfo=timezone.utc)
+stage=os.environ['HANG_STAGE']
+def hang():
+    print('HUNG',flush=True)
+    time.sleep(3600)
+class Target:
+    def __enter__(self): return self
+    def __exit__(self,*a): pass
+    def cursor(self): return self
+    def execute(self,sql,params):
+        assert sql.strip().lower().startswith('select')
+        if stage=='database': hang()
+    def fetchall(self):
+        return [(19745046,'provider_unavailable','2026-10-03T16:37:11Z',
+                 '2026-10-03T16:37:11Z',{'provider_status':'POSTPONED'},'postponed',
+                 '2026-10-10T16:37:11Z',758,238115)]
+def connect(*a,**kw):
+    assert kw['options']=='-c default_transaction_read_only=on'
+    return Target()
+d.psycopg2.connect=connect
+class Source(sqlite3.Connection):
+    def close(self):
+        if stage=='cleanup': hang()
+        super().close()
+def source():
+    if stage=='sqlite': hang()
+    return sqlite3.connect(os.environ['TEST_SPOOL'],factory=Source)
+d.source_connection=source
+d.SportMonksClient=lambda: SimpleNamespace(timeout=20,base_url='https://offline.invalid/',api_token='offline')
+def request(*a,**kw):
+    if stage=='provider': hang()
+    return SimpleNamespace(status_code=200,json=lambda:{'data':json.load(open(sys.argv[2]))[0]['payload']})
+d.requests.request=request
+if stage=='audit': d.finish_postponement_review=lambda *a,**kw: hang()
+raise SystemExit(command.main())
+'''
+
+
+@pytest.mark.parametrize("stage", ["database", "sqlite", "provider", "audit", "cleanup"])
+def test_actual_status_command_hard_kill_releases_lock_and_preserves_claim(tmp_path, stage):
+    evidence = tmp_path / "capture.json"
+    evidence.write_text(json.dumps([capture()]))
+    lock = tmp_path / "canonical.lock"
+    spool = tmp_path / "audit.sqlite"
+    env = {**os.environ, "SUPABASE_DB_URL_SESSION": "offline", "HANG_STAGE": stage,
+           "TEST_SPOOL": str(spool), "STATS_RECONCILE_LOCK_PATH": str(lock)}
+    env.pop("STATS_RECONCILE_LOCK_HELD", None)
+    args = [sys.executable, "-B", "-c", HUNG_COMMAND, "--postponement-status-evidence", str(evidence),
+            "--postponement-observe-status", "--postponement-provider-budget", "1", "--execution-seconds", "1"]
+    child = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            assert selector.select(timeout=5), "Worker did not reach hung operation"
+        assert child.stdout.readline().strip() == "HUNG"
+        fd = os.open(lock, os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError): fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            stdout, stderr = child.communicate(timeout=5)
+            assert child.returncode == -signal.SIGALRM, (stdout, stderr)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally: os.close(fd)
+        if stage in {"provider", "audit", "cleanup"}:
+            with sqlite3.connect(spool) as db:
+                assert db.execute("select attempt from fixture_postponement_reviews").fetchall() == [(1,)]
+                assert not delivery.claim_postponement_review(db, quarantine(), capture(), NOW)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.communicate(timeout=5)
 
 
 def claim_in_process(path, day):

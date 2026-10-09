@@ -15,6 +15,7 @@ that becomes available after a match finishes.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import logging
@@ -2379,9 +2380,29 @@ def observe_postponement_status(conn: sqlite3.Connection, captures: list[dict], 
         report["postponement_revalidation"]["observations"].append(observation)
 
 
+def acquire_postponement_lock() -> int | None:
+    """Own the canonical flock for this status operation, never an inherited lease."""
+    if os.environ.get("STATS_RECONCILE_LOCK_HELD") == "1":
+        raise SystemExit("Status observation requires its own canonical lock")
+    path = os.environ.get("STATS_RECONCILE_LOCK_PATH", "/var/lock/odds-sync.lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()}\n".encode())
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def run_postponement_revalidation(args: argparse.Namespace) -> int:
     """Both status modes return before ordinary detail-delivery orchestration."""
-    if not args.postponement_status_evidence or args.force or args.fixture_ids or args.batch_projection or args.report_json:
+    if (not isinstance(args.postponement_status_evidence, str) or not args.postponement_status_evidence.strip()
+            or args.force or args.fixture_ids or args.batch_projection or args.report_json):
         raise SystemExit("Status revalidation requires evidence; force, fixture IDs, projection and report files are prohibited")
     active = args.postponement_observe_status
     if (active and not 1 <= args.postponement_provider_budget <= 3) or (not active and args.postponement_provider_budget != 0):
@@ -2394,11 +2415,32 @@ def run_postponement_revalidation(args: argparse.Namespace) -> int:
                   "publication_authorized": False, "quarantine_modified": False, "detail_completeness": "not_assessed",
                   "observations": [], "rejections": []}}
     conn = None
+    lock_fd = None
     try:
-        captures = json.loads(Path(args.postponement_status_evidence).read_text(encoding="utf-8"))
+        path = Path(args.postponement_status_evidence)
+        if not path.is_file() or path.stat().st_size > 2_000_000:
+            raise ValueError("Evidence must be a regular JSON file of at most 2 MB")
+        captures = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(captures, list) or not 1 <= len(captures) <= 3
+                or any(not isinstance(item, dict) or not isinstance(item.get("payload"), dict)
+                       or type(item["payload"].get("id")) is not int or item["payload"]["id"] <= 0
+                       for item in captures)):
+            raise ValueError("Evidence requires 1-3 valid fixture captures")
+        for capture in captures:
+            payload = capture["payload"]
+            try:
+                status = revalidation_fixture_status(payload)
+                observed = datetime.fromisoformat(str(capture.get("observed_at")).replace("Z", "+00:00"))
+                if (capture.get("source") != "fixture_core_provider_response"
+                        or capture.get("payload_sha256") != provider_payload_hash(payload)
+                        or observed.tzinfo is None or not timedelta(0) <= utc_now() - observed <= timedelta(hours=24)
+                        or status not in FINISHED_STATUSES or len(_team_ids(payload)) != 2):
+                    raise ValueError("Stale, untrusted, non-final or malformed status evidence")
+            except (ProviderDetailIncompleteError, TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from None
         if active:
-            from scripts.reconcile_stats_provider_queue import acquire_process_lock
-            if acquire_process_lock() is None:
+            lock_fd = acquire_postponement_lock()
+            if lock_fd is None:
                 raise SystemExit("Canonical spool lock is busy; no status observation started")
             conn = source_connection()
             report["fixture_ids"] = select_postponement_reviews(conn, target_url, captures, args.postponement_provider_budget,
@@ -2415,10 +2457,15 @@ def run_postponement_revalidation(args: argparse.Namespace) -> int:
             report["status"] = "status_observations_recorded_locally"
     except (ValueError, OSError) as exc:
         report["failed"].append({"stage": "postponement_status_review", "error": str(exc)})
+        report["postponement_revalidation"]["rejections"].append({"reason": str(exc)})
         report["status"] = "status_evidence_rejected"
     finally:
-        if conn is not None:
-            conn.close()
+        try:
+            if conn is not None:
+                conn.close()
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
     print(json.dumps(report, default=str))
     return 1 if report["failed"] else 0
 
@@ -2435,11 +2482,9 @@ def default_leagues() -> list[int]:
 
 
 def main() -> int:
+    if any(arg.startswith("--postponement-") for arg in sys.argv[1:]):
+        raise SystemExit("Revalidation is status-only; use python -m scripts.review_postponement_status")
     args = build_parser().parse_args()
-    if args.postponement_publish_details:
-        raise SystemExit("Postponement detail publication has been withdrawn; no publication is permitted")
-    if args.postponement_status_evidence or args.postponement_observe_status or args.postponement_provider_budget:
-        return run_postponement_revalidation(args)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     leagues = parse_csv_ints(args.leagues) if args.leagues else default_leagues()
     explicit_ids = parse_csv_ints(args.fixture_ids)
