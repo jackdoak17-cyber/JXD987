@@ -2222,11 +2222,12 @@ def select_postponement_reviews(conn: sqlite3.Connection, target_url: str, captu
         with target.cursor() as cur:
             cur.execute("""select x.fixture_id, x.exclusion_type, x.first_identified_at,
                 x.last_checked_at, x.evidence, x.reason, x.next_review_at,
-                f.home_team_id, f.away_team_id
+                f.home_team_id, f.away_team_id,
+                (select count(*) from public.fixture_players fp where fp.fixture_id = x.fixture_id)
                 from public.fixture_stats_quality_exclusions x join public.fixtures f on f.id = x.fixture_id
                 where x.fixture_id = any(%s)""", (ids,))
             exclusions = {int(row[0]): dict(zip(
-                ("fixture_id", "exclusion_type", "first_identified_at", "last_checked_at", "evidence", "reason", "next_review_at", "home_team_id", "away_team_id"), row))
+                ("fixture_id", "exclusion_type", "first_identified_at", "last_checked_at", "evidence", "reason", "next_review_at", "home_team_id", "away_team_id", "target_lineup_count"), row))
                 for row in cur.fetchall()}
     selected = []
     now = utc_now()
@@ -2272,6 +2273,35 @@ def postponement_provider_request(client: SportMonksClient, method: str, endpoin
     if response.status_code != 200:
         raise RuntimeError(f"Postponement provider returned HTTP {response.status_code}; reserved attempt consumed")
     return response.json()
+
+
+def review_postponement_status_only(conn: sqlite3.Connection, target_url: str, captures: list[dict], report: dict) -> None:
+    """Keep provider-review approval separate from delivery/data-repair approval."""
+    client = SportMonksClient()
+    client.max_retries = client.rate_limit_retries = 1
+    client.timeout = min(client.timeout, 20)
+    report["postponement_revalidation"]["observations"] = []
+    for fixture_id in report["fixture_ids"]:
+        outcome = "blocked_or_failed"
+        try:
+            report["provider_calls"] += 1
+            payload = postponement_provider_request(client, "GET", f"fixtures/{fixture_id}",
+                {"include": "participants;scores;state;statistics;statistics.type;lineups.details;lineups.player"})
+            data = payload.get("data") if isinstance(payload, dict) else None
+            status_capture = next(capture["payload"] for capture in captures if capture["payload"]["id"] == fixture_id)
+            if not isinstance(data, dict) or data.get("id") != fixture_id or set(_team_ids(data)) != set(_team_ids(status_capture)):
+                raise ProviderDetailIncompleteError("Provider review identity differs from approved evidence")
+            assessment = assess_provider_payload(data)
+            snapshot_id = persist_provider_snapshot(target_url, fixture_id, _int(data.get("league_id")),
+                _int(data.get("season_id")), data, assessment, provider_payload_hash(data), normalized_provider_hash(data))
+            report["postponement_revalidation"]["observations"].append(
+                {"fixture_id": fixture_id, "snapshot_id": snapshot_id, "assessment": asdict(assessment),
+                 "requires_separate_data_repair_approval": True})
+            outcome = "reviewed_without_delivery"
+        except Exception as exc:
+            report["failed"].append({"fixture_id": fixture_id, "stage": "postponement_status_review", "error": str(exc)})
+        finally:
+            finish_postponement_review(conn, fixture_id, outcome)
 
 
 def default_leagues() -> list[int]:
@@ -2349,7 +2379,7 @@ def main() -> int:
     if postponement_review:
         report["postponement_revalidation"] = {"approved_provider_budget": args.postponement_provider_budget,
             "maximum_attempts_per_exclusion": 3, "minimum_retry_hours": 24,
-            "detail_publication_approved": args.postponement_publish_details, "detail_candidates": []}
+            "detail_publication_approved": args.postponement_publish_details}
     if not fixture_ids:
         report["status"] = "idle"
         if args.report_json:
@@ -2357,6 +2387,15 @@ def main() -> int:
         print(json.dumps(report))
         conn.close()
         return 0
+
+    if postponement_review and not args.postponement_publish_details:
+        review_postponement_status_only(conn, target_url, captures, report)
+        report["status"] = "failed" if report["failed"] else "reviewed_without_delivery"
+        if args.report_json:
+            Path(args.report_json).write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        print(json.dumps(report, default=str))
+        conn.close()
+        return 1 if report["failed"] else 0
 
     # Use an explicit SQLite engine so the sync session and the exporter read
     # the same source database even when JXD_DB_URL is configured for a
@@ -2397,6 +2436,15 @@ def main() -> int:
             prior_player_count = max(prior_player_count, target_meta[4])
         prior_normalized_hash = str(prior[2]) if prior and prior[2] else None
         prior_stable_count = int(prior[3] or 0) if prior else 0
+        prior_lineup_count = 0
+        if postponement_review:
+            # Quarantined fixtures may already have richer unpublished local facts.
+            local = source_snapshot(conn, fixture_id)
+            prior_team_count = max(prior_team_count, sum(int(key.rsplit(":", 1)[1]) not in DERIVED_STAT_TYPE_IDS for key in local.team_stat_values))
+            prior_player_count = max(prior_player_count, sum(int(key.rsplit(":", 1)[1]) not in DERIVED_STAT_TYPE_IDS for key in local.player_stat_values))
+            original = json.loads(conn.execute("""select original_exclusion from fixture_postponement_reviews
+                where fixture_id = ? and outcome = 'claimed' order by claimed_at desc, rowid desc limit 1""", (fixture_id,)).fetchone()[0])
+            prior_lineup_count = max(local.lineup_count, int(original.get("target_lineup_count", 0)))
         attempt = ledger_attempt_start(conn, fixture_id, utc_now(), league_id, season_id)
         assessment: ProviderAssessment | None = None
         snapshot_id: int | None = None
@@ -2526,6 +2574,7 @@ def main() -> int:
             candidate_shrank = (
                 (prior_team_count > 0 and assessment.team_stat_count < prior_team_count)
                 or (prior_player_count > 0 and assessment.player_stat_count < prior_player_count)
+                or (postponement_review and assessment.lineup_count < prior_lineup_count)
             )
             if (
                 not args.force
@@ -2554,12 +2603,6 @@ def main() -> int:
                     stable_fetch_count=stable_fetch_count,
                 )
                 report["provider_pending"].append({"fixture_id": fixture_id, "next_attempt_at": next_at, "reason": message})
-                continue
-
-            if postponement_review and not args.postponement_publish_details:
-                report["postponement_revalidation"]["detail_candidates"].append(
-                    {"fixture_id": fixture_id, "snapshot_id": snapshot_id,
-                     "assessment": asdict(assessment), "requires_separate_data_repair_approval": True})
                 continue
 
             source = store_provider_detail(engine, client, fixture_id, data, assessment)
@@ -2671,8 +2714,7 @@ def main() -> int:
         finally:
             if postponement_review:
                 successful = any(item.get("fixture_id") == fixture_id for item in report["verified"] + report["provider_sparse"])
-                candidate = any(item.get("fixture_id") == fixture_id for item in report["postponement_revalidation"]["detail_candidates"])
-                finish_postponement_review(conn, fixture_id, "verified" if successful else "awaiting_data_repair_approval" if candidate else "blocked_or_failed")
+                finish_postponement_review(conn, fixture_id, "verified" if successful else "blocked_or_failed")
             try:
                 publish_delivery_status(target_url, conn, fixture_id)
             except Exception as status_exc:

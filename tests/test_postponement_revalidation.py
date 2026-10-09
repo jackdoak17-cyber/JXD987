@@ -121,11 +121,19 @@ def full_detail(status="FT"):
     return payload
 
 
-def run_main(monkeypatch, tmp_path, payload, *, export_failure=False, parity_failure=False, store_failure=False, publish=True):
+def run_main(monkeypatch, tmp_path, payload, *, export_failure=False, parity_failure=False, store_failure=False, publish=True,
+             local_stats=0, local_lineups=0):
     events = []
     db = sqlite3.connect(":memory:")
     db.execute("create table fixtures(id integer, league_id integer, season_id integer, starting_at text)")
     db.execute("insert into fixtures values(19745046,567,28479,'2026-10-04 19:00:00')")
+    db.execute("create table fixture_statistics(fixture_id integer,team_id integer,type_id integer,value numeric)")
+    db.execute("create table fixture_player_statistics(fixture_id integer,player_id integer,team_id integer,type_id integer,value numeric)")
+    db.execute("create table fixture_players(fixture_id integer,player_id integer,team_id integer,is_starter integer,minutes_played integer)")
+    for player in range(local_stats):
+        db.execute("insert into fixture_player_statistics values(19745046,?,758,42,1)", (player + 1,))
+    for player in range(local_lineups):
+        db.execute("insert into fixture_players values(19745046,?,758,1,90)", (player + 1,))
     delivery.ensure_ledger(db)
     assert delivery.claim_postponement_review(db, quarantine(), capture(), NOW)
     monkeypatch.setattr(delivery, "utc_now", lambda: NOW)
@@ -200,10 +208,23 @@ def test_complete_review_uses_existing_checks_before_clearing(monkeypatch, tmp_p
     assert events.index("clear") < events.index("activate")
 
 
+@pytest.mark.parametrize("baseline", [{"local_stats": 10}, {"local_lineups": 3}])
+def test_richer_unpublished_local_facts_require_shrink_confirmation(monkeypatch, tmp_path, baseline):
+    _, events = run_main(monkeypatch, tmp_path, full_detail(), **baseline)
+    assert "snapshot" in events and "store" not in events and "export" not in events and "clear" not in events
+
+
 def test_provider_review_alone_cannot_authorize_data_repair(monkeypatch, tmp_path):
     result, events = run_main(monkeypatch, tmp_path, full_detail(), publish=False)
     assert result == 0 and events.count("request") == 1 and "snapshot" in events
-    assert not {"store", "export", "clear", "activate", "projection"}.intersection(events)
+    assert not {"store", "export", "clear", "activate", "projection", "ledger", "quarantine"}.intersection(events)
+
+
+@pytest.mark.parametrize("payload", [full_detail("POST"), full_detail("CANC"), capture()["payload"], TimeoutError("offline")])
+def test_review_only_does_not_mutate_delivery_state_even_on_failure(monkeypatch, tmp_path, payload):
+    _, events = run_main(monkeypatch, tmp_path, copy.deepcopy(payload), publish=False)
+    assert events.count("request") == 1
+    assert not {"store", "export", "clear", "activate", "projection", "ledger", "quarantine"}.intersection(events)
 
 
 def test_busy_canonical_lock_stops_before_database_or_provider(monkeypatch):
