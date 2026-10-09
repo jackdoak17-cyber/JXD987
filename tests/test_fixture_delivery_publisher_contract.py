@@ -16,6 +16,8 @@ class FixtureDeliveryPublisherContractTests(unittest.TestCase):
         self.assertIn("/var/lib/oddssearch/fixture-delivery/dirty-state.json", source)
         self.assertIn("fixture_delivery_dirty_state.py status", source)
         self.assertIn("fixture_delivery_dirty_state.py clear", source)
+        self.assertIn("--expected-revision", source)
+        self.assertIn("payload['state']['revision']", source)
         self.assertIn("fixture_delivery_dirty_state.py failure", source)
         self.assertIn("refresh_fixture_delivery.py", source)
         self.assertIn('cd "${REPO_ROOT}"', source)
@@ -35,6 +37,10 @@ class FixtureDeliveryPublisherContractTests(unittest.TestCase):
         self.assertIn("validate_release_components", source)
         self.assertIn("finalize_release", source)
         self.assertIn("return 2", source)
+        self.assertIn('isolation_level="REPEATABLE READ"', source)
+        self.assertIn("semantic_projection_fingerprint", source)
+        self.assertIn("record_verified_noop", source)
+        self.assertIn("semantic_noop", source)
 
     def test_runtime_manifest_includes_guarded_publisher_files(self) -> None:
         entries = {

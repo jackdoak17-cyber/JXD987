@@ -10,6 +10,7 @@ from scripts.refresh_fixture_delivery import (
     finalize_release,
     iso_date,
     publish_release,
+    record_verified_noop,
 )
 
 
@@ -17,6 +18,41 @@ UTC = timezone.utc
 
 
 class FixtureDeliveryReleaseContractTests(unittest.TestCase):
+    def test_verified_noop_writes_health_evidence_but_no_projection_rows(self) -> None:
+        cursor = Mock()
+        cursor.fetchone.return_value = ("run-id",)
+        cursor.rowcount = 1
+        report = {"components": {}}
+        fingerprint = {
+            "version": 1,
+            "algorithm_version": "fixture-delivery-v1",
+            "sha256": "abc",
+            "requested_start": "2026-10-07",
+            "requested_end": "2026-11-21",
+        }
+
+        record_verified_noop(
+            cursor,
+            "00000000-0000-4000-8000-000000000001",
+            datetime(2026, 10, 7, tzinfo=UTC).date(),
+            datetime(2026, 11, 21, tzinfo=UTC).date(),
+            1232,
+            19000,
+            fingerprint,
+            report,
+        )
+
+        queries = "\n".join(str(call.args[0]) for call in cursor.execute.call_args_list)
+        self.assertNotIn("insert into public.fixture_delivery_schedule", queries)
+        self.assertNotIn("insert into public.fixture_delivery_standings", queries)
+        self.assertNotIn("insert into public.fixture_delivery_metrics", queries)
+        self.assertNotIn("insert into public.fixture_delivery_odds", queries)
+        self.assertIn("fixture_delivery_refresh_runs", queries)
+        self.assertIn("health_checked_at = now()", queries)
+        self.assertTrue(report["verified_noop"])
+        self.assertEqual(report["projection_rows_written"], 0)
+        self.assertTrue(all(component["rows_written"] == 0 for component in report["components"].values()))
+
     def test_publish_release_switches_pointer_only_after_build_is_marked_published(self) -> None:
         cursor = Mock()
         cursor.rowcount = 1
