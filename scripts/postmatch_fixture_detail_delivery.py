@@ -1390,6 +1390,7 @@ def persist_provider_snapshot(
     payload_hash: str,
     normalized_hash: str,
     target_conn: Any | None = None,
+    preserve_accepted: bool = False,
 ) -> int:
     """Persist every successful provider response before active facts publish."""
     owns_target_conn = target_conn is None
@@ -1416,6 +1417,7 @@ def persist_provider_snapshot(
                   release_id = excluded.release_id,
                   error = excluded.error,
                   last_seen_at = now()
+                where not (%s and fixture_detail_snapshots.quality_status = 'accepted')
                 returning id
                 """,
                 (
@@ -1429,9 +1431,14 @@ def persist_provider_snapshot(
                     json_text(data),
                     release_id(),
                     assessment.error,
+                    preserve_accepted,
                 ),
             )
             row = cur.fetchone()
+            if not row and preserve_accepted:
+                cur.execute("select id from public.fixture_detail_snapshots where fixture_id = %s and payload_hash = %s",
+                            (fixture_id, payload_hash))
+                row = cur.fetchone()
             if not row:
                 raise RuntimeError(f"Provider snapshot was not persisted for fixture {fixture_id}")
             snapshot_id = int(row[0])
@@ -2148,7 +2155,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-fail-on-sla-breach", action="store_true")
     parser.add_argument("--postponement-status-evidence", default=None,
-                        help="Explicitly approved independent provider-status capture JSON; disables normal queue selection.")
+                        help="Independent provider-status capture JSON; defaults to non-mutating offline evaluation.")
     parser.add_argument("--postponement-provider-budget", type=int, default=0,
                         help="Approved single-attempt provider requests for this isolated run (1-3; default disabled).")
     parser.add_argument("--postponement-publish-details", action="store_true",
@@ -2157,8 +2164,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def revalidation_fixture_status(payload: dict) -> str:
+    """Reject conflicting status families only in the opt-in revalidation path."""
+    state = payload.get("state") or {}
+    if not isinstance(state, dict):
+        raise ProviderDetailIncompleteError("Malformed revalidation fixture state")
+    values = [state.get(key) for key in ("developer_name", "state", "short_name")]
+    values += [payload.get(key) for key in ("status", "status_code")]
+    statuses = []
+    for value in values:
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ProviderDetailIncompleteError("Malformed revalidation fixture status")
+        statuses.append(value.strip().upper())
+    if not statuses:
+        raise ProviderDetailIncompleteError("Missing revalidation fixture status")
+    aliases = {"POST": "POSTPONED", "CANC": "CANCELLED", "CANCELED": "CANCELLED",
+               "ABAN": "ABANDONED"}
+    families = {"FINAL" if value in FINISHED_STATUSES else aliases.get(value, value) for value in statuses}
+    if len(families) != 1:
+        raise ProviderDetailIncompleteError(f"Contradictory revalidation fixture statuses: {', '.join(statuses)}")
+    return statuses[0]
+
+
 def postponement_review_eligible(exclusion: dict, evidence: dict, now: datetime) -> bool:
     """Status evidence permits a review, never publication or quarantine removal."""
+    if not isinstance(evidence, dict) or not isinstance(exclusion, dict):
+        return False
     payload = evidence.get("payload")
     if not isinstance(payload, dict) or evidence.get("source") != "fixture_core_provider_response":
         return False
@@ -2167,6 +2200,11 @@ def postponement_review_eligible(exclusion: dict, evidence: dict, now: datetime)
         return False
     excluded_at = parse_iso(exclusion.get("last_checked_at"))
     old_status = (exclusion.get("evidence") or {}).get("provider_status")
+    try:
+        status = revalidation_fixture_status(payload)
+    except ProviderDetailIncompleteError as exc:
+        LOG.warning("Postponement evidence rejected: %s", exc)
+        return False
     return bool(
         exclusion.get("exclusion_type") == "provider_unavailable"
         and old_status in {"POST", "POSTPONED"}
@@ -2174,7 +2212,7 @@ def postponement_review_eligible(exclusion: dict, evidence: dict, now: datetime)
         and evidence.get("payload_sha256") == provider_payload_hash(payload)
         and observed and excluded_at and excluded_at < observed <= now
         and now - observed <= timedelta(hours=24)
-        and _provider_status(payload) in FINISHED_STATUSES
+        and status in FINISHED_STATUSES
         and len(_team_ids(payload)) == 2
         and set(_team_ids(payload)) == {exclusion.get("home_team_id"), exclusion.get("away_team_id")}
     )
@@ -2212,13 +2250,15 @@ def claim_postponement_review(conn: sqlite3.Connection, exclusion: dict, evidenc
         raise
 
 
-def select_postponement_reviews(conn: sqlite3.Connection, target_url: str, captures: list[dict], budget: int) -> list[int]:
-    if not 1 <= budget <= 3 or not isinstance(captures, list) or len(captures) > 3:
-        raise ValueError("Postponement review requires 1-3 captures and an approved budget of 1-3")
-    ids = list(dict.fromkeys(int(capture["payload"]["id"]) for capture in captures))
-    if not ids:
-        return []
-    with psycopg2.connect(target_url, connect_timeout=20) as target:
+def postponement_exclusions(target_url: str, captures: list[dict]) -> dict[int, dict]:
+    if not isinstance(captures, list) or not 1 <= len(captures) <= 3:
+        raise ValueError("Postponement evidence requires 1-3 captures")
+    if any(not isinstance(capture, dict) or not isinstance(capture.get("payload"), dict)
+           or type(capture["payload"].get("id")) is not int or capture["payload"]["id"] <= 0 for capture in captures):
+        raise ValueError("Malformed postponement capture identity")
+    ids = list(dict.fromkeys(capture["payload"]["id"] for capture in captures))
+    with psycopg2.connect(target_url, connect_timeout=20,
+                          options="-c default_transaction_read_only=on") as target:
         with target.cursor() as cur:
             cur.execute("""select x.fixture_id, x.exclusion_type, x.first_identified_at,
                 x.last_checked_at, x.evidence, x.reason, x.next_review_at,
@@ -2226,9 +2266,15 @@ def select_postponement_reviews(conn: sqlite3.Connection, target_url: str, captu
                 (select count(*) from public.fixture_players fp where fp.fixture_id = x.fixture_id)
                 from public.fixture_stats_quality_exclusions x join public.fixtures f on f.id = x.fixture_id
                 where x.fixture_id = any(%s)""", (ids,))
-            exclusions = {int(row[0]): dict(zip(
+            return {int(row[0]): dict(zip(
                 ("fixture_id", "exclusion_type", "first_identified_at", "last_checked_at", "evidence", "reason", "next_review_at", "home_team_id", "away_team_id", "target_lineup_count"), row))
                 for row in cur.fetchall()}
+
+
+def select_postponement_reviews(conn: sqlite3.Connection, target_url: str, captures: list[dict], budget: int) -> list[int]:
+    if not 1 <= budget <= 3:
+        raise ValueError("Postponement review requires an approved budget of 1-3")
+    exclusions = postponement_exclusions(target_url, captures)
     selected = []
     now = utc_now()
     for capture in captures:
@@ -2276,32 +2322,21 @@ def postponement_provider_request(client: SportMonksClient, method: str, endpoin
 
 
 def review_postponement_status_only(conn: sqlite3.Connection, target_url: str, captures: list[dict], report: dict) -> None:
-    """Keep provider-review approval separate from delivery/data-repair approval."""
-    client = SportMonksClient()
-    client.max_retries = client.rate_limit_retries = 1
-    client.timeout = min(client.timeout, 20)
+    """Evaluate supplied evidence with SELECT-only access; never claim or fetch."""
+    exclusions = postponement_exclusions(target_url, captures)
     report["postponement_revalidation"]["observations"] = []
-    for fixture_id in report["fixture_ids"]:
-        outcome = "blocked_or_failed"
+    for capture in captures:
+        fixture_id = capture["payload"]["id"]
         try:
-            report["provider_calls"] += 1
-            payload = postponement_provider_request(client, "GET", f"fixtures/{fixture_id}",
-                {"include": "participants;scores;state;statistics;statistics.type;lineups.details;lineups.player"})
-            data = payload.get("data") if isinstance(payload, dict) else None
-            status_capture = next(capture["payload"] for capture in captures if capture["payload"]["id"] == fixture_id)
-            if not isinstance(data, dict) or data.get("id") != fixture_id or set(_team_ids(data)) != set(_team_ids(status_capture)):
-                raise ProviderDetailIncompleteError("Provider review identity differs from approved evidence")
-            assessment = assess_provider_payload(data)
-            snapshot_id = persist_provider_snapshot(target_url, fixture_id, _int(data.get("league_id")),
-                _int(data.get("season_id")), data, assessment, provider_payload_hash(data), normalized_provider_hash(data))
+            data = capture["payload"]
+            revalidation_fixture_status(data)
+            if not postponement_review_eligible(exclusions.get(fixture_id, {}), capture, utc_now()):
+                raise ProviderDetailIncompleteError("Evidence is stale, untrusted, non-final, or does not match the postponement quarantine")
             report["postponement_revalidation"]["observations"].append(
-                {"fixture_id": fixture_id, "snapshot_id": snapshot_id, "assessment": asdict(assessment),
+                {"fixture_id": fixture_id, "assessment": asdict(assess_provider_payload(data)),
                  "requires_separate_data_repair_approval": True})
-            outcome = "reviewed_without_delivery"
         except Exception as exc:
             report["failed"].append({"fixture_id": fixture_id, "stage": "postponement_status_review", "error": str(exc)})
-        finally:
-            finish_postponement_review(conn, fixture_id, outcome)
 
 
 def default_leagues() -> list[int]:
@@ -2323,6 +2358,22 @@ def main() -> int:
         raise SystemExit("Isolated postponement review needs budget 1-3; force, fixture IDs and batch projection are prohibited")
     if not postponement_review and (args.postponement_provider_budget or args.postponement_publish_details):
         raise SystemExit("A provider budget/publication approval requires explicit postponement status evidence")
+    if postponement_review and not args.postponement_publish_details:
+        if args.report_json:
+            raise SystemExit("Non-mutating review writes no report files; use stdout")
+        target_url = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
+        if not target_url:
+            raise SystemExit("A database URL is required for read-only quarantine inspection")
+        report = {"fixture_ids": [], "provider_calls": 0, "failed": [], "postponement_revalidation": {
+            "detail_publication_approved": False, "mode": "non_mutating_evaluation"}}
+        try:
+            captures = json.loads(Path(args.postponement_status_evidence).read_text(encoding="utf-8"))
+            review_postponement_status_only(None, target_url, captures, report)
+        except (ValueError, OSError) as exc:
+            report["failed"].append({"stage": "postponement_status_review", "error": str(exc)})
+        report["status"] = "failed" if report["failed"] else "reviewed_without_delivery"
+        print(json.dumps(report, default=str))
+        return 1 if report["failed"] else 0
     if postponement_review:
         from scripts.reconcile_stats_provider_queue import acquire_process_lock
         if acquire_process_lock() is None:
@@ -2387,15 +2438,6 @@ def main() -> int:
         print(json.dumps(report))
         conn.close()
         return 0
-
-    if postponement_review and not args.postponement_publish_details:
-        review_postponement_status_only(conn, target_url, captures, report)
-        report["status"] = "failed" if report["failed"] else "reviewed_without_delivery"
-        if args.report_json:
-            Path(args.report_json).write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-        print(json.dumps(report, default=str))
-        conn.close()
-        return 1 if report["failed"] else 0
 
     # Use an explicit SQLite engine so the sync session and the exporter read
     # the same source database even when JXD_DB_URL is configured for a
@@ -2483,6 +2525,8 @@ def main() -> int:
                 or set(_team_ids(data)) != set(_team_ids(next(capture["payload"] for capture in captures if capture["payload"]["id"] == fixture_id)))
             ):
                 raise ProviderDetailIncompleteError("Revalidation provider identity differs from approved status evidence")
+            if postponement_review:
+                revalidation_fixture_status(data)
             assessment = assess_provider_payload(data)
             payload_hash = provider_payload_hash(data)
             normalized_hash = normalized_provider_hash(data)
@@ -2495,6 +2539,7 @@ def main() -> int:
                 assessment,
                 payload_hash,
                 normalized_hash,
+                preserve_accepted=postponement_review,
             )
             stable_fetch_count = prior_stable_count + 1 if prior_normalized_hash == normalized_hash else 1
             if is_non_competitive_provider_assessment(assessment):
