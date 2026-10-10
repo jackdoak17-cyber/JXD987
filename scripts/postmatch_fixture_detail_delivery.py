@@ -15,11 +15,13 @@ that becomes available after a match finishes.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -29,6 +31,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 import psycopg2
+import requests
 from psycopg2.extras import Json
 from sqlalchemy import create_engine
 
@@ -1389,6 +1392,7 @@ def persist_provider_snapshot(
     payload_hash: str,
     normalized_hash: str,
     target_conn: Any | None = None,
+    preserve_accepted: bool = False,
 ) -> int:
     """Persist every successful provider response before active facts publish."""
     owns_target_conn = target_conn is None
@@ -1415,6 +1419,7 @@ def persist_provider_snapshot(
                   release_id = excluded.release_id,
                   error = excluded.error,
                   last_seen_at = now()
+                where not (%s and fixture_detail_snapshots.quality_status = 'accepted')
                 returning id
                 """,
                 (
@@ -1428,9 +1433,14 @@ def persist_provider_snapshot(
                     json_text(data),
                     release_id(),
                     assessment.error,
+                    preserve_accepted,
                 ),
             )
             row = cur.fetchone()
+            if not row and preserve_accepted:
+                cur.execute("select id from public.fixture_detail_snapshots where fixture_id = %s and payload_hash = %s",
+                            (fixture_id, payload_hash))
+                row = cur.fetchone()
             if not row:
                 raise RuntimeError(f"Provider snapshot was not persisted for fixture {fixture_id}")
             snapshot_id = int(row[0])
@@ -2146,8 +2156,463 @@ def build_parser() -> argparse.ArgumentParser:
         help="Select missing/due completed fixtures from the serving database as well as the source queue.",
     )
     parser.add_argument("--no-fail-on-sla-breach", action="store_true")
+    parser.add_argument("--postponement-status-evidence", default=None,
+                        help="Independent provider-status capture JSON; defaults to non-mutating offline evaluation.")
+    parser.add_argument("--postponement-provider-budget", type=int, default=0,
+                        help="Approved single-attempt provider requests for this isolated run (1-3; default disabled).")
+    parser.add_argument("--postponement-observe-status", action="store_true",
+                        help="Separately approved status observation only; never delivers details or removes quarantine.")
+    parser.add_argument("--postponement-publish-details", action="store_true",
+                        help="Withdrawn; always rejected before any access.")
     parser.add_argument("--report-json", default=None)
     return parser
+
+
+def revalidation_fixture_status(payload: dict) -> str:
+    """Reject conflicting status families only in the opt-in revalidation path."""
+    state = payload.get("state")
+    if state is None:
+        state = {}
+    if not isinstance(state, dict):
+        raise ProviderDetailIncompleteError("Malformed revalidation fixture state")
+    values = [state.get(key) for key in ("developer_name", "state", "short_name")]
+    values += [payload.get(key) for key in ("status", "status_code")]
+    statuses = []
+    for value in values:
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str) or not value.strip():
+            raise ProviderDetailIncompleteError("Malformed revalidation fixture status")
+        statuses.append(value.strip().upper())
+    if not statuses:
+        raise ProviderDetailIncompleteError("Missing revalidation fixture status")
+    aliases = {"POST": "POSTPONED", "CANC": "CANCELLED", "CANCELED": "CANCELLED",
+               "ABAN": "ABANDONED"}
+    families = {"FINAL" if value in FINISHED_STATUSES else aliases.get(value, value) for value in statuses}
+    if len(families) != 1:
+        raise ProviderDetailIncompleteError(f"Contradictory revalidation fixture statuses: {', '.join(statuses)}")
+    return statuses[0]
+
+
+def strict_status_identity(payload: dict, expected: dict | None = None) -> tuple[int, set[int]]:
+    """Provider identifiers are exact integers, never coerced by ordinary ingestion helpers."""
+    def identifier(value: object) -> int:
+        if type(value) is not int or value <= 0:
+            raise ValueError("Status identity must be an exact positive integer")
+        return value
+    fixture_id = identifier(payload.get("id"))
+    participants = payload.get("participants")
+    if not isinstance(participants, list) or len(participants) != 2 or any(not isinstance(p, dict) for p in participants):
+        raise ValueError("Status evidence requires exactly two team participants")
+    teams = [identifier(p.get("id")) for p in participants]
+    if len(set(teams)) != 2:
+        raise ValueError("Duplicate status team identities")
+    if expected is not None and (fixture_id != expected["fixture_id"]
+            or set(teams) != {expected["home_team_id"], expected["away_team_id"]}):
+        raise ValueError("Status identities differ from trusted fixture metadata")
+    for participant in participants:
+        if "team_id" in participant and identifier(participant["team_id"]) != participant["id"]:
+            raise ValueError("Inconsistent participant team identity")
+    located = {}
+    for participant in participants:
+        if "meta" not in participant:
+            continue
+        meta = participant["meta"]
+        if not isinstance(meta, dict):
+            raise ValueError("Malformed participant metadata")
+        if "location" not in meta:
+            continue
+        location = meta["location"]
+        if type(location) is not str or location not in {"home", "away"} or location in located:
+            raise ValueError("Contradictory participant side identities")
+        located[location] = participant["id"]
+        if expected is not None and participant["id"] != expected[location + "_team_id"]:
+            raise ValueError("Participant side differs from trusted fixture metadata")
+    if any(key in payload for key in ("home_team_id", "away_team_id")):
+        sides = [identifier(payload.get(key)) for key in ("home_team_id", "away_team_id")]
+        if len(set(sides)) != 2 or set(sides) != set(teams):
+            raise ValueError("Inconsistent home/away team identities")
+        if expected is not None and sides != [expected["home_team_id"], expected["away_team_id"]]:
+            raise ValueError("Home/away identities differ from trusted metadata")
+        if any(payload[location + "_team_id"] != team for location, team in located.items()):
+            raise ValueError("Participant and top-level side identities disagree")
+    return fixture_id, set(teams)
+
+
+def strict_status_metadata(exclusion: dict) -> None:
+    values = [exclusion.get(key) for key in ("fixture_id", "home_team_id", "away_team_id")]
+    if any(type(value) is not int or value <= 0 for value in values) or values[1] == values[2]:
+        raise ValueError("Malformed trusted fixture/quarantine identity")
+    try:
+        postponement_episode_instant(exclusion.get("first_identified_at"))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise ValueError("Malformed quarantine episode identity") from None
+
+
+def postponement_review_eligible(exclusion: dict, evidence: dict, now: datetime) -> bool:
+    """Status evidence permits a review, never publication or quarantine removal."""
+    if not isinstance(evidence, dict) or not isinstance(exclusion, dict):
+        return False
+    payload = evidence.get("payload")
+    if not isinstance(payload, dict) or evidence.get("source") != "fixture_core_provider_response":
+        return False
+    observed = parse_iso(evidence.get("observed_at"))
+    if observed is None or datetime.fromisoformat(str(evidence["observed_at"]).replace("Z", "+00:00")).tzinfo is None:
+        return False
+    excluded_at = parse_iso(exclusion.get("last_checked_at"))
+    prior_evidence = exclusion.get("evidence")
+    if not isinstance(prior_evidence, dict):
+        return False
+    old_status = prior_evidence.get("provider_status")
+    try:
+        strict_status_metadata(exclusion)
+        fixture_id, teams = strict_status_identity(payload, exclusion)
+        status = revalidation_fixture_status(payload)
+    except (ProviderDetailIncompleteError, ValueError) as exc:
+        LOG.warning("Postponement evidence rejected: %s", exc)
+        return False
+    return bool(
+        exclusion.get("exclusion_type") == "provider_unavailable"
+        and old_status in {"POST", "POSTPONED"}
+        and fixture_id == exclusion.get("fixture_id")
+        and evidence.get("payload_sha256") == provider_payload_hash(payload)
+        and observed and excluded_at and excluded_at < observed <= now
+        and now - observed <= timedelta(hours=24)
+        and status in FINISHED_STATUSES
+        and teams == {exclusion.get("home_team_id"), exclusion.get("away_team_id")}
+    )
+
+
+def postponement_episode_instant(value: Any) -> datetime:
+    """Accept only explicit instants representable without losing timestamp precision."""
+    if type(value) is str:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)", value):
+            raise ValueError("Unsafe quarantine episode timestamp")
+        # RFC3339 -00:00 denotes an unknown, rather than trusted, offset.
+        if value.endswith("-00:00"):
+            raise ValueError("Unknown quarantine episode offset")
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Quarantine episode requires an explicit timezone")
+    return value.astimezone(timezone.utc)
+
+
+def claim_postponement_review(conn: sqlite3.Connection, exclusion: dict, evidence: dict, now: datetime,
+                             claim_ref: dict | None = None) -> bool:
+    """Reserve before requesting: crashes spend an attempt, rather than retrying unboundedly."""
+    instant = postponement_episode_instant(exclusion["first_identified_at"])
+    exclusion_key = instant.isoformat(timespec="microseconds")
+    now = postponement_episode_instant(now)
+    try:
+        conn.execute("begin immediate")
+        conn.execute("""create table if not exists fixture_postponement_reviews (
+            fixture_id integer not null, exclusion_key text not null, attempt integer not null,
+            claimed_at text not null, evidence text not null, original_exclusion text not null,
+            outcome text not null default 'claimed', observation text,
+            primary key (fixture_id, exclusion_key, attempt)
+        )""")
+        if "observation" not in {row[1] for row in conn.execute("pragma table_info(fixture_postponement_reviews)")}:
+            conn.execute("alter table fixture_postponement_reviews add column observation text")
+        history = conn.execute("""select exclusion_key, claimed_at, outcome, original_exclusion
+            from fixture_postponement_reviews where fixture_id = ?""", (exclusion["fixture_id"],)).fetchall()
+        rows = []
+        try:
+            for key, claimed_at, outcome, provenance in history:
+                previous = postponement_episode_instant(key)
+                original = json.loads(provenance)
+                if (original.get("fixture_id") != exclusion["fixture_id"]
+                        or postponement_episode_instant(original.get("first_identified_at")) != previous):
+                    raise ValueError("Unreconciled legacy quarantine provenance")
+                claimed = postponement_episode_instant(claimed_at)
+                if previous == instant:
+                    rows.append((claimed, outcome))
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            conn.rollback()
+            return False
+        if len(rows) >= 3 or any(row[1] == "verified" for row in rows) or (
+            rows and now - max(row[0] for row in rows) < timedelta(hours=24)
+        ):
+            conn.rollback()
+            return False
+        conn.execute("""insert into fixture_postponement_reviews
+            (fixture_id, exclusion_key, attempt, claimed_at, evidence, original_exclusion)
+            values (?, ?, ?, ?, ?, ?)""",
+            (exclusion["fixture_id"], exclusion_key, len(rows) + 1, now.isoformat(timespec="microseconds"),
+             json_text(evidence), json.dumps(exclusion, sort_keys=True, default=str)))
+        conn.commit()
+        if claim_ref is not None:
+            claim_ref.update(fixture_id=exclusion["fixture_id"], exclusion_key=exclusion_key, attempt=len(rows) + 1)
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def postponement_exclusions(target_url: str, captures: list[dict]) -> dict[int, dict]:
+    if not isinstance(captures, list) or not 1 <= len(captures) <= 3:
+        raise ValueError("Postponement evidence requires 1-3 captures")
+    if any(not isinstance(capture, dict) or not isinstance(capture.get("payload"), dict)
+           or type(capture["payload"].get("id")) is not int or capture["payload"]["id"] <= 0 for capture in captures):
+        raise ValueError("Malformed postponement capture identity")
+    ids = list(dict.fromkeys(capture["payload"]["id"] for capture in captures))
+    with psycopg2.connect(target_url, connect_timeout=20,
+                          options="-c default_transaction_read_only=on") as target:
+        with target.cursor() as cur:
+            cur.execute("""select x.fixture_id, x.exclusion_type, x.first_identified_at,
+                x.last_checked_at, x.evidence, x.reason, x.next_review_at,
+                f.home_team_id, f.away_team_id
+                from public.fixture_stats_quality_exclusions x join public.fixtures f on f.id = x.fixture_id
+                where x.fixture_id = any(%s)""", (ids,))
+            rows = [dict(zip(
+                ("fixture_id", "exclusion_type", "first_identified_at", "last_checked_at", "evidence", "reason", "next_review_at", "home_team_id", "away_team_id"), row))
+                for row in cur.fetchall()]
+            for row in rows:
+                strict_status_metadata(row)
+                if row["fixture_id"] not in ids:
+                    raise ValueError("Unexpected quarantine identity")
+            if len({row["fixture_id"] for row in rows}) != len(rows):
+                raise ValueError("Duplicate quarantine metadata")
+            return {row["fixture_id"]: row for row in rows}
+
+
+def select_postponement_reviews(conn: sqlite3.Connection, target_url: str, captures: list[dict], budget: int,
+                               rejections: list[dict] | None = None, exclusions: dict | None = None,
+                               claims: dict | None = None) -> list[int]:
+    if not 1 <= budget <= 3:
+        raise ValueError("Postponement review requires an approved budget of 1-3")
+    if exclusions is None:
+        exclusions = postponement_exclusions(target_url, captures)
+    selected = []
+    now = utc_now()
+    for capture in captures:
+        exclusion = exclusions.get(int(capture["payload"]["id"]))
+        if not exclusion or not postponement_review_eligible(exclusion, capture, now):
+            if rejections is not None:
+                rejections.append({"fixture_id": capture["payload"]["id"], "reason": "Evidence rejected or no matching postponement quarantine"})
+            continue
+        claim = {}
+        if not claim_postponement_review(conn, exclusion, capture, now, claim):
+            if rejections is not None:
+                rejections.append({"fixture_id": exclusion["fixture_id"], "reason": "Persistent attempt limit, completed episode, or 24-hour spacing blocks this request"})
+            continue
+        selected.append(exclusion["fixture_id"])
+        if claims is not None:
+            claims[exclusion["fixture_id"]] = claim
+        if len(selected) >= budget:
+            break
+    return selected
+
+
+def finish_postponement_review(conn: sqlite3.Connection, claim: dict, outcome: str, observation: dict | None = None) -> None:
+    updated = conn.execute("""update fixture_postponement_reviews set outcome = ?, observation = ?
+        where fixture_id = ? and exclusion_key = ? and attempt = ? and outcome = 'claimed'""",
+        (outcome, json_text(observation) if observation is not None else None,
+         claim["fixture_id"], claim["exclusion_key"], claim["attempt"]))
+    if updated.rowcount != 1:
+        conn.rollback()
+        raise ValueError("Reserved postponement claim is missing or already completed")
+    conn.commit()
+
+
+def postponement_provider_request(client: SportMonksClient, method: str, endpoint: str, params: dict) -> dict:
+    """One HTTP attempt, including no redirects; the durable claim owns retries."""
+    try:
+        response = requests.request(method, client.base_url + endpoint,
+            params={**params, "api_token": client.api_token},
+            timeout=min(client.timeout, 20), allow_redirects=False)
+    except requests.RequestException:
+        raise RuntimeError("Postponement provider request failed; reserved attempt consumed") from None
+    if response.status_code != 200:
+        raise RuntimeError(f"Postponement provider returned HTTP {response.status_code}; reserved attempt consumed")
+    return response.json()
+
+
+def review_postponement_status_only(conn: sqlite3.Connection, target_url: str, captures: list[dict], report: dict) -> None:
+    """Evaluate supplied evidence with SELECT-only access; never claim or fetch."""
+    exclusions = postponement_exclusions(target_url, captures)
+    report["postponement_revalidation"]["observations"] = []
+    for capture in captures:
+        fixture_id = capture["payload"]["id"]
+        try:
+            data = capture["payload"]
+            revalidation_fixture_status(data)
+            if not postponement_review_eligible(exclusions.get(fixture_id, {}), capture, utc_now()):
+                raise ProviderDetailIncompleteError("Evidence is stale, untrusted, non-final, or does not match the postponement quarantine")
+            report["postponement_revalidation"]["observations"].append(
+                {"fixture_id": fixture_id, "fixture_status": revalidation_fixture_status(data),
+                 "candidate_for_separate_repair": True, "detail_completeness": "not_assessed",
+                 "publication_authorized": False, "quarantine_modified": False})
+        except Exception as exc:
+            report["failed"].append({"fixture_id": fixture_id, "stage": "postponement_status_review", "error": str(exc)})
+
+
+def observe_postponement_status(conn: sqlite3.Connection, captures: list[dict], report: dict,
+                               exclusions: dict | None = None, claims: dict | None = None) -> None:
+    """Consume durable claims and record status evidence locally, never deliver facts."""
+    client = SportMonksClient()
+    client.timeout = min(client.timeout, 20)
+    for fixture_id in report["fixture_ids"]:
+        observation = {"fixture_id": fixture_id, "observed_at": iso(utc_now()),
+                       "classification": "request_failed", "candidate_for_separate_repair": False,
+                       "detail_completeness": "not_assessed", "publication_authorized": False,
+                       "quarantine_modified": False}
+        try:
+            report["provider_calls"] += 1
+            payload = postponement_provider_request(client, "GET", f"fixtures/{fixture_id}",
+                                                    {"include": "participants;state"})
+            data = payload.get("data") if isinstance(payload, dict) else None
+            observation["provider_payload"] = data
+            approved = next(capture["payload"] for capture in captures if capture["payload"]["id"] == fixture_id)
+            if (not isinstance(data, dict) or strict_status_identity(data, (exclusions or {}).get(fixture_id)) != strict_status_identity(approved)
+                    or data["id"] != fixture_id):
+                raise ProviderDetailIncompleteError("Provider status observation identity differs from approved evidence")
+            status = revalidation_fixture_status(data)
+            observation["fixture_status"] = status
+            observation["payload_sha256"] = provider_payload_hash(data)
+            classification = ("final_status_observed" if status in FINISHED_STATUSES else
+                              "postponed" if status in {"POST", "POSTPONED"} else
+                              "cancelled" if status in {"CANC", "CANCELLED", "CANCELED"} else
+                              "abandoned" if status in {"ABAN", "ABANDONED"} else "unknown_or_non_final")
+            observation["classification"] = classification
+            observation["candidate_for_separate_repair"] = status in FINISHED_STATUSES
+            if status not in FINISHED_STATUSES:
+                report["failed"].append({"fixture_id": fixture_id, "error": f"Status observation is not final: {status}"})
+        except Exception as exc:
+            observation["classification"] = "blocked_or_failed"
+            observation["diagnostic"] = str(exc)
+            report["failed"].append({"fixture_id": fixture_id, "error": str(exc)})
+        finally:
+            finish_postponement_review(conn, claims[fixture_id], observation["classification"], observation)
+        report["postponement_revalidation"]["observations"].append(observation)
+
+
+def acquire_postponement_lock() -> int | None:
+    """Use the production wrapper's flock and verify any inherited descriptor."""
+    path = os.environ.get("ODDS_SYNC_LOCK_FILE", "/var/lock/odds-sync.lock")
+    if not path or not Path(path).is_absolute():
+        raise SystemExit("Canonical lock path must be absolute")
+    path = os.path.realpath(path)
+    alternate = os.environ.get("STATS_RECONCILE_LOCK_PATH")
+    if alternate is not None and (not Path(alternate).is_absolute() or os.path.realpath(alternate) != path):
+        raise SystemExit("Conflicting canonical lock configuration")
+    inherited = None
+    try:
+        state = os.stat(path)
+        descriptor = os.fstat(9)
+        if (state.st_dev, state.st_ino) == (descriptor.st_dev, descriptor.st_ino):
+            inherited = 9
+    except OSError:
+        pass
+    if os.environ.get("STATS_RECONCILE_LOCK_HELD") == "1" and inherited is None:
+        raise SystemExit("Inherited canonical lock descriptor is missing or mismatched")
+    if inherited is not None:
+        try:
+            lease = int(os.environ.get("ODDS_SYNC_P3_MAX_DURATION_SECONDS", "0"))
+        except ValueError:
+            lease = 0
+        if not 1 <= lease <= 120:
+            raise SystemExit("Inherited observation requires a canonical wrapper lease of at most 120 seconds")
+        fd = os.dup(inherited)
+    else:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        current = os.stat(path)
+        owned = os.fstat(fd)
+        if (current.st_dev, current.st_ino) != (owned.st_dev, owned.st_ino):
+            raise SystemExit("Canonical lock file identity changed")
+        return fd
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def run_postponement_revalidation(args: argparse.Namespace) -> int:
+    """Both status modes return before ordinary detail-delivery orchestration."""
+    if (not isinstance(args.postponement_status_evidence, str) or not args.postponement_status_evidence.strip()
+            or args.force or args.fixture_ids or args.batch_projection or args.report_json):
+        raise SystemExit("Status revalidation requires evidence; force, fixture IDs, projection and report files are prohibited")
+    active = args.postponement_observe_status
+    if (active and not 1 <= args.postponement_provider_budget <= 3) or (not active and args.postponement_provider_budget != 0):
+        raise SystemExit("Only explicit status observation accepts a provider budget of 1-3; offline review requires zero")
+    target_url = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
+    if not target_url:
+        raise SystemExit("A database URL is required for read-only quarantine inspection")
+    report = {"fixture_ids": [], "provider_calls": 0, "failed": [], "status": "status_review_only",
+              "postponement_revalidation": {"mode": "provider_status_observation" if active else "offline_review",
+                  "publication_authorized": False, "quarantine_modified": False, "detail_completeness": "not_assessed",
+                  "observations": [], "rejections": []}}
+    conn = None
+    lock_fd = None
+    try:
+        path = Path(args.postponement_status_evidence)
+        if not path.is_file() or path.stat().st_size > 2_000_000:
+            raise ValueError("Evidence must be a regular JSON file of at most 2 MB")
+        captures = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(captures, list) or not 1 <= len(captures) <= 3
+                or any(not isinstance(item, dict) or not isinstance(item.get("payload"), dict)
+                       or type(item["payload"].get("id")) is not int or item["payload"]["id"] <= 0
+                       for item in captures)):
+            raise ValueError("Evidence requires 1-3 valid fixture captures")
+        for capture in captures:
+            payload = capture["payload"]
+            try:
+                strict_status_identity(payload)
+                status = revalidation_fixture_status(payload)
+                observed = datetime.fromisoformat(str(capture.get("observed_at")).replace("Z", "+00:00"))
+                if (capture.get("source") != "fixture_core_provider_response"
+                        or capture.get("payload_sha256") != provider_payload_hash(payload)
+                        or observed.tzinfo is None or not timedelta(0) <= utc_now() - observed <= timedelta(hours=24)
+                        or status not in FINISHED_STATUSES):
+                    raise ValueError("Stale, untrusted, non-final or malformed status evidence")
+            except (ProviderDetailIncompleteError, TypeError, ValueError) as exc:
+                raise ValueError(str(exc)) from None
+        if active:
+            import signal
+            if (signal.getsignal(signal.SIGALRM) != signal.SIG_DFL
+                    or signal.SIGALRM in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                    or not 0 < signal.getitimer(signal.ITIMER_REAL)[0] <= 120):
+                raise SystemExit("Active observation requires the hard-deadline status entry point")
+            if not Path(SOURCE_DB).is_absolute():
+                raise SystemExit("Active observation requires an absolute persistent JXD_DB_PATH")
+            lock_fd = acquire_postponement_lock()
+            if lock_fd is None:
+                raise SystemExit("Canonical spool lock is busy; no status observation started")
+            exclusions = postponement_exclusions(target_url, captures)
+            for capture in captures:
+                original = exclusions.get(capture["payload"]["id"])
+                if original is not None:
+                    strict_status_identity(capture["payload"], original)
+            conn = source_connection()
+            claims = {}
+            report["fixture_ids"] = select_postponement_reviews(conn, target_url, captures, args.postponement_provider_budget,
+                report["postponement_revalidation"]["rejections"], exclusions=exclusions, claims=claims)
+            if report["fixture_ids"]:
+                observe_postponement_status(conn, captures, report, exclusions, claims)
+            else:
+                report["status"] = "no_eligible_or_budget_available_status_observations"
+        else:
+            review_postponement_status_only(None, target_url, captures, report)
+        if report["failed"]:
+            report["status"] = "status_evidence_rejected"
+        elif report["fixture_ids"]:
+            report["status"] = "status_observations_recorded_locally"
+    except (ValueError, OSError) as exc:
+        report["failed"].append({"stage": "postponement_status_review", "error": str(exc)})
+        report["postponement_revalidation"]["rejections"].append({"reason": str(exc)})
+        report["status"] = "status_evidence_rejected"
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+    print(json.dumps(report, default=str))
+    return 1 if report["failed"] else 0
 
 
 def default_leagues() -> list[int]:
@@ -2162,6 +2627,8 @@ def default_leagues() -> list[int]:
 
 
 def main() -> int:
+    if any(arg.startswith("--postponement-") for arg in sys.argv[1:]):
+        raise SystemExit("Revalidation is status-only; use python -m scripts.review_postponement_status")
     args = build_parser().parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
     leagues = parse_csv_ints(args.leagues) if args.leagues else default_leagues()
