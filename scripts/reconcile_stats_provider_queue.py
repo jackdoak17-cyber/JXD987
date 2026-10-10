@@ -30,6 +30,7 @@ import psycopg2
 
 from jxd import SportMonksClient
 from scripts.postmatch_fixture_detail_delivery import (
+    FINISHED_STATUSES,
     TRACKED_PLAYER_STAT_TYPES,
     activate_provider_snapshot,
     assess_provider_payload,
@@ -56,7 +57,6 @@ from scripts.postmatch_fixture_detail_delivery import (
     ledger_attempt_start,
     update_ledger,
     mark_provider_unavailable,
-    clear_provider_unavailable_exclusion,
     recover_stale_running,
     hydrate_missing_source_delivery_history,
     repair_legacy_ledger,
@@ -627,19 +627,19 @@ def main() -> int:
                 target_meta = target_metadata.get(fixture_id)
                 meta = source_meta_row or (target_meta[:3] if target_meta else None)
                 prior = conn.execute(
-                    "select provider_team_stat_count,provider_player_stat_count,last_normalized_hash,stable_fetch_count from fixture_detail_deliveries where fixture_id = ?",
+                    "select provider_team_stat_count,provider_player_stat_count,last_normalized_hash,stable_fetch_count,provider_status from fixture_detail_deliveries where fixture_id = ?",
                     (fixture_id,),
                 ).fetchone()
                 if prior is None and target_meta:
                     hydrate_missing_source_delivery_history(conn, fixture_id, target_meta)
                     prior = conn.execute(
-                        "select provider_team_stat_count,provider_player_stat_count,last_normalized_hash,stable_fetch_count from fixture_detail_deliveries where fixture_id = ?",
+                        "select provider_team_stat_count,provider_player_stat_count,last_normalized_hash,stable_fetch_count,provider_status from fixture_detail_deliveries where fixture_id = ?",
                         (fixture_id,),
                     ).fetchone()
                 prior_team_count = int(prior[0] or 0) if prior else 0
                 prior_player_count = int(prior[1] or 0) if prior else 0
                 prior_hash = str(prior[2]) if prior and prior[2] else None
-                prior_stable = int(prior[3] or 0) if prior else 0
+                prior_stable = int(prior[3] or 0) if prior and str(prior[4] or "").upper() in FINISHED_STATUSES else 0
                 if target_meta:
                     prior_team_count = max(prior_team_count, target_meta[3])
                     prior_player_count = max(prior_player_count, target_meta[4])
@@ -775,11 +775,11 @@ def main() -> int:
                         report["provider_pending"].append({"fixture_id": fixture_id, "reason": message})
                         continue
                     source = store_provider_detail(engine, client, fixture_id, data, assessment)
-                    clear_provider_unavailable_exclusion(
-                        target_url,
-                        fixture_id,
-                        target_conn=shared_target_connection(),
-                    )
+                    if assessment.status == "provider_sparse":
+                        update_ledger(conn, fixture_id, "running", attempt, assessment, source=source,
+                                      payload_hash=payload_hash, normalized_hash=normalized_hash,
+                                      stable_fetch_count=stable_count)
+                        publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                     if not meta:
                         meta = conn.execute("select league_id,season_id,starting_at from fixtures where id=?", (fixture_id,)).fetchone()
                     accepted.append({"fixture_id": fixture_id, "attempt": attempt, "assessment": assessment, "source": source, "snapshot_id": snapshot_id, "payload_hash": payload_hash, "normalized_hash": normalized_hash, "stable_count": stable_count, "meta": meta})

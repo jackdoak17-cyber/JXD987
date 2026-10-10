@@ -307,7 +307,7 @@ def test_actual_snapshot_SQL_preserves_accepted_evidence_for_active_revalidation
         def execute(self, sql, params):
             calls.append(sql)
             if sql.strip().startswith("insert"):
-                assert "where not (%s and fixture_detail_snapshots.quality_status = 'accepted')" in sql
+                assert "case when %s and fixture_detail_snapshots.quality_status = 'accepted'" in sql
                 assert params[-1] is True
                 self.row = None
             else:

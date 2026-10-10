@@ -1556,6 +1556,16 @@ class SyncService:
 
         stats = raw.get("statistics")
         lineups = raw.get("lineups")
+        # Keep historical detail and identities, but never ingest a postponed
+        # response's provisional lineups/statistics as played-match evidence.
+        if {data.get("status"), data.get("status_code")} & {"POST", "POSTP", "POSTPONED"}:
+            loc_map = self._store_participants(fixture.id, raw.get("participants") or [], retain_raw=retain_raw)
+            self._apply_participant_derivations(fixture, loc_map)
+            # Provisional scores are not final results. Raw provider evidence
+            # remains retained; null scores also exclude pending bets from the
+            # existing completed-match settlement selection.
+            fixture.home_score = fixture.away_score = None
+            return
         authoritative_detail = (
             full_detail
             and isinstance(stats, list)

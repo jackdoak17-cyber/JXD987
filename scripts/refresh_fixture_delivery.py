@@ -30,6 +30,7 @@ UTC = timezone.utc
 LONDON = ZoneInfo("Europe/London")
 EXCLUDED_CUPS = {24, 27, 109, 307, 390, 570}
 HIDDEN_STATUSES = {
+    "POST",
     "POSTP",
     "POSTPONED",
     "CANCL",
