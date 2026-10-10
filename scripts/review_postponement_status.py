@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import signal
 
 from scripts import postmatch_fixture_detail_delivery as delivery
@@ -30,8 +29,6 @@ def main() -> int:
     if ((active and not 1 <= args.postponement_provider_budget <= 3)
             or (not active and args.postponement_provider_budget != 0)):
         parser.error("Active observation requires budget 1-3; offline review requires budget zero")
-    if active and os.environ.get("STATS_RECONCILE_LOCK_HELD") == "1":
-        parser.error("Observation must own its lock; inherited supervisor locks are not supported")
     # SIG_DFL is kernel termination, not a Python callback delayed by blocked C I/O.
     # No child workers are created. Process death closes its own flock descriptor.
     if active:

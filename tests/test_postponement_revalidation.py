@@ -376,13 +376,17 @@ def test_original_review_snapshot_probe_now_reads_only_and_preserves_real_audit(
     assert len(statements) == 3 and all(sql.startswith("select") for sql in statements)
 
 
-def run_observation(monkeypatch, tmp_path, payload, *, captures=None, budget=1, repeats=1, changed_quarantine=False):
+def run_observation(monkeypatch, tmp_path, payload, *, captures=None, budget=1, repeats=1, changed_quarantine=False,
+                    metadata_updates=None, preserve_response_id=False):
     captures = captures or [capture()]
     state = {"snapshot": {"quality_status": "accepted", "payload": "trusted"},
              "quarantines": {item["payload"]["id"]: quarantine(item["payload"]["id"]) for item in captures}}
+    if metadata_updates:
+        for original in state["quarantines"].values(): original.update(metadata_updates)
     original_snapshot = copy.deepcopy(state["snapshot"])
     calls, sql = [], []
     path = tmp_path / "source.sqlite"
+    monkeypatch.setattr(delivery, "SOURCE_DB", str(path))
     db = sqlite3.connect(path)
     db.execute("create table football_facts(fixture_id integer,value integer)")
     db.execute("insert into football_facts values(19745046,16)")
@@ -438,7 +442,7 @@ def run_observation(monkeypatch, tmp_path, payload, *, captures=None, budget=1, 
             state["quarantines"][fixture]["evidence"] = {"provider_status": "CANCELLED"}
         if isinstance(payload, Exception): raise payload
         data = copy.deepcopy(payload)
-        data["id"] = fixture
+        if not preserve_response_id: data["id"] = fixture
         return SimpleNamespace(status_code=200, json=lambda: {"data": data})
     monkeypatch.setattr(delivery.requests, "request", transport)
     monkeypatch.setenv("SUPABASE_DB_URL_SESSION", "offline")
@@ -577,6 +581,8 @@ def test_observation_busy_lock_prevents_claim_or_request(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["delivery", "--postponement-status-evidence", str(evidence),
         "--postponement-observe-status", "--postponement-provider-budget", "1"])
     monkeypatch.setenv("SUPABASE_DB_URL_SESSION", "offline")
+    monkeypatch.setattr(delivery, "SOURCE_DB", str(tmp_path / "source.sqlite"))
+    monkeypatch.setattr(delivery, "postponement_exclusions", lambda *a: {19745046: quarantine()})
     monkeypatch.setattr(delivery, "acquire_postponement_lock", lambda: None)
     monkeypatch.setattr(delivery, "source_connection", lambda: pytest.fail("Unexpected source access"))
     with pytest.raises(SystemExit, match="lock is busy"): checker.main()
@@ -640,9 +646,9 @@ def test_inherited_lock_observation_rejected_before_access(monkeypatch):
     monkeypatch.setenv("STATS_RECONCILE_LOCK_HELD", "1")
     monkeypatch.setattr(sys, "argv", ["status", "--postponement-status-evidence", "unused",
         "--postponement-observe-status", "--postponement-provider-budget", "1"])
-    monkeypatch.setattr(delivery, "run_postponement_revalidation", lambda *a: pytest.fail("Worker reached"))
+    monkeypatch.setattr(delivery, "SOURCE_DB", "/tmp/offline-unused.sqlite")
     with pytest.raises(SystemExit) as rejected: checker.main()
-    assert rejected.value.code == 2
+    assert rejected.value.code != 0
 
 
 HUNG_COMMAND = r'''
@@ -659,6 +665,7 @@ for name in ('store_provider_detail','export_fixture','clear_provider_unavailabl
              'publish_delivery_status','ensure_ledger','source_engine','update_ledger'):
     setattr(d,name,deny)
 d.utc_now=lambda: datetime(2026,10,9,16,tzinfo=timezone.utc)
+d.SOURCE_DB=os.environ['TEST_SPOOL']
 stage=os.environ['HANG_STAGE']
 def hang():
     print('HUNG',flush=True)
@@ -703,8 +710,9 @@ def test_actual_status_command_hard_kill_releases_lock_and_preserves_claim(tmp_p
     lock = tmp_path / "canonical.lock"
     spool = tmp_path / "audit.sqlite"
     env = {**os.environ, "SUPABASE_DB_URL_SESSION": "offline", "HANG_STAGE": stage,
-           "TEST_SPOOL": str(spool), "STATS_RECONCILE_LOCK_PATH": str(lock)}
+           "TEST_SPOOL": str(spool), "ODDS_SYNC_LOCK_FILE": str(lock)}
     env.pop("STATS_RECONCILE_LOCK_HELD", None)
+    env.pop("STATS_RECONCILE_LOCK_PATH", None)
     args = [sys.executable, "-B", "-c", HUNG_COMMAND, "--postponement-status-evidence", str(evidence),
             "--postponement-observe-status", "--postponement-provider-budget", "1", "--execution-seconds", "1"]
     child = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -713,7 +721,7 @@ def test_actual_status_command_hard_kill_releases_lock_and_preserves_claim(tmp_p
             selector.register(child.stdout, selectors.EVENT_READ)
             assert selector.select(timeout=5), "Worker did not reach hung operation"
         assert child.stdout.readline().strip() == "HUNG"
-        fd = os.open(lock, os.O_RDWR)
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             with pytest.raises(BlockingIOError): fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             stdout, stderr = child.communicate(timeout=5)
@@ -753,3 +761,205 @@ def test_claim_limits_survive_concurrent_processes_and_legacy_audit_upgrade(tmp_
     with sqlite3.connect(path) as db:
         assert db.execute("select count(*) from fixture_postponement_reviews").fetchone()[0] == 3
         assert "observation" in {row[1] for row in db.execute("pragma table_info(fixture_postponement_reviews)")}
+
+
+@pytest.mark.parametrize("value", [758.9, 758.0, True, False, None, 0, -1, "758", "758.9", "bad"])
+@pytest.mark.parametrize("location", ["fixture", "team", "metadata"])
+def test_exact_integer_identity_rejected_before_active_writes(monkeypatch, tmp_path, value, location):
+    evidence = capture()
+    if location == "fixture": evidence["payload"]["id"] = value
+    if location == "team": evidence["payload"]["participants"][0]["id"] = value
+    evidence["payload_sha256"] = delivery.provider_payload_hash(evidence["payload"])
+    if location == "metadata":
+        old = quarantine()
+        old["home_team_id"] = value
+        with pytest.raises(ValueError): delivery.strict_status_metadata(old)
+        results, calls, rows, _ = run_observation(monkeypatch, tmp_path, full_detail(), metadata_updates={"home_team_id": value})
+        assert results == [1] and calls == ["lock", "target_SELECT"] and rows == []
+        return
+    deny = lambda *a, **kw: pytest.fail("Malformed identity reached active side effect")
+    for name in ("acquire_postponement_lock", "source_connection", "SportMonksClient"):
+        monkeypatch.setattr(delivery, name, deny)
+    monkeypatch.setattr(delivery.psycopg2, "connect", deny)
+    monkeypatch.setenv("SUPABASE_DB_URL_SESSION", "offline")
+    file = tmp_path / "evidence.json"
+    file.write_text(json.dumps([evidence]))
+    monkeypatch.setattr(sys, "argv", ["status", "--postponement-status-evidence", str(file),
+        "--postponement-observe-status", "--postponement-provider-budget", "1"])
+    assert checker.main() == 1
+
+
+@pytest.mark.parametrize("value", [758.9, 758.0, True, None, 0, -1, "758", "bad"])
+def test_current_provider_invalid_team_cannot_become_candidate(monkeypatch, tmp_path, capsys, value):
+    payload = full_detail()
+    payload["participants"][0]["id"] = value
+    results, calls, rows, _ = run_observation(monkeypatch, tmp_path, payload)
+    assert results == [1] and calls.count("mock_HTTP") == 1 and rows[0][2] == "blocked_or_failed"
+    report = json.loads(capsys.readouterr().out)
+    assert not report["postponement_revalidation"]["observations"][0]["candidate_for_separate_repair"]
+
+
+@pytest.mark.parametrize("value", [19745046.0, 19745046.9, True, None, 0, -1, "19745046"])
+def test_current_provider_fixture_id_is_not_coerced(monkeypatch, tmp_path, value):
+    payload = full_detail()
+    payload["id"] = value
+    results, _, rows, _ = run_observation(monkeypatch, tmp_path, payload, preserve_response_id=True)
+    assert results == [1] and rows[0][2] == "blocked_or_failed"
+
+
+@pytest.mark.parametrize("kind", ["duplicate", "missing", "inconsistent", "reversed"])
+def test_duplicate_or_inconsistent_team_identity_is_rejected(kind):
+    payload = capture()["payload"]
+    if kind == "duplicate": payload["participants"][1]["id"] = 758
+    if kind == "missing": payload["participants"][0].pop("id")
+    if kind == "inconsistent": payload["participants"][0]["team_id"] = 99
+    if kind == "reversed": payload.update(home_team_id=238115, away_team_id=758)
+    with pytest.raises(ValueError): delivery.strict_status_identity(payload, quarantine())
+
+
+PRODUCTION_LOCK_PROCESS = r'''
+import fcntl,os,sys,time
+fd=os.open(os.environ['ODDS_SYNC_LOCK_FILE'],os.O_CREAT|os.O_RDWR,0o600)
+os.dup2(fd,9)
+try: fcntl.flock(9,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except BlockingIOError: raise SystemExit(75)
+print('LOCKED',flush=True)
+if len(sys.argv)>1: time.sleep(3600)
+'''
+
+
+def status_process_args(tmp_path, stage="provider"):
+    file = tmp_path / "capture.json"
+    file.write_text(json.dumps([capture()]))
+    env = {**os.environ, "HANG_STAGE": stage, "SUPABASE_DB_URL_SESSION": "offline",
+           "TEST_SPOOL": str(tmp_path / "audit.sqlite"), "ODDS_SYNC_LOCK_FILE": str(tmp_path / "canonical.lock")}
+    env.pop("STATS_RECONCILE_LOCK_HELD", None)
+    env.pop("STATS_RECONCILE_LOCK_PATH", None)
+    args = [sys.executable, "-B", "-c", HUNG_COMMAND, "--postponement-status-evidence", str(file),
+        "--postponement-observe-status", "--postponement-provider-budget", "1", "--execution-seconds", "2"]
+    return args, env
+
+
+def await_marker(process, expected):
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        assert selector.select(timeout=5)
+    assert process.stdout.readline().strip() == expected
+
+
+def test_real_production_lock_refuses_observation_without_claim_or_request(tmp_path):
+    args, env = status_process_args(tmp_path)
+    writer = subprocess.Popen([sys.executable, "-B", "-c", PRODUCTION_LOCK_PROCESS, "hold"],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        await_marker(writer, "LOCKED")
+        observer = subprocess.run(args, env=env, capture_output=True, text=True, timeout=5)
+        assert observer.returncode == 1 and "lock is busy" in observer.stderr
+        assert "HUNG" not in observer.stdout and not (tmp_path / "audit.sqlite").exists()
+    finally:
+        writer.kill(); writer.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("termination", ["timeout", "crash"])
+def test_real_observation_refuses_production_then_releases_lock(tmp_path, termination):
+    args, env = status_process_args(tmp_path)
+    observer = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        await_marker(observer, "HUNG")
+        writer = subprocess.run([sys.executable, "-B", "-c", PRODUCTION_LOCK_PROCESS], env=env,
+            capture_output=True, text=True, timeout=5)
+        assert writer.returncode == 75
+        if termination == "crash": observer.kill()
+        observer.communicate(timeout=5)
+        assert observer.returncode == (-signal.SIGKILL if termination == "crash" else -signal.SIGALRM)
+        writer = subprocess.run([sys.executable, "-B", "-c", PRODUCTION_LOCK_PROCESS], env=env,
+            capture_output=True, text=True, timeout=5)
+        assert writer.returncode == 0
+        with sqlite3.connect(tmp_path / "audit.sqlite") as db:
+            assert db.execute("select attempt,outcome from fixture_postponement_reviews").fetchall() == [(1, "claimed")]
+            assert not delivery.claim_postponement_review(db, quarantine(), capture(), NOW)
+    finally:
+        if observer.poll() is None: observer.kill(); observer.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("stage", ["success", "provider"])
+def test_wrapper_inherited_fd9_is_verified_without_self_deadlock(tmp_path, stage):
+    args, env = status_process_args(tmp_path, stage)
+    env.update(STATS_RECONCILE_LOCK_HELD="1", ODDS_SYNC_P3_MAX_DURATION_SECONDS="120")
+    wrapper = r'''
+import fcntl,json,os,subprocess,sys
+fd=os.open(os.environ['ODDS_SYNC_LOCK_FILE'],os.O_CREAT|os.O_RDWR,0o600)
+os.dup2(fd,9); os.set_inheritable(9,True); fcntl.flock(9,fcntl.LOCK_EX|fcntl.LOCK_NB)
+try:
+    result=subprocess.run(json.loads(sys.argv[1]),pass_fds=(9,),capture_output=True,text=True,timeout=5)
+    print(result.stdout,end=''); print(result.stderr,file=sys.stderr,end='')
+    raise SystemExit(result.returncode)
+finally: os.close(9)
+'''
+    result = subprocess.run([sys.executable, "-B", "-c", wrapper, json.dumps(args)], env=env,
+        capture_output=True, text=True, timeout=8)
+    if stage == "success":
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["provider_calls"] == 1
+    else:
+        assert result.returncode != 0 and "HUNG" in result.stdout
+        with sqlite3.connect(tmp_path / "audit.sqlite") as db:
+            assert db.execute("select attempt from fixture_postponement_reviews").fetchall() == [(1,)]
+    writer = subprocess.run([sys.executable, "-B", "-c", PRODUCTION_LOCK_PROCESS], env=env,
+        capture_output=True, text=True, timeout=5)
+    assert writer.returncode == 0
+
+
+@pytest.mark.parametrize("configuration", ["relative", "conflicting", "false_inherited"])
+def test_unsafe_lock_configuration_is_rejected(tmp_path, monkeypatch, configuration):
+    monkeypatch.setenv("ODDS_SYNC_LOCK_FILE", str(tmp_path / "canonical.lock"))
+    monkeypatch.delenv("STATS_RECONCILE_LOCK_HELD", raising=False)
+    monkeypatch.delenv("STATS_RECONCILE_LOCK_PATH", raising=False)
+    if configuration == "relative": monkeypatch.setenv("ODDS_SYNC_LOCK_FILE", "relative.lock")
+    if configuration == "conflicting": monkeypatch.setenv("STATS_RECONCILE_LOCK_PATH", str(tmp_path / "other.lock"))
+    if configuration == "false_inherited": monkeypatch.setenv("STATS_RECONCILE_LOCK_HELD", "1")
+    with pytest.raises(SystemExit): delivery.acquire_postponement_lock()
+
+
+def test_changed_cwd_and_symlink_alias_share_canonical_inode(tmp_path):
+    args, env = status_process_args(tmp_path)
+    canonical = tmp_path / "canonical.lock"
+    canonical.touch()
+    alias = tmp_path / "alias.lock"
+    alias.symlink_to(canonical)
+    env["STATS_RECONCILE_LOCK_PATH"] = str(alias)
+    writer = subprocess.Popen([sys.executable, "-B", "-c", PRODUCTION_LOCK_PROCESS, "hold"], env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        await_marker(writer, "LOCKED")
+        # Absolute module location keeps the controlled command importable in another cwd.
+        env["PYTHONPATH"] = str(__import__("pathlib").Path(__file__).resolve().parents[1])
+        result = subprocess.run(args, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=5)
+        assert result.returncode == 1 and "lock is busy" in result.stderr
+        assert not (tmp_path / "audit.sqlite").exists()
+    finally: writer.kill(); writer.communicate(timeout=5)
+
+
+def test_relative_spool_cannot_reset_audit_through_changed_cwd(tmp_path):
+    args, env = status_process_args(tmp_path)
+    env["TEST_SPOOL"] = "relative.sqlite"
+    result = subprocess.run(args, env=env, capture_output=True, text=True, timeout=5)
+    assert result.returncode != 0 and "absolute persistent JXD_DB_PATH" in result.stderr
+    assert not (tmp_path / "canonical.lock").exists()
+
+
+@pytest.mark.parametrize("kind", ["reversed", "duplicate", "unknown", "malformed"])
+def test_provider_participant_locations_must_match_trusted_sides(monkeypatch, tmp_path, kind):
+    payload = full_detail()
+    payload["participants"][0]["meta"] = {"location": "away" if kind == "reversed" else "home"}
+    payload["participants"][1]["meta"] = {"location": "home" if kind == "reversed" else "away"}
+    if kind == "duplicate": payload["participants"][1]["meta"]["location"] = "home"
+    if kind == "unknown": payload["participants"][1]["meta"]["location"] = "unknown"
+    if kind == "malformed": payload["participants"][1]["meta"] = []
+    results, _, rows, _ = run_observation(monkeypatch, tmp_path, payload)
+    assert results == [1] and rows[0][2] == "blocked_or_failed"
+
+
+def test_metadata_is_read_only_after_canonical_lock(monkeypatch, tmp_path):
+    results, calls, _, _ = run_observation(monkeypatch, tmp_path, full_detail())
+    assert results == [0] and calls[:2] == ["lock", "target_SELECT"]
