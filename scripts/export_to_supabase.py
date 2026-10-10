@@ -21,6 +21,7 @@ import logging
 import os
 import sqlite3
 import time
+from decimal import Decimal
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Sequence, Set, Tuple
@@ -394,6 +395,11 @@ def fetch_fixtures(
     now_iso = now.isoformat(sep=" ")
     upcoming_iso = upcoming_end.isoformat(sep=" ")
     finished_iso = finished_start.isoformat(sep=" ") if finished_start else None
+    # Null-scored postponements must still update serving status after kickoff.
+    # Keep this extra lane bounded even when completed-history export is unbounded.
+    postponed_iso = finished_iso or datetime.combine(
+        (now - timedelta(days=2)).date(), datetime.min.time()
+    ).isoformat(sep=" ")
     finished_clause = "home_score is not null and away_score is not null"
     if finished_iso:
         finished_clause += " and starting_at >= ?"
@@ -407,10 +413,13 @@ def fetch_fixtures(
           and away_team_id is not null
           and (
             ({finished_clause})
+            or ((upper(coalesce(status, '')) in ('POST','POSTP','POSTPONED')
+                 or upper(coalesce(status_code, '')) in ('POST','POSTP','POSTPONED'))
+                and starting_at >= ? and starting_at <= ?)
             or (starting_at >= ? and starting_at <= ?)
           )
         """,
-        [*keep_ids, *( [finished_iso] if finished_iso else []), now_iso, upcoming_iso],
+        [*keep_ids, *( [finished_iso] if finished_iso else []), postponed_iso, now_iso, now_iso, upcoming_iso],
     )
     fixtures = []
     for row in cur.fetchall():
@@ -989,6 +998,179 @@ def delete_fixture_rows(table: str, fixture_ids: Sequence[int], dry_run: bool) -
     return total, sorted(set(missed_fixture_ids))
 
 
+def upsert_fixture_core(target_conn, rows: Sequence[Dict]) -> None:
+    """Discovery updates identity/status, but cannot certify quarantined results."""
+    from psycopg2 import sql
+    from psycopg2.extras import Json, execute_values
+
+    if not rows:
+        return
+    try:
+        with target_conn.cursor() as cur:
+            # Bound round trips and acquire overlapping batches in ID order.
+            for offset in range(0, len(rows), 500):
+                batch = sorted((dict(row) for row in rows[offset:offset + 500]), key=lambda row: row["id"])
+                ids = [row["id"] for row in batch]
+                cur.execute("select id from public.fixtures where id = any(%s) order by id for update", (ids,))
+                cur.execute("""select fixture_id, exclusion_type, evidence from public.fixture_stats_quality_exclusions
+                               where fixture_id = any(%s) order by fixture_id for update""", (ids,))
+                recovering_ids = {fixture_id for fixture_id, kind, evidence in cur.fetchall()
+                                  if kind == "provider_unavailable"
+                                  and str((evidence or {}).get("provider_status", "")).upper() in {"POST", "POSTP", "POSTPONED"}}
+                columns = list(batch[0])
+                if not {"home_score", "away_score"} <= set(columns):
+                    raise ValueError("Fixture core export requires explicit score fields")
+                for row in batch:
+                    if set(row) != set(columns):
+                        raise ValueError("Fixture core batch has inconsistent columns")
+                    postponed = {str(row.get(key) or "").upper() for key in ("status", "status_code")} & {"POST", "POSTP", "POSTPONED"}
+                    if postponed or row["id"] in recovering_ids:
+                        row["home_score"] = row["away_score"] = None
+                statement = sql.SQL("insert into public.fixtures ({}) values %s on conflict (id) do update set {}").format(
+                    sql.SQL(",").join(map(sql.Identifier, columns)),
+                    sql.SQL(",").join(sql.SQL("{} = excluded.{}").format(sql.Identifier(key), sql.Identifier(key))
+                                      for key in columns if key != "id"),
+                )
+                execute_values(cur, statement, [[Json(row.get(key)) if isinstance(row.get(key), (dict, list))
+                                                else row.get(key) for key in columns] for row in batch], page_size=500)
+                postponed = [(row["id"], next(str(row.get(key)).upper() for key in ("status", "status_code")
+                              if str(row.get(key) or "").upper() in {"POST", "POSTP", "POSTPONED"}))
+                             for row in batch if {str(row.get(key) or "").upper() for key in ("status", "status_code")}
+                             & {"POST", "POSTP", "POSTPONED"}]
+                if postponed:
+                    # Discovery itself must establish the gate. No detail worker
+                    # runs for POST, so relying on that worker leaves a gap.
+                    execute_values(cur, """
+                        insert into public.fixture_stats_quality_exclusions
+                          (fixture_id, league_id, season_id, exclusion_type, reason, source, evidence,
+                           next_review_at, last_checked_at, updated_at)
+                        select f.id, f.league_id, f.season_id, 'provider_unavailable',
+                               'Postponed fixture observed by core discovery',
+                               'fixture_core_discovery',
+                               jsonb_build_object('provider_status', observed.status,
+                                                  'source', 'fixture_core_discovery'),
+                               now() + interval '7 days', now(), now()
+                        from (values %s) as observed(id,status)
+                        join public.fixtures f on f.id = observed.id
+                        on conflict (fixture_id) do update set
+                          evidence = fixture_stats_quality_exclusions.evidence || excluded.evidence,
+                          last_checked_at = now(), updated_at = now()
+                        where fixture_stats_quality_exclusions.exclusion_type = 'provider_unavailable'
+                          and upper(coalesce(fixture_stats_quality_exclusions.evidence->>'provider_status',''))
+                              in ('POST','POSTP','POSTPONED')
+                    """, postponed, page_size=500)
+        target_conn.commit()
+    except Exception:
+        target_conn.rollback()
+        raise
+
+
+def lock_fixture_recovery(cur, fixture_id: int, snapshot_id: int | None,
+                          appearances: Sequence[Dict], team_stats: Sequence[Dict],
+                          player_stats: Sequence[Dict]) -> bool:
+    """Validate recovery under the parent/exclusion locks used by quarantine writers.
+
+    SQLite is only staging. Replacement, quarantine release, projection and
+    accepted-snapshot activation must commit together on the serving database.
+    """
+    cur.execute("select home_team_id, away_team_id from public.fixtures where id = %s for update", (fixture_id,))
+    fixture = cur.fetchone()
+    if not fixture:
+        raise ValueError("Fixture recovery has no canonical fixture")
+    cur.execute("""select exclusion_type, evidence, last_checked_at, next_review_at
+                   from public.fixture_stats_quality_exclusions
+                   where fixture_id = %s for update""", (fixture_id,))
+    exclusion = cur.fetchone()
+    if not exclusion:
+        return False
+    if exclusion[0] != "provider_unavailable" or snapshot_id is None:
+        raise ValueError("Fixture quarantine cannot be released by this export")
+    old_status = (exclusion[1] or {}).get("provider_status")
+    if old_status and str(old_status).upper() not in {"POST", "POSTP", "POSTPONED"}:
+        raise ValueError("Non-postponement status quarantine requires separate review")
+    cur.execute("""select payload, quality_status, last_seen_at, normalized_hash from public.fixture_detail_snapshots
+                   where id = %s and fixture_id = %s for update""", (snapshot_id, fixture_id))
+    snapshot = cur.fetchone()
+    if not snapshot or snapshot[1] not in {"ready", "accepted", "provider_sparse"}:
+        raise ValueError("Quarantine recovery requires validated provider detail")
+    if exclusion[2] is None or snapshot[2] <= exclusion[2]:
+        raise ValueError("Provider snapshot predates the current quarantine evidence")
+
+    from jxd.sync import _extract_stat_value, _extract_minutes, _is_starter
+    from scripts.postmatch_fixture_detail_delivery import (
+        DERIVED_STAT_TYPE_IDS, FINISHED_STATUSES, assess_provider_payload,
+        revalidation_fixture_status, strict_status_identity,
+    )
+
+    data = snapshot[0]
+    _, teams = strict_status_identity(data, {"fixture_id": fixture_id,
+                                           "home_team_id": fixture[0], "away_team_id": fixture[1]})
+    assessment = assess_provider_payload(data)
+    if (revalidation_fixture_status(data) not in FINISHED_STATUSES
+            or assessment.status not in {"ready", "provider_sparse"}):
+        raise ValueError("Provider recovery identity, status or detail evidence is inconsistent")
+    if assessment.status == "provider_sparse":
+        # This is the existing two-response policy, persisted by the ordinary
+        # detail worker after source validation, not a status-only certificate.
+        cur.execute("""select stable_fetch_count, last_normalized_hash, last_checked_at, source_snapshot
+                       from public.fixture_detail_delivery_status
+                       where fixture_id = %s and status = 'running' and provider_finished
+                       for update""", (fixture_id,))
+        confirmation = cur.fetchone()
+        if (not confirmation or (confirmation[0] or 0) < 2 or confirmation[1] != snapshot[3]
+                or confirmation[2] is None or confirmation[2] <= exclusion[2] or not confirmation[3]):
+            raise ValueError("Provider-sparse recovery requires current durable matching-response evidence")
+    raw_appearances = {(row.get("player_id"), row.get("team_id")) for row in data["lineups"]}
+    if raw_appearances != {(row.get("player_id"), row.get("team_id")) for row in appearances}:
+        raise ValueError("Recovery export does not contain the provider appearances")
+    expected_lineups = {}
+    for lineup in data["lineups"]:
+        player_id, team_id = lineup.get("player_id"), lineup.get("team_id")
+        starter = _is_starter(lineup.get("type") or lineup.get("type_id") or lineup.get("lineup_type"))
+        minutes = _extract_minutes(lineup, lineup.get("details", []))
+        if (type(player_id) is not int or player_id <= 0 or type(team_id) is not int
+                or team_id not in teams or starter is None
+                or ("fixture_id" in lineup and (type(lineup["fixture_id"]) is not int or lineup["fixture_id"] != fixture_id))):
+            raise ValueError("Recovery appearance identity/participation is incomplete")
+        if starter and (minutes is None or minutes < 0):
+            raise ValueError("Recovery starter minutes are incomplete")
+        expected_lineups[player_id, team_id] = (starter, minutes)
+    if any(sum(starter for (player, side), (starter, minutes) in expected_lineups.items() if side == team) != 11
+           for team in teams):
+        raise ValueError("Recovery requires the complete starting lineups")
+    if expected_lineups != {(row["player_id"], row["team_id"]): (row.get("is_starter"), row.get("minutes_played"))
+                            for row in appearances}:
+        raise ValueError("Recovery export differs from the provider participation")
+    for raw, exported, player in ((data["statistics"], team_stats, False),
+                                  ([(dict(detail, player_id=lineup.get("player_id"), team_id=lineup.get("team_id")))
+                                    for lineup in data["lineups"] for detail in lineup.get("details", [])], player_stats, True)):
+        def key(row):
+            team_id = row.get("team_id") or row.get("participant_id")
+            type_id = row.get("type_id") or (row.get("type") or {}).get("id")
+            identities = [team_id, type_id] + ([row.get("player_id")] if player else [])
+            if (any(type(value) is not int or value <= 0 for value in identities)
+                    or team_id not in teams
+                    or ("fixture_id" in row and (type(row["fixture_id"]) is not int or row["fixture_id"] != fixture_id))):
+                raise ValueError("Recovery statistic identity is malformed or inconsistent")
+            return (row.get("player_id") if player else None, team_id, type_id)
+        provided = {key(row): Decimal(str(row["value"])) for row in exported
+                    if row.get("value") is not None and row.get("type_id") not in DERIVED_STAT_TYPE_IDS}
+        expected = {}
+        for row in raw:
+            value = _extract_stat_value(row.get("data") or row.get("value"))
+            if value is not None:
+                expected[key(row)] = Decimal(str(value))
+        if provided != expected:
+            raise ValueError("Recovery export differs from the captured provider statistics")
+    from jxd.sync import SyncService
+    home_score, away_score = SyncService(None, None)._extract_scores(data.get("scores") or data.get("score"))
+    if home_score is None or away_score is None:
+        raise ValueError("Recovery requires explicit completed-match scores")
+    cur.execute("update public.fixtures set home_score = %s, away_score = %s where id = %s",
+                (home_score, away_score, fixture_id))
+    return True
+
+
 def atomic_fixture_detail_publish(
     target_conn,
     *,
@@ -998,6 +1180,7 @@ def atomic_fixture_detail_publish(
     fixture_statistics: Sequence[Dict],
     fixture_player_statistics: Sequence[Dict],
     player_dimensions: Sequence[Dict] = (),
+    defer_quarantined: bool = False,
 ) -> Dict:
     """Replace one fixture's raw detail through the dependency-safe RPC."""
     def json_rows(rows: Sequence[Dict]) -> list[Dict]:
@@ -1020,6 +1203,15 @@ def atomic_fixture_detail_publish(
     )
     try:
         with target_conn.cursor() as cur:
+            if defer_quarantined and snapshot_id is None:
+                cur.execute("select id from public.fixtures where id = %s for update", (fixture_id,))
+                cur.execute("select fixture_id from public.fixture_stats_quality_exclusions where fixture_id = %s for update", (fixture_id,))
+                if cur.fetchone():
+                    target_conn.commit()
+                    return {"fixture_id": fixture_id, "deferred": "quarantine_requires_validated_snapshot"}
+            recovering = lock_fixture_recovery(cur, fixture_id, snapshot_id,
+                                                fixture_players, fixture_statistics,
+                                                fixture_player_statistics)
             cur.execute(
                 """
                 select public.publish_fixture_detail_atomic_v2(
@@ -1029,6 +1221,12 @@ def atomic_fixture_detail_publish(
                 (fixture_id, snapshot_id, *payloads),
             )
             row = cur.fetchone()
+            if recovering:
+                cur.execute("delete from public.fixture_stats_quality_exclusions where fixture_id = %s", (fixture_id,))
+                cur.execute("select public.refresh_player_stats_for_fixture(%s)", (fixture_id,))
+                cur.execute("""update public.fixture_detail_snapshots
+                               set quality_status = 'accepted', accepted_at = coalesce(accepted_at, now())
+                               where id = %s and fixture_id = %s""", (snapshot_id, fixture_id))
         target_conn.commit()
         return row[0] if row else {"fixture_id": fixture_id}
     except Exception:
@@ -1043,6 +1241,12 @@ def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) 
     if not rows:
         return 0, 0
     if dry_run:
+        return len(rows), 0
+    if table == "fixtures":
+        if not SUPABASE_DB_URL or psycopg2 is None:
+            raise RuntimeError("Fixture core export requires PostgreSQL for quarantine-safe result publication")
+        with psycopg2.connect(SUPABASE_DB_URL, connect_timeout=20) as target_conn:
+            upsert_fixture_core(target_conn, rows)
         return len(rows), 0
 
     url = SUPABASE_URL.rstrip("/") + REST_PATH + f"/{table}"
@@ -1214,6 +1418,9 @@ def main():
         help="Optional path to write detailed export report (including timeout splits/missed fixture deletes).",
     )
     args = parser.parse_args()
+
+    if not args.dry_run and not args.fixture_core_only and not args.atomic_fixture_detail:
+        raise SystemExit("Fixture detail export requires --atomic-fixture-detail; REST replacement is not quarantine-safe")
 
     require_env(args.dry_run)
 
@@ -1431,6 +1638,7 @@ def main():
     export_rows(exports)
 
     atomic_published: Dict[str, int] = {}
+    atomic_deferred: list[int] = []
     if args.atomic_fixture_detail and not args.dry_run:
         if psycopg2 is None or not SUPABASE_DB_URL:
             raise SystemExit("--atomic-fixture-detail requires SUPABASE_DB_URL and psycopg2")
@@ -1445,10 +1653,11 @@ def main():
                 player_ids_by_fixture.setdefault(int(detail_fixture_id), set()).add(int(detail_player_id))
             for fixture_id in sorted(fixture_ids):
                 try:
-                    atomic_fixture_detail_publish(
+                    outcome = atomic_fixture_detail_publish(
                         target_conn,
                         fixture_id=int(fixture_id),
                         snapshot_id=args.provider_snapshot_id,
+                        defer_quarantined=not explicit_fixture_ids,
                         player_dimensions=[
                             row
                             for row in players
@@ -1460,7 +1669,11 @@ def main():
                             row for row in fixture_player_stats if int(row["fixture_id"]) == int(fixture_id)
                         ],
                     )
-                    atomic_published[str(fixture_id)] = 1
+                    if outcome.get("deferred"):
+                        atomic_deferred.append(int(fixture_id))
+                        log.warning("Deferred quarantined fixture %s: validated snapshot required", fixture_id)
+                    else:
+                        atomic_published[str(fixture_id)] = 1
                 except Exception as exc:
                     failure = {
                         "status": "failed",
@@ -1502,6 +1715,7 @@ def main():
         "fixture_core_only": args.fixture_core_only,
         "explicit_fixture_ids": explicit_fixture_ids,
         "fixtures_selected": len(fixtures),
+        "quarantined_detail_deferred": atomic_deferred,
         "keep_season_ids": list(keep_ids),
         "fixtures_exported": exported["fixtures"],
         "teams_exported": exported["teams"],

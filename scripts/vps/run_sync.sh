@@ -118,6 +118,7 @@ if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE
     --with-details; then
     if ! python scripts/export_to_supabase.py \
       --strict \
+      --atomic-fixture-detail \
       --leagues "${STATS_LEAGUES}" \
       --days-back "${FIXTURE_EXPORT_DAYS_BACK}" \
       --upcoming-days "${FIXTURE_EXPORT_DAYS_FORWARD}" \

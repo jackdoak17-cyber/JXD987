@@ -224,6 +224,8 @@ def test_candidate_selection_is_due_and_does_not_require_local_scores() -> None:
     conn.execute("create table fixtures (id integer, league_id integer, starting_at text)")
     conn.execute("insert into fixtures values (1, 8, datetime('now', '-4 hours'))")
     conn.execute("insert into fixtures values (2, 8, datetime('now', '-3 hours'))")
+    conn.execute("alter table fixtures add column status text")
+    conn.execute("alter table fixtures add column status_code text")
     ensure_ledger(conn)
     conn.execute(
         "insert into fixture_detail_deliveries(fixture_id,league_id,status,first_seen_at,next_attempt_at,updated_at) "
@@ -239,6 +241,8 @@ def test_candidate_selection_prioritizes_recent_fixtures_over_old_revalidation()
     conn.execute("create table fixtures (id integer, league_id integer, starting_at text)")
     conn.execute("insert into fixtures values (1, 8, datetime('now', '-20 days'))")
     conn.execute("insert into fixtures values (2, 8, datetime('now', '-3 hours'))")
+    conn.execute("alter table fixtures add column status text")
+    conn.execute("alter table fixtures add column status_code text")
     ensure_ledger(conn)
     conn.execute(
         "insert into fixture_detail_deliveries(fixture_id,league_id,status,first_seen_at,next_revalidation_at,updated_at) "
@@ -253,6 +257,8 @@ def test_candidate_selection_does_not_leave_confirmation_behind_long_backoff() -
     conn = sqlite3.connect(":memory:")
     conn.execute("create table fixtures (id integer, league_id integer, starting_at text)")
     conn.execute("insert into fixtures values (1, 8, datetime('now', '-3 hours'))")
+    conn.execute("alter table fixtures add column status text")
+    conn.execute("alter table fixtures add column status_code text")
     ensure_ledger(conn)
     conn.execute(
         "insert into fixture_detail_deliveries("
@@ -271,6 +277,8 @@ def test_candidate_selection_rechecks_expired_exclusion_outside_recent_window() 
     conn = sqlite3.connect(":memory:")
     conn.execute("create table fixtures (id integer, league_id integer, starting_at text)")
     conn.execute("insert into fixtures values (1, 8, datetime('now', '-20 days'))")
+    conn.execute("alter table fixtures add column status text")
+    conn.execute("alter table fixtures add column status_code text")
     ensure_ledger(conn)
     conn.execute(
         "insert into fixture_detail_deliveries("

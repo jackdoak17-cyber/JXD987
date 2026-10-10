@@ -533,7 +533,7 @@ def candidate_fixture_ids(
         f"""
         select f.id, f.starting_at, d.status, d.next_attempt_at, d.updated_at,
                d.next_revalidation_at, d.reason_code, d.stable_fetch_count,
-               d.last_attempted_at
+               d.last_attempted_at, f.status, f.status_code, d.provider_status
           from fixtures f
           left join {LEDGER_TABLE} d on d.fixture_id = f.id
          where ((f.starting_at >= ? and f.starting_at <= ?)
@@ -551,6 +551,15 @@ def candidate_fixture_ids(
     now = utc_now()
     for row in rows:
         status = str(row[2] or "new")
+        fixture_states = {str(value).upper() for value in row[9:11] if value}
+        if fixture_states & {"POST", "POSTP", "POSTPONED"}:
+            continue
+        rediscovered_final = (
+            status == "excluded"
+            and str(row[11] or "").upper() in {"POST", "POSTP", "POSTPONED"}
+            and bool(fixture_states)
+            and fixture_states <= FINISHED_STATUSES
+        )
         if not force and status == "running":
             running_at = parse_iso(row[4])
             if running_at and now - running_at < timedelta(minutes=30):
@@ -567,7 +576,7 @@ def candidate_fixture_ids(
                     continue
             elif status == "provider_sparse" and not due(row[3], now):
                 continue
-            elif row[3] is not None and not due(row[3], now) and not stable_confirmation_due(
+            elif not rediscovered_final and row[3] is not None and not due(row[3], now) and not stable_confirmation_due(
                 status,
                 str(row[6]) if row[6] is not None else None,
                 int(row[7] or 0),
@@ -579,6 +588,15 @@ def candidate_fixture_ids(
         if len(selected) >= max(limit, 0):
             break
     return selected
+
+
+def rediscovered_postponement_sql() -> str:
+    """Discovery permits a detail fetch, never quarantine release or publication."""
+    return """(x.exclusion_type = 'provider_unavailable'
+        and upper(coalesce(x.evidence->>'provider_status', '')) in ('POST', 'POSTP', 'POSTPONED')
+        and upper(coalesce(f.status, f.status_code, '')) in ('FT','AET','FT_PEN','FTP','PEN','FINISHED','ENDED')
+        and (f.status is null or upper(f.status) in ('FT','AET','FT_PEN','FTP','PEN','FINISHED','ENDED'))
+        and (f.status_code is null or upper(f.status_code) in ('FT','AET','FT_PEN','FTP','PEN','FINISHED','ENDED')))"""
 
 
 def candidate_target_fixture_ids(
@@ -598,9 +616,10 @@ def candidate_target_fixture_ids(
     never-delivered population.
     """
     clauses = [
-        "f.home_score is not null",
-        "f.away_score is not null",
-        "not exists (select 1 from public.fixture_stats_quality_exclusions x where x.fixture_id = f.id and (x.exclusion_type = 'duplicate' or x.next_review_at is null or x.next_review_at > now()))",
+        f"((f.home_score is not null and f.away_score is not null) or exists (select 1 from public.fixture_stats_quality_exclusions x where x.fixture_id = f.id and {rediscovered_postponement_sql()}))",
+        "upper(coalesce(f.status, '')) not in ('POST','POSTP','POSTPONED')",
+        "upper(coalesce(f.status_code, '')) not in ('POST','POSTP','POSTPONED')",
+        f"not exists (select 1 from public.fixture_stats_quality_exclusions x where x.fixture_id = f.id and (x.exclusion_type = 'duplicate' or x.next_review_at is null or x.next_review_at > now()) and not {rediscovered_postponement_sql()})",
     ]
     params: list[object] = []
     if league_ids:
@@ -664,10 +683,13 @@ def candidate_target_fixture_ids(
               or (
                 d.status = 'excluded'
                 and d.next_attempt_at is not null
-                and d.next_attempt_at <= now()
+                and (d.next_attempt_at <= now() or exists (
+                  select 1 from public.fixture_stats_quality_exclusions x
+                  where x.fixture_id = f.id and REDISCOVERED_POSTPONEMENT
+                ))
               )
             )
-            """,
+            """.replace("REDISCOVERED_POSTPONEMENT", rediscovered_postponement_sql()),
             """
             coalesce(d.next_attempt_at, d.updated_at, f.starting_at),
             f.season_id desc,
@@ -952,7 +974,7 @@ def excluded_target_fixture_ids(target_url: str, fixture_ids: Sequence[int]) -> 
     with psycopg2.connect(target_url, connect_timeout=20) as target_conn:
         with target_conn.cursor() as cur:
             cur.execute(
-                "select fixture_id from public.fixture_stats_quality_exclusions where fixture_id = any(%s) and (exclusion_type = 'duplicate' or next_review_at is null or next_review_at > now())",
+                f"select x.fixture_id from public.fixture_stats_quality_exclusions x join public.fixtures f on f.id = x.fixture_id where x.fixture_id = any(%s) and (x.exclusion_type = 'duplicate' or x.next_review_at is null or x.next_review_at > now()) and not {rediscovered_postponement_sql()}",
                 (ids,),
             )
             return {int(row[0]) for row in cur.fetchall()}
@@ -1288,6 +1310,9 @@ def mark_provider_unavailable(
     target = target_conn or psycopg2.connect(target_url, connect_timeout=20)
     try:
         with target.cursor() as cur:
+            # Use the same parent lock as atomic publication, including when
+            # no exclusion row exists yet (row locking an absent row is unsafe).
+            cur.execute("select id from public.fixtures where id = %s for update", (fixture_id,))
             if not meta:
                 cur.execute(
                     "select league_id, season_id from public.fixtures where id = %s",
@@ -1338,6 +1363,9 @@ def mark_provider_unavailable(
                     json.dumps(resolved_evidence),
                 ),
             )
+            if assessment and assessment.fixture_status in {"POST", "POSTP", "POSTPONED"}:
+                cur.execute("update public.fixtures set status = %s, status_code = %s, home_score = null, away_score = null where id = %s",
+                            (assessment.fixture_status, assessment.fixture_status, fixture_id))
         target.commit()
     except Exception:
         target.rollback()
@@ -1345,6 +1373,9 @@ def mark_provider_unavailable(
     finally:
         if owns_target_conn:
             target.close()
+    if assessment and assessment.fixture_status in {"POST", "POSTP", "POSTPONED"}:
+        conn.execute("update fixtures set status = ?, status_code = ?, home_score = null, away_score = null where id = ?",
+                     (assessment.fixture_status, assessment.fixture_status, fixture_id))
     update_ledger(
         conn,
         fixture_id,
@@ -1392,7 +1423,7 @@ def persist_provider_snapshot(
     payload_hash: str,
     normalized_hash: str,
     target_conn: Any | None = None,
-    preserve_accepted: bool = False,
+    preserve_accepted: bool = True,
 ) -> int:
     """Persist every successful provider response before active facts publish."""
     owns_target_conn = target_conn is None
@@ -1414,12 +1445,15 @@ def persist_provider_snapshot(
                   season_id = excluded.season_id,
                   normalized_hash = excluded.normalized_hash,
                   provider_status = excluded.provider_status,
-                  quality_status = excluded.quality_status,
-                  payload = excluded.payload,
-                  release_id = excluded.release_id,
-                  error = excluded.error,
+                  quality_status = case when %s and fixture_detail_snapshots.quality_status = 'accepted'
+                    then fixture_detail_snapshots.quality_status else excluded.quality_status end,
+                  payload = case when fixture_detail_snapshots.quality_status = 'accepted'
+                    then fixture_detail_snapshots.payload else excluded.payload end,
+                  release_id = case when fixture_detail_snapshots.quality_status = 'accepted'
+                    then fixture_detail_snapshots.release_id else excluded.release_id end,
+                  error = case when fixture_detail_snapshots.quality_status = 'accepted'
+                    then fixture_detail_snapshots.error else excluded.error end,
                   last_seen_at = now()
-                where not (%s and fixture_detail_snapshots.quality_status = 'accepted')
                 returning id
                 """,
                 (
@@ -1473,7 +1507,7 @@ def activate_provider_snapshot(
             cur.execute(
                 """
                 update public.fixture_detail_snapshots
-                   set accepted_at = now(), quality_status = 'accepted'
+                   set accepted_at = coalesce(accepted_at, now()), quality_status = 'accepted'
                  where id = %s and fixture_id = %s
                 """,
                 (snapshot_id, fixture_id),
@@ -2703,7 +2737,7 @@ def main() -> int:
         season_id = _int(source_meta_row[1]) if source_meta_row else (target_meta[1] if target_meta else None)
         starting_at = source_meta_row[2] if source_meta_row else (target_meta[2] if target_meta else None)
         prior = conn.execute(
-            f"select provider_team_stat_count, provider_player_stat_count, last_normalized_hash, stable_fetch_count "
+            f"select provider_team_stat_count, provider_player_stat_count, last_normalized_hash, stable_fetch_count, provider_status "
             f"from {LEDGER_TABLE} where fixture_id = ?",
             (fixture_id,),
         ).fetchone()
@@ -2717,7 +2751,7 @@ def main() -> int:
             prior_team_count = max(prior_team_count, target_meta[3])
             prior_player_count = max(prior_player_count, target_meta[4])
         prior_normalized_hash = str(prior[2]) if prior and prior[2] else None
-        prior_stable_count = int(prior[3] or 0) if prior else 0
+        prior_stable_count = int(prior[3] or 0) if prior and str(prior[4] or "").upper() in FINISHED_STATUSES else 0
         attempt = ledger_attempt_start(conn, fixture_id, utc_now(), league_id, season_id)
         assessment: ProviderAssessment | None = None
         snapshot_id: int | None = None
@@ -2872,7 +2906,11 @@ def main() -> int:
                 continue
 
             source = store_provider_detail(engine, client, fixture_id, data, assessment)
-            clear_provider_unavailable_exclusion(target_url, fixture_id)
+            if assessment.status == "provider_sparse":
+                update_ledger(conn, fixture_id, "running", attempt, assessment, source=source,
+                              payload_hash=payload_hash, normalized_hash=normalized_hash,
+                              stable_fetch_count=stable_fetch_count)
+                publish_delivery_status(target_url, conn, fixture_id)
             export_result = export_fixture(
                 fixture_id,
                 leagues,

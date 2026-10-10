@@ -100,6 +100,8 @@ def fetch_candidate_fixture_ids(
         where starting_at >= :window_start
           and starting_at <= :window_end
           and coalesce(status, '') not in ('FT', 'AET', 'PEN', 'FT_PEN')
+          and upper(coalesce(status, '')) not in ('POST', 'POSTP', 'POSTPONED')
+          and upper(coalesce(status_code, '')) not in ('POST', 'POSTP', 'POSTPONED')
           {league_clause}
         order by starting_at asc
         limit :limit

@@ -111,6 +111,7 @@ jobs:
 
       - name: Export recent fixture core to Supabase
         env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SUPABASE_EXPORT_CHUNK: "1000"
@@ -133,6 +134,7 @@ jobs:
       - name: Export provider-confirmed team history core
         if: ${{ env.TEAM_HISTORY_DAYS != '0' }}
         env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SUPABASE_EXPORT_CHUNK: "1000"

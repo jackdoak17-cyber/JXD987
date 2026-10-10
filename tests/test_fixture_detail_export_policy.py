@@ -247,6 +247,10 @@ def test_atomic_publication_calls_v2_with_player_dimensions_and_snapshot() -> No
             captured["params"] = params
 
         def fetchone(self):
+            if "home_team_id" in captured["statement"]:
+                return (101, 202)
+            if "fixture_stats_quality_exclusions" in captured["statement"]:
+                return None
             return ({"fixture_id": 1},)
 
     class Transaction:
