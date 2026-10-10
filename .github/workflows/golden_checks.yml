@@ -46,9 +46,10 @@ jobs:
 
       - name: Export to Supabase
         env:
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-        run: python3 scripts/export_to_supabase.py --strict
+        run: python3 scripts/export_to_supabase.py --strict --atomic-fixture-detail
 
       - name: Golden checks (Supabase)
         env:

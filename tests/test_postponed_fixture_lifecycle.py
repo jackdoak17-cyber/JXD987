@@ -27,10 +27,45 @@ from jxd.models import Base, Fixture, FixturePlayer, FixturePlayerStatistic, Fix
 from jxd.sync import SyncService
 from scripts import postmatch_fixture_detail_delivery as delivery
 from scripts.export_to_supabase import atomic_fixture_detail_publish, upsert_fixture_core
+from scripts.export_to_supabase import fetch_fixtures
 from scripts.refresh_fixture_delivery import is_hidden
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = 19745046
+
+
+@pytest.mark.parametrize("status", ["POST", "POSTP", "POSTPONED"])
+def test_rolling_core_export_delivers_past_postponements_within_history_window(status):
+    from datetime import timedelta
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""create table fixtures(id int, league_id int, season_id int, starting_at text,
+        status text, status_code text, home_team_id int, away_team_id int, home_score int,
+        away_score int, lineup_confirmed bool, extra text)""")
+    now = datetime.utcnow()
+    for fixture_id, days, state in ((1, 1, status), (2, 10, status), (3, 1, "NS")):
+        conn.execute("insert into fixtures values(?,8,10,?,?,?,101,202,null,null,0,null)",
+                     (fixture_id, (now - timedelta(days=days)).isoformat(sep=" "), state, state))
+    try:
+        rows = fetch_fixtures(conn, [10], days_back=2, upcoming_days=30)
+        assert [row["id"] for row in rows] == [1]
+        assert rows[0]["home_score"] is None and rows[0]["away_score"] is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("workflow,count", [
+    ("sync_recent.yml", 2), ("gather_premier_league_data.yml", 1), ("golden_checks.yml", 1),
+])
+def test_rest_only_export_workflows_wire_the_existing_session_secret(workflow, count):
+    # Pin the source configuration contract without adding a YAML dependency.
+    text = (ROOT / ".github/workflows" / workflow).read_text()
+    export_steps = [step for step in text.split("      - name:")
+                    if "scripts/export_to_supabase.py" in step]
+    assert len(export_steps) == count
+    for step in export_steps:
+        assert "SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}" in step
+        assert "--fixture-core-only" in step or "--atomic-fixture-detail" in step
 
 
 @pytest.fixture(scope="module")
@@ -102,7 +137,7 @@ def replay(postgres, tmp_path):
             fetched_at timestamptz, last_seen_at timestamptz, accepted_at timestamptz,
             unique(fixture_id,payload_hash));
           create table fixture_stats_quality_exclusions(fixture_id bigint primary key references fixtures(id),
-            league_id bigint, season_id bigint, exclusion_type text, reason text, evidence jsonb,
+            league_id bigint, season_id bigint, exclusion_type text, reason text, source text, evidence jsonb,
             first_identified_at timestamptz default now(), last_checked_at timestamptz,
             updated_at timestamptz, next_review_at timestamptz);
           create table fixture_detail_delivery_status(fixture_id bigint primary key, status text,
@@ -194,7 +229,9 @@ class Replay:
     def quarantine(self, fixture_id=FIXTURE):
         self.sql("""insert into fixture_stats_quality_exclusions
           (fixture_id,exclusion_type,evidence,last_checked_at,next_review_at)
-          values(%s,'provider_unavailable','{"provider_status":"POST"}',now()-interval '2 days',now()+interval '7 days')""", (fixture_id,))
+          values(%s,'provider_unavailable','{"provider_status":"POST"}',now()-interval '2 days',now()+interval '7 days')
+          on conflict(fixture_id) do update set last_checked_at=excluded.last_checked_at,
+            next_review_at=excluded.next_review_at""", (fixture_id,))
         self.sql("""insert into fixture_detail_delivery_status
           (fixture_id,status,next_attempt_at,updated_at,first_seen_at)
           values(%s,'excluded',now()+interval '7 days',now(),now())""", (fixture_id,))
@@ -235,6 +272,113 @@ def test_normal_fixture_to_played_complete(replay):
     assert replay.publish(payload())
     assert replay.shots() == [(2,)]
     assert replay.shots(player=22) == [(0,)]  # Only an explicit provider zero.
+
+
+def test_discovery_alone_quarantines_postponement_until_complete_recovery(replay):
+    replay.discover(payload())
+    assert replay.publish(payload())
+    replay.discover(payload("POST"))
+    assert replay.sql("select evidence->>'provider_status' from fixture_stats_quality_exclusions") == [("POST",)]
+    rescheduled = payload("NS")
+    rescheduled["starting_at"] = "2026-10-10 12:00:00"
+    replay.discover(rescheduled)
+    replay.discover(payload())
+    assert replay.sql("select home_score,away_score from fixtures") == [(None, None)]
+    assert not replay.publish(payload(complete=False))
+    assert replay.sql("select home_score,away_score from fixtures") == [(None, None)]
+    assert delivery.candidate_target_fixture_ids(replay.url, [8], 10, False) == [FIXTURE]
+    assert replay.publish(payload(shots=3))
+    assert replay.sql("select count(*) from fixture_stats_quality_exclusions") == [(0,)]
+    assert replay.sql("select home_score,away_score from fixtures") == [(1, 0)]
+    assert replay.shots() == [(3,)]
+
+
+def test_discovery_quarantine_is_idempotent_and_preserves_accepted_evidence(replay):
+    replay.discover(payload())
+    assert replay.publish(payload())
+    previous = replay.sql("select quality_status,payload,release_id,accepted_at from fixture_detail_snapshots")
+    replay.discover(payload("POST"))
+    first = replay.sql("select first_identified_at from fixture_stats_quality_exclusions")
+    replay.discover(payload("POST"))
+    assert replay.sql("select first_identified_at from fixture_stats_quality_exclusions") == first
+    assert replay.sql("select quality_status,payload,release_id,accepted_at from fixture_detail_snapshots") == previous
+
+
+@pytest.mark.parametrize("kind,status", [("duplicate", "POST"), ("provider_unavailable", "CANC")])
+def test_discovery_preserves_unrelated_quarantine(replay, kind, status):
+    replay.discover(payload("NS"))
+    replay.sql("""insert into fixture_stats_quality_exclusions(fixture_id,exclusion_type,evidence)
+        values(%s,%s,jsonb_build_object('provider_status',%s::text))""", (FIXTURE, kind, status))
+    before = replay.sql("select * from fixture_stats_quality_exclusions")
+    replay.discover(payload("POST"))
+    assert replay.sql("select * from fixture_stats_quality_exclusions") == before
+
+
+def test_discovery_quarantine_failure_rolls_back_core_update(replay):
+    replay.discover(payload())
+    replay.sql("""create function reject_quarantine() returns trigger language plpgsql as $$
+        begin raise exception 'simulated quarantine persistence failure'; end $$;
+        create trigger reject_quarantine before insert on fixture_stats_quality_exclusions
+        for each row execute function reject_quarantine()""")
+    with pytest.raises(psycopg2.Error, match="simulated quarantine persistence failure"):
+        replay.discover(payload("POST"))
+    assert replay.sql("select status,home_score,away_score from fixtures") == [("FT", 1, 0)]
+    assert replay.sql("select count(*) from fixture_stats_quality_exclusions") == [(0,)]
+
+
+def test_rolling_history_defers_quarantine_without_publishing_or_releasing(replay):
+    replay.discover(payload("POST"))
+    replay.discover(payload())
+    before = replay.sql("select * from fixture_stats_quality_exclusions")
+    result = atomic_fixture_detail_publish(replay.conn, fixture_id=FIXTURE, snapshot_id=None,
+        fixture_players=[], fixture_statistics=[], fixture_player_statistics=[], defer_quarantined=True)
+    assert result["deferred"] == "quarantine_requires_validated_snapshot"
+    assert replay.sql("select * from fixture_stats_quality_exclusions") == before
+    assert replay.sql("select home_score,away_score from fixtures") == [(None, None)]
+    assert replay.shots() == []
+    normal = payload(fixture_id=FIXTURE + 1)
+    replay.discover(normal)
+    assert replay.publish(normal)
+    assert replay.shots(FIXTURE + 1) == [(2,)]
+
+
+def test_nonatomic_detail_command_rejected_before_any_connection(monkeypatch):
+    from scripts import export_to_supabase as exporter
+
+    monkeypatch.setattr(sys, "argv", ["export_to_supabase.py", "--strict"])
+    monkeypatch.setattr(exporter, "get_conn", Mock(side_effect=AssertionError("Unexpected source connection")))
+    with pytest.raises(SystemExit, match="requires --atomic-fixture-detail"):
+        exporter.main()
+
+
+def test_legacy_sync_wrapper_uses_the_guarded_atomic_export():
+    text = (ROOT / "scripts/vps/run_sync.sh").read_text()
+    command = text.split("if ! python scripts/export_to_supabase.py", 1)[1].split("; then", 1)[0]
+    assert "--atomic-fixture-detail" in command
+
+
+def test_scheduled_refresh_only_discovers_yesterdays_final_fixture(replay, monkeypatch):
+    from datetime import timedelta
+    from scripts import sync_odds
+
+    today = datetime.utcnow().date()
+    yesterday = today - timedelta(days=1)
+    data = payload()
+    data["starting_at"] = f"{yesterday} 19:30:00"
+    replay.client.fetch_collection.side_effect = None
+    replay.client.fetch_collection.return_value = [data]
+    monkeypatch.setenv("SPORTMONKS_API_TOKEN", "offline-test-token")
+    monkeypatch.setattr(sync_odds, "get_engine", lambda: replay.engine)
+    monkeypatch.setattr(sync_odds, "SportMonksClient", lambda: replay.client)
+    monkeypatch.setattr(sys, "argv", ["sync_odds.py", "--refresh-only", "--refresh-upcoming",
+        "--days-back", "2", "--days-forward", "31", "--leagues", "8",
+        "--no-refresh-squads-missing", "--no-refresh-sidelined-window"])
+    sync_odds.main()
+    path = replay.client.fetch_collection.call_args.args[0]
+    assert f"/{today - timedelta(days=2)}/" in path
+    assert str(today + timedelta(days=31)) in path
+    with Session(replay.engine) as session:
+        assert session.get(Fixture, FIXTURE).status == "FT"
 
 
 def test_postponed_rescheduled_same_identity_preserves_bets(replay):

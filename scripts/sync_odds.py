@@ -2277,7 +2277,10 @@ def main() -> None:
             svc.ensure_schema()
             if refresh_upcoming:
                 log.info("Refreshing upcoming fixtures for odds window (%s days)", args.days_forward)
-                svc.sync_upcoming_window(league_ids, days_forward=args.days_forward)
+                # The fixture-core refresh job owns a bounded history window;
+                # matches finishing after midnight must also be rediscovered.
+                svc.sync_upcoming_window(league_ids, days_forward=args.days_forward,
+                                         days_back=args.days_back if args.refresh_only else 0)
 
     fixtures = load_fixtures(session, league_ids, args.days_back, args.days_forward)
     if args.priority:

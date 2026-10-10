@@ -1734,11 +1734,13 @@ class SyncService:
             return 0
         return self.reconcile_fixtures(fixture_ids)
 
-    def sync_upcoming_window(self, league_ids: Sequence[int], days_forward: int = 14) -> int:
+    def sync_upcoming_window(self, league_ids: Sequence[int], days_forward: int = 14,
+                             days_back: int = 0) -> int:
         today = datetime.utcnow().date()
+        start = today - timedelta(days=max(0, days_back))
         end = today + timedelta(days=days_forward)
         includes = ["participants", "scores", "state"]
-        return self.sync_fixtures_between(today, end, league_ids=league_ids, includes=includes)
+        return self.sync_fixtures_between(start, end, league_ids=league_ids, includes=includes)
 
     def sync_team_history_for_recent_fixtures(
         self,
