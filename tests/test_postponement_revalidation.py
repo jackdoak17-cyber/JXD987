@@ -82,10 +82,11 @@ def test_claim_is_durable_idempotent_and_exhausts_three_attempts(tmp_path):
     original = quarantine()
     for day in range(3):
         now = NOW + timedelta(days=day)
-        assert delivery.claim_postponement_review(first, original, capture(), now)
+        claim = {}
+        assert delivery.claim_postponement_review(first, original, capture(), now, claim)
         assert not delivery.claim_postponement_review(second, original, capture(), now)
         assert not delivery.claim_postponement_review(second, original, capture(), now + timedelta(hours=23))
-        delivery.finish_postponement_review(first, original["fixture_id"], "blocked_or_failed")
+        delivery.finish_postponement_review(first, claim, "blocked_or_failed")
     assert not delivery.claim_postponement_review(second, original, capture(), NOW + timedelta(days=30))
     rows = first.execute("select original_exclusion, evidence, outcome from fixture_postponement_reviews").fetchall()
     assert len(rows) == 3
@@ -96,8 +97,9 @@ def test_claim_is_durable_idempotent_and_exhausts_three_attempts(tmp_path):
 
 def test_successful_review_cannot_be_reclaimed():
     db = sqlite3.connect(":memory:")
-    assert delivery.claim_postponement_review(db, quarantine(), capture(), NOW)
-    delivery.finish_postponement_review(db, 19745046, "verified")
+    claim = {}
+    assert delivery.claim_postponement_review(db, quarantine(), capture(), NOW, claim)
+    delivery.finish_postponement_review(db, claim, "verified")
     assert not delivery.claim_postponement_review(db, quarantine(), capture(), NOW + timedelta(days=2))
 
 
@@ -115,8 +117,9 @@ def test_native_postgres_timestamps_are_preserved_in_audit():
 def test_finishing_retry_does_not_rewrite_crashed_attempt_evidence():
     db = sqlite3.connect(":memory:")
     assert delivery.claim_postponement_review(db, quarantine(), capture(), NOW)
-    assert delivery.claim_postponement_review(db, quarantine(), capture(), NOW + timedelta(days=1))
-    delivery.finish_postponement_review(db, 19745046, "verified")
+    claim = {}
+    assert delivery.claim_postponement_review(db, quarantine(), capture(), NOW + timedelta(days=1), claim)
+    delivery.finish_postponement_review(db, claim, "verified")
     assert db.execute("select outcome from fixture_postponement_reviews order by attempt").fetchall() == [("claimed",), ("verified",)]
 
 
@@ -963,3 +966,154 @@ def test_provider_participant_locations_must_match_trusted_sides(monkeypatch, tm
 def test_metadata_is_read_only_after_canonical_lock(monkeypatch, tmp_path):
     results, calls, _, _ = run_observation(monkeypatch, tmp_path, full_detail())
     assert results == [0] and calls[:2] == ["lock", "target_SELECT"]
+
+
+EPISODE_FORMS = ["2026-10-03T16:37:11Z", "2026-10-03T16:37:11+00:00",
+                 "2026-10-03T17:37:11+01:00", "2026-10-03T18:37:11+02:00",
+                 "2026-10-03T19:37:11+03:00"]
+
+
+def legacy_audit(db, forms, times):
+    db.execute("""create table fixture_postponement_reviews (
+        fixture_id integer, exclusion_key text, attempt integer, claimed_at text,
+        evidence text, original_exclusion text, outcome text default 'claimed', observation text,
+        primary key(fixture_id, exclusion_key, attempt))""")
+    for index, (form, claimed) in enumerate(zip(forms, times)):
+        original = quarantine()
+        original["first_identified_at"] = form
+        db.execute("insert into fixture_postponement_reviews values(?,?,?,?,?,?,?,?)",
+                   (19745046, form, index + 1, claimed.isoformat(), json.dumps(capture()),
+                    json.dumps(original), "claimed", None))
+    db.commit()
+
+
+@pytest.mark.parametrize("form", EPISODE_FORMS)
+def test_equivalent_episode_same_instant_cannot_claim_again(form):
+    db = sqlite3.connect(":memory:")
+    assert delivery.claim_postponement_review(db, quarantine(), capture(), NOW)
+    other = quarantine()
+    other["first_identified_at"] = form
+    assert not delivery.claim_postponement_review(db, other, capture(), NOW)
+    assert not delivery.claim_postponement_review(db, other, capture(), NOW + timedelta(hours=23))
+    assert db.execute("select count(*) from fixture_postponement_reviews").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("form", EPISODE_FORMS)
+@pytest.mark.parametrize("attempts", [1, 3])
+def test_legacy_equivalent_attempts_preserved_and_counted(form, attempts):
+    db = sqlite3.connect(":memory:")
+    legacy_audit(db, EPISODE_FORMS[:attempts], [NOW + timedelta(days=i) for i in range(attempts)])
+    before = db.execute("select * from fixture_postponement_reviews").fetchall()
+    other = quarantine()
+    other["first_identified_at"] = form
+    assert not delivery.claim_postponement_review(db, other, capture(), NOW + timedelta(days=attempts-1, hours=23))
+    result = delivery.claim_postponement_review(db, other, capture(), NOW + timedelta(days=10))
+    assert result == (attempts < 3)
+    after = db.execute("select * from fixture_postponement_reviews").fetchall()
+    assert after[:attempts] == before
+    if result:
+        assert after[-1][1:3] == ("2026-10-03T16:37:11.000000+00:00", 2)
+
+
+@pytest.mark.parametrize("bad", [None, True, 123, "2026-10-03T16:37:11", "bad",
+    "2026-10-03T16:37:11.1234567Z", "2026-10-03T16:37:11-00:00", "2026-10-03T16:37:11+00:60"])
+def test_unsafe_episode_identity_rejected_without_claim(bad):
+    db = sqlite3.connect(":memory:")
+    old = quarantine()
+    old["first_identified_at"] = bad
+    with pytest.raises(ValueError): delivery.claim_postponement_review(db, old, capture(), NOW)
+    assert not db.execute("select name from sqlite_master where type='table'").fetchall()
+
+
+@pytest.mark.parametrize("bad", ["bad", "2026-10-03T16:37:11", "2026-10-03T16:37:11.1234567Z"])
+def test_unreconciled_legacy_history_fails_closed_without_rewrite(bad):
+    db = sqlite3.connect(":memory:")
+    legacy_audit(db, [bad], [NOW])
+    before = db.execute("select * from fixture_postponement_reviews").fetchall()
+    assert not delivery.claim_postponement_review(db, quarantine(), capture(), NOW + timedelta(days=10))
+    assert db.execute("select * from fixture_postponement_reviews").fetchall() == before
+
+
+def test_exact_claim_completion_cannot_complete_another_episode():
+    db = sqlite3.connect(":memory:")
+    first, second = {}, {}
+    assert delivery.claim_postponement_review(db, quarantine(), capture(), NOW, first)
+    other = quarantine()
+    other["first_identified_at"] = "2026-10-03T16:37:11.000001Z"
+    assert delivery.claim_postponement_review(db, other, capture(), NOW, second)
+    delivery.finish_postponement_review(db, first, "blocked_or_failed")
+    rows = db.execute("select exclusion_key,outcome from fixture_postponement_reviews order by rowid").fetchall()
+    assert rows == [(first["exclusion_key"], "blocked_or_failed"), (second["exclusion_key"], "claimed")]
+    with pytest.raises(ValueError): delivery.finish_postponement_review(db, first, "verified")
+    assert db.execute("select outcome from fixture_postponement_reviews where exclusion_key=?", (second["exclusion_key"],)).fetchone() == ("claimed",)
+
+
+def test_spacing_preserves_subsecond_precision():
+    db = sqlite3.connect(":memory:")
+    now = NOW.replace(microsecond=999999)
+    assert delivery.claim_postponement_review(db, quarantine(), capture(), now)
+    assert not delivery.claim_postponement_review(db, quarantine(), capture(), NOW + timedelta(days=1))
+    assert delivery.claim_postponement_review(db, quarantine(), capture(), now + timedelta(days=1))
+
+
+def equivalent_claim_in_process(path, form, day):
+    deny = lambda *a, **kw: (_ for _ in ()).throw(AssertionError("Offline network forbidden"))
+    requests.request = socket.socket.connect = socket.create_connection = delivery.psycopg2.connect = deny
+    old = quarantine()
+    old["first_identified_at"] = form
+    with sqlite3.connect(path, timeout=30) as db:
+        return delivery.claim_postponement_review(db, old, capture(), NOW + timedelta(days=day))
+
+
+def test_concurrent_equivalent_episode_claims_share_one_durable_budget(tmp_path):
+    path = str(tmp_path / "equivalent.sqlite")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=5, mp_context=multiprocessing.get_context("spawn")) as pool:
+        for day, expected in [(0, 1), (0, 0), (1, 1), (2, 1), (20, 0)]:
+            assert sum(pool.map(equivalent_claim_in_process, [path]*5, EPISODE_FORMS, [day]*5)) == expected
+    with sqlite3.connect(path) as db:
+        assert db.execute("select attempt from fixture_postponement_reviews order by attempt").fetchall() == [(1,), (2,), (3,)]
+
+
+@pytest.mark.parametrize("inherited", [False, True])
+def test_blocked_sigalrm_command_dies_releases_flock_and_preserves_claim(tmp_path, inherited):
+    args, env = status_process_args(tmp_path)
+    args[-1] = "1"
+    args[3] = args[3].replace("raise SystemExit(command.main())",
+        "signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM}); raise SystemExit(command.main())")
+    # HUNG_COMMAND imports signal only in this adversarial launcher.
+    args[3] = "import signal\n" + args[3]
+    wrapper = r'''
+import fcntl,json,os,signal,sys
+fd=os.open(os.environ['ODDS_SYNC_LOCK_FILE'],os.O_CREAT|os.O_RDWR,0o600)
+os.dup2(fd,9); os.set_inheritable(9,True); os.close(fd)
+fcntl.flock(9,fcntl.LOCK_EX|fcntl.LOCK_NB)
+signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGALRM})
+args=json.loads(sys.argv[1]); os.execv(args[0],args)
+'''
+    if inherited:
+        env.update(STATS_RECONCILE_LOCK_HELD="1", ODDS_SYNC_P3_MAX_DURATION_SECONDS="120")
+        args = [sys.executable, "-B", "-c", wrapper, json.dumps(args)]
+    child = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        await_marker(child, "HUNG")
+        refused = subprocess.run([sys.executable,"-B","-c",PRODUCTION_LOCK_PROCESS], env=env,
+                                 capture_output=True, text=True, timeout=5)
+        assert refused.returncode == 75
+        stdout, stderr = child.communicate(timeout=4)
+        assert child.returncode == -signal.SIGALRM, (stdout, stderr)
+        acquired = subprocess.run([sys.executable,"-B","-c",PRODUCTION_LOCK_PROCESS], env=env,
+                                  capture_output=True,text=True,timeout=5)
+        assert acquired.returncode == 0
+        with sqlite3.connect(tmp_path / "audit.sqlite") as db:
+            assert db.execute("select attempt,outcome from fixture_postponement_reviews").fetchall() == [(1,"claimed")]
+            assert not delivery.claim_postponement_review(db, quarantine(), capture(), NOW)
+    finally:
+        if child.poll() is None: child.kill(); child.communicate(timeout=5)
+
+
+def test_signal_unblock_failure_stops_before_any_active_work(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["status", "--postponement-status-evidence", "unused",
+        "--postponement-observe-status", "--postponement-provider-budget", "1"])
+    monkeypatch.setattr(signal, "pthread_sigmask", lambda *a: {signal.SIGALRM})
+    monkeypatch.setattr(delivery, "run_postponement_revalidation", lambda *a: pytest.fail("Deadline failure reached active work"))
+    with pytest.raises(SystemExit, match="Cannot establish hard observation deadline"): checker.main()

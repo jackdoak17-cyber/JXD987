@@ -32,8 +32,18 @@ def main() -> int:
     # SIG_DFL is kernel termination, not a Python callback delayed by blocked C I/O.
     # No child workers are created. Process death closes its own flock descriptor.
     if active:
-        signal.signal(signal.SIGALRM, signal.SIG_DFL)
-        signal.setitimer(signal.ITIMER_REAL, args.execution_seconds)
+        try:
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
+            if (signal.getsignal(signal.SIGALRM) != signal.SIG_DFL
+                    or signal.SIGALRM in signal.pthread_sigmask(signal.SIG_BLOCK, set())):
+                raise RuntimeError("SIGALRM termination is not available")
+            signal.setitimer(signal.ITIMER_REAL, args.execution_seconds)
+            remaining, interval = signal.getitimer(signal.ITIMER_REAL)
+            if not 0 < remaining <= args.execution_seconds or interval != 0:
+                raise RuntimeError("Hard process timer was not established")
+        except (OSError, ValueError, RuntimeError, AttributeError) as exc:
+            raise SystemExit(f"Cannot establish hard observation deadline: {exc}") from None
     try:
         args.force = False
         args.fixture_ids = None

@@ -21,6 +21,7 @@ import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -2242,12 +2243,9 @@ def strict_status_metadata(exclusion: dict) -> None:
     values = [exclusion.get(key) for key in ("fixture_id", "home_team_id", "away_team_id")]
     if any(type(value) is not int or value <= 0 for value in values) or values[1] == values[2]:
         raise ValueError("Malformed trusted fixture/quarantine identity")
-    first = exclusion.get("first_identified_at")
     try:
-        timestamp = first if isinstance(first, datetime) else datetime.fromisoformat(first.replace("Z", "+00:00"))
-        if timestamp.tzinfo is None:
-            raise ValueError("Quarantine episode timestamp must be timezone-qualified")
-    except (AttributeError, TypeError, ValueError):
+        postponement_episode_instant(exclusion.get("first_identified_at"))
+    except (AttributeError, TypeError, ValueError, OverflowError):
         raise ValueError("Malformed quarantine episode identity") from None
 
 
@@ -2285,9 +2283,26 @@ def postponement_review_eligible(exclusion: dict, evidence: dict, now: datetime)
     )
 
 
-def claim_postponement_review(conn: sqlite3.Connection, exclusion: dict, evidence: dict, now: datetime) -> bool:
+def postponement_episode_instant(value: Any) -> datetime:
+    """Accept only explicit instants representable without losing timestamp precision."""
+    if type(value) is str:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)", value):
+            raise ValueError("Unsafe quarantine episode timestamp")
+        # RFC3339 -00:00 denotes an unknown, rather than trusted, offset.
+        if value.endswith("-00:00"):
+            raise ValueError("Unknown quarantine episode offset")
+        value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("Quarantine episode requires an explicit timezone")
+    return value.astimezone(timezone.utc)
+
+
+def claim_postponement_review(conn: sqlite3.Connection, exclusion: dict, evidence: dict, now: datetime,
+                             claim_ref: dict | None = None) -> bool:
     """Reserve before requesting: crashes spend an attempt, rather than retrying unboundedly."""
-    exclusion_key = str(exclusion["first_identified_at"])
+    instant = postponement_episode_instant(exclusion["first_identified_at"])
+    exclusion_key = instant.isoformat(timespec="microseconds")
+    now = postponement_episode_instant(now)
     try:
         conn.execute("begin immediate")
         conn.execute("""create table if not exists fixture_postponement_reviews (
@@ -2298,20 +2313,35 @@ def claim_postponement_review(conn: sqlite3.Connection, exclusion: dict, evidenc
         )""")
         if "observation" not in {row[1] for row in conn.execute("pragma table_info(fixture_postponement_reviews)")}:
             conn.execute("alter table fixture_postponement_reviews add column observation text")
-        rows = conn.execute("""select claimed_at, outcome from fixture_postponement_reviews
-            where fixture_id = ? and exclusion_key = ? order by attempt""",
-            (exclusion["fixture_id"], exclusion_key)).fetchall()
+        history = conn.execute("""select exclusion_key, claimed_at, outcome, original_exclusion
+            from fixture_postponement_reviews where fixture_id = ?""", (exclusion["fixture_id"],)).fetchall()
+        rows = []
+        try:
+            for key, claimed_at, outcome, provenance in history:
+                previous = postponement_episode_instant(key)
+                original = json.loads(provenance)
+                if (original.get("fixture_id") != exclusion["fixture_id"]
+                        or postponement_episode_instant(original.get("first_identified_at")) != previous):
+                    raise ValueError("Unreconciled legacy quarantine provenance")
+                claimed = postponement_episode_instant(claimed_at)
+                if previous == instant:
+                    rows.append((claimed, outcome))
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            conn.rollback()
+            return False
         if len(rows) >= 3 or any(row[1] == "verified" for row in rows) or (
-            rows and now - parse_iso(rows[-1][0]) < timedelta(hours=24)
+            rows and now - max(row[0] for row in rows) < timedelta(hours=24)
         ):
             conn.rollback()
             return False
         conn.execute("""insert into fixture_postponement_reviews
             (fixture_id, exclusion_key, attempt, claimed_at, evidence, original_exclusion)
             values (?, ?, ?, ?, ?, ?)""",
-            (exclusion["fixture_id"], exclusion_key, len(rows) + 1, iso(now),
+            (exclusion["fixture_id"], exclusion_key, len(rows) + 1, now.isoformat(timespec="microseconds"),
              json_text(evidence), json.dumps(exclusion, sort_keys=True, default=str)))
         conn.commit()
+        if claim_ref is not None:
+            claim_ref.update(fixture_id=exclusion["fixture_id"], exclusion_key=exclusion_key, attempt=len(rows) + 1)
         return True
     except Exception:
         conn.rollback()
@@ -2346,7 +2376,8 @@ def postponement_exclusions(target_url: str, captures: list[dict]) -> dict[int, 
 
 
 def select_postponement_reviews(conn: sqlite3.Connection, target_url: str, captures: list[dict], budget: int,
-                               rejections: list[dict] | None = None, exclusions: dict | None = None) -> list[int]:
+                               rejections: list[dict] | None = None, exclusions: dict | None = None,
+                               claims: dict | None = None) -> list[int]:
     if not 1 <= budget <= 3:
         raise ValueError("Postponement review requires an approved budget of 1-3")
     if exclusions is None:
@@ -2359,21 +2390,27 @@ def select_postponement_reviews(conn: sqlite3.Connection, target_url: str, captu
             if rejections is not None:
                 rejections.append({"fixture_id": capture["payload"]["id"], "reason": "Evidence rejected or no matching postponement quarantine"})
             continue
-        if not claim_postponement_review(conn, exclusion, capture, now):
+        claim = {}
+        if not claim_postponement_review(conn, exclusion, capture, now, claim):
             if rejections is not None:
                 rejections.append({"fixture_id": exclusion["fixture_id"], "reason": "Persistent attempt limit, completed episode, or 24-hour spacing blocks this request"})
             continue
         selected.append(exclusion["fixture_id"])
+        if claims is not None:
+            claims[exclusion["fixture_id"]] = claim
         if len(selected) >= budget:
             break
     return selected
 
 
-def finish_postponement_review(conn: sqlite3.Connection, fixture_id: int, outcome: str, observation: dict | None = None) -> None:
-    conn.execute("""update fixture_postponement_reviews set outcome = ?, observation = ?
-        where rowid = (select rowid from fixture_postponement_reviews
-            where fixture_id = ? and outcome = 'claimed' order by claimed_at desc, rowid desc limit 1)""",
-        (outcome, json_text(observation) if observation is not None else None, fixture_id))
+def finish_postponement_review(conn: sqlite3.Connection, claim: dict, outcome: str, observation: dict | None = None) -> None:
+    updated = conn.execute("""update fixture_postponement_reviews set outcome = ?, observation = ?
+        where fixture_id = ? and exclusion_key = ? and attempt = ? and outcome = 'claimed'""",
+        (outcome, json_text(observation) if observation is not None else None,
+         claim["fixture_id"], claim["exclusion_key"], claim["attempt"]))
+    if updated.rowcount != 1:
+        conn.rollback()
+        raise ValueError("Reserved postponement claim is missing or already completed")
     conn.commit()
 
 
@@ -2410,7 +2447,7 @@ def review_postponement_status_only(conn: sqlite3.Connection, target_url: str, c
 
 
 def observe_postponement_status(conn: sqlite3.Connection, captures: list[dict], report: dict,
-                               exclusions: dict | None = None) -> None:
+                               exclusions: dict | None = None, claims: dict | None = None) -> None:
     """Consume durable claims and record status evidence locally, never deliver facts."""
     client = SportMonksClient()
     client.timeout = min(client.timeout, 20)
@@ -2445,7 +2482,7 @@ def observe_postponement_status(conn: sqlite3.Connection, captures: list[dict], 
             observation["diagnostic"] = str(exc)
             report["failed"].append({"fixture_id": fixture_id, "error": str(exc)})
         finally:
-            finish_postponement_review(conn, fixture_id, observation["classification"], observation)
+            finish_postponement_review(conn, claims[fixture_id], observation["classification"], observation)
         report["postponement_revalidation"]["observations"].append(observation)
 
 
@@ -2535,7 +2572,9 @@ def run_postponement_revalidation(args: argparse.Namespace) -> int:
                 raise ValueError(str(exc)) from None
         if active:
             import signal
-            if signal.getsignal(signal.SIGALRM) != signal.SIG_DFL or signal.getitimer(signal.ITIMER_REAL)[0] <= 0:
+            if (signal.getsignal(signal.SIGALRM) != signal.SIG_DFL
+                    or signal.SIGALRM in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+                    or not 0 < signal.getitimer(signal.ITIMER_REAL)[0] <= 120):
                 raise SystemExit("Active observation requires the hard-deadline status entry point")
             if not Path(SOURCE_DB).is_absolute():
                 raise SystemExit("Active observation requires an absolute persistent JXD_DB_PATH")
@@ -2548,10 +2587,11 @@ def run_postponement_revalidation(args: argparse.Namespace) -> int:
                 if original is not None:
                     strict_status_identity(capture["payload"], original)
             conn = source_connection()
+            claims = {}
             report["fixture_ids"] = select_postponement_reviews(conn, target_url, captures, args.postponement_provider_budget,
-                report["postponement_revalidation"]["rejections"], exclusions=exclusions)
+                report["postponement_revalidation"]["rejections"], exclusions=exclusions, claims=claims)
             if report["fixture_ids"]:
-                observe_postponement_status(conn, captures, report, exclusions)
+                observe_postponement_status(conn, captures, report, exclusions, claims)
             else:
                 report["status"] = "no_eligible_or_budget_available_status_observations"
         else:
