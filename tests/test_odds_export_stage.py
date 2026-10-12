@@ -1,10 +1,12 @@
 import importlib.util
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
 
 PATH = Path(__file__).resolve().parents[1] / 'scripts/export_odds_to_supabase_psql.py'
+sys.path.insert(0, str(PATH.parent))
 spec = importlib.util.spec_from_file_location('exporter', PATH)
 exporter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(exporter)

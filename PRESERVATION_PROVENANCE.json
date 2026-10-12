@@ -1,0 +1,20 @@
+{
+  "purpose": "read-only preservation snapshot; not approved for merge or deployment",
+  "original_path": "~/Documents/Codex/2026-10-03/we/work/JXD987-odds-shadow",
+  "original_head": "eb85cf7646d3678a1cd26808a1a8a65552633db2",
+  "original_branch": "codex/odds-delivery-shadow-validation",
+  "source_repository": "https://github.com/jackdoak17-cyber/JXD987.git",
+  "included": [
+    {
+      "path": "scripts/export_odds_to_supabase_psql.py",
+      "sha256": "9644d6ec4e5e2206c30c0750c1919ae703f2a89a807d0c98d1064dcc8e557da5",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "tests/test_odds_export_stage.py",
+      "sha256": "176ebd22d530db4022932a8009336c1c36cb636b5eb3ee70f1fb6801c9af9a4b",
+      "category": "tracked_or_untracked"
+    }
+  ],
+  "excluded": []
+}
