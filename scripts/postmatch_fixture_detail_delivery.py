@@ -584,6 +584,7 @@ def candidate_target_fixture_ids(
     limit: int,
     force: bool = False,
     season_ids: Sequence[int] | None = None,
+    fair_cohorts: bool = False,
 ) -> list[int]:
     """Select completed target fixtures missing or due for provider detail.
 
@@ -592,7 +593,9 @@ def candidate_target_fixture_ids(
     while retaining a bounded retry/revalidation lane. If either lane is
     smaller than its reservation, the spare slots are filled from the other
     lane. This prevents repeated shrink confirmations from starving the
-    never-delivered population.
+    never-delivered population. The reconciliation queue can additionally
+    request fair cohort interleaving so its projection cap cannot hide later
+    overdue provider-pending cohorts behind the candidate-pool limit.
     """
     clauses = [
         "f.home_score is not null",
@@ -614,15 +617,76 @@ def candidate_target_fixture_ids(
         target_conn: Any,
         extra_clause: str,
         order_clause: str,
+        fair_cohorts: bool = False,
     ) -> list[int]:
-        query = f"""
-            select f.id
-              from public.fixtures f
-              left join public.fixture_detail_delivery_status d on d.fixture_id = f.id
-             where {' and '.join([*clauses, extra_clause])}
-             order by {order_clause}
-             limit %s
-        """
+        if fair_cohorts:
+            # Keep one bounded candidate pool broad enough to represent many
+            # cohorts.  The outer order interleaves one row per cohort before
+            # taking the pool limit; the downstream limiter can then choose
+            # its safe cohort count without permanently hiding later cohorts.
+            query = f"""
+                with ranked as (
+                    select f.id,
+                           row_number() over (
+                             partition by f.league_id, f.season_id
+                             order by {order_clause}
+                           ) as cohort_rank,
+                           coalesce(
+                             max(d.last_attempted_at) over (
+                               partition by f.league_id, f.season_id
+                             ),
+                             max(d.first_seen_at) over (
+                               partition by f.league_id, f.season_id
+                             ),
+                             max(f.starting_at) over (
+                               partition by f.league_id, f.season_id
+                             )
+                           ) as cohort_last_served_at,
+                           min(d.first_seen_at) over (
+                             partition by f.league_id, f.season_id
+                           ) as cohort_first_seen_at,
+                           case
+                              when count(*) filter (
+                                where d.status = 'provider_pending'
+                                  and (d.next_attempt_at is null or d.next_attempt_at <= now())
+                              ) over (partition by f.league_id, f.season_id) > 0
+                               and (
+                                 count(*) filter (
+                                   where d.status = 'provider_pending'
+                                     and d.last_attempted_at is null
+                                 ) over (partition by f.league_id, f.season_id) > 0
+                                 or min(d.last_attempted_at) filter (
+                                   where d.status = 'provider_pending'
+                                 ) over (partition by f.league_id, f.season_id)
+                                 < max(d.last_attempted_at) filter (
+                                   where d.status = 'provider_pending'
+                                 ) over (partition by f.league_id, f.season_id)
+                               )
+                              then 0
+                              else 1
+                            end as cohort_carry_forward_priority
+                      from public.fixtures f
+                      left join public.fixture_detail_delivery_status d on d.fixture_id = f.id
+                     where {' and '.join([*clauses, extra_clause])}
+                )
+                select id
+                  from ranked
+                order by cohort_rank,
+                          cohort_carry_forward_priority,
+                          cohort_last_served_at nulls first,
+                          cohort_first_seen_at nulls first,
+                          id
+                 limit %s
+            """
+        else:
+            query = f"""
+                select f.id
+                  from public.fixtures f
+                  left join public.fixture_detail_delivery_status d on d.fixture_id = f.id
+                 where {' and '.join([*clauses, extra_clause])}
+                 order by {order_clause}
+                 limit %s
+            """
         with target_conn.cursor() as cur:
             cur.execute(query, [*params, requested])
             return [int(row[0]) for row in cur.fetchall()]
@@ -725,6 +789,7 @@ def candidate_target_fixture_ids(
             f.starting_at desc,
             f.id asc
             """,
+            fair_cohorts=fair_cohorts,
         )
         urgent_pending_candidates = fetch_candidates(
             target_conn,
@@ -817,11 +882,22 @@ def candidate_target_fixture_ids(
         urgent_pending_count=urgent_pending_count,
         urgent_revalidation_count=len(urgent_revalidation_candidates),
     )
-    retry_candidates = interleave_retry_lanes(
-        recovery_candidates[:recovery_quota],
-        pending_candidates[:pending_quota],
-        revalidation_candidates[:revalidation_quota],
-    )
+    if urgent_pending_count > 0:
+        # Provider-pending SLA work is the incident lane. Put it first in the
+        # bounded retry sequence so the downstream cohort cap cannot consume
+        # the batch on a recovery or ordinary revalidation cohort before an
+        # overdue confirmation is considered.
+        retry_candidates = interleave_retry_lanes(
+            pending_candidates[:pending_quota],
+            recovery_candidates[:recovery_quota],
+            revalidation_candidates[:revalidation_quota],
+        )
+    else:
+        retry_candidates = interleave_retry_lanes(
+            recovery_candidates[:recovery_quota],
+            pending_candidates[:pending_quota],
+            revalidation_candidates[:revalidation_quota],
+        )
     allocated_ids = set(retry_candidates)
     retry_candidates.extend(
         fixture_id

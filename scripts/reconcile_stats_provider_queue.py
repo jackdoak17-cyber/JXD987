@@ -23,7 +23,7 @@ import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from sqlalchemy import create_engine
 import psycopg2
@@ -38,6 +38,7 @@ from scripts.postmatch_fixture_detail_delivery import (
     compare_snapshots,
     ensure_ledger,
     iso,
+    parse_iso,
     normalized_provider_hash,
     persist_provider_snapshot,
     provider_payload_hash,
@@ -207,6 +208,8 @@ def cohort_limited_fixture_ids(
         tuple[int | None, int | None, str | None, int, int, int, str | None, str | None],
     ],
     max_cohorts: int,
+    fair_cohorts: bool = False,
+    priority_fixture_ids: Sequence[int] | None = None,
 ) -> list[int]:
     """Keep a batch within a bounded number of projection cohorts.
 
@@ -220,6 +223,66 @@ def cohort_limited_fixture_ids(
         return fixture_ids
     if any(fixture_id not in target_metadata for fixture_id in fixture_ids):
         return fixture_ids
+
+    if fair_cohorts:
+        cohort_rows: dict[tuple[int | None, int | None], dict[str, Any]] = {}
+        for index, fixture_id in enumerate(fixture_ids):
+            meta = target_metadata[fixture_id]
+            cohort = (meta[0], meta[1])
+            state = cohort_rows.setdefault(
+                cohort,
+                {
+                    "first_index": index,
+                    "last_attempted": [],
+                    "first_seen": [],
+                },
+            )
+            attempted = parse_iso(meta[7])
+            first_seen = parse_iso(meta[6])
+            if attempted is not None:
+                state["last_attempted"].append(attempted)
+            if first_seen is not None:
+                state["first_seen"].append(first_seen)
+
+        def fairness_key(item: tuple[tuple[int | None, int | None], dict[str, Any]]) -> tuple[Any, ...]:
+            cohort, state = item
+            # A cohort with a recent attempt yields to cohorts that have not
+            # been serviced recently.  This is an in-memory cursor derived
+            # from durable ledger timestamps; no schema or mutable cursor is
+            # required. The original candidate order remains the tie-breaker
+            # for equally old cohorts.
+            attempted = state["last_attempted"]
+            first_seen = state["first_seen"]
+            if attempted:
+                return (0, max(attempted), state["first_index"], cohort)
+            if first_seen:
+                return (1, max(first_seen), state["first_index"], cohort)
+            return (2, datetime.min.replace(tzinfo=timezone.utc), state["first_index"], cohort)
+
+        selected_cohorts: list[tuple[int | None, int | None]] = []
+        selected_cohort_set: set[tuple[int | None, int | None]] = set()
+        for fixture_id in priority_fixture_ids or ():
+            if fixture_id not in target_metadata:
+                continue
+            cohort = (target_metadata[fixture_id][0], target_metadata[fixture_id][1])
+            if cohort not in selected_cohort_set:
+                selected_cohorts.append(cohort)
+                selected_cohort_set.add(cohort)
+            if len(selected_cohorts) >= max_cohorts:
+                break
+        if len(selected_cohorts) < max_cohorts:
+            for cohort, _state in sorted(cohort_rows.items(), key=fairness_key):
+                if cohort in selected_cohort_set:
+                    continue
+                selected_cohorts.append(cohort)
+                selected_cohort_set.add(cohort)
+                if len(selected_cohorts) >= max_cohorts:
+                    break
+        return [
+            fixture_id
+            for fixture_id in fixture_ids
+            if (target_metadata[fixture_id][0], target_metadata[fixture_id][1]) in selected_cohort_set
+        ]
 
     seen: set[tuple[int | None, int | None]] = set()
     selected: list[int] = []
@@ -568,6 +631,7 @@ def main() -> int:
         "bulk_size": bulk_size,
         "max_cohorts": max_cohorts,
         "candidate_pool_multiplier": candidate_pool_multiplier,
+        "selection_events": [],
         "stage_seconds": {},
     }
     target_conn: Any | None = None
@@ -596,12 +660,19 @@ def main() -> int:
                 batch_size * candidate_pool_multiplier,
                 args.force,
                 season_ids or None,
+                fair_cohorts=True,
             )
             if not fixture_ids:
                 break
             target_metadata = target_fixture_metadata(target_url, fixture_ids)
             original_fixture_count = len(fixture_ids)
-            fixture_ids = cohort_limited_fixture_ids(fixture_ids, target_metadata, max_cohorts)
+            fixture_ids = cohort_limited_fixture_ids(
+                fixture_ids,
+                target_metadata,
+                max_cohorts,
+                fair_cohorts=True,
+                priority_fixture_ids=fixture_ids[:2],
+            )
             fixture_ids = fixture_ids[:batch_size]
             if len(fixture_ids) < original_fixture_count:
                 LOG.info(
@@ -613,7 +684,38 @@ def main() -> int:
                 target_metadata = {fixture_id: target_metadata[fixture_id] for fixture_id in fixture_ids}
             report["batches"] += 1
             report["fixtures_selected"] += len(fixture_ids)
-            LOG.info("Processing stats reconciliation batch %s: %s fixtures", report["batches"], len(fixture_ids))
+            selected_metadata = [
+                target_metadata[fixture_id]
+                for fixture_id in fixture_ids
+                if fixture_id in target_metadata
+            ]
+            selected_cohorts = sorted({
+                f"{meta[0]}:{meta[1]}" for meta in selected_metadata
+            })
+            first_seen_values = sorted(
+                str(meta[6]) for meta in selected_metadata if meta[6] is not None
+            )
+            last_attempted_values = sorted(
+                str(meta[7]) for meta in selected_metadata if meta[7] is not None
+            )
+            selection_event = {
+                "batch": report["batches"],
+                "selected_at": iso(datetime.now(timezone.utc)),
+                "fixture_count": len(fixture_ids),
+                "cohorts": selected_cohorts,
+                "oldest_first_seen_at": first_seen_values[0] if first_seen_values else None,
+                "oldest_last_attempted_at": last_attempted_values[0] if last_attempted_values else None,
+            }
+            report["selection_events"].append(selection_event)
+            LOG.info(
+                "Processing stats reconciliation batch %s: %s fixtures cohorts=%s "
+                "oldest_first_seen_at=%s oldest_last_attempted_at=%s",
+                report["batches"],
+                len(fixture_ids),
+                ",".join(selected_cohorts) or "none",
+                selection_event["oldest_first_seen_at"] or "none",
+                selection_event["oldest_last_attempted_at"] or "none",
+            )
 
             # Mark the complete batch as running before fetching so a worker
             # handoff cannot leave a subset looking untouched.  The source

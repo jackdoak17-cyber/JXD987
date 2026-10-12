@@ -97,7 +97,12 @@ def test_target_selection_requeues_legacy_accepted_rows_for_v2_evidence(
 
     monkeypatch.setattr(postmatch.psycopg2, "connect", lambda *args, **kwargs: Connection())
 
-    assert postmatch.candidate_target_fixture_ids("postgres://target", [8], 10) == []
+    assert postmatch.candidate_target_fixture_ids(
+        "postgres://target",
+        [8],
+        10,
+        fair_cohorts=True,
+    ) == []
     retry_queries = [query for query in queries if "next_attempt_at" in query]
     assert retry_queries
     assert any("coalesce(d.delivery_contract_version, 1) < 2" in query for query in queries)
@@ -115,6 +120,13 @@ def test_target_selection_requeues_legacy_accepted_rows_for_v2_evidence(
     assert "d.first_seen_at <= now() - interval '24 hours'" in pending_query
     assert "f.starting_at >= date_trunc('day', now()) - interval '30 days'" in pending_query
     assert pending_query.index("coalesce(d.next_attempt_at") < pending_query.index("f.season_id desc")
+    assert "row_number() over" in pending_query
+    assert "partition by f.league_id, f.season_id" in pending_query
+    assert "cohort_last_served_at" in pending_query
+    assert "cohort_carry_forward_priority" in pending_query
+    assert "min(d.last_attempted_at)" in pending_query
+    assert "max(d.last_attempted_at)" in pending_query
+    assert "order by cohort_rank" in pending_query
 
 
 def test_ledger_upgrade_does_not_promote_pre_contract_rows_to_v2() -> None:
@@ -147,6 +159,153 @@ def test_cohort_limit_preserves_clustered_prefix() -> None:
     assert queue.cohort_limited_fixture_ids([1, 2, 3, 4], metadata, 2) == [1, 2, 3]
     assert queue.cohort_limited_fixture_ids([1, 4, 2, 3], metadata, 2) == [1, 4, 2]
     assert queue.cohort_limited_fixture_ids([1, 2, 3, 4], metadata, 0) == [1, 2, 3, 4]
+
+
+def test_fair_cohort_limit_rotates_least_recently_served_cohorts() -> None:
+    metadata = {
+        1: (8, 2026, None, 0, 0, 1, "2026-09-20T10:00:00Z", "2026-09-21T09:00:00Z"),
+        2: (8, 2026, None, 0, 0, 1, "2026-09-20T10:00:00Z", "2026-09-21T09:00:00Z"),
+        3: (387, 2026, None, 0, 0, 1, "2026-09-19T10:00:00Z", "2026-09-20T09:00:00Z"),
+        4: (387, 2026, None, 0, 0, 1, "2026-09-19T10:00:00Z", "2026-09-20T09:00:00Z"),
+        5: (591, 2026, None, 0, 0, 1, "2026-09-18T10:00:00Z", "2026-09-19T09:00:00Z"),
+        6: (591, 2026, None, 0, 0, 1, "2026-09-18T10:00:00Z", "2026-09-19T09:00:00Z"),
+    }
+
+    first = queue.cohort_limited_fixture_ids(
+        [1, 2, 3, 4, 5, 6], metadata, 2, fair_cohorts=True
+    )
+    assert first == [3, 4, 5, 6]
+    assert len({(metadata[fixture_id][0], metadata[fixture_id][1]) for fixture_id in first}) == 2
+
+    for fixture_id in (3, 4, 5, 6):
+        row = list(metadata[fixture_id])
+        row[7] = "2026-09-21T09:05:00Z"
+        metadata[fixture_id] = tuple(row)
+    second = queue.cohort_limited_fixture_ids(
+        [1, 2, 3, 4, 5, 6], metadata, 2, fair_cohorts=True
+    )
+    assert second[:2] == [1, 2]
+
+
+def test_fair_cohort_limit_preserves_priority_and_new_work_cohorts() -> None:
+    metadata = {
+        1: (8, 2026, None, 0, 0, 1, "2026-09-20T10:00:00Z", "2026-09-21T09:00:00Z"),
+        2: (387, 2026, None, 0, 0, 0, None, None),
+        3: (591, 2026, None, 0, 0, 1, "2026-09-18T10:00:00Z", "2026-09-19T09:00:00Z"),
+    }
+
+    selected = queue.cohort_limited_fixture_ids(
+        [1, 2, 3],
+        metadata,
+        2,
+        fair_cohorts=True,
+        priority_fixture_ids=[1, 2],
+    )
+
+    assert selected == [1, 2]
+    assert len({(metadata[fixture_id][0], metadata[fixture_id][1]) for fixture_id in selected}) == 2
+
+
+def test_partial_overdue_cohort_carries_forward_oldest_rows() -> None:
+    old = "2026-09-20T09:00:00Z"
+    recent = "2026-09-21T09:00:00Z"
+    metadata = {
+        1: (648, 23265, None, 0, 0, 1, old, recent),
+        2: (648, 23265, None, 0, 0, 1, old, recent),
+        3: (648, 23265, None, 0, 0, 1, old, old),
+        4: (648, 23265, None, 0, 0, 1, old, old),
+        5: (648, 23265, None, 0, 0, 1, old, old),
+        101: (591, 28121, None, 0, 0, 1, old, old),
+        102: (591, 28121, None, 0, 0, 1, old, old),
+        103: (591, 28121, None, 0, 0, 1, old, old),
+    }
+    # This is the fair SQL order after the partially served cohort is ranked
+    # ahead at each row rank. The first bounded turn already served 1/2; the
+    # next turn must carry 3/4 forward while still giving the sibling cohort a
+    # slot.
+    candidate_ids = [3, 101, 4, 102, 5, 103]
+    selected = queue.cohort_limited_fixture_ids(
+        candidate_ids,
+        metadata,
+        2,
+        fair_cohorts=True,
+        priority_fixture_ids=candidate_ids[:2],
+    )
+    assert selected[:4] == [3, 101, 4, 102]
+    assert 3 in selected[:4] and 4 in selected[:4]
+    assert 5 not in selected[:4]
+
+
+def test_carry_forward_does_not_monopolize_repeated_turns() -> None:
+    old = "2026-09-20T09:00:00Z"
+    recent = "2026-09-21T09:00:00Z"
+    metadata = {
+        **{
+            fixture_id: (648, 23265, None, 0, 0, 1, old, recent if fixture_id <= 2 else old)
+            for fixture_id in range(1, 9)
+        },
+        **{
+            fixture_id: (591, 28121, None, 0, 0, 1, old, old)
+            for fixture_id in range(101, 109)
+        },
+    }
+    remaining_large = list(range(3, 9))
+    other_rows = list(range(101, 109))
+    turns: list[list[int]] = []
+    for _ in range(3):
+        candidate_ids = [value for pair in zip(remaining_large, other_rows) for value in pair]
+        selected = queue.cohort_limited_fixture_ids(
+            candidate_ids,
+            metadata,
+            2,
+            fair_cohorts=True,
+            priority_fixture_ids=candidate_ids[:2],
+        )[:4]
+        turns.append(selected)
+        assert any(value in other_rows for value in selected)
+        served_large = [value for value in selected if value in remaining_large]
+        remaining_large = [value for value in remaining_large if value not in served_large]
+        other_rows = [value for value in other_rows if value not in selected]
+        for value in served_large:
+            row = list(metadata[value])
+            row[7] = recent
+            metadata[value] = tuple(row)
+    assert turns == [
+        [3, 101, 4, 102],
+        [5, 103, 6, 104],
+        [7, 105, 8, 106],
+    ]
+    assert remaining_large == []
+
+
+def test_carry_forward_progression_is_deterministic_and_bounded() -> None:
+    old = "2026-09-20T09:00:00Z"
+    recent = "2026-09-21T09:00:00Z"
+    metadata = {
+        1: (648, 23265, None, 0, 0, 1, old, recent),
+        2: (648, 23265, None, 0, 0, 1, old, old),
+        3: (648, 23265, None, 0, 0, 1, old, old),
+        101: (591, 28121, None, 0, 0, 1, old, old),
+        102: (591, 28121, None, 0, 0, 1, old, old),
+        201: (387, 23839, None, 0, 0, 1, old, old),
+    }
+    candidate_ids = [2, 101, 3, 102, 201]
+    selected = queue.cohort_limited_fixture_ids(
+        candidate_ids,
+        metadata,
+        2,
+        fair_cohorts=True,
+        priority_fixture_ids=candidate_ids[:2],
+    )
+    assert selected[:3] == [2, 101, 3]
+    assert len({(metadata[value][0], metadata[value][1]) for value in selected[:3]}) <= 2
+    assert selected[:3] == queue.cohort_limited_fixture_ids(
+        candidate_ids,
+        metadata,
+        2,
+        fair_cohorts=True,
+        priority_fixture_ids=candidate_ids[:2],
+    )[:3]
 
 
 def test_stale_running_rows_are_requeued_with_a_reason() -> None:

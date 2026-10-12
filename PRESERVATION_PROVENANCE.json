@@ -1,0 +1,30 @@
+{
+  "purpose": "read-only preservation snapshot; not approved for merge or deployment",
+  "original_path": "~/JXD987-sportmonks-sla-repair",
+  "original_head": "f250c851786e1fb70111e1849470661a5b70416d",
+  "original_branch": "codex/sportmonks-sla-repair-20260921",
+  "source_repository": "https://github.com/jackdoak17-cyber/JXD987.git",
+  "included": [
+    {
+      "path": "scripts/postmatch_fixture_detail_delivery.py",
+      "sha256": "f9b900a2c2994756576e32ba3017d303f7d16f492a5773ea9c33328be0451b71",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/reconcile_stats_provider_queue.py",
+      "sha256": "496d29a073f14e18ebf512ed2e00f9206201f258e479e6cd9c24a69f5de1ab9b",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/runtime_manifest.sha1",
+      "sha256": "41909770c1ef2084bf0028841e21a5f463368042e9db7f7daf2770dbbd482368",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "tests/test_reconcile_stats_provider_queue.py",
+      "sha256": "b719a776f4b4700926856e94bc578eded9156834a295d432f19a565c6fa7d582",
+      "category": "tracked_or_untracked"
+    }
+  ],
+  "excluded": []
+}
