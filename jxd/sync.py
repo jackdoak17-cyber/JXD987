@@ -18,6 +18,10 @@ from .models import (
     FixtureStatistic,
     FixturePlayerStatistic,
     FixturePlayer,
+    Bookmaker,
+    Market,
+    OddsOutcome,
+    HeadToHead,
 )
 
 log = logging.getLogger(__name__)
@@ -673,3 +677,182 @@ class SyncService:
         for season in seasons:
             total += self.sync_fixtures_for_season(season)
         return total
+
+    # --- H2H ---
+    def sync_h2h(self, team_a_id: int, team_b_id: int) -> Dict:
+        log.info("Syncing H2H %s vs %s", team_a_id, team_b_id)
+        # H2H endpoint returns a specialized payload structure
+        data = self.client.fetch_single(f"head-to-head/{team_a_id}/{team_b_id}", params={"per_page": 50})
+        # The structure might vary; catch top-level keys
+        summary = data.get("summary") or {}
+        # 'fixtures' list might be under data/fixtures or just list in data depending on API version details
+        fixtures = data.get("fixtures") or data.get("data") or []
+        if isinstance(fixtures, dict):
+            fixtures = [fixtures] # unlikely but safe
+
+        # Store in HeadToHead table
+        row = {
+            "team_a_id": team_a_id,
+            "team_b_id": team_b_id,
+            "summary": summary,
+            "fixtures": fixtures,
+            "fetched_at": datetime.utcnow(),
+        }
+        _upsert(self.session, HeadToHead, row)
+        self.session.commit()
+        log.info("Stored H2H for %s vs %s", team_a_id, team_b_id)
+        return data
+
+    # --- Odds ---
+    def sync_bookmakers(self) -> int:
+        log.info("Syncing bookmakers")
+        count = 0
+        # bookmakers/all usually safer or just bookmakers
+        for item in self.client.fetch_collection("odds/bookmakers"):
+            data = {
+                "id": item.get("id"),
+                "name": item.get("name"),
+                "slug": item.get("legacy_id") or str(item.get("id")), # slug might be missing
+                "extra": item,
+            }
+            _upsert(self.session, Bookmaker, data)
+            count += 1
+        self.session.commit()
+        log.info("Synced bookmakers: %s", count)
+        return count
+
+    def sync_odds(
+        self,
+        league_ids: Sequence[int],
+        bookmaker_id: int = 2,
+        limit: Optional[int] = None,
+        days_forward: int = 7,
+    ) -> int:
+        """
+        Sync odds for upcoming fixtures in given leagues.
+        SportMonks v3 Odds by Fixture endpoint: odds/pre-match/fixtures/{fixture_id}
+        """
+        log.info("Syncing odds (bookmaker=%s) for leagues %s", bookmaker_id, league_ids)
+        
+        # 1. Find upcoming fixtures
+        today = datetime.utcnow().date()
+        end = today + timedelta(days=days_forward)
+        params = {"filters": f"fixtureLeagues:{','.join(str(l) for l in league_ids)}"}
+        
+        # Using chunks to find fixture IDs first
+        fixture_ids = []
+        # We can reuse sync_upcoming_window logic but just to get IDs? 
+        # Easier to specific fetch or just query DB if we trust we synced fixtures already.
+        # Let's query DB for upcoming fixtures in these leagues to save API calls on fixture search
+        query = (
+            self.session.query(Fixture.id)
+            .filter(
+                Fixture.league_id.in_(league_ids),
+                Fixture.starting_at >= datetime.utcnow(),
+                Fixture.starting_at <= datetime.utcnow() + timedelta(days=days_forward),
+            )
+            .order_by(Fixture.starting_at.asc())
+        )
+        if limit:
+            query = query.limit(limit)
+        
+        fixture_ids = [r[0] for r in query.all()]
+        log.info("Found %s fixtures to sync odds for", len(fixture_ids))
+
+        count = 0
+        for fid in fixture_ids:
+            # Fetch odds for this fixture
+            # Use 'bookmakers' filter in query to reduce payload
+            # Endpoint: odds/pre-match/fixtures/{ID}
+            # Note: This endpoint returns a list of odd groups (markets)
+            try:
+                # We need raw request because fetch_collection handles pagination of lists, 
+                # but odds endpoint might return a wrapper.
+                # Usually v3 returns {data: [...] } where each item is a market.
+                # Filtering by bookmaker is highly recommended.
+                endpoint = f"odds/pre-match/fixtures/{fid}"
+                payload = self.client.request("GET", endpoint, params={"bookmakers": bookmaker_id})
+                
+                market_rows = []
+                if isinstance(payload, dict):
+                    market_rows = payload.get("data") or []
+                
+                for market_row in market_rows:
+                    self._store_market_odds(fid, bookmaker_id, market_row)
+                
+                count += 1
+                if count % 10 == 0:
+                    self.session.commit()
+            except Exception as e:
+                log.error("Failed to sync odds for fixture %s: %s", fid, e)
+                continue
+        
+        self.session.commit()
+        log.info("Synced odds for %s fixtures", count)
+        return count
+
+    def _store_market_odds(self, fixture_id: int, bookmaker_id: int, market_row: Dict) -> None:
+        market_id = market_row.get("id") # Market Type ID (e.g. 1 for 3Way)
+        market_name = market_row.get("name")
+        if not market_id:
+            return
+        
+        # Upsert Market Type
+        _upsert(self.session, Market, {"id": market_id, "name": market_name or "Unknown", "extra": market_row})
+
+        # Process Odds
+        # 'odds' key contains the outcomes
+        outcomes = market_row.get("odds") or []
+        for out in outcomes:
+            label = out.get("label")
+            if not label:
+                continue
+            
+            # Construct a unique key logic or just insertion
+            # We use provider_outcome_id if available, else composite
+            # Note: SportMonks odds items usually have 'id' which is unique per update? Or persistent?
+            # Safe bet is to update by fixture+bookmaker+market+label+handicap? 
+            # Actually, using 'id' from API is best if stable.
+            
+            outcome_data = {
+                "provider_outcome_id": out.get("id"),
+                "fixture_id": fixture_id,
+                "bookmaker_id": bookmaker_id,
+                "market_id": market_id,
+                "market_description": market_name,
+                "label": label,
+                "name": out.get("name") or label,
+                "participant": out.get("participant"),
+                "handicap": str(out.get("handicap")) if out.get("handicap") is not None else None,
+                "total": str(out.get("total")) if out.get("total") is not None else None,
+                "decimal_odds": str(out.get("value")),
+                "fractional_odds": out.get("fractional"),
+                "probability": out.get("probability"),
+                "is_winning": out.get("winning"),
+                "stopped": out.get("stopped"),
+                "raw": out
+            }
+            
+            # Find existing or create
+            # We try to match by provider_outcome_id first if present
+            found = None
+            if outcome_data["provider_outcome_id"]:
+                 found = self.session.query(OddsOutcome).filter_by(provider_outcome_id=outcome_data["provider_outcome_id"]).first()
+            
+            if not found:
+                 # Try composite key
+                 q = self.session.query(OddsOutcome).filter_by(
+                     fixture_id=fixture_id,
+                     bookmaker_id=bookmaker_id,
+                     market_id=market_id,
+                     label=label
+                 )
+                 if outcome_data["handicap"]:
+                     q = q.filter_by(handicap=outcome_data["handicap"])
+                 found = q.first()
+            
+            if found:
+                for k, v in outcome_data.items():
+                    setattr(found, k, v)
+            else:
+                self.session.add(OddsOutcome(**outcome_data))

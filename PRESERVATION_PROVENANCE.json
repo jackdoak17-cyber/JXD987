@@ -1,0 +1,30 @@
+{
+  "purpose": "read-only preservation snapshot; not approved for merge or deployment",
+  "original_path": "~/Desktop/Coding/JXD987",
+  "original_head": "225088b1eff07b7b6f0a574d185327a867f8912a",
+  "original_branch": "main",
+  "source_repository": "https://github.com/jackdoak17-cyber/JXD987.git",
+  "included": [
+    {
+      "path": "jxd/cli.py",
+      "sha256": "8eb0c181123fccdc6a4243129234fb576f9ca9729369c31581fcdd03d0f2e7d0",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "jxd/config.py",
+      "sha256": "68818fffc7d455255c7d6719ec37585333753b94455722d854ae0013344eca7e",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "jxd/models.py",
+      "sha256": "2a846ad9d86c1a35dda51a47449cbae9753566bb70042c1c27655b6360af44b0",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "jxd/sync.py",
+      "sha256": "64775b817f035d97b22ba276a75837da54b01516028cd0d4d8d93d89370a59d9",
+      "category": "tracked_or_untracked"
+    }
+  ],
+  "excluded": []
+}

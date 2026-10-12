@@ -127,3 +127,55 @@ class SyncState(Base):
     key = Column(String, primary_key=True)
     value = Column(String, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Bookmaker(Base):
+    __tablename__ = "bookmakers"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    slug = Column(String)
+    extra = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class Market(Base):
+    __tablename__ = "markets"
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    grouping = Column(String)
+    extra = Column(JSON)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class OddsOutcome(Base):
+    __tablename__ = "odds_outcomes"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    provider_outcome_id = Column(Integer, index=True) # BigInt in Postgres, Int in SQLite (Python handles large ints)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), index=True, nullable=False)
+    bookmaker_id = Column(Integer, ForeignKey("bookmakers.id"), index=True, nullable=False)
+    market_id = Column(Integer, ForeignKey("markets.id"), index=True, nullable=False)
+    market_description = Column(String, nullable=True)
+    label = Column(String, nullable=False) # e.g. "1", "X", "2", "Over", "Under"
+    name = Column(String, nullable=True)   # Display name
+    participant = Column(String, nullable=True)
+    handicap = Column(String, nullable=True)
+    total = Column(String, nullable=True)
+    decimal_odds = Column(String, nullable=True) # numeric string
+    fractional_odds = Column(String, nullable=True) 
+    probability = Column(String, nullable=True)
+    is_winning = Column(Boolean, nullable=True)
+    stopped = Column(Boolean, nullable=True)
+    raw = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class HeadToHead(Base):
+    __tablename__ = "head_to_head"
+    team_a_id = Column(Integer, primary_key=True)
+    team_b_id = Column(Integer, primary_key=True)
+    summary = Column(JSON)
+    fixtures = Column(JSON)
+    fetched_at = Column(DateTime, default=datetime.utcnow)
