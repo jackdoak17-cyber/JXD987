@@ -616,12 +616,19 @@ def stage_and_upsert(
     )
     src_cte = f"""
 with src as (
-  select distinct on (fixture_id, bookmaker_id, market_key, selection_key, line)
+  -- The database uniqueness rule treats NULL lines as the -9999 sentinel.
+  -- Normalize the same way here or a feed containing both NULL and -9999
+  -- produces two source rows that collide during the insert.
+  select distinct on (
+    fixture_id, bookmaker_id, market_key, selection_key,
+    coalesce(line, -9999)
+  )
     fixture_id, bookmaker_id, market_key, selection_key, line,
     price_decimal, price_american, participant_type, participant_id, last_updated_at
   from odds_outcomes_stage
   where price_decimal is null or (price_decimal > {ODDS_MIN_PRICE} and price_decimal <= {ODDS_MAX_PRICE})
-  order by fixture_id, bookmaker_id, market_key, selection_key, line,
+  order by fixture_id, bookmaker_id, market_key, selection_key,
+           coalesce(line, -9999),
            last_updated_at desc nulls last
 )
 """

@@ -1,58 +1,53 @@
+import sys
 import unittest
+from pathlib import Path
 
-from scripts.validate_moneyline_coverage import evaluate_failures
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+from validate_moneyline_coverage import expected_moneyline_pairs, has_complete_api_moneyline
 
 
 class ValidateMoneylineCoverageTests(unittest.TestCase):
-    def test_passes_when_league_meets_threshold(self) -> None:
-        failures = evaluate_failures(
-            [
-                {
-                    "league_id": 444,
-                    "fixtures_in_window": 8,
-                    "fixtures_with_complete_moneyline": 8,
-                    "coverage_pct": 100.0,
-                    "missing_fixture_ids": [],
-                    "first_missing_starting_at": None,
-                }
-            ],
-            fail_below_pct=100.0,
+    def test_provider_complete_moneyline_requires_three_sides(self) -> None:
+        self.assertTrue(
+            has_complete_api_moneyline(
+                [{"name": "h2h", "odds": [{"home": 1.9, "draw": 3.4, "away": 4.1}]}],
+            )
         )
-        self.assertEqual(failures, [])
+        self.assertFalse(
+            has_complete_api_moneyline(
+                [{"name": "h2h", "odds": [{"home": 1.9, "away": 4.1}]}],
+            )
+        )
+        self.assertFalse(
+            has_complete_api_moneyline(
+                [{"name": "h2h", "odds": [{"home": 91, "draw": 67, "away": 1}]}],
+            )
+        )
 
-    def test_fails_when_league_drops_below_threshold(self) -> None:
-        failures = evaluate_failures(
+    def test_expected_pairs_include_only_provider_supported_books(self) -> None:
+        expected, by_fixture = expected_moneyline_pairs(
             [
                 {
-                    "league_id": 444,
-                    "fixtures_in_window": 8,
-                    "fixtures_with_complete_moneyline": 7,
-                    "coverage_pct": 87.5,
-                    "missing_fixture_ids": [19629715],
-                    "first_missing_starting_at": "2026-04-11T12:00:00+00:00",
+                    "fixture_id": 19629715,
+                    "bookmakers_payload": {
+                        "BetMGM": [
+                            {"name": "h2h", "odds": [{"home": 1.9, "draw": 3.4, "away": 4.1}]}
+                        ],
+                        "Bet365": [
+                            {"name": "h2h", "odds": [{"home": 1.9, "away": 4.1}]}
+                        ],
+                    },
                 }
             ],
-            fail_below_pct=100.0,
+            requested_bookmaker_keys={"betmgm", "bet365"},
+            bookmaker_id_allowlist={2, 8},
         )
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0]["league_id"], 444)
-        self.assertEqual(failures[0]["missing_fixture_ids"], [19629715])
 
-    def test_ignores_leagues_without_upcoming_fixtures(self) -> None:
-        failures = evaluate_failures(
-            [
-                {
-                    "league_id": 600,
-                    "fixtures_in_window": 0,
-                    "fixtures_with_complete_moneyline": 0,
-                    "coverage_pct": 0.0,
-                    "missing_fixture_ids": [],
-                    "first_missing_starting_at": None,
-                }
-            ],
-            fail_below_pct=100.0,
-        )
-        self.assertEqual(failures, [])
+        self.assertEqual(set(expected), {(19629715, 8)})
+        self.assertEqual(by_fixture, {19629715: {8}})
 
 
 if __name__ == "__main__":

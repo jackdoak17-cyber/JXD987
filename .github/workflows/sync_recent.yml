@@ -52,7 +52,11 @@ jobs:
           SUPABASE_EXPORT_SLEEP: "0"
           SUPABASE_EXPORT_RETRIES: "5"
           EXPORT_DAYS_BACK: "240"
-        run: python3 scripts/export_to_supabase.py --strict --leagues "$LEAGUE_IDS"
+        run: |
+          python3 scripts/export_to_supabase.py \
+            --strict \
+            --leagues "$LEAGUE_IDS" \
+            --report-json /tmp/export_to_supabase_report.json
 
       - name: Refresh likely players
         env:
@@ -66,3 +70,56 @@ jobs:
               -H "Content-Type: application/json" \
               -d "{\"p_league_id\":${league_id},\"p_recent_days\":30,\"p_last_n\":1}"
           done
+
+      - name: Upload export report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: export_to_supabase_report
+          path: /tmp/export_to_supabase_report.json
+          if-no-files-found: ignore
+
+      - name: Publish export gap summary
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          report_path = Path("/tmp/export_to_supabase_report.json")
+          if not report_path.exists():
+              print("No export report found; skipping gap summary.")
+              raise SystemExit(0)
+
+          report = json.loads(report_path.read_text(encoding="utf-8"))
+          ds = report.get("delete_stats", {}) or {}
+
+          def missed_count(key: str) -> int:
+              rows = (ds.get(key, {}) or {}).get("missed_fixture_ids") or []
+              return len(rows)
+
+          fp_missed = missed_count("fixture_players")
+          fps_missed = missed_count("fixture_player_statistics")
+          odds_missed = missed_count("odds_outcomes")
+          odds_delete_skipped = bool((ds.get("odds_outcomes", {}) or {}).get("delete_skipped"))
+          total_missed = fp_missed + fps_missed + odds_missed
+
+          lines = [
+              "## Export Gap Summary (Baseline Mode)",
+              f"- fixture_players missed fixtures: {fp_missed}",
+              f"- fixture_player_statistics missed fixtures: {fps_missed}",
+              f"- odds_outcomes missed fixtures: {odds_missed}",
+              f"- odds_outcomes delete skipped: {odds_delete_skipped}",
+              f"- total missed fixtures (delete stage): {total_missed}",
+              "",
+              "> Strict mode is intentionally OFF while we establish baseline miss behavior.",
+          ]
+
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write("\\n".join(lines) + "\\n")
+          else:
+              print("\\n".join(lines))
+          PY

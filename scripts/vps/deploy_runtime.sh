@@ -22,6 +22,21 @@ if [[ ! -f "${RUNTIME_FILE_LIST}" ]]; then
   exit 1
 fi
 
+required_runtime_entries=(
+  "scripts/reconcile_stats_provider_queue.py"
+  "scripts/vps/run_stats_reconciliation.sh"
+)
+for required_entry in "${required_runtime_entries[@]}"; do
+  if [[ ! -f "${REPO_ROOT}/${required_entry}" ]]; then
+    echo "Runtime source missing required production entry: ${required_entry}" >&2
+    exit 1
+  fi
+  if ! grep -Fqx -- "${required_entry}" < <(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "${RUNTIME_FILE_LIST}"); then
+    echo "Runtime file list missing required production entry: ${required_entry}" >&2
+    exit 1
+  fi
+done
+
 "${SCRIPT_DIR}/update_runtime_manifest.sh"
 
 ssh_cmd=(ssh)
@@ -32,7 +47,7 @@ if [[ -n "${SSH_KEY}" ]]; then
 fi
 ssh_cmd+=("${TARGET_USER}@${TARGET_HOST}")
 
-files_to_sync=("scripts/vps/runtime_manifest.sha1" "scripts/vps/runtime_files.txt")
+files_to_sync=("scripts/vps/runtime_files.txt")
 while IFS= read -r relpath || [[ -n "${relpath}" ]]; do
   [[ -n "${relpath}" ]] || continue
   [[ "${relpath}" == \#* ]] && continue
@@ -44,5 +59,11 @@ done < "${RUNTIME_FILE_LIST}"
   rsync -avR -e "$(printf '%q ' "${rsync_rsh[@]}")" "${files_to_sync[@]}" "${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}/"
 )
 
-"${ssh_cmd[@]}" "cd '${TARGET_REPO_ROOT}' && shasum -c scripts/vps/runtime_manifest.sha1"
+(
+  cd "${REPO_ROOT}"
+  rsync -avR -e "$(printf '%q ' "${rsync_rsh[@]}")" \
+    scripts/vps/runtime_manifest.sha1 "${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}/"
+)
+
+"${ssh_cmd[@]}" "cd '${TARGET_REPO_ROOT}' && shasum -c scripts/vps/runtime_manifest.sha1 && grep -Fqx -- 'scripts/reconcile_stats_provider_queue.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_stats_reconciliation.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1)"
 echo "Runtime deployed and verified on ${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}"

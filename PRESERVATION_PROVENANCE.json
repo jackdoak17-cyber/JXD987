@@ -1,0 +1,562 @@
+{
+  "purpose": "read-only preservation snapshot; not approved for merge or deployment",
+  "original_path": "~/JXD987",
+  "original_head": "d0442ee4a488ad3541da34d620f364a8f6818da7",
+  "original_branch": "codex/stage-fixture-reconcile-stale-status",
+  "source_repository": "https://github.com/jackdoak17-cyber/JXD987.git",
+  "included": [
+    {
+      "path": ".github/workflows/sync_history.yml",
+      "sha256": "3e71415eb77c04b065ed587594b3e9f49e6b23d8cac673be80fd65feff57a4f0",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": ".github/workflows/sync_recent.yml",
+      "sha256": "567d902d26390f0ae701c1f3326eefc51e83d52aa01f619bc836765afe4decd0",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "VPS_SETUP.md",
+      "sha256": "4e5e4f292819b97fb0bbb15b589b27828adb6d3333b020d727becf8b6bd0c166",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "config/league_ids.txt",
+      "sha256": "50e2cdb9e60a92c9edd19d71820f0625f1527616a85977591778574bd8ea994e",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "config/odds_api_leagues.json",
+      "sha256": "8235abf47d0238cd73771ebe4b67e95843de1401c46f201f8c94bb160dc98dfc",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "config/odds_api_sync_excluded_leagues.json",
+      "sha256": "baa0c077930e2dac4f44643bc238eac2e367bd6655e716b3f23b2927d9fdba4f",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "jxd/db.py",
+      "sha256": "3659c7fdfdd960fd5fa2d1a5ad9ffd7a8006c90dda354a4a71a980388c486150",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "jxd/sync.py",
+      "sha256": "2a9cfbebc631dd8e8c78150b04820d58fd67375c825e16c17fefeb2007362400",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "research/model1_re/compare_statshub_week.py",
+      "sha256": "12b7b61799f6dd23485e115ad117d87471b9cb9fe5713c717fafa1d46ac72d49",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "research/model1_re/fit_model1_outcomes.py",
+      "sha256": "c8be55bf06372fb315c7841248656c0ca6a4115df172b3ea507a9dc93bd78eed",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "research/model1_re/local_targets.py",
+      "sha256": "3255b9887bd533c4ac609bc7ce40f214876dc8e7fcc0612c188311b9c4977584",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "research/model1_re/run_model1_research_range.py",
+      "sha256": "bb0b4cc1344a76fd46b0812d5a26e50fe7c1a86cdbf503ff841e04dadb97188b",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "research/model1_re/run_model1_train_local.py",
+      "sha256": "fd118e5d0d21e0ad7273c56ecc79d14426186f7a05e9c5411416758ff0515755",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "research/model1_re/ui/app.js",
+      "sha256": "253356752d2180295ca8d3195a53301a6aa71f5d17ca5f4316c6a5b8af11fb9b",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "research/model1_re/ui/index.html",
+      "sha256": "57d0fc8599744eaa395b3bd99adf922af05493379f73520775c7882fc0beec92",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "research/model1_re/ui/styles.css",
+      "sha256": "ed7105afbeef55d4d564f65bf8f86d4ba5af567714b2981ce618348e6c3645cd",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/export_odds_to_supabase_psql.py",
+      "sha256": "00277e76627e62b92bc3078d3ea5e0eeedd3edd0ec02a1b7e1ba591570c7c10e",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/export_to_supabase.py",
+      "sha256": "377987a77c68945d2bea6b709586df08c4e1cd245982f80905f07f983f49e601",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/postmatch_fixture_detail_delivery.py",
+      "sha256": "50f2876c178e74057416770ca12fb83f1de9138cb4462bec5908e9c10aa14d83",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/refresh_fixture_delivery.py",
+      "sha256": "225219ab02d5a49874a07461a1a46717b4bb4d8760ca697f4dd09d7bf15b4511",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/sync_confirmed_lineups.py",
+      "sha256": "ae818c88597d21490d9bc8392fef6b9bdc103824f71c4c8d5099a52e35bd907e",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/sync_fixture_referee_stats.py",
+      "sha256": "4c9747113f4bc14e831768d50ec8ea51c301121aa756cda04e08b78fc3f01a3b",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/sync_odds.py",
+      "sha256": "ad2a39212807df457567d585dc0f883d42c49aec0e814f5849446fbf74a0f80d",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/sync_odds_all_leagues.py",
+      "sha256": "951004f3e9a5ef0ac12e4ef3c2e446f8aa12b7f446443c2a5fd17cbfcbbc1cbf",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/sync_sparse_squads.py",
+      "sha256": "b4cfde8b9c7985ad0bef924343e1e408fc19f5cf6313c84e3d9a0cb707599608",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/sync_sportmonks_metadata.py",
+      "sha256": "bff4330a3914b21273de26d8f9cd67d91621e3e05c5c2f84e5ab34760b108e51",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/validate_moneyline_coverage.py",
+      "sha256": "e66cf51247cf9723a3aa63de09c6b21963c73d70c0c2d754cc7be89e46871afc",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/validate_player_prop_odds_feed.py",
+      "sha256": "7c816f3b39ae76ec2b0d0b398b9ebd622d4ac6c3a04b3e08d271a23a21ca221e",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/verify_fixture_delivery_parity.py",
+      "sha256": "cd606f9c64499a923f3e2fec3f7c88031278d68efc5e1498c006c7fe71534394",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/verify_fixture_detail_delivery.py",
+      "sha256": "76cd6f51092ad80402c035b50c28b21022b7ec94646cd206600691b3d0084955",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/verify_squad_freshness.py",
+      "sha256": "7d9b8dc5bf09e6ff3b59943fed5d89e0622f5fd2bce088c9496fa35e758469e2",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/common.sh",
+      "sha256": "cdba3e879831f1ae6359cfaef9621de7f6540e72eb6218de08042def6d2d7466",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/deploy_runtime.sh",
+      "sha256": "897dd242e355e1734ea0c321140cde681958126dff6ef2e6ae97ff9d3e956de5",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/run_models.sh",
+      "sha256": "42a6b8766efb0b981dab9573c95c02e8b38dc97027696bc157c8fb62651acfb2",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/run_models_snapshots_close.sh",
+      "sha256": "005fdd8ada1516fa8c8b6cfcf3bdc9191d4a00500ff82751dc4250b9a88cfb56",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/run_models_snapshots_open.sh",
+      "sha256": "d7c248a5ce9ccaf4128c34a6355e8c6507f7415c83c7fd0918b29e23e18cefe2",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/run_models_train_weekly.sh",
+      "sha256": "f57bc715655c5c21fbfc1fddab9d4c6d082fad6ca7e7b7f1858809c5dd954563",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/run_p1.sh",
+      "sha256": "b802a3fcc06493f6b19d91c6686f74dea6a5cb898c1d03616df2fbb912dda9e5",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/run_p2.sh",
+      "sha256": "d371633186f2a4d958ababa4ff7c12f45c29ea272c3ed83c1fa4e37add0c4db2",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/run_p3.sh",
+      "sha256": "4fc0759e7882ab4cad5db7ce02fcedf93f2b8babeb48524c9aa168f5557f2d70",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/run_postmatch_settlement.sh",
+      "sha256": "6af781adbfc1351c4d8f7ed4bef973585cea9d2d047142ea837baad7282f0d93",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/run_sync.sh",
+      "sha256": "d6b785a8e3c471deaa54756eafdbca4204a58ccaf388826a4181f8caa8d3cdb6",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/runtime_files.txt",
+      "sha256": "74fbc1f19183d5f2e9d1374bec37035e9bd993992872e7fc23a6b5eea3b18a20",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "scripts/vps/runtime_manifest.sha1",
+      "sha256": "ee960ddd3bc54b317bd12495c1868bf8ab79461969ac5727b059503cad2d627a",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "supabase/migrations/20260602_enable_rls_on_public_security_lint_tables.sql",
+      "sha256": "eadb75316b0f723c4ece15f9398369f053456b1dfca6c9e783407c6327a50e28",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "tests/test_postmatch_fixture_detail_delivery.py",
+      "sha256": "4ba37e71881b810bc8214f319fe45bf75fcbdc0ae5807625320d8a7b16f85779",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "tests/test_refresh_fixture_delivery.py",
+      "sha256": "b8ed417ec04afbce355b469f12d61af67eafe1f343798c37dfd91d764118a24d",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "tests/test_revised_fixture_delivery_contract.py",
+      "sha256": "26d1b0a0bf35c90d87acf90c962bc0753970eb2443a4f656676fa80c163ead93",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "tests/test_sync_odds_matcher.py",
+      "sha256": "00976ee9c66ed059a4475378b6db4e4dc3d13d659c7fd0eca1a498563e28c9df",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "tests/test_validate_moneyline_coverage.py",
+      "sha256": "edb5c07bb19e0ac2147893d48c14b87a19af1dd27e35f5b1dab5c55f3411dd50",
+      "category": "tracked_or_untracked"
+    },
+    {
+      "path": "tests/test_verify_fixture_delivery_parity.py",
+      "sha256": "3926ba4e7f9dc3007fc80df5bad801afc735a0e1f700fed41dc437259f1245a4",
+      "category": "tracked_or_untracked"
+    }
+  ],
+  "excluded": [
+    {
+      "path": "supabase/.temp/cli-latest",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": ".claude/settings.local.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": ".env",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "Betting/",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referee_stats_after_hydrate.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referee_stats_report_dryrun.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referee_stats_report_manual.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referee_stats_report_manual_30d.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referee_stats_report_v2_dryrun.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referee_stats_report_v2_live.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referee_stats_with_red_avg.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referees_report_dryrun.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referees_report_manual.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referees_report_manual_30d.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referees_report_now.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/fixture_referees_report_seed.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/referee_assignments_dryrun_700d.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/referee_history_dryrun_5.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/referee_history_live.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/referee_profiles_report_dryrun.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/referee_profiles_report_manual.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "artifacts/referee_profiles_report_seed.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "core_markets_report.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "core_markets_report.md",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "data/jxd.sqlite",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "data/jxd_fresh.sqlite",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "mapping_report.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "mapping_report.md",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/.gitkeep",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_all_dataset.csv",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_all_dataset.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_all_matched_targets.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_future_2d.csv",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_future_2d.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_future_7d.csv",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_future_7d.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_local_dataset.csv",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_local_dataset.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_range_10d_dataset.csv",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_range_10d_dataset.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_range_10d_matched_targets.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_range_7d_dataset.csv",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_range_7d_dataset.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_range_7d_matched_targets.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_today_dataset.csv",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_today_dataset.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/model1_today_matched_targets.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-08.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-09.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-10.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-11.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-12.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-13.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-14.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-15.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-16.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-17.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_2026-04-18.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_all.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/artifacts/public_model1_targets_today.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/compare_week_20260418.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/compare_week_20260418.md",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_all_fit_report.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_all_fit_report.md",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_all_force40_fit_report.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_all_force40_fit_report.md",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_all_force_fit_report.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_all_force_fit_report.md",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_local_fit_report.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_local_fit_report.md",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_range_7d_fit_report.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_range_7d_fit_report.md",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_today_fit_report.json",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    },
+    {
+      "path": "research/model1_re/reports/model1_today_fit_report.md",
+      "reason": "sensitive/runtime/evidence/ignored policy"
+    }
+  ]
+}

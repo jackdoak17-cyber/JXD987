@@ -52,6 +52,7 @@ Location:
 - `scripts/vps/run_p1.sh`
 - `scripts/vps/run_p2.sh`
 - `scripts/vps/run_p3.sh`
+- `scripts/vps/run_postmatch_settlement.sh`
 
 Exit codes:
 - `0`: success (healthcheck ping sent)
@@ -89,6 +90,7 @@ Path B is enforced:
 - P1/P2: fetch-only
 - P2: fetch-only + best-effort confirmed-lineup refresh for imminent fixtures
 - P3: SportMonks refresh + fetch + ingest + retention + best-effort lightweight recent fixture refresh/export
+- Post-match settlement: every 15 minutes, refresh fixture cores and run the bounded full-detail delivery worker for recently started fixtures. The worker retries provider-pending fixtures and verifies source-to-Supabase parity before marking them delivered.
 
 ### Conservative production schedule for Supabase Micro
 
@@ -98,6 +100,7 @@ Use this schedule while the production Supabase project is on Micro compute or w
 */10 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
 */15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
 7,37 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
+*/15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_postmatch_settlement.sh >> /var/log/odds-sync-postmatch.log 2>&1
 
 # Betting picks publish (Models -> Supabase, optional R2 fallback).
 # Shares the same global lock as P3 and will skip while ingestion is running.
@@ -119,6 +122,7 @@ Only use this after Supabase has enough IO/CPU headroom and the hot tables have 
 */2 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p1.sh >> /var/log/odds-sync-p1.log 2>&1
 */5 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p2.sh >> /var/log/odds-sync-p2.log 2>&1
 */20 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_p3.sh >> /var/log/odds-sync-p3.log 2>&1
+*/15 * * * * cd /opt/odds-sync/JXD987 && /opt/odds-sync/JXD987/scripts/vps/run_postmatch_settlement.sh >> /var/log/odds-sync-postmatch.log 2>&1
 
 # Betting picks publish (Models -> Supabase, optional R2 fallback).
 # Shares the same global lock as P3 and will skip while ingestion is running.
@@ -133,7 +137,7 @@ Only use this after Supabase has enough IO/CPU headroom and the hot tables have 
 ```
 
 Important:
-- No separate SportMonks cron entry (SportMonks refresh is inside `run_p3.sh`)
+- No separate historical SportMonks cron entry (historical refresh remains inside `run_p3.sh`; the post-match worker polls only the bounded recent-fixture queue)
 - Retention runs only in `run_p3.sh` (and `run_sync.sh` parity mode)
 
 ## 6) Healthcheck timeout formula

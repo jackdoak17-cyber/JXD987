@@ -113,7 +113,8 @@ def main() -> None:
     require_env(args.dry_run)
 
     session = get_session(get_engine())
-    team_ids = current_season_team_ids(session, parse_ids(args.leagues), 0)
+    requested_league_ids = parse_ids(args.leagues)
+    team_ids = current_season_team_ids(session, requested_league_ids, 0)
     team_ids = sorted(set(team_ids))
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=args.max_age_hours)
@@ -132,6 +133,8 @@ def main() -> None:
     local_latest = _latest_successful_snapshot(local_rows, now)
 
     failures: Dict[str, List[Dict]] = {"missing_local_snapshot": [], "stale_local_snapshot": []}
+    if requested_league_ids and not team_ids:
+        failures["no_current_season_teams"] = [{"league_ids": list(requested_league_ids)}]
     for team_id in team_ids:
         row = local_latest.get(team_id)
         if row is None:

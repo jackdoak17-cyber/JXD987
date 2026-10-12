@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence
 
@@ -61,14 +62,28 @@ def current_season_team_ids(
         select distinct f.league_id, f.home_team_id as team_id
         from fixtures f
         join seasons s on s.id = f.season_id
-        where coalesce(s.is_current, 0) = 1
+        where (
+            coalesce(s.is_current, 0) = 1
+            or (
+                s.start_date is not null
+                and s.start_date <= CURRENT_TIMESTAMP
+                and (s.end_date is null or s.end_date >= CURRENT_TIMESTAMP)
+            )
+        )
           and f.home_team_id is not null
           {league_filter}
         union
         select distinct f.league_id, f.away_team_id as team_id
         from fixtures f
         join seasons s on s.id = f.season_id
-        where coalesce(s.is_current, 0) = 1
+        where (
+            coalesce(s.is_current, 0) = 1
+            or (
+                s.start_date is not null
+                and s.start_date <= CURRENT_TIMESTAMP
+                and (s.end_date is null or s.end_date >= CURRENT_TIMESTAMP)
+            )
+        )
           and f.away_team_id is not null
           {league_filter}
         """
@@ -167,19 +182,77 @@ def fetch_players_by_ids(player_ids: Sequence[int]) -> List[Dict]:
     ]
 
 
+def deactivate_remote_squad_memberships_missing(
+    team_ids: Sequence[int],
+    memberships: Sequence[Dict],
+    dry_run: bool,
+) -> Dict[str, int]:
+    """Close remote active memberships absent from the latest local snapshot.
+
+    Upserts cannot remove rows that disappeared from the provider response. A
+    current-squad reconciliation therefore needs an explicit, auditable
+    deactivation step before the remote verifier can compare active sets.
+    """
+    active_by_team: Dict[int, set[int]] = {}
+    for row in memberships:
+        if row.get("is_active") and row.get("team_id") is not None and row.get("player_id") is not None:
+            active_by_team.setdefault(int(row["team_id"]), set()).add(int(row["player_id"]))
+    deactivated: Dict[str, int] = {}
+    if dry_run:
+        return deactivated
+    for team_id in team_ids:
+        response = requests.get(
+            f"{SUPABASE_URL.rstrip()}{REST_PATH}/team_squad_memberships",
+            headers=rest_headers(),
+            params={"select": "player_id", "team_id": f"eq.{team_id}", "is_active": "eq.true", "limit": "1000"},
+            timeout=60,
+        )
+        if not response.ok:
+            raise SystemExit(f"Supabase membership lookup for team {team_id} failed {response.status_code}: {response.text}")
+        remote_ids = {
+            int(row["player_id"])
+            for row in response.json()
+            if isinstance(row, dict) and row.get("player_id") is not None
+        }
+        stale_ids = sorted(remote_ids - active_by_team.get(int(team_id), set()))
+        if not stale_ids:
+            continue
+        patch = requests.patch(
+            f"{SUPABASE_URL.rstrip()}{REST_PATH}/team_squad_memberships",
+            headers=rest_headers(),
+            params={"team_id": f"eq.{team_id}", "player_id": f"in.({','.join(str(player_id) for player_id in stale_ids)})"},
+            json={"is_active": False, "updated_at": datetime.utcnow().isoformat()},
+            timeout=60,
+        )
+        if not patch.ok:
+            raise SystemExit(f"Supabase membership deactivation for team {team_id} failed {patch.status_code}: {patch.text}")
+        deactivated[str(team_id)] = len(stale_ids)
+    return deactivated
+
+
 def detach_remote_players_missing_from_squads(
     team_ids: Sequence[int],
     current_players: Sequence[Dict],
     dry_run: bool,
+    memberships: Sequence[Dict] | None = None,
 ) -> Dict[str, int]:
-    """Remove remote team assignments not present in a successful local squad snapshot."""
+    """Remove remote team assignments not present in active squad membership."""
     current_player_ids_by_team: Dict[int, set[int]] = {}
-    for row in current_players:
-        team_id = row.get("team_id")
-        player_id = row.get("id")
-        if team_id is None or player_id is None:
-            continue
-        current_player_ids_by_team.setdefault(int(team_id), set()).add(int(player_id))
+    if memberships is not None:
+        for row in memberships:
+            if not row.get("is_active"):
+                continue
+            team_id = row.get("team_id")
+            player_id = row.get("player_id")
+            if team_id is not None and player_id is not None:
+                current_player_ids_by_team.setdefault(int(team_id), set()).add(int(player_id))
+    else:
+        for row in current_players:
+            team_id = row.get("team_id")
+            player_id = row.get("id")
+            if team_id is None or player_id is None:
+                continue
+            current_player_ids_by_team.setdefault(int(team_id), set()).add(int(player_id))
 
     detached_by_team: Dict[str, int] = {}
     if dry_run:
@@ -415,10 +488,16 @@ def main() -> None:
         memberships_exported, _ = upsert_table(
             "team_squad_memberships", squad_memberships, "team_id,player_id", args.dry_run
         )
+    remote_memberships_deactivated = deactivate_remote_squad_memberships_missing(
+        sparse_team_ids,
+        squad_memberships,
+        args.dry_run,
+    )
     remote_players_detached = detach_remote_players_missing_from_squads(
         sparse_team_ids,
         current_players,
         args.dry_run,
+        squad_memberships,
     )
 
     report = {
@@ -436,6 +515,7 @@ def main() -> None:
         "player_team_history_exported": history_exported,
         "squad_snapshots_exported": snapshots_exported,
         "squad_memberships_exported": memberships_exported,
+        "remote_memberships_deactivated": remote_memberships_deactivated,
         "remote_players_detached": remote_players_detached,
     }
     write_report(args.report_json, report)

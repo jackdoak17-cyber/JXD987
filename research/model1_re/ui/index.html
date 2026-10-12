@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OddsSearch | Model 1 Bets Review</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg"></div>
+    <header class="header">
+      <div class="header__title">
+        <div class="kicker">OddsSearch • Model 1</div>
+        <h1>Bets Review</h1>
+        <div class="sub">Local-only UI for reviewing generated candidates (no DB writes).</div>
+      </div>
+      <div class="header__actions">
+        <button id="reloadBtn" class="btn">Reload default JSON</button>
+        <label class="file">
+          <input id="fileInput" type="file" accept="application/json" />
+          Load JSON…
+        </label>
+      </div>
+    </header>
+
+    <main class="wrap">
+      <section class="panel">
+        <div class="panel__row">
+          <div class="field">
+            <label>Market</label>
+            <select id="marketSelect">
+              <option value="all">All</option>
+              <option value="shots">Shots</option>
+              <option value="onTargetScoringAttempt">SOT</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Min edge %</label>
+            <input id="minEdge" type="number" step="1" value="0" />
+          </div>
+          <div class="field">
+            <label>Max odd</label>
+            <input id="maxOdd" type="number" step="0.1" value="4" />
+          </div>
+          <div class="field">
+            <label>Search</label>
+            <input id="search" type="text" placeholder="Player / team / league text…" />
+          </div>
+        </div>
+
+        <div class="panel__row">
+          <div class="field">
+            <label>Sort</label>
+            <select id="sortSelect">
+              <option value="predicted_over_edge_pct_desc">Edge % (desc)</option>
+              <option value="fixture_timestamp_asc">Kickoff (asc)</option>
+              <option value="fixture_timestamp_desc">Kickoff (desc)</option>
+              <option value="best_over_odds_desc">Best odds (desc)</option>
+              <option value="predicted_fair_over_odds_asc">Fair odds (asc)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Limit</label>
+            <select id="limitSelect">
+              <option value="100">100</option>
+              <option value="250">250</option>
+              <option value="500">500</option>
+              <option value="0">All</option>
+            </select>
+          </div>
+          <div class="field field--grow">
+            <label>Source</label>
+            <div id="sourceLabel" class="mono muted">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel panel--flat">
+        <div class="summary">
+          <div class="stat">
+            <div class="stat__k">Rows</div>
+            <div id="rowsStat" class="stat__v">0</div>
+          </div>
+          <div class="stat">
+            <div class="stat__k">Shown</div>
+            <div id="shownStat" class="stat__v">0</div>
+          </div>
+          <div class="stat">
+            <div class="stat__k">Max edge</div>
+            <div id="maxEdgeStat" class="stat__v">—</div>
+          </div>
+          <div class="stat">
+            <div class="stat__k">Last kickoff</div>
+            <div id="lastKickoffStat" class="stat__v">—</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div id="errorBox" class="error hidden"></div>
+        <div class="tableWrap">
+          <table class="table" id="betsTable">
+            <thead>
+              <tr>
+                <th>Kickoff</th>
+                <th>Match</th>
+                <th>Player</th>
+                <th>Pos</th>
+                <th>Market</th>
+                <th class="num">Line</th>
+                <th class="num">Best</th>
+                <th class="num">Fair</th>
+                <th class="num">Edge %</th>
+                <th class="num">mu</th>
+                <th class="num">Avg</th>
+                <th class="num">Per 90</th>
+                <th class="num">HR 5</th>
+                <th class="num">HR 10</th>
+                <th class="num">HR 20</th>
+              </tr>
+            </thead>
+            <tbody id="betsTbody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <div class="muted">
+        Default file: <span class="mono">/artifacts/model1_future_7d.json</span>. Run from
+        <span class="mono">research/model1_re</span> with <span class="mono">python3 -m http.server</span>.
+      </div>
+    </footer>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

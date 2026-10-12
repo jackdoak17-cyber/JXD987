@@ -7,6 +7,7 @@ source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
 require_runtime_manifest_entries_or_exit "$0" \
   "scripts/vps/common.sh" \
+  "scripts/validate_player_prop_odds_feed.py" \
   "scripts/vps/run_models.sh"
 
 # This wrapper publishes betting picks into Supabase (and optionally R2) by running the
@@ -27,20 +28,27 @@ require_runtime_manifest_entries_or_exit "$0" \
 # - MODELS_PUBLISH_R2 (true/false, defaults to true)
 
 export MODELS_REPO_ROOT="${MODELS_REPO_ROOT:-/opt/odds-sync/Models}"
-export MODELS_ENV_PATH="${MODELS_ENV_PATH:-${REPO_ROOT}/.env}"
+export MODELS_ENV_PATH="${MODELS_ENV_PATH:-${MODELS_REPO_ROOT}/.env}"
 export MODELS_TOP="${MODELS_TOP:-50}"
 export MODELS_FIXTURE_LIMIT="${MODELS_FIXTURE_LIMIT:-20}"
 export MODELS_PLAYERS_LIMIT="${MODELS_PLAYERS_LIMIT:-20}"
 export MODELS_PLAYER_REQUIRE_POSITIVE_EV="${MODELS_PLAYER_REQUIRE_POSITIVE_EV:-true}"
 export MODELS_PLAYER_VALUE_ODDS_MIN="${MODELS_PLAYER_VALUE_ODDS_MIN:-1.0}"
 export MODELS_PLAYER_HIGH_ODDS_MIN="${MODELS_PLAYER_HIGH_ODDS_MIN:-1.0}"
-export MODELS_PLAYER_HIGH_PROB_MIN="${MODELS_PLAYER_HIGH_PROB_MIN:-0.8}"
+export MODELS_PLAYER_HIGH_PROB_MIN="${MODELS_PLAYER_HIGH_PROB_MIN:-0.0}"
 export MODELS_PLAYER_HIGH_HIT_RATE_MIN="${MODELS_PLAYER_HIGH_HIT_RATE_MIN:-0.8}"
+export MODELS_TEAM_VALUE_HIT_RATE_MIN="${MODELS_TEAM_VALUE_HIT_RATE_MIN:-0.7}"
+export MODELS_TEAM_HIGH_HIT_RATE_MIN="${MODELS_TEAM_HIGH_HIT_RATE_MIN:-0.8}"
+export MODELS_TEAM_HIGH_ODDS_MIN="${MODELS_TEAM_HIGH_ODDS_MIN:-1.0}"
 export MODELS_SKIP_PLAYER_AI="${MODELS_SKIP_PLAYER_AI:-false}"
 export MODELS_SKIP_TEAM_AI="${MODELS_SKIP_TEAM_AI:-false}"
 export MODELS_PUBLISH_R2="${MODELS_PUBLISH_R2:-true}"
+export PLAYER_PROP_VALIDATE_BEFORE_MODELS="${PLAYER_PROP_VALIDATE_BEFORE_MODELS:-true}"
+export PLAYER_PROP_VALIDATE_DAYS_BACK="${PLAYER_PROP_VALIDATE_DAYS_BACK:-2}"
+export PLAYER_PROP_VALIDATE_DAYS_FORWARD="${PLAYER_PROP_VALIDATE_DAYS_FORWARD:-14}"
 
 # Reuse the global lock helper, but allow a separate timeout for model publishing.
+export REPO_ROOT
 export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${MODELS_MAX_DURATION_SECONDS:-900}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
@@ -49,6 +57,25 @@ set -euo pipefail
 if [[ ! -d "${MODELS_REPO_ROOT}" ]]; then
   echo "Models repo not found at ${MODELS_REPO_ROOT}. Set MODELS_REPO_ROOT." >&2
   exit 1
+fi
+
+if [[ "${PLAYER_PROP_VALIDATE_BEFORE_MODELS}" == "true" || "${PLAYER_PROP_VALIDATE_BEFORE_MODELS}" == "1" ]]; then
+  cd "${REPO_ROOT}"
+  if [[ -f .venv/bin/activate ]]; then
+    # shellcheck disable=SC1091
+    source .venv/bin/activate
+  fi
+  if [[ -f "${MODELS_ENV_PATH}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${MODELS_ENV_PATH}"
+    set +a
+  fi
+  python scripts/validate_player_prop_odds_feed.py \
+    --days-back "${PLAYER_PROP_VALIDATE_DAYS_BACK}" \
+    --days-forward "${PLAYER_PROP_VALIDATE_DAYS_FORWARD}" \
+    --out-json "/tmp/player_prop_odds_feed_report_models.json" \
+    --out-md "/tmp/player_prop_odds_feed_report_models.md"
 fi
 
 cd "${MODELS_REPO_ROOT}"
@@ -91,8 +118,7 @@ if [[ "${MODELS_PUBLISH_R2}" == "true" || "${MODELS_PUBLISH_R2}" == "1" ]]; then
       --bucket "${CLOUDFLARE_R2_BUCKET}" \
       --prefix betting-picks \
       --top "${MODELS_TOP}" \
-      --fixtureLimit "${MODELS_FIXTURE_LIMIT}" \
-      --playersLimit "${MODELS_PLAYERS_LIMIT}"
+      --env "${MODELS_ENV_PATH}"
   else
     echo "Skipping R2 publish; missing CLOUDFLARE_R2_* env vars." >&2
   fi
@@ -101,5 +127,16 @@ CHAIN
 )
 
 status=0
+RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+RUN_STARTED_EPOCH="$(date -u +"%s")"
 run_with_global_lock_and_timeout "${CHAIN_COMMAND}" || status=$?
+RUN_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+RUN_FINISHED_EPOCH="$(date -u +"%s")"
+record_pipeline_job_run \
+  "run_models" \
+  "Models publish" \
+  "${status}" \
+  "${RUN_STARTED_AT}" \
+  "${RUN_FINISHED_AT}" \
+  "$(((RUN_FINISHED_EPOCH - RUN_STARTED_EPOCH) * 1000))"
 finalize_with_healthcheck "${status}" "${HEALTHCHECK_PING_URL_MODELS:-${HEALTHCHECK_PING_URL:-}}"

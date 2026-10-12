@@ -17,15 +17,18 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/sync_odds.py" \
   "scripts/sync_sportmonks_metadata.py" \
   "scripts/sync_sparse_squads.py" \
+  "scripts/verify_squad_freshness.py" \
   "scripts/export_odds_to_supabase_psql.py" \
   "scripts/odds_retention_psql.py" \
   "scripts/reconcile_recent_fixtures.py" \
+  "scripts/verify_fixture_detail_delivery.py" \
   "scripts/validate_moneyline_coverage.py" \
   "scripts/validate_player_prop_odds_feed.py" \
-  "scripts/export_to_supabase.py"
+  "scripts/export_to_supabase.py" \
+  "scripts/refresh_fixture_delivery.py"
 
 export REPO_ROOT
-export STATS_LEAGUES="${STATS_LEAGUE_IDS:-${LEAGUE_IDS:-$(default_league_csv)}}"
+export STATS_LEAGUES="${STATS_LEAGUE_IDS:-${LEAGUE_IDS:-$(supported_league_csv)}}"
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export FIXTURE_LEAGUES="${FIXTURE_LEAGUE_IDS:-$(union_csv "${STATS_LEAGUES}" "${ODDS_LEAGUES}")}"
 export ODDS_SYNC_DAYS_BACK="${ODDS_SYNC_DAYS_BACK:-2}"
@@ -44,15 +47,25 @@ export FIXTURE_EXPORT_DAYS_FORWARD="${FIXTURE_EXPORT_DAYS_FORWARD:-31}"
 export LATE_FIXTURE_RECONCILE_HOURS_BACK="${LATE_FIXTURE_RECONCILE_HOURS_BACK:-48}"
 export LATE_FIXTURE_RECONCILE_EXPORT_DAYS_BACK="${LATE_FIXTURE_RECONCILE_EXPORT_DAYS_BACK:-2}"
 export SQUAD_REFRESH_MIN_PLAYERS="${SQUAD_REFRESH_MIN_PLAYERS:-15}"
+export SQUAD_FRESHNESS_MAX_HOURS="${SQUAD_FRESHNESS_MAX_HOURS:-12}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
 export MONEYLINE_COVERAGE_MIN_PCT="${MONEYLINE_COVERAGE_MIN_PCT:-100}"
+export MONEYLINE_REPAIR_ATTEMPTS="${MONEYLINE_REPAIR_ATTEMPTS:-1}"
 export PLAYER_PROP_VALIDATE="${PLAYER_PROP_VALIDATE:-true}"
 export PLAYER_PROP_VALIDATE_DAYS_BACK="${PLAYER_PROP_VALIDATE_DAYS_BACK:-${ODDS_EXPORT_DAYS_BACK}}"
 export PLAYER_PROP_VALIDATE_DAYS_FORWARD="${PLAYER_PROP_VALIDATE_DAYS_FORWARD:-${DAYS_FORWARD}}"
 export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${ODDS_SYNC_P3_MAX_DURATION_SECONDS:-5400}"
 export FIXTURE_CORE_EXPORT_CHUNK="${FIXTURE_CORE_EXPORT_CHUNK:-500}"
 export FIXTURE_DETAIL_EXPORT_CHUNK="${FIXTURE_DETAIL_EXPORT_CHUNK:-500}"
+export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-43}"
+export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-1800}"
+export FIXTURE_DETAIL_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DETAIL_DELIVERY_TIMEOUT_SECONDS:-2400}"
+FIXTURE_DELIVERY_END_DATE="$(TZ=Europe/London date -d "+${FIXTURE_DELIVERY_DAYS_FORWARD} days" +%F)"
+export FIXTURE_DELIVERY_END_DATE
+export FIXTURE_DETAIL_REPAIR_MAX_FIXTURES="${FIXTURE_DETAIL_REPAIR_MAX_FIXTURES:-250}"
+export FIXTURE_DETAIL_PROVIDER_REFRESH_LIMIT="${FIXTURE_DETAIL_PROVIDER_REFRESH_LIMIT:-25}"
+export FIXTURE_DETAIL_PROVIDER_REFRESH_COOLDOWN_HOURS="${FIXTURE_DETAIL_PROVIDER_REFRESH_COOLDOWN_HOURS:-24}"
 
 if [[ "${RUN_COVERAGE}" == "true" || "${RUN_COVERAGE}" == "1" ]]; then
   export COVERAGE_ARGS=""
@@ -111,6 +124,7 @@ run_isolated_pipeline_job() {
   set +e
   timeout "${max_runtime}" bash -lc "${command}"
   status=$?
+  LAST_PIPELINE_JOB_STATUS="${status}"
   set -e
   finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   finished_epoch="$(date -u +"%s")"
@@ -143,14 +157,25 @@ else
 fi
 
 # Step 2: Reconcile/export current-season squads.
+SQUAD_RECONCILIATION_STATUS=0
+SQUAD_FRESHNESS_STATUS=0
 if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   run_isolated_pipeline_job \
     "run_p3_sparse_squad_refresh" \
     "P3 current squad reconciliation" \
     "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/sync_sparse_squads.py --leagues \"${STATS_LEAGUES}\" --refresh-all --report-json \"/tmp/sparse_squad_refresh_report_p3.json\"" \
     "${P3_SPARSE_SQUAD_REFRESH_TIMEOUT_SECONDS:-900}"
+  SQUAD_RECONCILIATION_STATUS="${LAST_PIPELINE_JOB_STATUS:-1}"
+  set +e
+  python scripts/verify_squad_freshness.py \
+    --leagues "${STATS_LEAGUES}" \
+    --max-age-hours "${SQUAD_FRESHNESS_MAX_HOURS}" \
+    --report-json "/tmp/squad_freshness_report_p3.json"
+  SQUAD_FRESHNESS_STATUS=$?
+  set -e
 else
   echo "Skipping squad reconciliation; missing SportMonks or Supabase REST env" >&2
+  SQUAD_RECONCILIATION_STATUS=1
 fi
 
 # Step 3: Odds fetch scoped to P3 fixtures only
@@ -188,9 +213,9 @@ python scripts/odds_retention_psql.py \
 # Step 6: Report the user-facing fixtures moneyline window.
 # Keep this close to the odds sync/export so the live API comparison is not
 # invalidated by provider updates that arrive during the long stats exports.
-# This validator is intentionally non-blocking: it records a red fidelity
-# result for Operations, while P3 continues to independent SportMonks and
-# model work after odds ingestion has already completed.
+# Do not interrupt independent SportMonks/model work, but do retain a failing
+# final P3 status so the health-check ping and Operations job heartbeat alert
+# on provider-supported prices that failed to reach Supabase.
 set +e
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
@@ -202,32 +227,122 @@ python scripts/validate_moneyline_coverage.py \
 MONEYLINE_VALIDATION_STATUS=$?
 set -e
 if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
-  echo "Moneyline fidelity report is red (exit=${MONEYLINE_VALIDATION_STATUS}); continuing P3 downstream work." >&2
+  echo "Moneyline fidelity report is red (exit=${MONEYLINE_VALIDATION_STATUS}); running bounded autonomous repair attempts before final alert." >&2
+  repair_attempt=0
+  while [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 && "${repair_attempt}" -lt "${MONEYLINE_REPAIR_ATTEMPTS}" ]]; do
+    repair_attempt=$((repair_attempt + 1))
+    echo "Moneyline repair attempt ${repair_attempt}/${MONEYLINE_REPAIR_ATTEMPTS}: refetching P3 events and exporting the complete odds window." >&2
+    set +e
+    python scripts/sync_odds.py \
+      --leagues "${ODDS_LEAGUES}" \
+      --days-back "${ODDS_SYNC_DAYS_BACK}" \
+      --days-forward "${DAYS_FORWARD}" \
+      --priority p3 \
+      --bookmakers "${ODDS_BOOKMAKERS}" \
+      --report-out "/tmp/odds_sync_report_p3_repair_${repair_attempt}.json" \
+      --unmatched-out "/tmp/unmatched_players_p3_repair_${repair_attempt}.json"
+    repair_sync_status=$?
+    if [[ "${repair_sync_status}" -eq 0 ]]; then
+      python scripts/export_odds_to_supabase_psql.py \
+        --leagues "${ODDS_LEAGUES}" \
+        --days-back "${ODDS_EXPORT_DAYS_BACK}" \
+        --days-forward "${DAYS_FORWARD}" \
+        --csv-out "/tmp/odds_outcomes_export_p3_repair_${repair_attempt}.csv" \
+        --no-include-fixture-leagues \
+        --progress-rows 10000 \
+        --progress-fixtures 100 \
+        --max-runtime-minutes "${INGEST_MAX_RUNTIME_MINUTES}" \
+        --report-out "/tmp/odds_ingest_report_p3_repair_${repair_attempt}.json" \
+        --skip-retention \
+        --skip-retention-snapshots \
+        ${COVERAGE_ARGS}
+      repair_export_status=$?
+    else
+      repair_export_status=${repair_sync_status}
+    fi
+    if [[ "${repair_sync_status}" -eq 0 && "${repair_export_status}" -eq 0 ]]; then
+      python scripts/validate_moneyline_coverage.py \
+        --leagues "${ODDS_LEAGUES}" \
+        --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
+        --priority p3 \
+        --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
+        --out-json "/tmp/moneyline_coverage_report_p3.json" \
+        --out-md "/tmp/moneyline_coverage_report_p3.md"
+      MONEYLINE_VALIDATION_STATUS=$?
+    else
+      MONEYLINE_VALIDATION_STATUS=1
+    fi
+    set -e
+  done
+  if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
+    echo "Moneyline fidelity remains red after ${repair_attempt} repair attempt(s); continuing P3 downstream work before final alert." >&2
+  else
+    echo "Moneyline fidelity passed after ${repair_attempt} autonomous repair attempt(s)." >&2
+  fi
 fi
 
 # Step 7: Best-effort recent fixture detail refresh/export.
+STATS_DETAIL_STATUS=0
 if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   run_isolated_pipeline_job \
     "run_p3_stats_detail_export" \
     "P3 stats-detail export" \
-    "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/sync_sportmonks_metadata.py --leagues \"${STATS_LEAGUES}\" && python scripts/reconcile_recent_fixtures.py --leagues \"${STATS_LEAGUES}\" --days-back \"${FIXTURE_REFRESH_DAYS_BACK}\" --days-forward \"${FIXTURE_REFRESH_DAYS_FORWARD}\" --with-details && SUPABASE_EXPORT_CHUNK=\"${FIXTURE_DETAIL_EXPORT_CHUNK}\" python scripts/export_to_supabase.py --strict --leagues \"${STATS_LEAGUES}\" --days-back \"${FIXTURE_EXPORT_DAYS_BACK}\" --upcoming-days 0 --skip-odds-snapshots --skip-odds-outcomes --skip-prune --report-json \"/tmp/stats_detail_export_report_p3.json\"" \
+    "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/sync_sportmonks_metadata.py --leagues \"${STATS_LEAGUES}\" && python scripts/reconcile_recent_fixtures.py --leagues \"${STATS_LEAGUES}\" --days-back \"${FIXTURE_REFRESH_DAYS_BACK}\" --days-forward \"${FIXTURE_REFRESH_DAYS_FORWARD}\" --with-details && SUPABASE_EXPORT_CHUNK=\"${FIXTURE_DETAIL_EXPORT_CHUNK}\" python scripts/export_to_supabase.py --strict --leagues \"${STATS_LEAGUES}\" --days-back \"${FIXTURE_EXPORT_DAYS_BACK}\" --upcoming-days 0 --protect-empty-detail --skip-odds-snapshots --skip-odds-outcomes --skip-prune --report-json \"/tmp/stats_detail_export_report_p3.json\"" \
     "${P3_STATS_DETAIL_EXPORT_TIMEOUT_SECONDS:-2400}"
+  STATS_DETAIL_STATUS="${LAST_PIPELINE_JOB_STATUS:-1}"
 else
   echo "Skipping recent fixture refresh/export; missing SportMonks or Supabase REST env" >&2
+  STATS_DETAIL_STATUS=1
 fi
 
 # Step 8: Late post-match reconciliation for provider updates that land after the main stats export.
+LATE_DETAIL_STATUS=0
 if [[ -n "${SPORTMONKS_API_TOKEN:-}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
   run_isolated_pipeline_job \
     "run_p3_late_fixture_detail_reconcile" \
     "P3 late fixture-detail reconcile" \
-    "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/reconcile_recent_fixtures.py --leagues \"${STATS_LEAGUES}\" --completed-hours-back \"${LATE_FIXTURE_RECONCILE_HOURS_BACK}\" --with-details --report-json \"/tmp/late_fixture_detail_reconcile_report_p3.json\" && SUPABASE_EXPORT_CHUNK=\"${FIXTURE_DETAIL_EXPORT_CHUNK}\" python scripts/export_to_supabase.py --strict --leagues \"${STATS_LEAGUES}\" --days-back \"${LATE_FIXTURE_RECONCILE_EXPORT_DAYS_BACK}\" --upcoming-days 0 --skip-odds-snapshots --skip-odds-outcomes --skip-prune --report-json \"/tmp/late_fixture_detail_export_report_p3.json\"" \
+    "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/reconcile_recent_fixtures.py --leagues \"${STATS_LEAGUES}\" --completed-hours-back \"${LATE_FIXTURE_RECONCILE_HOURS_BACK}\" --with-details --report-json \"/tmp/late_fixture_detail_reconcile_report_p3.json\" && SUPABASE_EXPORT_CHUNK=\"${FIXTURE_DETAIL_EXPORT_CHUNK}\" python scripts/export_to_supabase.py --strict --leagues \"${STATS_LEAGUES}\" --days-back \"${LATE_FIXTURE_RECONCILE_EXPORT_DAYS_BACK}\" --upcoming-days 0 --protect-empty-detail --skip-odds-snapshots --skip-odds-outcomes --skip-prune --report-json \"/tmp/late_fixture_detail_export_report_p3.json\"" \
     "${P3_LATE_FIXTURE_RECONCILE_TIMEOUT_SECONDS:-1200}"
+  LATE_DETAIL_STATUS="${LAST_PIPELINE_JOB_STATUS:-1}"
 else
   echo "Skipping late fixture-detail reconcile; missing SportMonks or Supabase REST env" >&2
+  LATE_DETAIL_STATUS=1
 fi
 
-# Step 9: Hard guard for the player-prop odds feed used by betting models.
+# Step 9: Historical source-to-Supabase fixture-detail parity and bounded repair.
+# This is deliberately independent of the rolling export window: historical
+# source backfills must be published even after they age out of that window.
+FIXTURE_DETAIL_DELIVERY_STATUS=0
+if [[ -n "${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}" && -n "${SUPABASE_URL:-}" && -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]]; then
+  run_isolated_pipeline_job \
+    "run_p3_fixture_detail_delivery" \
+    "P3 historical fixture-detail delivery parity" \
+    "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/verify_fixture_detail_delivery.py --leagues \"${STATS_LEAGUES}\" --repair --max-repair-fixtures \"${FIXTURE_DETAIL_REPAIR_MAX_FIXTURES}\" --provider-refresh-limit \"${FIXTURE_DETAIL_PROVIDER_REFRESH_LIMIT}\" --provider-refresh-cooldown-hours \"${FIXTURE_DETAIL_PROVIDER_REFRESH_COOLDOWN_HOURS}\" --report-json /tmp/fixture_detail_delivery_report_p3.json" \
+    "${FIXTURE_DETAIL_DELIVERY_TIMEOUT_SECONDS}"
+  FIXTURE_DETAIL_DELIVERY_STATUS="${LAST_PIPELINE_JOB_STATUS:-1}"
+else
+  echo "Skipping fixture-detail delivery parity; missing Supabase or database env" >&2
+  FIXTURE_DETAIL_DELIVERY_STATUS=1
+fi
+
+# Step 10: Publish the persistent Fixtures Data Delivery v2 read models.
+# This runs after fixture detail and odds ingestion so all delivery rows share
+# one source watermark. A failed refresh fails P3 rather than serving an older
+# hidden fallback.
+FIXTURE_DELIVERY_STATUS=0
+if [[ -n "${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}" ]]; then
+  run_isolated_pipeline_job \
+    "run_p3_fixture_delivery_v2" \
+    "P3 Fixtures Data Delivery v2 refresh" \
+    "cd \"${REPO_ROOT}\" && source .venv/bin/activate && export PYTHONPATH=\"${REPO_ROOT}\" && python scripts/refresh_fixture_delivery.py --start-date \"$(TZ=Europe/London date +%F)\" --end-date \"${FIXTURE_DELIVERY_END_DATE}\" --leagues \"${FIXTURE_LEAGUES}\" --report-out /tmp/fixture_delivery_v2_report.json" \
+    "${FIXTURE_DELIVERY_TIMEOUT_SECONDS}"
+  FIXTURE_DELIVERY_STATUS="${LAST_PIPELINE_JOB_STATUS:-1}"
+else
+  echo "Skipping Fixtures Data Delivery v2 refresh; missing Supabase DB URL" >&2
+  FIXTURE_DELIVERY_STATUS=1
+fi
+
+# Step 10: Hard guard for the player-prop odds feed used by betting models.
 if [[ "${PLAYER_PROP_VALIDATE}" == "true" || "${PLAYER_PROP_VALIDATE}" == "1" ]]; then
   python scripts/validate_player_prop_odds_feed.py \
     --days-back "${PLAYER_PROP_VALIDATE_DAYS_BACK}" \
@@ -236,7 +351,7 @@ if [[ "${PLAYER_PROP_VALIDATE}" == "true" || "${PLAYER_PROP_VALIDATE}" == "1" ]]
     --out-md "/tmp/player_prop_odds_feed_report_p3.md"
 fi
 
-# Step 10: Best-effort betting picks publish (uses odds already ingested into Supabase).
+# Step 11: Best-effort betting picks publish (uses odds already ingested into Supabase).
 if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; then
   if [[ "${MODELS_PUBLISH_AFTER_P3}" == "true" || "${MODELS_PUBLISH_AFTER_P3}" == "1" ]]; then
     if [[ -d "${MODELS_REPO_ROOT}" ]]; then
@@ -260,6 +375,26 @@ if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; th
       echo "Skipping models publish; Models repo missing at ${MODELS_REPO_ROOT}" >&2
     fi
   fi
+fi
+
+if [[ "${SQUAD_RECONCILIATION_STATUS}" -ne 0 || "${SQUAD_FRESHNESS_STATUS}" -ne 0 ]]; then
+  echo "P3 completed independent work but is failing for squad reconciliation/freshness; see /tmp/sparse_squad_refresh_report_p3.json and /tmp/squad_freshness_report_p3.json" >&2
+  exit 1
+fi
+
+if [[ "${STATS_DETAIL_STATUS}" -ne 0 || "${LATE_DETAIL_STATUS}" -ne 0 || "${FIXTURE_DETAIL_DELIVERY_STATUS}" -ne 0 ]]; then
+  echo "P3 failed fixture-detail ingestion/delivery parity; see /tmp/stats_detail_export_report_p3.json, /tmp/late_fixture_detail_export_report_p3.json, and /tmp/fixture_detail_delivery_report_p3.json" >&2
+  exit 1
+fi
+
+if [[ "${FIXTURE_DELIVERY_STATUS}" -ne 0 ]]; then
+  echo "P3 failed Fixtures Data Delivery v2 refresh; see /tmp/fixture_delivery_v2_report.json" >&2
+  exit "${FIXTURE_DELIVERY_STATUS}"
+fi
+
+if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
+  echo "P3 completed independent work but is failing for moneyline ingestion fidelity; see /tmp/moneyline_coverage_report_p3.json" >&2
+  exit "${MONEYLINE_VALIDATION_STATUS}"
 fi
 CHAIN
 )

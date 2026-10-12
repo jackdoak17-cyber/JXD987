@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--report-json", type=str, default="")
+    parser.add_argument("--upsert-page-size", type=int, default=250, help="Batch size for execute_values upsert.")
     return parser.parse_args()
 
 
@@ -84,10 +85,11 @@ def fetch_fixture_referee_metrics(
     limit_fixtures: int,
 ) -> List[Dict[str, Any]]:
     limit_clause = ""
-    params: List[Any] = [max(0, days_back), max(0, days_forward), FINISHED_STATUSES]
+    params: List[Any] = [max(0, days_back), max(0, days_forward)]
     if limit_fixtures > 0:
         limit_clause = "\n          limit %s"
         params.append(limit_fixtures)
+    params.append(FINISHED_STATUSES)
 
     sql = f"""
       with target as (
@@ -230,6 +232,9 @@ def fetch_fixture_referee_metrics(
     """
 
     with conn.cursor() as cur:
+        # This read query can scan substantial historical referee fixture windows.
+        # Disable statement timeout for this session to prevent partial syncs.
+        cur.execute("set statement_timeout = 0")
         cur.execute(sql, params)
         column_names = [desc[0] for desc in cur.description]
         rows = cur.fetchall()
@@ -260,7 +265,9 @@ def build_windows_payload(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def upsert_fixture_referee_stats(conn: psycopg2.extensions.connection, rows: Iterable[Dict[str, Any]]) -> int:
+def upsert_fixture_referee_stats(
+    conn: psycopg2.extensions.connection, rows: Iterable[Dict[str, Any]], *, page_size: int
+) -> int:
     values: List[Tuple[Any, ...]] = []
 
     for row in rows:
@@ -337,7 +344,9 @@ def upsert_fixture_referee_stats(conn: psycopg2.extensions.connection, rows: Ite
     """
 
     with conn.cursor() as cur:
-        execute_values(cur, sql, values, page_size=500)
+        # Avoid write-side timeout on larger windows.
+        cur.execute("set statement_timeout = 0")
+        execute_values(cur, sql, values, page_size=max(1, int(page_size)))
     conn.commit()
     return len(values)
 
@@ -377,7 +386,7 @@ def main() -> int:
 
     conn_write = psycopg2.connect(db_url)
     try:
-        upserted = upsert_fixture_referee_stats(conn_write, rows)
+        upserted = upsert_fixture_referee_stats(conn_write, rows, page_size=args.upsert_page_size)
     finally:
         conn_write.close()
 

@@ -34,16 +34,22 @@ from jxd.odds_api_client import OddsApiClient, OddsApiError
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
-DEFAULT_BOOKMAKERS = ["Bet365", "Kambi", "Paddy Power"]
+DEFAULT_BOOKMAKERS = ["Bet365", "Paddy Power", "Unibet", "BetMGM"]
 BOOKMAKER_NAME_TO_ID = {
     "bet365": 2,
     "kambi": 3,
     "paddypower": 4,
+    "unibet": 5,
+    "betmgm": 8,
+    "betfairexchange": 9,
 }
 BOOKMAKER_CANONICAL = {
     "bet365": "Bet365",
     "kambi": "Kambi",
     "paddypower": "Paddy Power",
+    "unibet": "Unibet",
+    "betmgm": "BetMGM",
+    "betfairexchange": "Betfair Exchange",
 }
 HISTORICAL_ODDS_BASE_URL = os.environ.get("ODDS_API_HISTORICAL_BASE") or "https://api.odds-api.io/v3"
 SETTLED_EVENT_STATUSES = {"settled", "finished", "final", "ended", "completed"}
@@ -144,6 +150,15 @@ TEAM_NAME_ALIAS = {
     "sandefjordfotball": "sandefjord",
     "tromsoeil": "tromso",
     "fredrikstadfk": "fredrikstad",
+    "fckobenhavn": "fccopenhagen",
+    "fckoebenhavn": "fccopenhagen",
+    "fckbenhavn": "fccopenhagen",
+    "kobenhavn": "copenhagen",
+    "koebenhavn": "copenhagen",
+    "kbenhavn": "copenhagen",
+    "copenhagen": "kobenhavn",
+    "sportingkc": "sportingkansascity",
+    "lagalaxy": "losangelesgalaxy",
     "kasimpasa": "kasmpasa",
     "kasimpasaistanbul": "kasmpasa",
     "rcceltavigo": "celtavigo",
@@ -169,6 +184,9 @@ TEAM_TOKEN_DROP = {
 
 # Generic suffix/prefix tokens that should not be treated as strong standalone team matches.
 TEAM_VARIANT_NOISE = {
+    # Arabic club names commonly share this article. It is not a team
+    # identity and must never be used as a standalone alias.
+    "al",
     "city",
     "united",
     "town",
@@ -423,6 +441,12 @@ def normalize_bookmaker_key(value: str) -> str:
         return "kambi"
     if "paddypower" in raw or ("paddy" in raw and "power" in raw):
         return "paddypower"
+    if "unibet" in raw:
+        return "unibet"
+    if "betmgm" in raw:
+        return "betmgm"
+    if "betfair" in raw and "exchange" in raw:
+        return "betfairexchange"
     return raw
 
 
@@ -687,6 +711,8 @@ def load_fixtures(session, league_ids: List[int], days_back: int, days_forward: 
         select f.id,
                f.league_id,
                f.starting_at,
+               f.status,
+               f.status_code,
                f.home_team_id,
                f.away_team_id,
                th.name as home_name,
@@ -731,8 +757,12 @@ def load_fixtures(session, league_ids: List[int], days_back: int, days_forward: 
                 "fixture_id": int(row.id),
                 "league_id": int(row.league_id),
                 "starting_at": start_val,
+                "status": row.status,
+                "status_code": row.status_code,
                 "home_team_id": row.home_team_id,
                 "away_team_id": row.away_team_id,
+                "home_name": row.home_name,
+                "away_name": row.away_name,
                 "home_alias": home_alias,
                 "away_alias": away_alias,
                 "has_moneyline_odds": int(row.id) in moneyline_fixture_ids,
@@ -1049,12 +1079,16 @@ def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[in
     rows = session.execute(
         text(
             """
+            -- The production Supabase fixture_players contract deliberately
+            -- stores identity through players; it does not carry a duplicate
+            -- per-fixture name column. Keep this query on the canonical
+            -- columns so the live PostgreSQL sync path and the local SQLite
+            -- research store use the same schema contract.
             select fp.player_id,
                    fp.team_id,
                    p.name,
                    p.common_name,
-                   p.short_name,
-                   fp.name as fixture_name
+                   p.short_name
             from fixture_players fp
             left join players p on p.id = fp.player_id
             where fp.fixture_id = :fixture_id
@@ -1063,10 +1097,10 @@ def load_fixture_player_map(session, fixture_id: int) -> Dict[str, List[Tuple[in
         {"fixture_id": fixture_id},
     ).fetchall()
     mapping: Dict[str, List[Tuple[int, Optional[int]]]] = {}
-    for player_id, team_id, name, common_name, short_name, fixture_name in rows:
+    for player_id, team_id, name, common_name, short_name in rows:
         if not player_id:
             continue
-        for candidate in (name, common_name, short_name, fixture_name):
+        for candidate in (name, common_name, short_name):
             if not candidate:
                 continue
             for normalized in name_variants(str(candidate)):
@@ -1281,6 +1315,26 @@ def resolve_player_id(
 
 
 def upsert_outcomes(session, rows: List[Dict]) -> None:
+    if not rows:
+        return
+    # Supabase enforces the customer-facing decimal odds contract (strictly
+    # greater than 1 and capped at 500).  Odds-API occasionally returns a
+    # suspended/placeholder price of exactly 1.0; SQLite accepted that value,
+    # which made the VPS sync fail only when pointed at the live PostgreSQL
+    # store. Filter invalid provider values at the single write boundary so
+    # every market parser follows the same production rule.
+    valid_rows = []
+    invalid_rows = 0
+    for row in rows:
+        price = parse_float(row.get("price_decimal"))
+        if price is None or not 1.0 < price <= 500.0:
+            invalid_rows += 1
+            continue
+        row["price_decimal"] = price
+        valid_rows.append(row)
+    if invalid_rows:
+        log.warning("Dropped %s provider odds rows outside decimal price range (1, 500].", invalid_rows)
+    rows = valid_rows
     if not rows:
         return
     rows = dedupe_outcome_rows(rows)

@@ -359,7 +359,8 @@ def _upsert_fixture_team_derived_stat(
     value: Optional[float],
     extra: Dict,
 ) -> None:
-    pk = (fixture_id, team_id, type_id, code, None)
+    location = "all"
+    pk = (fixture_id, team_id, type_id, code, location)
     obj = session.get(FixtureStatistic, pk)
     if value is None:
         if obj:
@@ -371,7 +372,7 @@ def _upsert_fixture_team_derived_stat(
         "type_id": type_id,
         "code": code,
         "name": name,
-        "location": None,
+        "location": location,
         "value": value,
         "extra": extra,
     }
@@ -952,7 +953,7 @@ class SyncService:
             type_id = s.get("type_id") or type_info.get("id")
             code = type_info.get("code") or (type_id and str(type_id))
             name = type_info.get("name")
-            location = (s.get("location") or "").lower() or None
+            location = (s.get("location") or "").lower() or "unknown"
             data = s.get("data") or {}
             value = _extract_stat_value(data)
             team_id = s.get("participant_id") or s.get("team_id")
@@ -1288,6 +1289,36 @@ class SyncService:
             else:
                 self.session.add(FixturePlayerStatistic(**payload))
 
+    def _replace_fixture_lineup_rows(self, fixture_id: int) -> None:
+        """Replace only lineup rows while preserving already-ingested player stats.
+
+        Lineup-only requests intentionally omit ``statistics``.  They must not
+        be allowed to erase player-stat rows which were populated by the full
+        fixture-detail pipeline.
+        """
+        self.session.query(FixturePlayer).filter(
+            FixturePlayer.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
+
+    def _replace_fixture_detail_rows(self, fixture_id: int) -> None:
+        """Replace provider-owned detail collections without retaining stale rows.
+
+        SportMonks can remove a player or a stat detail on a later fixture
+        response.  Upserting only the rows present in that response leaves the
+        old identity behind, which makes Supabase appear to contain a player
+        the provider no longer reports.  Delete the dependent stats first so
+        the next detailed payload is authoritative for this fixture.
+        """
+        self.session.query(FixtureStatistic).filter(
+            FixtureStatistic.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
+        self.session.query(FixturePlayerStatistic).filter(
+            FixturePlayerStatistic.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
+        self.session.query(FixturePlayer).filter(
+            FixturePlayer.fixture_id == fixture_id
+        ).delete(synchronize_session=False)
+
     def _apply_participant_derivations(self, fixture: Fixture, loc_map: Dict[str, Dict]) -> None:
         if fixture.home_team_id is None and loc_map.get("home"):
             fixture.home_team_id = loc_map["home"].get("team_id")
@@ -1301,7 +1332,12 @@ class SyncService:
         if fixture.away_score is None and away_part:
             fixture.away_score = _safe_int(away_part.get("score"))
 
-    def _store_fixture_raw(self, raw: Dict, log_changes: bool = False) -> None:
+    def _store_fixture_raw(
+        self,
+        raw: Dict,
+        log_changes: bool = False,
+        full_detail: bool = False,
+    ) -> None:
         data = self._map_fixture(raw)
         fixture = self.session.get(Fixture, data["id"])
         if fixture:
@@ -1311,18 +1347,28 @@ class SyncService:
             fixture = Fixture(**data)
             self.session.add(fixture)
 
+        stats = raw.get("statistics")
+        lineups = raw.get("lineups")
+        authoritative_detail = (
+            full_detail
+            and isinstance(stats, list)
+            and bool(stats)
+            and isinstance(lineups, list)
+            and bool(lineups)
+        )
+        if authoritative_detail:
+            self._replace_fixture_detail_rows(fixture.id)
+        elif isinstance(lineups, list) and lineups:
+            self._replace_fixture_lineup_rows(fixture.id)
+
         loc_map = self._store_participants(fixture.id, raw.get("participants") or [])
         self._apply_participant_derivations(fixture, loc_map)
         self._store_statistics(
             fixture.id,
-            raw.get("statistics") or [],
+            stats or [],
             log_changes=log_changes,
         )
-        self._store_lineups(
-            fixture.id,
-            raw.get("lineups") or [],
-            log_changes=log_changes,
-        )
+        self._store_lineups(fixture.id, lineups or [], log_changes=log_changes)
 
     def _chunks_newest_first(self, start: date, end: date, span_days: int = 90):
         cursor = end
@@ -1354,11 +1400,17 @@ class SyncService:
                 "lineups.player",
             ]
         count = 0
+        commit_every = 25
         for chunk_start, chunk_end in self._chunks_newest_first(start, end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
             for item in self.client.fetch_collection(endpoint, params=params, includes=includes, per_page=50):
-                self._store_fixture_raw(item)
+                self._store_fixture_raw(item, full_detail="statistics" in includes)
                 count += 1
+                # Do not hold the SQLite write transaction across the entire
+                # network-bound fixture window. Other readers must remain
+                # responsive while P3 refreshes detailed fixture data.
+                if count % commit_every == 0:
+                    self.session.commit()
         self.session.commit()
         log.info("Synced fixtures between %s and %s: %s", start, end, count)
         return count
@@ -1385,7 +1437,7 @@ class SyncService:
         for chunk_start, chunk_end in self._chunks_newest_first(season_start, season_end):
             endpoint = f"fixtures/between/{chunk_start.isoformat()}/{chunk_end.isoformat()}"
             for item in self.client.fetch_collection(endpoint, params=params, includes=includes, per_page=50):
-                self._store_fixture_raw(item)
+                self._store_fixture_raw(item, full_detail=True)
                 count += 1
         self.session.commit()
         log.info("Synced fixtures for season %s (%s - %s): %s", season.id, season_start, season_end, count)
@@ -1414,6 +1466,7 @@ class SyncService:
                 "lineups.player",
             ]
         count = 0
+        commit_every = 10
         for fixture_id in fixture_ids:
             endpoint = f"fixtures/{fixture_id}"
             try:
@@ -1429,8 +1482,16 @@ class SyncService:
             if not data:
                 log.warning("Reconcile missing data for fixture %s", fixture_id)
                 continue
-            self._store_fixture_raw(data, log_changes=True)
+            self._store_fixture_raw(
+                data,
+                log_changes=True,
+                full_detail="statistics" in includes,
+            )
             count += 1
+            # Each provider request can be slow. Commit bounded batches so a
+            # long refresh does not keep the local SQLite database write-locked.
+            if count % commit_every == 0:
+                self.session.commit()
         self.session.commit()
         log.info("Reconciled %s fixtures by ID", count)
         return count
