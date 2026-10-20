@@ -334,6 +334,29 @@ def verify_fixture_source_freshness(
     }
 
 
+def bounded_release_pin_expires_at(
+    source_freshness: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    """Keep the two-hour lease inside the verified source-freshness window."""
+    current = now or datetime.now(UTC)
+    current = current if current.tzinfo is not None else current.replace(tzinfo=UTC)
+    raw_verified_at = str(source_freshness.get("verified_at") or "").replace("Z", "+00:00")
+    try:
+        verified_at = datetime.fromisoformat(raw_verified_at)
+        max_age_minutes = int(source_freshness["max_age_minutes"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("fixture source freshness evidence cannot bound the release lease") from error
+    verified_at = (
+        verified_at if verified_at.tzinfo is not None else verified_at.replace(tzinfo=UTC)
+    )
+    source_valid_until = verified_at.astimezone(UTC) + timedelta(minutes=max_age_minutes)
+    if source_valid_until <= current.astimezone(UTC):
+        raise RuntimeError("fixture source freshness expired before release lease calculation")
+    return min(current.astimezone(UTC) + timedelta(hours=2), source_valid_until)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-date", default=None, help="London date, inclusive (default today)")
@@ -545,6 +568,7 @@ def record_verified_noop(
     fingerprint: dict[str, Any],
     source_freshness: dict[str, Any],
     projection_counts: dict[str, int],
+    pin_expires_at: datetime,
     report: dict[str, Any],
 ) -> None:
     """Record fresh verification evidence without rewriting projection rows."""
@@ -571,11 +595,12 @@ def record_verified_noop(
         """
         update public.fixture_delivery_releases
            set health_checked_at = now(),
-               pin_expires_at = now() + interval '2 hours',
+               pin_expires_at = %s,
                metadata = coalesce(metadata, '{}'::jsonb) || %s::jsonb
          where id = %s and status = 'published'
         """,
         (
+            pin_expires_at,
             json.dumps({
                 "semantic_projection_fingerprint": fingerprint,
                 "last_semantic_noop_verified_at": datetime.now(UTC).isoformat(),
@@ -593,6 +618,7 @@ def record_verified_noop(
         "projection_rows_written": 0,
         "projection_rows_verified": projection_counts,
         "source_freshness": source_freshness,
+        "pin_expires_at": pin_expires_at.isoformat(),
         "semantic_projection_fingerprint": fingerprint,
     })
 
@@ -794,6 +820,7 @@ def publish_release(
     counts: dict[str, int],
     source_watermark: datetime | None,
     semantic_fingerprint: dict[str, Any] | None = None,
+    pin_expires_at: datetime | None = None,
 ) -> None:
     """Switch the sole customer-visible pointer inside the caller's transaction."""
     cur.execute(
@@ -801,7 +828,7 @@ def publish_release(
         update public.fixture_delivery_releases
            set status = 'published', published_at = now(),
                health_checked_at = now(),
-               pin_expires_at = now() + interval '2 hours',
+               pin_expires_at = coalesce(%s, now() + interval '2 hours'),
                source_watermark = %s,
                schedule_rows = %s, standings_rows = %s,
                metrics_rows = %s, odds_rows = %s,
@@ -809,6 +836,7 @@ def publish_release(
          where id = %s and status = 'building'
         """,
         (
+            pin_expires_at,
             source_watermark,
             counts.get("schedule", 0),
             counts.get("standings", 0),
@@ -840,6 +868,7 @@ def finalize_release(
     source_watermark: datetime | None,
     report: dict[str, Any],
     semantic_fingerprint: dict[str, Any] | None = None,
+    pin_expires_at: datetime | None = None,
 ) -> None:
     """Publish durably before best-effort retention cleanup.
 
@@ -847,7 +876,14 @@ def finalize_release(
     publication transaction. A large expired release must never roll back a
     fully validated replacement and leave the website pinned to stale data.
     """
-    publish_release(cur, release_id, counts, source_watermark, semantic_fingerprint)
+    publish_release(
+        cur,
+        release_id,
+        counts,
+        source_watermark,
+        semantic_fingerprint,
+        pin_expires_at,
+    )
     report["release_id"] = release_id
     report["published"] = True
     if semantic_fingerprint is not None:
@@ -1503,6 +1539,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 ),
             )
             report["source_freshness"] = source_freshness
+            pin_expires_at = bounded_release_pin_expires_at(source_freshness)
+            report["pin_expires_at"] = pin_expires_at.isoformat()
             source = source_fixtures(cur, start, end, leagues)
             validate_source_fixture_identity(source)
             valid_schedule = [
@@ -1542,6 +1580,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         semantic_fingerprint,
                         source_freshness,
                         projection_counts,
+                        pin_expires_at,
                         report,
                     )
                     conn.commit()
@@ -1608,6 +1647,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 source_watermark,
                 report,
                 semantic_fingerprint,
+                pin_expires_at,
             )
     except Exception as error:
         conn.rollback()

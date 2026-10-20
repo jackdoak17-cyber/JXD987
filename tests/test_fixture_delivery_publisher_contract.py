@@ -30,6 +30,13 @@ class FixtureDeliveryPublisherContractTests(unittest.TestCase):
         self.assertIn("record_pipeline_job_run", source)
         self.assertIn('"run_fixture_delivery_publisher"', source)
         self.assertIn('if [[ "${publisher_status}" -eq 2 ]]; then', source)
+        self.assertIn('dirty_revision=""', source)
+        self.assertIn("A clean dirty-state still needs bounded validation", source)
+
+        status_check = source.index("fixture_delivery_dirty_state.py status")
+        refresh = source.index("python scripts/refresh_fixture_delivery.py")
+        status_block_end = source.index("\nfi\n", status_check)
+        self.assertLess(status_block_end, refresh)
 
     def test_refresh_supports_guarded_complete_publication_without_changing_default_callers(self) -> None:
         source = (ROOT / "scripts/refresh_fixture_delivery.py").read_text(encoding="utf-8")

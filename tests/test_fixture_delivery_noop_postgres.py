@@ -11,6 +11,7 @@ from scripts.refresh_fixture_delivery import (
     METRIC_MODES,
     METRIC_SEASON_SCOPES,
     METRIC_WINDOWS,
+    bounded_release_pin_expires_at,
     record_verified_noop,
     validate_release_components,
     validate_schedule_projection,
@@ -197,18 +198,24 @@ class FixtureDeliveryNoopPostgresTests(unittest.TestCase):
                 [1001],
                 expected_standings,
             )
-            record_verified_noop(
-                cur,
-                RELEASE_ID,
-                date(2026, 10, 20),
-                date(2026, 12, 2),
-                1,
-                1,
-                fingerprint,
-                freshness,
-                counts,
-                report,
-            )
+            source_verified_at = datetime.fromisoformat(freshness["verified_at"])
+            for interval_hours in (1, 2):
+                record_verified_noop(
+                    cur,
+                    RELEASE_ID,
+                    date(2026, 10, 20),
+                    date(2026, 12, 2),
+                    1,
+                    1,
+                    fingerprint,
+                    freshness,
+                    counts,
+                    bounded_release_pin_expires_at(
+                        freshness,
+                        now=source_verified_at + timedelta(hours=interval_hours),
+                    ),
+                    report,
+                )
         with self.conn.cursor() as cur:
             cur.execute(
                 """
@@ -227,7 +234,7 @@ class FixtureDeliveryNoopPostgresTests(unittest.TestCase):
         self.assertEqual(release_id, RELEASE_ID)
         self.assertTrue(lease_current)
         self.assertEqual(stored_fingerprint, fingerprint)
-        self.assertEqual((zero_writes, run_count), (4, 4))
+        self.assertEqual((zero_writes, run_count), (8, 8))
         self.assertTrue(report["verified_noop"])
         self.assertEqual(report["projection_rows_written"], 0)
         self.assertEqual(report["projection_rows_verified"]["metrics"], 88)
@@ -250,6 +257,48 @@ class FixtureDeliveryNoopPostgresTests(unittest.TestCase):
             )
             after = cur.fetchone()[0]
         self.assertEqual(after, before)
+
+        report = {"components": {}}
+        fingerprint = {
+            "version": 1,
+            "algorithm_version": "fixture-delivery-v1",
+            "sha256": "verified-semantic-snapshot",
+            "requested_start": "2026-10-20",
+            "requested_end": "2026-12-02",
+        }
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "insert into operations.pipeline_job_runs values "
+                "('run_p3_fixture_core_export', 'success', now())"
+            )
+            freshness = verify_fixture_source_freshness(cur, 540)
+            validate_schedule_projection(
+                cur,
+                [{"id": 1001, "status": "NS", "status_code": "NS", "home_score": None, "away_score": None}],
+                RELEASE_ID,
+            )
+            counts = validate_release_components(cur, RELEASE_ID, [1001])
+            record_verified_noop(
+                cur,
+                RELEASE_ID,
+                date(2026, 10, 20),
+                date(2026, 12, 2),
+                1,
+                1,
+                fingerprint,
+                freshness,
+                counts,
+                bounded_release_pin_expires_at(freshness),
+                report,
+            )
+            cur.execute(
+                "select pin_expires_at from public.fixture_delivery_releases where id = %s",
+                (RELEASE_ID,),
+            )
+            recovered = cur.fetchone()[0]
+        self.assertGreater(recovered, before)
+        self.assertTrue(report["verified_noop"])
+        self.assertEqual(report["projection_rows_written"], 0)
 
     def test_incomplete_projection_is_not_eligible_for_renewal(self) -> None:
         with self.conn.cursor() as cur:

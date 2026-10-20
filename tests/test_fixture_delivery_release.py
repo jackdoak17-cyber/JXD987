@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
 
 from scripts.refresh_fixture_delivery import (
+    bounded_release_pin_expires_at,
     build_season_scoped_history,
     compute_standings,
     finalize_release,
@@ -30,6 +31,14 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             "requested_start": "2026-10-07",
             "requested_end": "2026-11-21",
         }
+        source_freshness = {
+            "kind": "fixture_core_pipeline_job",
+            "job_id": "run_p3_fixture_core_export",
+            "verified_at": "2026-10-07T12:00:00+00:00",
+            "age_seconds": 60,
+            "max_age_minutes": 540,
+        }
+        pin_expires_at = datetime(2026, 10, 7, 14, 1, tzinfo=UTC)
 
         record_verified_noop(
             cursor,
@@ -39,14 +48,9 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             1232,
             19000,
             fingerprint,
-            {
-                "kind": "fixture_core_pipeline_job",
-                "job_id": "run_p3_fixture_core_export",
-                "verified_at": "2026-10-07T12:00:00+00:00",
-                "age_seconds": 60,
-                "max_age_minutes": 540,
-            },
+            source_freshness,
             {"schedule": 10, "standings": 20, "metrics": 880, "odds": 30},
+            pin_expires_at,
             report,
         )
 
@@ -57,11 +61,52 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         self.assertNotIn("insert into public.fixture_delivery_odds", queries)
         self.assertIn("fixture_delivery_refresh_runs", queries)
         self.assertIn("health_checked_at = now()", queries)
-        self.assertIn("pin_expires_at = now() + interval '2 hours'", queries)
+        self.assertIn("pin_expires_at = %s", queries)
         self.assertTrue(report["verified_noop"])
+        self.assertEqual(report["pin_expires_at"], pin_expires_at.isoformat())
         self.assertEqual(report["projection_rows_written"], 0)
         self.assertEqual(report["projection_rows_verified"]["schedule"], 10)
         self.assertTrue(all(component["rows_written"] == 0 for component in report["components"].values()))
+
+    def test_release_lease_is_bounded_by_source_freshness(self) -> None:
+        freshness = {
+            "verified_at": "2026-10-07T00:00:00+00:00",
+            "max_age_minutes": 540,
+        }
+
+        self.assertEqual(
+            bounded_release_pin_expires_at(
+                freshness,
+                now=datetime(2026, 10, 7, 8, 30, tzinfo=UTC),
+            ),
+            datetime(2026, 10, 7, 9, 0, tzinfo=UTC),
+        )
+
+    def test_release_lease_uses_two_hours_when_source_window_is_longer(self) -> None:
+        freshness = {
+            "verified_at": "2026-10-07T00:00:00+00:00",
+            "max_age_minutes": 540,
+        }
+
+        self.assertEqual(
+            bounded_release_pin_expires_at(
+                freshness,
+                now=datetime(2026, 10, 7, 1, 0, tzinfo=UTC),
+            ),
+            datetime(2026, 10, 7, 3, 0, tzinfo=UTC),
+        )
+
+    def test_expired_source_cannot_bound_a_release_lease(self) -> None:
+        freshness = {
+            "verified_at": "2026-10-07T00:00:00+00:00",
+            "max_age_minutes": 540,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "expired"):
+            bounded_release_pin_expires_at(
+                freshness,
+                now=datetime(2026, 10, 7, 9, 0, tzinfo=UTC),
+            )
 
     def test_publish_release_switches_pointer_only_after_build_is_marked_published(self) -> None:
         cursor = Mock()
