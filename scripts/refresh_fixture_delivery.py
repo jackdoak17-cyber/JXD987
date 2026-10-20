@@ -61,6 +61,8 @@ PROJECTION_ALGORITHM_VERSION = "fixture-delivery-v1"
 METRIC_WINDOWS = tuple(range(5, 16))
 METRIC_MODES = ("overall", "venue")
 METRIC_SEASON_SCOPES = ("all", "current")
+DEFAULT_FIXTURE_SOURCE_JOB_ID = "run_p3_fixture_core_export"
+DEFAULT_FIXTURE_SOURCE_MAX_AGE_MINUTES = 540
 
 SCHEDULE_SEMANTIC_FIELDS = (
     "id",
@@ -266,6 +268,93 @@ def parse_leagues(raw: str | None) -> list[int]:
     if not result:
         raise SystemExit("FIXTURE_DELIVERY_LEAGUES produced an empty non-cup allowlist")
     return result
+
+
+def verify_fixture_source_freshness(
+    cur,
+    max_age_minutes: int,
+    *,
+    refreshed_at_override: str | None = None,
+    job_id: str = DEFAULT_FIXTURE_SOURCE_JOB_ID,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Require recent fixture-core evidence before publishing or renewing.
+
+    The six-hourly fixture-core caller supplies in-run evidence after its
+    source export succeeds. The independent hourly publisher relies on the
+    durable Operations heartbeat from the latest successful fixture-core run.
+    """
+    if max_age_minutes <= 0:
+        raise RuntimeError("fixture source maximum age must be positive")
+
+    current = now or datetime.now(UTC)
+    current = current if current.tzinfo is not None else current.replace(tzinfo=UTC)
+    evidence_kind = "fixture_core_pipeline_job"
+
+    if refreshed_at_override:
+        raw = refreshed_at_override.strip().replace("Z", "+00:00")
+        try:
+            observed = datetime.fromisoformat(raw)
+        except ValueError as error:
+            raise RuntimeError("fixture source refresh evidence is malformed") from error
+        evidence_kind = "current_fixture_core_export"
+    else:
+        cur.execute(
+            """
+            select finished_at
+              from operations.pipeline_job_runs
+             where job_id = %s and status = 'success'
+             order by finished_at desc
+             limit 1
+            """,
+            (job_id,),
+        )
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            raise RuntimeError(
+                f"fixture source freshness is unverified: no successful {job_id} run"
+            )
+        observed = row[0]
+
+    observed = observed if observed.tzinfo is not None else observed.replace(tzinfo=UTC)
+    age = current.astimezone(UTC) - observed.astimezone(UTC)
+    if age < timedelta(minutes=-5):
+        raise RuntimeError("fixture source freshness evidence is in the future")
+    if age > timedelta(minutes=max_age_minutes):
+        raise RuntimeError(
+            "fixture source freshness is stale: "
+            f"age_minutes={int(age.total_seconds() // 60)} max_age_minutes={max_age_minutes}"
+        )
+    return {
+        "kind": evidence_kind,
+        "job_id": job_id,
+        "verified_at": observed.astimezone(UTC).isoformat(),
+        "age_seconds": max(0, int(age.total_seconds())),
+        "max_age_minutes": max_age_minutes,
+    }
+
+
+def bounded_release_pin_expires_at(
+    source_freshness: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    """Keep the two-hour lease inside the verified source-freshness window."""
+    current = now or datetime.now(UTC)
+    current = current if current.tzinfo is not None else current.replace(tzinfo=UTC)
+    raw_verified_at = str(source_freshness.get("verified_at") or "").replace("Z", "+00:00")
+    try:
+        verified_at = datetime.fromisoformat(raw_verified_at)
+        max_age_minutes = int(source_freshness["max_age_minutes"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("fixture source freshness evidence cannot bound the release lease") from error
+    verified_at = (
+        verified_at if verified_at.tzinfo is not None else verified_at.replace(tzinfo=UTC)
+    )
+    source_valid_until = verified_at.astimezone(UTC) + timedelta(minutes=max_age_minutes)
+    if source_valid_until <= current.astimezone(UTC):
+        raise RuntimeError("fixture source freshness expired before release lease calculation")
+    return min(current.astimezone(UTC) + timedelta(hours=2), source_valid_until)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -477,6 +566,9 @@ def record_verified_noop(
     source_rows: int,
     completed_rows: int,
     fingerprint: dict[str, Any],
+    source_freshness: dict[str, Any],
+    projection_counts: dict[str, int],
+    pin_expires_at: datetime,
     report: dict[str, Any],
 ) -> None:
     """Record fresh verification evidence without rewriting projection rows."""
@@ -503,13 +595,16 @@ def record_verified_noop(
         """
         update public.fixture_delivery_releases
            set health_checked_at = now(),
+               pin_expires_at = %s,
                metadata = coalesce(metadata, '{}'::jsonb) || %s::jsonb
          where id = %s and status = 'published'
         """,
         (
+            pin_expires_at,
             json.dumps({
                 "semantic_projection_fingerprint": fingerprint,
                 "last_semantic_noop_verified_at": datetime.now(UTC).isoformat(),
+                "last_source_freshness_evidence": source_freshness,
             }),
             release_id,
         ),
@@ -521,6 +616,9 @@ def record_verified_noop(
         "published": False,
         "verified_noop": True,
         "projection_rows_written": 0,
+        "projection_rows_verified": projection_counts,
+        "source_freshness": source_freshness,
+        "pin_expires_at": pin_expires_at.isoformat(),
         "semantic_projection_fingerprint": fingerprint,
     })
 
@@ -722,6 +820,7 @@ def publish_release(
     counts: dict[str, int],
     source_watermark: datetime | None,
     semantic_fingerprint: dict[str, Any] | None = None,
+    pin_expires_at: datetime | None = None,
 ) -> None:
     """Switch the sole customer-visible pointer inside the caller's transaction."""
     cur.execute(
@@ -729,7 +828,7 @@ def publish_release(
         update public.fixture_delivery_releases
            set status = 'published', published_at = now(),
                health_checked_at = now(),
-               pin_expires_at = now() + interval '2 hours',
+               pin_expires_at = coalesce(%s, now() + interval '2 hours'),
                source_watermark = %s,
                schedule_rows = %s, standings_rows = %s,
                metrics_rows = %s, odds_rows = %s,
@@ -737,6 +836,7 @@ def publish_release(
          where id = %s and status = 'building'
         """,
         (
+            pin_expires_at,
             source_watermark,
             counts.get("schedule", 0),
             counts.get("standings", 0),
@@ -768,6 +868,7 @@ def finalize_release(
     source_watermark: datetime | None,
     report: dict[str, Any],
     semantic_fingerprint: dict[str, Any] | None = None,
+    pin_expires_at: datetime | None = None,
 ) -> None:
     """Publish durably before best-effort retention cleanup.
 
@@ -775,7 +876,14 @@ def finalize_release(
     publication transaction. A large expired release must never roll back a
     fully validated replacement and leave the website pinned to stale data.
     """
-    publish_release(cur, release_id, counts, source_watermark, semantic_fingerprint)
+    publish_release(
+        cur,
+        release_id,
+        counts,
+        source_watermark,
+        semantic_fingerprint,
+        pin_expires_at,
+    )
     report["release_id"] = release_id
     report["published"] = True
     if semantic_fingerprint is not None:
@@ -1416,6 +1524,23 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         with conn.cursor() as cur:
             validate_delivery_schema(cur)
             lock_refresh_publication(cur)
+            source_freshness = verify_fixture_source_freshness(
+                cur,
+                int(
+                    os.environ.get(
+                        "FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES",
+                        DEFAULT_FIXTURE_SOURCE_MAX_AGE_MINUTES,
+                    )
+                ),
+                refreshed_at_override=os.environ.get("FIXTURE_DELIVERY_SOURCE_REFRESHED_AT"),
+                job_id=os.environ.get(
+                    "FIXTURE_DELIVERY_SOURCE_JOB_ID",
+                    DEFAULT_FIXTURE_SOURCE_JOB_ID,
+                ),
+            )
+            report["source_freshness"] = source_freshness
+            pin_expires_at = bounded_release_pin_expires_at(source_freshness)
+            report["pin_expires_at"] = pin_expires_at.isoformat()
             source = source_fixtures(cur, start, end, leagues)
             validate_source_fixture_identity(source)
             valid_schedule = [
@@ -1434,18 +1559,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             report["semantic_projection_fingerprint"] = semantic_fingerprint
             current_release_id, stored_fingerprint = current_publication_semantic_state(cur)
             if current_release_id and fingerprints_match(stored_fingerprint, semantic_fingerprint):
-                record_verified_noop(
-                    cur,
-                    current_release_id,
-                    start,
-                    end,
-                    len(source),
-                    len(completed),
-                    semantic_fingerprint,
-                    report,
-                )
-                conn.commit()
-                return report
+                try:
+                    validate_schedule_projection(cur, valid_schedule, current_release_id)
+                    projection_counts = validate_release_components(
+                        cur,
+                        current_release_id,
+                        [int(row["id"]) for row in valid_schedule],
+                        compute_standings(completed),
+                    )
+                except RuntimeError as error:
+                    report["semantic_noop_rejected_reason"] = str(error)
+                else:
+                    record_verified_noop(
+                        cur,
+                        current_release_id,
+                        start,
+                        end,
+                        len(source),
+                        len(completed),
+                        semantic_fingerprint,
+                        source_freshness,
+                        projection_counts,
+                        pin_expires_at,
+                        report,
+                    )
+                    conn.commit()
+                    return report
 
             # A missing, incompatible, or changed fingerprint preserves the
             # complete atomic publication path.
@@ -1508,6 +1647,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 source_watermark,
                 report,
                 semantic_fingerprint,
+                pin_expires_at,
             )
     except Exception as error:
         conn.rollback()

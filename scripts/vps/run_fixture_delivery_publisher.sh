@@ -31,6 +31,8 @@ export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUES:-$(supported_league_
 validate_supported_leagues "${STATS_LEAGUES}"
 export FIXTURE_DELIVERY_DAYS_BACK="${FIXTURE_DELIVERY_DAYS_BACK:-$(contract_value history_window_days)}"
 export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-$(contract_value delivery_window_days)}"
+export FIXTURE_DELIVERY_SOURCE_JOB_ID="${FIXTURE_DELIVERY_SOURCE_JOB_ID:-$(contract_value job_id)}"
+export FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES="${FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES:-$(contract_value max_job_age_minutes)}"
 export FIXTURE_DELIVERY_DIRTY_STATE_PATH="${FIXTURE_DELIVERY_DIRTY_STATE_PATH:-/var/lib/oddssearch/fixture-delivery/dirty-state.json}"
 export FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS="${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS:-3600}"
 export FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS="${FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS:-1800}"
@@ -41,18 +43,12 @@ source .venv/bin/activate
 export PYTHONPATH="${REPO_ROOT}"
 
 publisher_status=0
+dirty_revision=""
 RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RUN_STARTED_EPOCH="$(date -u +%s)"
 rm -f "${PIPELINE_EVIDENCE_FILE}"
 
-if ! python scripts/fixture_delivery_dirty_state.py status > /tmp/fixture_delivery_dirty_status.json; then
-  python3 - <<'PY' "${PIPELINE_EVIDENCE_FILE}" "${FIXTURE_DELIVERY_DIRTY_STATE_PATH}"
-import json, sys
-with open(sys.argv[1], "w", encoding="utf-8") as fh:
-    json.dump({"status": "skipped", "reason": "nothing_dirty", "dirty_state_path": sys.argv[2]}, fh)
-PY
-  publisher_status=2
-else
+if python scripts/fixture_delivery_dirty_state.py status > /tmp/fixture_delivery_dirty_status.json; then
   python scripts/fixture_delivery_dirty_state.py attempt >/tmp/fixture_delivery_dirty_attempt.json
   dirty_revision="$(python3 - <<'PY'
 import json
@@ -61,24 +57,32 @@ with open('/tmp/fixture_delivery_dirty_attempt.json', encoding='utf-8') as handl
 print(int(payload['state']['revision']))
 PY
 )"
-  if timeout --signal=TERM --kill-after=5s "${FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS}" \
-    python scripts/refresh_fixture_delivery.py \
-      --start-date "$(TZ=Europe/London date -d "-${FIXTURE_DELIVERY_DAYS_BACK} days" +%F)" \
-      --end-date "$(TZ=Europe/London date -d "+${FIXTURE_DELIVERY_DAYS_FORWARD} days" +%F)" \
-      --leagues "${STATS_LEAGUES}" \
-      --report-out "${PIPELINE_EVIDENCE_FILE}" \
-      --skip-if-publication-active \
-      --min-publish-interval-seconds "${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS}"; then
+fi
+
+# A clean dirty-state still needs bounded validation. The fixture-core cadence
+# is six-hourly while the customer lease is two hours; skipping here would
+# leave healthy unchanged fixtures unavailable between core runs.
+if timeout --signal=TERM --kill-after=5s "${FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS}" \
+  python scripts/refresh_fixture_delivery.py \
+    --start-date "$(TZ=Europe/London date -d "-${FIXTURE_DELIVERY_DAYS_BACK} days" +%F)" \
+    --end-date "$(TZ=Europe/London date -d "+${FIXTURE_DELIVERY_DAYS_FORWARD} days" +%F)" \
+    --leagues "${STATS_LEAGUES}" \
+    --report-out "${PIPELINE_EVIDENCE_FILE}" \
+    --skip-if-publication-active \
+    --min-publish-interval-seconds "${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS}"; then
+  if [[ -n "${dirty_revision}" ]]; then
     python scripts/fixture_delivery_dirty_state.py clear \
       --expected-revision "${dirty_revision}" \
       >/tmp/fixture_delivery_dirty_clear.json
-    publisher_status=0
+  fi
+  publisher_status=0
+else
+  publisher_status=$?
+  if [[ "${publisher_status}" -eq 2 ]]; then
+    # Guarded skip: no duplicate build, recent enough publication, or another publisher active.
+    true
   else
-    publisher_status=$?
-    if [[ "${publisher_status}" -eq 2 ]]; then
-      # Guarded skip: no duplicate build, recent enough publication, or another publisher active.
-      true
-    else
+    if [[ -n "${dirty_revision}" ]]; then
       python scripts/fixture_delivery_dirty_state.py failure --error "refresh_fixture_delivery exit status ${publisher_status}" >/tmp/fixture_delivery_dirty_failure.json || true
     fi
   fi

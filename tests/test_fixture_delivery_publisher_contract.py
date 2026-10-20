@@ -25,9 +25,18 @@ class FixtureDeliveryPublisherContractTests(unittest.TestCase):
         self.assertIn('export PYTHONPATH="${REPO_ROOT}"', source)
         self.assertIn("--skip-if-publication-active", source)
         self.assertIn("--min-publish-interval-seconds", source)
+        self.assertIn("FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES", source)
+        self.assertIn("FIXTURE_DELIVERY_SOURCE_JOB_ID", source)
         self.assertIn("record_pipeline_job_run", source)
         self.assertIn('"run_fixture_delivery_publisher"', source)
         self.assertIn('if [[ "${publisher_status}" -eq 2 ]]; then', source)
+        self.assertIn('dirty_revision=""', source)
+        self.assertIn("A clean dirty-state still needs bounded validation", source)
+
+        status_check = source.index("fixture_delivery_dirty_state.py status")
+        refresh = source.index("python scripts/refresh_fixture_delivery.py")
+        status_block_end = source.index("\nfi\n", status_check)
+        self.assertLess(status_block_end, refresh)
 
     def test_refresh_supports_guarded_complete_publication_without_changing_default_callers(self) -> None:
         source = (ROOT / "scripts/refresh_fixture_delivery.py").read_text(encoding="utf-8")
@@ -41,6 +50,10 @@ class FixtureDeliveryPublisherContractTests(unittest.TestCase):
         self.assertIn("semantic_projection_fingerprint", source)
         self.assertIn("record_verified_noop", source)
         self.assertIn("semantic_noop", source)
+        self.assertIn("verify_fixture_source_freshness", source)
+
+        fixture_core = (ROOT / "scripts/vps/run_p3_fixture_core.sh").read_text(encoding="utf-8")
+        self.assertIn("FIXTURE_DELIVERY_SOURCE_REFRESHED_AT", fixture_core)
 
     def test_runtime_manifest_includes_guarded_publisher_files(self) -> None:
         entries = {
