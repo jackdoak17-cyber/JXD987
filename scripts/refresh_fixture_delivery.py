@@ -61,6 +61,8 @@ PROJECTION_ALGORITHM_VERSION = "fixture-delivery-v1"
 METRIC_WINDOWS = tuple(range(5, 16))
 METRIC_MODES = ("overall", "venue")
 METRIC_SEASON_SCOPES = ("all", "current")
+DEFAULT_FIXTURE_SOURCE_JOB_ID = "run_p3_fixture_core_export"
+DEFAULT_FIXTURE_SOURCE_MAX_AGE_MINUTES = 540
 
 SCHEDULE_SEMANTIC_FIELDS = (
     "id",
@@ -266,6 +268,70 @@ def parse_leagues(raw: str | None) -> list[int]:
     if not result:
         raise SystemExit("FIXTURE_DELIVERY_LEAGUES produced an empty non-cup allowlist")
     return result
+
+
+def verify_fixture_source_freshness(
+    cur,
+    max_age_minutes: int,
+    *,
+    refreshed_at_override: str | None = None,
+    job_id: str = DEFAULT_FIXTURE_SOURCE_JOB_ID,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Require recent fixture-core evidence before publishing or renewing.
+
+    The six-hourly fixture-core caller supplies in-run evidence after its
+    source export succeeds. The independent hourly publisher relies on the
+    durable Operations heartbeat from the latest successful fixture-core run.
+    """
+    if max_age_minutes <= 0:
+        raise RuntimeError("fixture source maximum age must be positive")
+
+    current = now or datetime.now(UTC)
+    current = current if current.tzinfo is not None else current.replace(tzinfo=UTC)
+    evidence_kind = "fixture_core_pipeline_job"
+
+    if refreshed_at_override:
+        raw = refreshed_at_override.strip().replace("Z", "+00:00")
+        try:
+            observed = datetime.fromisoformat(raw)
+        except ValueError as error:
+            raise RuntimeError("fixture source refresh evidence is malformed") from error
+        evidence_kind = "current_fixture_core_export"
+    else:
+        cur.execute(
+            """
+            select finished_at
+              from operations.pipeline_job_runs
+             where job_id = %s and status = 'success'
+             order by finished_at desc
+             limit 1
+            """,
+            (job_id,),
+        )
+        row = cur.fetchone()
+        if not row or row[0] is None:
+            raise RuntimeError(
+                f"fixture source freshness is unverified: no successful {job_id} run"
+            )
+        observed = row[0]
+
+    observed = observed if observed.tzinfo is not None else observed.replace(tzinfo=UTC)
+    age = current.astimezone(UTC) - observed.astimezone(UTC)
+    if age < timedelta(minutes=-5):
+        raise RuntimeError("fixture source freshness evidence is in the future")
+    if age > timedelta(minutes=max_age_minutes):
+        raise RuntimeError(
+            "fixture source freshness is stale: "
+            f"age_minutes={int(age.total_seconds() // 60)} max_age_minutes={max_age_minutes}"
+        )
+    return {
+        "kind": evidence_kind,
+        "job_id": job_id,
+        "verified_at": observed.astimezone(UTC).isoformat(),
+        "age_seconds": max(0, int(age.total_seconds())),
+        "max_age_minutes": max_age_minutes,
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -477,6 +543,8 @@ def record_verified_noop(
     source_rows: int,
     completed_rows: int,
     fingerprint: dict[str, Any],
+    source_freshness: dict[str, Any],
+    projection_counts: dict[str, int],
     report: dict[str, Any],
 ) -> None:
     """Record fresh verification evidence without rewriting projection rows."""
@@ -511,6 +579,7 @@ def record_verified_noop(
             json.dumps({
                 "semantic_projection_fingerprint": fingerprint,
                 "last_semantic_noop_verified_at": datetime.now(UTC).isoformat(),
+                "last_source_freshness_evidence": source_freshness,
             }),
             release_id,
         ),
@@ -522,6 +591,8 @@ def record_verified_noop(
         "published": False,
         "verified_noop": True,
         "projection_rows_written": 0,
+        "projection_rows_verified": projection_counts,
+        "source_freshness": source_freshness,
         "semantic_projection_fingerprint": fingerprint,
     })
 
@@ -1417,6 +1488,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         with conn.cursor() as cur:
             validate_delivery_schema(cur)
             lock_refresh_publication(cur)
+            source_freshness = verify_fixture_source_freshness(
+                cur,
+                int(
+                    os.environ.get(
+                        "FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES",
+                        DEFAULT_FIXTURE_SOURCE_MAX_AGE_MINUTES,
+                    )
+                ),
+                refreshed_at_override=os.environ.get("FIXTURE_DELIVERY_SOURCE_REFRESHED_AT"),
+                job_id=os.environ.get(
+                    "FIXTURE_DELIVERY_SOURCE_JOB_ID",
+                    DEFAULT_FIXTURE_SOURCE_JOB_ID,
+                ),
+            )
+            report["source_freshness"] = source_freshness
             source = source_fixtures(cur, start, end, leagues)
             validate_source_fixture_identity(source)
             valid_schedule = [
@@ -1435,18 +1521,31 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             report["semantic_projection_fingerprint"] = semantic_fingerprint
             current_release_id, stored_fingerprint = current_publication_semantic_state(cur)
             if current_release_id and fingerprints_match(stored_fingerprint, semantic_fingerprint):
-                record_verified_noop(
-                    cur,
-                    current_release_id,
-                    start,
-                    end,
-                    len(source),
-                    len(completed),
-                    semantic_fingerprint,
-                    report,
-                )
-                conn.commit()
-                return report
+                try:
+                    validate_schedule_projection(cur, valid_schedule, current_release_id)
+                    projection_counts = validate_release_components(
+                        cur,
+                        current_release_id,
+                        [int(row["id"]) for row in valid_schedule],
+                        compute_standings(completed),
+                    )
+                except RuntimeError as error:
+                    report["semantic_noop_rejected_reason"] = str(error)
+                else:
+                    record_verified_noop(
+                        cur,
+                        current_release_id,
+                        start,
+                        end,
+                        len(source),
+                        len(completed),
+                        semantic_fingerprint,
+                        source_freshness,
+                        projection_counts,
+                        report,
+                    )
+                    conn.commit()
+                    return report
 
             # A missing, incompatible, or changed fingerprint preserves the
             # complete atomic publication path.

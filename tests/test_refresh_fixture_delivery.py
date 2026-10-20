@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 from copy import deepcopy
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import inspect
 
 from scripts.refresh_fixture_delivery import (
@@ -19,6 +19,7 @@ from scripts.refresh_fixture_delivery import (
     strict_current_season_rank,
     validate_delivery_schema,
     validate_source_fixture_identity,
+    verify_fixture_source_freshness,
 )
 
 
@@ -39,7 +40,59 @@ class SchemaCursor:
         return self.rows
 
 
+class FreshnessCursor:
+    def __init__(self, observed):
+        self.observed = observed
+        self.query = None
+        self.params = None
+
+    def execute(self, query, params=None):
+        self.query = query
+        self.params = params
+
+    def fetchone(self):
+        return (self.observed,) if self.observed is not None else None
+
+
 class FixtureDeliveryMetricsTests(unittest.TestCase):
+    def test_source_freshness_accepts_recent_durable_pipeline_evidence(self) -> None:
+        now = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+        cursor = FreshnessCursor(now - timedelta(minutes=30))
+        evidence = verify_fixture_source_freshness(cursor, 540, now=now)
+        self.assertEqual(evidence["kind"], "fixture_core_pipeline_job")
+        self.assertEqual(evidence["age_seconds"], 1800)
+        self.assertEqual(cursor.params, ("run_p3_fixture_core_export",))
+
+    def test_source_freshness_rejects_missing_stale_or_future_evidence(self) -> None:
+        now = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+        with self.assertRaisesRegex(RuntimeError, "no successful"):
+            verify_fixture_source_freshness(FreshnessCursor(None), 540, now=now)
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            verify_fixture_source_freshness(
+                FreshnessCursor(now - timedelta(minutes=541)),
+                540,
+                now=now,
+            )
+        with self.assertRaisesRegex(RuntimeError, "future"):
+            verify_fixture_source_freshness(
+                FreshnessCursor(None),
+                540,
+                refreshed_at_override=(now + timedelta(minutes=6)).isoformat(),
+                now=now,
+            )
+
+    def test_current_fixture_core_evidence_bypasses_prior_heartbeat_only_when_fresh(self) -> None:
+        now = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
+        cursor = FreshnessCursor(None)
+        evidence = verify_fixture_source_freshness(
+            cursor,
+            540,
+            refreshed_at_override=(now - timedelta(seconds=20)).isoformat(),
+            now=now,
+        )
+        self.assertEqual(evidence["kind"], "current_fixture_core_export")
+        self.assertIsNone(cursor.query)
+
     @staticmethod
     def changed_value(value):
         if isinstance(value, datetime):

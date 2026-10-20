@@ -114,6 +114,13 @@ python scripts/export_to_supabase.py \
   --skip-prune \
   --report-json "${PIPELINE_EVIDENCE_FILE}"
 
+# The current fixture-core invocation has refreshed and exported the source
+# successfully. This evidence is consumed by the publisher before it may
+# publish or renew a fixture-delivery release.
+export FIXTURE_DELIVERY_SOURCE_REFRESHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+export FIXTURE_DELIVERY_SOURCE_JOB_ID="${FIXTURE_CORE_JOB_ID}"
+export FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES="${FIXTURE_CORE_JOB_MAX_AGE_MINUTES}"
+
 # Publish with the existing release-aware, schema-preflighted delivery path.
 # London date boundaries match the public fixture-card contract; the source
 # identity contract itself remains UTC/date-only.

@@ -39,6 +39,14 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             1232,
             19000,
             fingerprint,
+            {
+                "kind": "fixture_core_pipeline_job",
+                "job_id": "run_p3_fixture_core_export",
+                "verified_at": "2026-10-07T12:00:00+00:00",
+                "age_seconds": 60,
+                "max_age_minutes": 540,
+            },
+            {"schedule": 10, "standings": 20, "metrics": 880, "odds": 30},
             report,
         )
 
@@ -52,6 +60,7 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         self.assertIn("pin_expires_at = now() + interval '2 hours'", queries)
         self.assertTrue(report["verified_noop"])
         self.assertEqual(report["projection_rows_written"], 0)
+        self.assertEqual(report["projection_rows_verified"]["schedule"], 10)
         self.assertTrue(all(component["rows_written"] == 0 for component in report["components"].values()))
 
     def test_publish_release_switches_pointer_only_after_build_is_marked_published(self) -> None:
