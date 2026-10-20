@@ -503,6 +503,7 @@ def record_verified_noop(
         """
         update public.fixture_delivery_releases
            set health_checked_at = now(),
+               pin_expires_at = now() + interval '2 hours',
                metadata = coalesce(metadata, '{}'::jsonb) || %s::jsonb
          where id = %s and status = 'published'
         """,

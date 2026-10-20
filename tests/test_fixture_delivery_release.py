@@ -49,6 +49,7 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         self.assertNotIn("insert into public.fixture_delivery_odds", queries)
         self.assertIn("fixture_delivery_refresh_runs", queries)
         self.assertIn("health_checked_at = now()", queries)
+        self.assertIn("pin_expires_at = now() + interval '2 hours'", queries)
         self.assertTrue(report["verified_noop"])
         self.assertEqual(report["projection_rows_written"], 0)
         self.assertTrue(all(component["rows_written"] == 0 for component in report["components"].values()))
