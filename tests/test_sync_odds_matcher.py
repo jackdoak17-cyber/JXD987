@@ -188,6 +188,7 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
             evidence["moneyline_sides_by_bookmaker"],
             {"Unibet": ["home", "draw", "away"]},
         )
+        self.assertRegex(result.odds_records[0]["observed_at"], r"Z$")
 
     @patch("scripts.sync_odds.OddsApiClient")
     def test_empty_date_probe_emits_explicit_provider_gap_evidence(self, client_type) -> None:
@@ -400,6 +401,7 @@ class MatchEventToFixtureRegressionTests(unittest.TestCase):
         self.assertEqual(client.request.call_args_list[1].args[0], "historical/odds")
         self.assertEqual(client.request.call_args_list[1].kwargs["params"], {"eventId": "8001", "bookmakers": "Unibet"})
         self.assertEqual(len(result.odds_records), 1)
+        self.assertRegex(result.odds_records[0]["observed_at"], r"Z$")
         self.assertEqual(result.moneyline_coverage[0]["odds_response_status"], "received")
 
     def test_accepts_all_supported_odds_bookmakers(self) -> None:
