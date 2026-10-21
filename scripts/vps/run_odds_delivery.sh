@@ -8,6 +8,7 @@ source "${ODDS_DELIVERY_RUNTIME}/scripts/vps/common.sh"
 verify_runtime_manifest_or_exit "${ODDS_DELIVERY_RUNTIME}/scripts/vps/run_odds_p3.sh"
 require_runtime_manifest_entries_or_exit "$0" "scripts/export_odds_to_supabase_psql.py"
 require_runtime_manifest_entries_or_exit "$0" "scripts/reconcile_fixture_delivery_odds.py"
+require_runtime_manifest_entries_or_exit "$0" "scripts/odds_quote_verification.py"
 export REPO_ROOT
 export ODDS_LEAGUES="$(odds_league_csv)"
 if [[ "${ODDS_DELIVERY_VERIFY_ONLY:-false}" == "true" ]]; then
@@ -29,6 +30,7 @@ from pathlib import Path
 for path in (
     Path("scripts/export_odds_to_supabase_psql.py"),
     Path("scripts/reconcile_fixture_delivery_odds.py"),
+    Path("scripts/odds_quote_verification.py"),
 ):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
@@ -62,6 +64,12 @@ python "${ODDS_DELIVERY_EXPORTER:-scripts/export_odds_to_supabase_psql.py}" \
 python scripts/reconcile_fixture_delivery_odds.py \
   --report-out /tmp/fixture_delivery_odds_sync_report.json \
   --delivery-report /tmp/odds_delivery_report.json
+# Verification is ancillary to price publication. Consume durable evidence
+# after reconciliation so a monitoring-writer outage cannot hold back a valid
+# customer price. The file remains pending and the website fails closed to an
+# unverified label until a later retry succeeds.
+python scripts/odds_quote_verification.py record \
+  --spool-dir "${ODDS_QUOTE_VERIFICATION_SPOOL_DIR:-/var/lib/odds-sync/quote-verifications}"
 CHAIN
 )
 run_recorded_pipeline_job "run_odds_delivery" "Website odds delivery" \
