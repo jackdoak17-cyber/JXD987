@@ -125,9 +125,28 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # The shared Odds API client already retries transient HTTP 5xx errors
+    # three times by default. The catalogue gates a six-hour P3 cycle, so
+    # tolerate two more bounded retries *only on this catalogue request*.
+    # Six total HTTP attempts, with capped exponential backoff, are still
+    # strictly fail-closed on persistent 503 or an invalid market contract.
+    client = OddsApiClient(retries=5, sleep_base=2, sleep_max=10)
     try:
-        payload = OddsApiClient().request("markets", {"sport": args.sport})
+        payload = client.request("markets", {"sport": args.sport})
     except OddsApiError as exc:
+        failure = {
+            "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "endpoint": "markets",
+            "sport": args.sport,
+            "ok": False,
+            "error_stage": "provider_request",
+            "error_message": str(exc),
+            "provider_http_attempts": client.stats.calls_by_endpoint.get("markets", 0),
+        }
+        if args.report_out:
+            # Overwrite the prior successful catalogue report on failure;
+            # operations must not mistake an old report for current evidence.
+            Path(args.report_out).write_text(json.dumps(failure, indent=2), encoding="utf-8")
         raise SystemExit(f"Odds API market catalogue unavailable: {exc}") from exc
     if isinstance(payload, dict):
         items = payload.get("markets") or payload.get(args.sport) or []
@@ -140,6 +159,7 @@ def main() -> None:
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "endpoint": "markets",
         "sport": args.sport,
+        "provider_http_attempts": client.stats.calls_by_endpoint.get("markets", 0),
         **validate_catalog(items),
     }
     if args.report_out:
