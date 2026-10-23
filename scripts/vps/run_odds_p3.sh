@@ -56,6 +56,8 @@ export SETTLED_HISTORY_DAYS="$(contract_value history_window_days)"
 export ODDS_SYNC_DAYS_BACK="${ODDS_SYNC_DAYS_BACK:-0}"
 export DAYS_FORWARD="$(contract_value odds_window_days)"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-$(odds_bookmaker_csv)}"
+# Observability only; no additional provider calls or canonical publication.
+export ODDS_PROVIDER_METRICS_DIR="${ODDS_PROVIDER_METRICS_DIR:-/var/lib/odds-sync/provider-run-metrics}"
 export INGEST_MAX_RUNTIME_MINUTES="${ODDS_INGEST_MAX_RUNTIME_MINUTES:-25}"
 export ODDS_EXPORT_DAYS_BACK="${SETTLED_HISTORY_DAYS}"
 export RETENTION_DAYS_BACK="${RETENTION_DAYS_BACK:-${SETTLED_HISTORY_DAYS}}"

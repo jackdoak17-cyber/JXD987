@@ -23,6 +23,8 @@ export REPO_ROOT
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-$(odds_bookmaker_csv)}"
+# Aggregate-only provider observation history. No odds or verification DB writes.
+export ODDS_PROVIDER_METRICS_DIR="${ODDS_PROVIDER_METRICS_DIR:-/var/lib/odds-sync/provider-run-metrics}"
 # A cron tick is a scheduling opportunity, not proof that the shared writer
 # lock was available.  Retry the bounded, idempotent P1 chain across a
 # settlement handoff so a long detail delivery cannot starve odds ingestion.

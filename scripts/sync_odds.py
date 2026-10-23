@@ -32,6 +32,7 @@ from jxd import SportMonksClient, SyncService
 from jxd.db import get_engine, get_session
 from jxd.models import Base
 from jxd.odds_api_client import OddsApiClient, OddsApiError
+from scripts.odds_provider_run_metrics import summarize_fetch, write_run_metric
 from scripts.odds_quote_verification import (
     is_verifiable_quote_row,
     observation_from_row,
@@ -3071,6 +3072,16 @@ def main() -> None:
                 "errors": [],
             }
             Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        if args.priority in {"p1", "p2", "p3"} and os.getenv("ODDS_PROVIDER_METRICS_DIR") and not args.refresh_only:
+            run_id = f"{args.priority}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+            try:
+                write_run_metric(
+                    Path(os.environ["ODDS_PROVIDER_METRICS_DIR"]),
+                    summarize_fetch(run_id=run_id, tier=args.priority, fixtures_in_scope=0,
+                                    coverage=[], observations=[], api_calls=0, errors=[]),
+                )
+            except (OSError, ValueError) as exc:
+                log.error("Provider run metrics unavailable: %s", exc)
         return
 
     teams_in_window = {
@@ -3422,16 +3433,38 @@ def main() -> None:
         }
         Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
 
+    observation_run_id = None
     if args.verification_out:
         lane = args.priority or "all"
-        run_id = f"{lane}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+        observation_run_id = f"{lane}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
         write_observation_document(
             Path(args.verification_out),
-            run_id=run_id,
+            run_id=observation_run_id,
             lane=lane,
             quotes=verified_quotes,
             errors=fetch_errors,
         )
+
+    # Existing provider observations and publication are unchanged. This is an
+    # independent aggregate-only record, explicitly including partial errors.
+    metrics_directory = os.getenv("ODDS_PROVIDER_METRICS_DIR")
+    if args.priority in {"p1", "p2", "p3"} and metrics_directory:
+        metrics_run_id = observation_run_id or (
+            f"{args.priority}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+        )
+        try:
+            write_run_metric(
+                Path(metrics_directory),
+                summarize_fetch(
+                    run_id=metrics_run_id, tier=args.priority,
+                    fixtures_in_scope=len(fixtures), coverage=moneyline_coverage,
+                    observations=verified_quotes, api_calls=api_calls_total,
+                    errors=fetch_errors,
+                ),
+            )
+        except (OSError, ValueError) as exc:
+            # Monitoring outage must not invalidate a committed bookmaker price.
+            log.error("Provider run metrics unavailable: %s", exc)
 
     if fetch_errors:
         if stage_writer is not None:
