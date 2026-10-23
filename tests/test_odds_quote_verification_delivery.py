@@ -7,7 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from scripts.odds_quote_verification import (load_document, record_spool, validate_document, write_observation_spool, append_run_metrics)
+from scripts.odds_quote_verification import (load_document, record_spool, validate_document, write_observation_spool, append_run_metrics, summarize_run_metrics)
 
 
 class OddsQuoteVerificationDeliveryTests(unittest.TestCase):
@@ -78,6 +78,18 @@ class OddsQuoteVerificationDeliveryTests(unittest.TestCase):
             event = json.loads(metrics_path.read_text(encoding="utf-8"))
             self.assertEqual((event["supplied"], event["matched"], event["written"], event["unmatched"]), (10, 7, 3, 3))
             self.assertEqual(event["observed_last_at"], document["quotes"][0]["observed_at"])
+
+    def test_fourteen_day_metrics_summary_deduplicates_replays(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run-metrics.jsonl"
+            doc = self.document()
+            append_run_metrics(path, doc, {"supplied": 10, "matched": 8, "written": 8})
+            append_run_metrics(path, doc, {"supplied": 10, "matched": 0, "written": 0})
+            metrics = summarize_run_metrics(path, days=14)
+            self.assertEqual(metrics["source_runs"], 1)
+            self.assertEqual(metrics["tiers"]["p1"]["runs"], 1)
+            self.assertEqual(metrics["tiers"]["p1"]["matched"], 8)
+            self.assertEqual(metrics["tiers"]["p1"]["matched_pct"], 80.0)
 
     def test_no_publication_or_heartbeat_can_create_a_provider_quote_spool(self) -> None:
         from pathlib import Path as _Path
