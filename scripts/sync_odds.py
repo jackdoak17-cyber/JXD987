@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from scripts.odds_quote_verification import write_observation_spool
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy import bindparam, text
@@ -916,6 +917,8 @@ def fetch_league_odds_payload(
                 )
                 if not isinstance(odds_batch, list):
                     continue
+                # This timestamp belongs to the upstream response, never the publish job.
+                provider_observed_at = datetime.now(timezone.utc).isoformat()
                 for odds_event in odds_batch:
                     event_id = odds_event.get("id")
                     if event_id is None:
@@ -930,6 +933,7 @@ def fetch_league_odds_payload(
                             "event_id": int(event_id),
                             "fixture_id": int(fixture_id),
                             "bookmakers_payload": bookmakers_payload,
+                            "provider_observed_at": provider_observed_at,
                         }
                     )
 
@@ -2441,6 +2445,7 @@ def main() -> None:
                 results_by_league[league_id] = result
 
     outcomes_total = 0
+    provider_observations: List[Dict[str, object]] = []
     api_calls_total = 0
     api_calls_by_endpoint: Dict[str, int] = {}
     api_time_seconds = 0.0
@@ -2524,6 +2529,32 @@ def main() -> None:
                     market_keys,
                 )
                 upsert_outcomes(session, rows)
+                # Evidence is derived exclusively from this successful live
+                # /odds/multi provider response. Historical odds have no such
+                # observation timestamp and never count as fresh.
+                observed_at = odds_record.get("provider_observed_at")
+                if observed_at and args.priority and os.getenv("ODDS_QUOTE_VERIFICATION_SPOOL_DIR"):
+                    for row in dedupe_outcome_rows(rows):
+                        price = row.get("price_decimal")
+                        if price is None or not 1 < float(price) <= 500:
+                            continue
+                        source_at = row.get("last_updated_at")
+                        if isinstance(source_at, datetime):
+                            if source_at.tzinfo is None:
+                                source_at = source_at.replace(tzinfo=timezone.utc)
+                            source_at = source_at.astimezone(timezone.utc).isoformat()
+                        provider_observations.append({
+                            "fixture_id": row["fixture_id"],
+                            "bookmaker_id": row["bookmaker_id"],
+                            "market_key": row["market_key"],
+                            "selection_key": row["selection_key"],
+                            "participant_type": row.get("participant_type") or "team",
+                            "participant_id": row.get("participant_id") or 0,
+                            "line": row.get("line"),
+                            "price_decimal": price,
+                            "source_last_updated_at": source_at,
+                            "observed_at": observed_at,
+                        })
                 outcomes_total += len(rows)
                 bookmaker_names_saved.add(canonical_name)
             session.commit()
@@ -2534,6 +2565,13 @@ def main() -> None:
     if removed_invalid:
         log.warning("Removed %s invalid goals_over_under rows after sync.", removed_invalid)
         session.commit()
+
+    # An observation file is emitted after the successful SQLite commits.
+    # The asynchronous writer checks the exact canonical price and source event.
+    spool_dir = os.getenv("ODDS_QUOTE_VERIFICATION_SPOOL_DIR")
+    if args.priority and spool_dir:
+        spool_path = write_observation_spool(Path(spool_dir), args.priority, provider_observations)
+        log.info("Provider observations spooled to %s (%s quotes)", spool_path, len(provider_observations))
 
     log.info(
         "Odds sync complete: outcomes=%s events_matched=%s actual_api_calls=%s",
