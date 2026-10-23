@@ -43,7 +43,7 @@ def summarize_fetch(
     if tier not in TIERS or not run_id.startswith(f"{tier}-"):
         raise ValueError("invalid tier or source run id")
     rows = list(coverage)
-    quote_rows = list(observations)
+    observation_count = len(observations) if hasattr(observations, "__len__") else sum(1 for _ in observations)
     failures = list(errors)
     statuses = Counter(str(row.get("odds_response_status") or "not_reported") for row in rows)
     matching = Counter(str(row.get("matching_status") or "not_reported") for row in rows)
@@ -71,7 +71,7 @@ def summarize_fetch(
         "matching_status_counts": dict(matching),
         "response_status_counts": dict(statuses),
         "returned_moneyline_side_gaps": missing_side_count,
-        "normalized_observations": len(quote_rows),
+        "normalized_observations": observation_count,
         "api_calls": int(api_calls),
         # Not known until a separate canonical-quote database match. Never
         # use these observation counts to claim customer-price verification.
@@ -103,7 +103,7 @@ def write_run_metric(directory: Path, record: Mapping[str, Any], *, now: datetim
     finally:
         temporary.unlink(missing_ok=True)
     cutoff = now - timedelta(days=RETENTION_DAYS)
-    for file in directory.glob("*.json"):
+    for file in directory.glob("p[123]-*.json"):
         if datetime.fromtimestamp(file.stat().st_mtime, timezone.utc) < cutoff:
             file.unlink()
     return target
