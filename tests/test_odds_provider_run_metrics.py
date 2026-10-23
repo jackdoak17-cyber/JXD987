@@ -89,9 +89,13 @@ class ProviderRunMetricsTests(unittest.TestCase):
             os.utime(old, (stamp, stamp))
             unrelated = root / "readme.txt"
             unrelated.write_text("keep", encoding="utf-8")
+            unrelated_json = root / "unrelated.json"
+            unrelated_json.write_text("{}", encoding="utf-8")
+            os.utime(unrelated_json, (stamp, stamp))
             write_run_metric(root, data, now=now)
             self.assertFalse(old.exists())
             self.assertTrue(unrelated.exists())
+            self.assertTrue(unrelated_json.exists())
             self.assertEqual(summarize_history(root)["tiers"]["p3"]["runs"], 1)
 
     def test_history_summary_distinguishes_provider_and_canonical_matching(self) -> None:
