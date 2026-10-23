@@ -189,11 +189,54 @@ def record_spool(spool_dir: Path, database_url: str) -> Dict[str, int]:
     return totals
 
 
+def summarize_run_metrics(path: Path, days: int = 14) -> Dict[str, Any]:
+    """Operational history; one metric event per source run, deduped on replay."""
+    cutoff = utc_now() - timedelta(days=days)
+    runs: Dict[str, Dict[str, Any]] = {}
+    if path.exists():
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            if not raw.strip():
+                continue
+            event = json.loads(raw)
+            recorded_at = datetime.fromisoformat(event["recorded_at"].replace("Z", "+00:00"))
+            if recorded_at >= cutoff:
+                run_id = str(event["run_id"])
+                # An earlier successful batch must not be silently replaced by
+                # lower counters in a retried/idempotently recorded run.
+                previous = runs.get(run_id)
+                if previous is None or int(event["matched"]) > int(previous["matched"]):
+                    runs[run_id] = event
+    report: Dict[str, Any] = {"window_days": days, "source_runs": len(runs), "tiers": {}}
+    for tier in ("p1", "p2", "p3"):
+        subset = [x for x in runs.values() if x.get("tier") == tier]
+        supplied = sum(int(x["supplied"]) for x in subset)
+        matched = sum(int(x["matched"]) for x in subset)
+        report["tiers"][tier] = {
+            "runs": len(subset),
+            "zero_quote_runs": sum(int(x["supplied"]) == 0 for x in subset),
+            "supplied": supplied,
+            "matched": matched,
+            "unmatched": supplied - matched,
+            "matched_pct": round(100 * matched / supplied, 2) if supplied else None,
+            "latest_provider_observation_at": max(
+                (str(x["observed_last_at"]) for x in subset if x.get("observed_last_at")),
+                default=None,
+            ),
+        }
+    return report
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["record"])
+    parser.add_argument("command", choices=["record", "summary"])
     parser.add_argument("--spool-dir", required=True)
+    parser.add_argument("--days", type=int, default=14, help="History window in days for summary")
     args = parser.parse_args()
+    if args.command == "summary":
+        if args.days < 1 or args.days > 365:
+            raise SystemExit("days must be between 1 and 365")
+        print(json.dumps(summarize_run_metrics(Path(args.spool_dir) / "run-metrics.jsonl", args.days), sort_keys=True))
+        return
     database_url = (
         os.environ.get("ODDS_QUOTE_VERIFICATION_DATABASE_URL")
         or os.environ.get("SUPABASE_DB_URL_SESSION")
