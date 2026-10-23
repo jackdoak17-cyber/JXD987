@@ -32,7 +32,11 @@ from jxd import SportMonksClient, SyncService
 from jxd.db import get_engine, get_session
 from jxd.models import Base
 from jxd.odds_api_client import OddsApiClient, OddsApiError
-from scripts.odds_quote_verification import observation_from_row, write_observation_document
+from scripts.odds_quote_verification import (
+    is_verifiable_quote_row,
+    observation_from_row,
+    write_observation_document,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -3307,7 +3311,9 @@ def main() -> None:
                 if not rows:
                     continue
                 verified_quotes.extend(
-                    observation_from_row(row, str(odds_record["observed_at"])) for row in rows
+                    observation_from_row(row, str(odds_record["observed_at"]))
+                    for row in rows
+                    if is_verifiable_quote_row(row)
                 )
                 if not write_owned:
                     continue

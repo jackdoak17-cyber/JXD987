@@ -10,6 +10,7 @@ from scripts.odds_quote_verification import (
     _load,
     _validate,
     deduplicate_observations,
+    is_verifiable_quote_row,
     observation_from_row,
     write_observation_document,
 )
@@ -61,6 +62,12 @@ class OddsQuoteVerificationTests(unittest.TestCase):
             document = _load(path)
 
             self.assertEqual(_validate(document), [])
+
+    def test_closed_or_invalid_prices_are_not_verifiable(self) -> None:
+        self.assertFalse(is_verifiable_quote_row(self.row(1.0)))
+        self.assertFalse(is_verifiable_quote_row(self.row(float("nan"))))
+        self.assertFalse(is_verifiable_quote_row(self.row(501.0)))
+        self.assertTrue(is_verifiable_quote_row(self.row(1.01)))
 
     def test_duplicate_and_expired_observations_fail_closed(self) -> None:
         quote = observation_from_row(self.row(), datetime.now(timezone.utc).isoformat())
