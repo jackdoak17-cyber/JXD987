@@ -3074,11 +3074,14 @@ def main() -> None:
             Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
         if args.priority in {"p1", "p2", "p3"} and os.getenv("ODDS_PROVIDER_METRICS_DIR") and not args.refresh_only:
             run_id = f"{args.priority}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
-            write_run_metric(
-                Path(os.environ["ODDS_PROVIDER_METRICS_DIR"]),
-                summarize_fetch(run_id=run_id, tier=args.priority, fixtures_in_scope=0,
-                                coverage=[], observations=[], api_calls=0, errors=[]),
-            )
+            try:
+                write_run_metric(
+                    Path(os.environ["ODDS_PROVIDER_METRICS_DIR"]),
+                    summarize_fetch(run_id=run_id, tier=args.priority, fixtures_in_scope=0,
+                                    coverage=[], observations=[], api_calls=0, errors=[]),
+                )
+            except (OSError, ValueError) as exc:
+                log.error("Provider run metrics unavailable: %s", exc)
         return
 
     teams_in_window = {
