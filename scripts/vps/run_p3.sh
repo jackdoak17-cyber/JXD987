@@ -46,6 +46,9 @@ export FIXTURE_CORE_HISTORY_DAYS="$(contract_value history_window_days)"
 export FIXTURE_CORE_DELIVERY_DAYS_FORWARD="$(contract_value delivery_window_days)"
 export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_CORE_DELIVERY_DAYS_FORWARD}"
 export FIXTURE_DELIVERY_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_TIMEOUT_SECONDS:-1800}"
+# Enabled only for VPS tier jobs. GitHub Actions / one-off local syncs do not
+# create provider-evidence files unless explicitly configured.
+export ODDS_QUOTE_VERIFICATION_SPOOL_DIR="${ODDS_QUOTE_VERIFICATION_SPOOL_DIR:-/var/lib/odds-sync/quote-verifications}"
 export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/odds_refresh_report_p3.json}"
 export RUN_COVERAGE="${RUN_COVERAGE:-false}"
 export MONEYLINE_COVERAGE_DAYS_FORWARD="${MONEYLINE_COVERAGE_DAYS_FORWARD:-7}"
