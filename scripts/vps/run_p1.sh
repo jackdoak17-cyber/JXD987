@@ -23,6 +23,9 @@ export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-Bet365,Paddy Power}"
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${P1_LOCK_RETRY_ATTEMPTS:-40}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${P1_LOCK_RETRY_DELAY_SECONDS:-15}"
+# Enabled only for VPS tier jobs. GitHub Actions / one-off local syncs do not
+# create provider-evidence files unless explicitly configured.
+export ODDS_QUOTE_VERIFICATION_SPOOL_DIR="${ODDS_QUOTE_VERIFICATION_SPOOL_DIR:-/var/lib/odds-sync/quote-verifications}"
 export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/odds_sync_report_p1.json}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
