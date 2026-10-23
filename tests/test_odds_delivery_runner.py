@@ -23,6 +23,7 @@ class DeliveryRunnerTest(unittest.TestCase):
             shutil.copy2(RUNNER, root / "scripts/vps/run_odds_delivery.sh")
             for name in (
                 "export_odds_to_supabase_psql.py",
+                "odds_quote_verification.py",
                 "reconcile_fixture_delivery_odds.py",
                 "refresh_fixture_delivery.py",
             ):
@@ -79,7 +80,7 @@ exit 0
 
             self.assertEqual((root / "job").read_text(), "run_odds_delivery")
             calls = (root / "calls").read_text().splitlines()
-            self.assertEqual(len(calls), 2 if status == 0 else 1)
+            self.assertEqual(len(calls), 3 if status == 0 else 1)
             args = calls[0].split()
             self.assertEqual(args[0], "scripts/export_odds_to_supabase_psql.py")
             for flag in ["--skip-retention", "--skip-retention-snapshots", "--no-include-fixture-leagues"]:
@@ -88,6 +89,7 @@ exit 0
             self.assertNotIn("--skip-verification", args)
             if status == 0:
                 self.assertTrue(calls[1].startswith("scripts/reconcile_fixture_delivery_odds.py "))
+                self.assertTrue(calls[2].startswith("scripts/odds_quote_verification.py record "))
 
     def test_success(self):
         self.run_case(0)

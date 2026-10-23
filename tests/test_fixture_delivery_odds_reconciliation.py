@@ -18,8 +18,10 @@ class FixtureDeliveryOddsReconciliationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         source = wrapper.read_text(encoding="utf-8")
         exporter = source.index("export_odds_to_supabase_psql.py}")
+        recorder = source.index("python scripts/odds_quote_verification.py record")
         reconciler = source.index("python scripts/reconcile_fixture_delivery_odds.py")
         self.assertLess(exporter, reconciler)
+        self.assertLess(reconciler, recorder)
         self.assertIn("set -euo pipefail", source)
 
     def test_runtime_manifest_includes_reconciler(self) -> None:
