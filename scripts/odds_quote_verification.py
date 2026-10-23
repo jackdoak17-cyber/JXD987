@@ -99,6 +99,55 @@ def record_document(connection, document: Dict[str, Any]) -> Dict[str, int]:
     return totals
 
 
+def write_observation_spool(spool_dir: Path, priority: str, observations: List[Dict[str, Any]]) -> Path:
+    """Atomically spool actual provider-response observations, never publication times."""
+    if priority not in {"p1", "p2", "p3"}:
+        raise ValueError("invalid observation priority")
+    pending = spool_dir / "pending"
+    pending.mkdir(mode=0o700, parents=True, exist_ok=True)
+    run_id = f"{priority}-{utc_now().strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+    unique: Dict[tuple, Dict[str, Any]] = {}
+    for row in observations:
+        key = (row["fixture_id"], row["bookmaker_id"], row["market_key"],
+               row["selection_key"], row.get("participant_type") or "team",
+               row.get("participant_id") or 0, row.get("line") if row.get("line") is not None else -9999)
+        if key not in unique or row["observed_at"] > unique[key]["observed_at"]:
+            unique[key] = row
+    document = {"schema_version": SCHEMA_VERSION, "source": SOURCE,
+                "run_id": run_id, "quotes": list(unique.values())}
+    validate_document(document)
+    target = pending / f"{run_id}.json.gz"
+    staging = pending / f".{run_id}.writing"
+    try:
+        with staging.open("wb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb") as zipped:
+                zipped.write(json.dumps(document, separators=(",", ":")).encode("utf-8"))
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.replace(staging, target)
+    finally:
+        staging.unlink(missing_ok=True)
+    return target
+
+
+def append_run_metrics(path: Path, document: Dict[str, Any], stats: Dict[str, int]) -> None:
+    """Small durable JSONL history. Readers deduplicate replayed run_id values."""
+    times = sorted(str(x["observed_at"]) for x in document["quotes"])
+    record = {"run_id": document["run_id"],
+              "tier": document["run_id"].split("-", 1)[0],
+              "recorded_at": utc_now().isoformat(),
+              "observed_first_at": times[0] if times else None,
+              "observed_last_at": times[-1] if times else None,
+              "supplied": stats["supplied"], "matched": stats["matched"],
+              "written": stats["written"], "unmatched": stats["supplied"] - stats["matched"]}
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def record_spool(spool_dir: Path, database_url: str) -> Dict[str, int]:
     import psycopg2
 
@@ -125,6 +174,7 @@ def record_spool(spool_dir: Path, database_url: str) -> Dict[str, int]:
             document = load_document(claimed)
             with psycopg2.connect(database_url, connect_timeout=10) as connection:
                 result = record_document(connection, document)
+            append_run_metrics(spool_dir / "run-metrics.jsonl", document, result)
             os.replace(claimed, processed / path.name)
             totals["files"] += 1
             for key in ("supplied", "matched", "written"):
