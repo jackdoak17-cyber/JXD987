@@ -26,6 +26,8 @@ validate_supported_leagues "${STATS_LEAGUES}"
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
 export DAYS_FORWARD="${ODDS_DAYS_FORWARD:-14}"
 export ODDS_BOOKMAKERS="${ODDS_BOOKMAKERS:-$(odds_bookmaker_csv)}"
+# Aggregate-only provider observation history. No odds or verification DB writes.
+export ODDS_PROVIDER_METRICS_DIR="${ODDS_PROVIDER_METRICS_DIR:-/var/lib/odds-sync/provider-run-metrics}"
 export LINEUP_SYNC_HOURS_BACK="${LINEUP_SYNC_HOURS_BACK:-2}"
 export LINEUP_SYNC_HOURS_FORWARD="${LINEUP_SYNC_HOURS_FORWARD:-3}"
 export LINEUP_SYNC_LIMIT="${LINEUP_SYNC_LIMIT:-40}"
