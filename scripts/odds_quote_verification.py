@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import math
 import os
 import re
 import socket
@@ -47,6 +48,15 @@ def observation_from_row(row: Dict[str, Any], observed_at: str) -> Dict[str, Any
         "source_last_updated_at": iso_utc(row.get("last_updated_at")),
         "observed_at": iso_utc(observed_at),
     }
+
+
+def is_verifiable_quote_row(row: Dict[str, Any]) -> bool:
+    """Return whether a normalized quote can be recorded as usable evidence."""
+    try:
+        price = float(row["price_decimal"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return math.isfinite(price) and 1 < price <= 500
 
 
 def deduplicate_observations(quotes: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
