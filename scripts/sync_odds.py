@@ -32,6 +32,7 @@ from jxd import SportMonksClient, SyncService
 from jxd.db import get_engine, get_session
 from jxd.models import Base
 from jxd.odds_api_client import OddsApiClient, OddsApiError
+from scripts.odds_quote_verification import observation_from_row, write_observation_document
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -1218,6 +1219,7 @@ def fetch_league_odds_payload(
                             "bookmakers": ",".join(bookmakers),
                         },
                     )
+                    batch_observed_at = utc_now_iso()
                 except Exception:
                     for event_id in batch:
                         odds_response_by_event_id[event_id]["valid"] = False
@@ -1245,6 +1247,7 @@ def fetch_league_odds_payload(
                             "event_id": event_id,
                             "fixture_id": int(fixture_id),
                             "bookmakers_payload": bookmakers_payload,
+                            "observed_at": batch_observed_at,
                         }
                     )
 
@@ -1267,6 +1270,7 @@ def fetch_league_odds_payload(
                             "bookmakers": ",".join(bookmakers),
                         },
                     )
+                    historical_observed_at = utc_now_iso()
                 except Exception:
                     odds_response_by_event_id[event_id]["valid"] = False
                     raise
@@ -1283,6 +1287,7 @@ def fetch_league_odds_payload(
                             "event_id": event_id,
                             "fixture_id": int(fixture_id),
                             "bookmakers_payload": bookmakers_payload,
+                            "observed_at": historical_observed_at,
                         }
                     )
 
@@ -2914,6 +2919,11 @@ def main() -> None:
         help="Write sync report JSON",
     )
     parser.add_argument(
+        "--verification-out",
+        default="",
+        help="Atomically write exact normalized quote observations from successful provider responses",
+    )
+    parser.add_argument(
         "--debug-events-out",
         default="",
         help="Write raw events JSON",
@@ -3130,6 +3140,7 @@ def main() -> None:
     league_stats: Dict[int, Dict[str, int]] = {}
     moneyline_coverage: List[Dict[str, object]] = []
     fetch_errors: List[str] = []
+    verified_quotes: List[Dict[str, object]] = []
     stage_writer = (
         OddsStageWriter(
             Path(args.stage_out),
@@ -3263,9 +3274,9 @@ def main() -> None:
             if fixture is None:
                 continue
             # P2 deliberately fetches a small boundary overlap to emit fresh
-            # provider evidence.  Only the owning lane may mutate odds rows.
-            if args.priority and not fixture.get("_priority_write_owned", True):
-                continue
+            # provider evidence. Only the owning lane may mutate odds rows,
+            # but a directly observed exact quote remains valid evidence.
+            write_owned = not args.priority or fixture.get("_priority_write_owned", True)
             bookmakers_payload = odds_record.get("bookmakers_payload") or {}
             if args.debug_odds_out:
                 odds_raw[event_id] = bookmakers_payload
@@ -3294,6 +3305,11 @@ def main() -> None:
                     unmatched_details,
                 )
                 if not rows:
+                    continue
+                verified_quotes.extend(
+                    observation_from_row(row, str(odds_record["observed_at"])) for row in rows
+                )
+                if not write_owned:
                     continue
                 market_keys = {row.get("market_key") for row in rows if row.get("market_key")}
                 if stage_writer is not None:
@@ -3399,6 +3415,17 @@ def main() -> None:
             "unmatched_players": len(unmatched_details),
         }
         Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    if args.verification_out:
+        lane = args.priority or "all"
+        run_id = f"{lane}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{os.getpid()}"
+        write_observation_document(
+            Path(args.verification_out),
+            run_id=run_id,
+            lane=lane,
+            quotes=verified_quotes,
+            errors=fetch_errors,
+        )
 
     if fetch_errors:
         if stage_writer is not None:

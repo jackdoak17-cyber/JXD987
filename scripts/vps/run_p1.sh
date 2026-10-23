@@ -16,7 +16,8 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/odds_api_client.py" \
   "jxd/sportmonks_client.py" \
   "jxd/sync.py" \
-  "scripts/sync_odds.py"
+  "scripts/sync_odds.py" \
+  "scripts/odds_quote_verification.py"
 
 export REPO_ROOT
 export ODDS_LEAGUES="${ODDS_LEAGUE_IDS:-$(odds_league_csv)}"
@@ -43,11 +44,16 @@ if [[ -f ./.env ]]; then
   set +a
 fi
 
+VERIFICATION_SPOOL_DIR="${ODDS_QUOTE_VERIFICATION_SPOOL_DIR:-/var/lib/odds-sync/quote-verifications}"
+mkdir -p "${VERIFICATION_SPOOL_DIR}/pending"
+VERIFICATION_OUT="${VERIFICATION_SPOOL_DIR}/pending/p1-$(date -u +%Y%m%dT%H%M%S)-$$.json.gz"
+
 python scripts/sync_odds.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-forward "${DAYS_FORWARD}" \
   --priority p1 \
   --bookmakers "${ODDS_BOOKMAKERS}" \
+  --verification-out "${VERIFICATION_OUT}" \
   --report-out "/tmp/odds_sync_report_p1.json" \
   --unmatched-out "/tmp/unmatched_players_p1.json"
 CHAIN

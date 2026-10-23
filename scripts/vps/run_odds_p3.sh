@@ -19,6 +19,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/sportmonks_client.py" \
   "jxd/sync.py" \
   "scripts/sync_odds.py" \
+  "scripts/odds_quote_verification.py" \
   "scripts/validate_odds_api_market_catalog.py" \
   "scripts/export_odds_to_supabase_psql.py" \
   "scripts/odds_retention_psql.py" \
@@ -121,6 +122,8 @@ source "${REPO_ROOT}/scripts/vps/common.sh"
 export SUPABASE_DB_URL_SESSION="${SUPABASE_DB_URL_SESSION:-${SUPABASE_DB_URL:-}}"
 export PGSSLMODE="${PGSSLMODE:-require}"
 mkdir -p "${ODDS_P3_STAGE_DIR}"
+VERIFICATION_SPOOL_DIR="${ODDS_QUOTE_VERIFICATION_SPOOL_DIR:-/var/lib/odds-sync/quote-verifications}"
+mkdir -p "${VERIFICATION_SPOOL_DIR}/pending"
 HISTORY_STAGE="${ODDS_P3_STAGE_DIR}/history.ndjson.gz"
 P3_STAGE="${ODDS_P3_STAGE_DIR}/p3.ndjson.gz"
 HISTORY_REPORT="${ODDS_P3_STAGE_DIR}/history-report.json"
@@ -173,6 +176,7 @@ if [[ ! -f "${HISTORY_STAGE}" || ! -f "${P3_STAGE}" || ! -f "${HISTORY_REPORT}" 
     --priority p3 \
     --bookmakers "${ODDS_BOOKMAKERS}" \
     --stage-out "${P3_STAGE}" \
+    --verification-out "${VERIFICATION_SPOOL_DIR}/pending/p3-$(date -u +%Y%m%dT%H%M%S)-$$.json.gz" \
     --report-out "${P3_REPORT}" \
     --unmatched-out "/tmp/unmatched_players_p3.json"
 else
@@ -216,6 +220,11 @@ python scripts/validate_moneyline_coverage.py \
   "${MONEYLINE_PROVIDER_REPORT_ARGS[@]}" \
   --out-json "/tmp/moneyline_coverage_report_p3.json" \
   --out-md "/tmp/moneyline_coverage_report_p3.md"
+
+# Consume evidence after canonical publication and validation. A writer outage
+# cannot bypass coverage checks; the pending spool remains retryable.
+python scripts/odds_quote_verification.py record \
+  --spool-dir "${VERIFICATION_SPOOL_DIR}"
 
 # Only discard resumable stages after publication and validation both succeed.
 rm -f "${HISTORY_STAGE}" "${P3_STAGE}" "${HISTORY_STAGE}.sha256" "${P3_STAGE}.sha256"
