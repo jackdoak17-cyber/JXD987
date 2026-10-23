@@ -29,6 +29,9 @@ export LINEUP_SYNC_HOURS_FORWARD="${LINEUP_SYNC_HOURS_FORWARD:-3}"
 export LINEUP_SYNC_LIMIT="${LINEUP_SYNC_LIMIT:-40}"
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${P2_LOCK_RETRY_ATTEMPTS:-40}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${P2_LOCK_RETRY_DELAY_SECONDS:-15}"
+# Enabled only for VPS tier jobs. GitHub Actions / one-off local syncs do not
+# create provider-evidence files unless explicitly configured.
+export ODDS_QUOTE_VERIFICATION_SPOOL_DIR="${ODDS_QUOTE_VERIFICATION_SPOOL_DIR:-/var/lib/odds-sync/quote-verifications}"
 export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/odds_sync_report_p2.json}"
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
