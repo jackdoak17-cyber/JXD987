@@ -2304,6 +2304,10 @@ def main() -> None:
                 "errors": [],
             }
             Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+        # Empty successful priority runs must be visible in per-run coverage:
+        # a successful process with zero provider quotes is not a verification.
+        if args.priority and os.getenv("ODDS_QUOTE_VERIFICATION_SPOOL_DIR") and not args.refresh_only:
+            write_observation_spool(Path(os.environ["ODDS_QUOTE_VERIFICATION_SPOOL_DIR"]), args.priority, [])
         return
 
     teams_in_window = {
