@@ -154,6 +154,40 @@ def current_customer_quotes(
     return [quote for quote in quotes if quote.get("market_key") in CUSTOMER_MARKETS and _quote_key(quote) in canonical]
 
 
+def partition_customer_quotes(
+    sqlite_db: Path,
+    quotes: List[Dict[str, Any]],
+    league_ids: List[int],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Separate mutable future quotes from fixtures whose publication is frozen."""
+    eligible = current_customer_quotes(sqlite_db, quotes, league_ids)
+    fixture_ids = sorted({int(quote["fixture_id"]) for quote in eligible})
+    kickoffs: Dict[int, datetime] = {}
+    uri = f"file:{sqlite_db.resolve(strict=True)}?mode=ro"
+    with sqlite3.connect(uri, uri=True) as connection:
+        for offset in range(0, len(fixture_ids), 400):
+            chunk = fixture_ids[offset : offset + 400]
+            slots = ",".join("?" for _ in chunk)
+            for fixture_id, starting_at in connection.execute(
+                f"select id, starting_at from fixtures where id in ({slots})", chunk,
+            ):
+                try:
+                    parsed = datetime.fromisoformat(str(starting_at).replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    kickoffs[int(fixture_id)] = parsed.astimezone(timezone.utc)
+                except (TypeError, ValueError):
+                    # Unknown kickoff stays in the strict future group.
+                    continue
+    now = utc_now()
+    frozen_fixture_ids = {
+        fixture_id for fixture_id, kickoff in kickoffs.items() if kickoff <= now
+    }
+    frozen = [quote for quote in eligible if int(quote["fixture_id"]) in frozen_fixture_ids]
+    future = [quote for quote in eligible if int(quote["fixture_id"]) not in frozen_fixture_ids]
+    return future, frozen
+
+
 def record_document(connection, document: Dict[str, Any]) -> Dict[str, int]:
     from psycopg2.extras import Json
 
@@ -205,19 +239,26 @@ def record_spool(
         try:
             document = load_document(claimed)
             observed = validate_document(document)
-            eligible = current_customer_quotes(sqlite_db, observed, league_ids)
-            canonical_document = {**document, "quotes": eligible}
+            future, frozen = partition_customer_quotes(sqlite_db, observed, league_ids)
             with psycopg2.connect(database_url, connect_timeout=10) as connection:
-                result = record_document(connection, canonical_document)
-            if result["matched"] != result["supplied"]:
-                raise RuntimeError(
-                    "canonical quote verification incomplete: "
-                    f"matched {result['matched']} of {result['supplied']}"
-                )
+                result = {"supplied": 0, "matched": 0, "written": 0}
+                if future:
+                    future_result = record_document(connection, {**document, "quotes": future})
+                    if future_result["matched"] != future_result["supplied"]:
+                        raise RuntimeError(
+                            "future canonical quote verification incomplete: "
+                            f"matched {future_result['matched']} of {future_result['supplied']}"
+                        )
+                    for key in result:
+                        result[key] += future_result[key]
+                if frozen:
+                    frozen_result = record_document(connection, {**document, "quotes": frozen})
+                    for key in result:
+                        result[key] += frozen_result[key]
             os.replace(claimed, processed / path.name)
             totals["files"] += 1
             totals["observed"] += len(observed)
-            totals["superseded"] += len(observed) - len(eligible)
+            totals["superseded"] += len(observed) - len(future) - result["matched"]
             for key in ("supplied", "matched", "written"):
                 totals[key] += result[key]
         except Exception:

@@ -30,9 +30,8 @@ class OddsQuoteVerificationDeliveryTests(unittest.TestCase):
                     line numeric, price_decimal numeric, last_updated_at text
                 );
             """)
-            connection.execute(
-                "insert into fixtures values (19728194, 8, '2026-10-25T12:00:00Z')"
-            )
+            kickoff = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+            connection.execute("insert into fixtures values (19728194, 8, ?)", (kickoff,))
             connection.execute(
                 "insert into odds_outcomes values (19728194,2,'moneyline','home','team',51,null,?,?)",
                 (price, "2026-10-18T10:00:00Z"),
@@ -131,6 +130,33 @@ class OddsQuoteVerificationDeliveryTests(unittest.TestCase):
 
             self.assertTrue(evidence.exists())
             self.assertFalse((Path(directory) / "processed" / evidence.name).exists())
+
+    def test_started_fixture_unmatched_frozen_quote_is_superseded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sqlite_db = self.sqlite_database(directory)
+            with sqlite3.connect(sqlite_db) as connection:
+                connection.execute(
+                    "update fixtures set starting_at = ? where id = 19728194",
+                    ((datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),),
+                )
+            pending = Path(directory) / "pending"
+            pending.mkdir()
+            evidence = pending / "p1.json"
+            evidence.write_text(json.dumps(self.document()))
+
+            cursor = MagicMock()
+            cursor.__enter__.return_value = cursor
+            cursor.fetchone.return_value = (1, 0, 0)
+            connection = MagicMock()
+            connection.__enter__.return_value = connection
+            connection.cursor.return_value = cursor
+
+            with patch("psycopg2.connect", return_value=connection):
+                result = record_spool(Path(directory), "postgresql://test", sqlite_db, [8])
+
+            self.assertEqual(result["superseded"], 1)
+            self.assertFalse(evidence.exists())
+            self.assertTrue((Path(directory) / "processed" / evidence.name).exists())
 
 
 if __name__ == "__main__":
