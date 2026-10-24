@@ -131,6 +131,27 @@ class OddsQuoteVerificationDeliveryTests(unittest.TestCase):
             self.assertTrue(evidence.exists())
             self.assertFalse((Path(directory) / "processed" / evidence.name).exists())
 
+    def test_complete_future_match_is_not_counted_as_superseded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sqlite_db = self.sqlite_database(directory)
+            pending = Path(directory) / "pending"
+            pending.mkdir()
+            evidence = pending / "p1.json"
+            evidence.write_text(json.dumps(self.document()))
+
+            cursor = MagicMock()
+            cursor.__enter__.return_value = cursor
+            cursor.fetchone.return_value = (1, 1, 1)
+            connection = MagicMock()
+            connection.__enter__.return_value = connection
+            connection.cursor.return_value = cursor
+
+            with patch("psycopg2.connect", return_value=connection):
+                result = record_spool(Path(directory), "postgresql://test", sqlite_db, [8])
+
+            self.assertEqual(result["matched"], 1)
+            self.assertEqual(result["superseded"], 0)
+
     def test_started_fixture_unmatched_frozen_quote_is_superseded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             sqlite_db = self.sqlite_database(directory)

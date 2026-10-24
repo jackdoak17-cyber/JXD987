@@ -240,6 +240,7 @@ def record_spool(
             document = load_document(claimed)
             observed = validate_document(document)
             future, frozen = partition_customer_quotes(sqlite_db, observed, league_ids)
+            frozen_matched = 0
             with psycopg2.connect(database_url, connect_timeout=10) as connection:
                 result = {"supplied": 0, "matched": 0, "written": 0}
                 if future:
@@ -253,12 +254,13 @@ def record_spool(
                         result[key] += future_result[key]
                 if frozen:
                     frozen_result = record_document(connection, {**document, "quotes": frozen})
+                    frozen_matched = frozen_result["matched"]
                     for key in result:
                         result[key] += frozen_result[key]
             os.replace(claimed, processed / path.name)
             totals["files"] += 1
             totals["observed"] += len(observed)
-            totals["superseded"] += len(observed) - len(future) - result["matched"]
+            totals["superseded"] += len(observed) - len(future) - frozen_matched
             for key in ("supplied", "matched", "written"):
                 totals[key] += result[key]
         except Exception:
