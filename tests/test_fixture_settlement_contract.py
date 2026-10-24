@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -21,8 +22,12 @@ class FixtureSettlementContractTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.assertIn("--completed-hours-back", result.stdout)
-        self.assertIn("--report-json", result.stdout)
+        # Rich/Typer colourises option names using ANSI SGR sequences. GitHub
+        # Actions captures those escapes, so raw substring checks can fail
+        # even though the CLI offers both required options.
+        help_text = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        self.assertIn("--completed-hours-back", help_text)
+        self.assertIn("--report-json", help_text)
 
     def test_settlement_wrapper_is_shell_valid_and_marks_delivery_dirty(self) -> None:
         wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
