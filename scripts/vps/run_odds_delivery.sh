@@ -9,11 +9,12 @@ verify_runtime_manifest_or_exit "${ODDS_DELIVERY_RUNTIME}/scripts/vps/run_odds_p
 require_runtime_manifest_entries_or_exit "$0" "scripts/export_odds_to_supabase_psql.py"
 require_runtime_manifest_entries_or_exit "$0" "scripts/reconcile_fixture_delivery_odds.py"
 require_runtime_manifest_entries_or_exit "$0" "scripts/odds_quote_verification.py"
+require_runtime_manifest_entries_or_exit "$0" "scripts/validate_odds_delivery_source.py"
 export REPO_ROOT
 export ODDS_LEAGUES="$(odds_league_csv)"
 if [[ "${ODDS_DELIVERY_VERIFY_ONLY:-false}" == "true" ]]; then
   cd "${REPO_ROOT}"
-  for required_path in .env .venv/bin/activate data/jxd.sqlite; do
+  for required_path in .env .venv/bin/activate; do
     if [[ ! -e "${required_path}" ]]; then
       log_error "odds delivery startup dependency missing: ${REPO_ROOT}/${required_path}"
       exit 1
@@ -31,11 +32,20 @@ for path in (
     Path("scripts/export_odds_to_supabase_psql.py"),
     Path("scripts/reconcile_fixture_delivery_odds.py"),
     Path("scripts/odds_quote_verification.py"),
+    Path("scripts/validate_odds_delivery_source.py"),
 ):
     ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
 
 import reconcile_fixture_delivery_odds  # noqa: F401, E402
 PY
+  DELIVERY_DB_PATH="${ODDS_DELIVERY_DB_PATH:-${JXD_DB_PATH:-}}"
+  if [[ -z "${DELIVERY_DB_PATH}" || "${DELIVERY_DB_PATH}" != /* ]]; then
+    log_error "odds delivery requires an explicit absolute ODDS_DELIVERY_DB_PATH"
+    exit 1
+  fi
+  export JXD_DB_PATH="${DELIVERY_DB_PATH}"
+  python scripts/validate_odds_delivery_source.py \
+    --db "${JXD_DB_PATH}" --leagues "${ODDS_LEAGUES}" --days-forward 14
   log_info "odds delivery startup verified runtime=${REPO_ROOT} exporter=scripts/export_odds_to_supabase_psql.py reconciler=scripts/reconcile_fixture_delivery_odds.py"
   exit 0
 fi
@@ -52,6 +62,14 @@ export ODDS_LOCK_TIMEOUT=15000
 export ODDS_STATEMENT_TIMEOUT=180000
 export ODDS_IDLE_TX_TIMEOUT=180000
 export ODDS_USE_ADVISORY_LOCK=true
+DELIVERY_DB_PATH="${ODDS_DELIVERY_DB_PATH:-${JXD_DB_PATH:-}}"
+if [[ -z "${DELIVERY_DB_PATH}" || "${DELIVERY_DB_PATH}" != /* ]]; then
+  echo "odds delivery requires an explicit absolute ODDS_DELIVERY_DB_PATH" >&2
+  exit 1
+fi
+export JXD_DB_PATH="${DELIVERY_DB_PATH}"
+python scripts/validate_odds_delivery_source.py \
+  --db "${JXD_DB_PATH}" --leagues "${ODDS_LEAGUES}" --days-forward 14
 # Do not perform retention or fill from unrelated fixture leagues in this job.
 python "${ODDS_DELIVERY_EXPORTER:-scripts/export_odds_to_supabase_psql.py}" \
   --leagues "${ODDS_LEAGUES}" --days-back 0 --days-forward 14 \
@@ -69,7 +87,8 @@ python scripts/reconcile_fixture_delivery_odds.py \
 # customer price. The file remains pending and the website fails closed to an
 # unverified label until a later retry succeeds.
 python scripts/odds_quote_verification.py record \
-  --spool-dir "${ODDS_QUOTE_VERIFICATION_SPOOL_DIR:-/var/lib/odds-sync/quote-verifications}"
+  --spool-dir "${ODDS_QUOTE_VERIFICATION_SPOOL_DIR:-/var/lib/odds-sync/quote-verifications}" \
+  --sqlite-db "${JXD_DB_PATH}" --leagues "${ODDS_LEAGUES}"
 CHAIN
 )
 run_recorded_pipeline_job "run_odds_delivery" "Website odds delivery" \

@@ -2,15 +2,43 @@ from __future__ import annotations
 
 import gzip
 import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
-from scripts.odds_quote_verification import load_document, record_spool, validate_document
+from scripts.odds_quote_verification import (
+    current_customer_quotes,
+    load_document,
+    record_spool,
+    validate_document,
+)
 
 
 class OddsQuoteVerificationDeliveryTests(unittest.TestCase):
+    @staticmethod
+    def sqlite_database(directory: str, *, price: float = 5.0) -> Path:
+        path = Path(directory) / "jxd.sqlite"
+        with sqlite3.connect(path) as connection:
+            connection.executescript("""
+                create table fixtures (id integer primary key, league_id integer, starting_at text);
+                create table odds_outcomes (
+                    fixture_id integer, bookmaker_id integer, market_key text,
+                    selection_key text, participant_type text, participant_id integer,
+                    line numeric, price_decimal numeric, last_updated_at text
+                );
+            """)
+            connection.execute(
+                "insert into fixtures values (19728194, 8, '2026-10-25T12:00:00Z')"
+            )
+            connection.execute(
+                "insert into odds_outcomes values (19728194,2,'moneyline','home','team',51,null,?,?)",
+                (price, "2026-10-18T10:00:00Z"),
+            )
+        return path
+
     @staticmethod
     def document() -> dict:
         return {
@@ -53,6 +81,7 @@ class OddsQuoteVerificationDeliveryTests(unittest.TestCase):
         import os
 
         with tempfile.TemporaryDirectory() as directory:
+            sqlite_db = self.sqlite_database(directory)
             pending = Path(directory) / "pending"
             pending.mkdir()
             claimed = pending / ".p1.json.gz.processing-old-host-1"
@@ -62,9 +91,46 @@ class OddsQuoteVerificationDeliveryTests(unittest.TestCase):
             os.utime(claimed, (old, old))
             with patch("psycopg2.connect", side_effect=RuntimeError("database unavailable")):
                 with self.assertRaisesRegex(RuntimeError, "database unavailable"):
-                    record_spool(Path(directory), "postgresql://invalid")
+                    record_spool(Path(directory), "postgresql://invalid", sqlite_db, [8])
 
             self.assertTrue((pending / "p1.json.gz").exists())
+
+    def test_only_current_local_quote_is_eligible_for_acknowledgement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sqlite_db = self.sqlite_database(directory)
+            current = self.document()["quotes"][0]
+            stale = {**current, "price_decimal": 4.5}
+
+            self.assertEqual(current_customer_quotes(sqlite_db, [current, stale], [8]), [current])
+
+    def test_wrong_league_quote_is_not_eligible(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sqlite_db = self.sqlite_database(directory)
+            quote = self.document()["quotes"][0]
+
+            self.assertEqual(current_customer_quotes(sqlite_db, [quote], [9]), [])
+
+    def test_partial_database_match_keeps_evidence_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            sqlite_db = self.sqlite_database(directory)
+            pending = Path(directory) / "pending"
+            pending.mkdir()
+            evidence = pending / "p1.json"
+            evidence.write_text(json.dumps(self.document()))
+
+            cursor = MagicMock()
+            cursor.__enter__.return_value = cursor
+            cursor.fetchone.return_value = (1, 0, 0)
+            connection = MagicMock()
+            connection.__enter__.return_value = connection
+            connection.cursor.return_value = cursor
+
+            with patch("psycopg2.connect", return_value=connection):
+                with self.assertRaisesRegex(RuntimeError, "matched 0 of 1"):
+                    record_spool(Path(directory), "postgresql://test", sqlite_db, [8])
+
+            self.assertTrue(evidence.exists())
+            self.assertFalse((Path(directory) / "processed" / evidence.name).exists())
 
 
 if __name__ == "__main__":
