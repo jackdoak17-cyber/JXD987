@@ -12,6 +12,7 @@ jxd/sportmonks_client.py
 jxd/sync.py
 scripts/export_odds_to_supabase_psql.py
 scripts/odds_quote_verification.py
+scripts/validate_odds_delivery_source.py
 scripts/reconcile_fixture_delivery_odds.py
 scripts/export_to_supabase.py
 scripts/fixture_detail_export_policy.py

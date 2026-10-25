@@ -10,10 +10,15 @@ TARGET_HOST="${1:-${VPS_HOST:-}}"
 TARGET_REPO_ROOT="${2:-${VPS_REPO_ROOT:-}}"
 TARGET_USER="${VPS_USER:-root}"
 SSH_KEY="${VPS_SSH_KEY:-}"
+TARGET_ODDS_DELIVERY_DB_PATH="${ODDS_DELIVERY_DB_PATH:-}"
 
 if [[ -z "${TARGET_HOST}" || -z "${TARGET_REPO_ROOT}" ]]; then
   echo "Usage: $(basename "$0") <host> <remote_repo_root>" >&2
   echo "Or set VPS_HOST and VPS_REPO_ROOT (plus VPS_USER / VPS_SSH_KEY)." >&2
+  exit 1
+fi
+if [[ -z "${TARGET_ODDS_DELIVERY_DB_PATH}" || "${TARGET_ODDS_DELIVERY_DB_PATH}" != /* ]]; then
+  echo "ODDS_DELIVERY_DB_PATH must name the absolute shared matcher SQLite database" >&2
   exit 1
 fi
 
@@ -78,5 +83,6 @@ done < "${RUNTIME_FILE_LIST}"
 )
 
 "${ssh_cmd[@]}" "cd '${TARGET_REPO_ROOT}' && shasum -c scripts/vps/runtime_manifest.sha1 && grep -Fqx -- 'scripts/refresh_fixture_delivery.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_p3.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_postmatch_settlement.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_fixture_delivery_publisher.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/fixture_delivery_dirty_state.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/reconcile_fixture_delivery_odds.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_odds_delivery.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/reconcile_stats_provider_queue.py' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1) && grep -Fqx -- 'scripts/vps/run_stats_reconciliation.sh' < <(awk '{print \$2}' scripts/vps/runtime_manifest.sha1)"
-"${ssh_cmd[@]}" "cd '${TARGET_REPO_ROOT}' && ODDS_DELIVERY_VERIFY_ONLY=true /bin/bash scripts/vps/run_odds_delivery.sh"
+printf -v quoted_delivery_db '%q' "${TARGET_ODDS_DELIVERY_DB_PATH}"
+"${ssh_cmd[@]}" "cd '${TARGET_REPO_ROOT}' && ODDS_DELIVERY_VERIFY_ONLY=true ODDS_DELIVERY_DB_PATH=${quoted_delivery_db} /bin/bash scripts/vps/run_odds_delivery.sh"
 echo "Runtime deployed and verified on ${TARGET_USER}@${TARGET_HOST}:${TARGET_REPO_ROOT}"
