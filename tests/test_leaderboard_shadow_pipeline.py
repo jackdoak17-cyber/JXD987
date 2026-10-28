@@ -1,10 +1,19 @@
 import os
+import json
 from pathlib import Path
 
 import pytest
 
+import scripts.leaderboard_shadow_worker as worker_module
 from scripts.leaderboard_shadow_capture import capture_fixture_ids
-from scripts.leaderboard_shadow_worker import DirtyClaim, process_dirty_claim
+from scripts.leaderboard_shadow_worker import (
+    MAX_FIXTURES_PER_RUN,
+    MAX_SECONDS_PER_RUN,
+    DirtyClaim,
+    RunBudget,
+    load_external_resource_evidence,
+    process_dirty_claim,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -100,3 +109,64 @@ def test_worker_and_capture_hooks_are_pinned_in_the_vps_runtime_manifest():
     wrapper = (ROOT / "scripts/vps/run_leaderboard_shadow_worker.sh").read_text()
     assert "verify_runtime_manifest_or_exit" in wrapper
     assert "require_runtime_manifest_entries_or_exit" in wrapper
+    assert "--fixture-limit 250" in wrapper
+    assert "--max-seconds 30" in wrapper
+    assert "--isolated-test-override" not in wrapper
+
+
+def test_run_budget_rejects_unbounded_fixture_and_time_limits():
+    assert RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN).available()
+    with pytest.raises(ValueError, match="fixture limit"):
+        RunBudget.create(MAX_FIXTURES_PER_RUN + 1, MAX_SECONDS_PER_RUN)
+    with pytest.raises(ValueError, match="max seconds"):
+        RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN + 0.01)
+
+
+def test_run_budget_stops_at_250_fixture_operations():
+    budget = RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN)
+    for _ in range(MAX_FIXTURES_PER_RUN):
+        assert budget.available()
+        budget.consume()
+    assert budget.processed == 250
+    assert not budget.available()
+
+
+def test_run_budget_stops_when_30_second_deadline_is_reached(monkeypatch):
+    clock = iter([100.0, 129.9, 130.0])
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(clock))
+    budget = RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN)
+    assert budget.available()
+    assert not budget.available()
+
+
+def test_external_resource_evidence_is_exact_and_protected(tmp_path):
+    path = tmp_path / "resource.json"
+    path.write_text(json.dumps({
+        "disk_available_bytes": 30 * 1024**3,
+        "source_ingestion_baseline_p95_ms": 10,
+        "source_ingestion_current_p95_ms": 10.5,
+        "observed_at": "2026-10-28T18:00:00Z",
+    }))
+    path.chmod(0o600)
+    cursor = FakeCursor()
+    evidence = load_external_resource_evidence(FakeConnection(cursor), str(path))
+    assert evidence["disk_available_bytes"] == 30 * 1024**3
+    assert "set_external_resource_evidence" in cursor.executed[0][0]
+
+    path.chmod(0o622)
+    with pytest.raises(RuntimeError, match="non-group/world-writable"):
+        load_external_resource_evidence(FakeConnection(FakeCursor()), str(path))
+
+
+def test_external_resource_evidence_rejects_unknown_fields(tmp_path):
+    path = tmp_path / "resource.json"
+    path.write_text(json.dumps({
+        "disk_available_bytes": 30 * 1024**3,
+        "source_ingestion_baseline_p95_ms": 10,
+        "source_ingestion_current_p95_ms": 10.5,
+        "observed_at": "2026-10-28T18:00:00Z",
+        "unreviewed_override": True,
+    }))
+    path.chmod(0o600)
+    with pytest.raises(RuntimeError, match="unexpected or missing"):
+        load_external_resource_evidence(FakeConnection(FakeCursor()), str(path))

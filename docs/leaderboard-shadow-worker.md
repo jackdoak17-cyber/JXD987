@@ -15,8 +15,29 @@ The integration is inert unless all separately approved controls are enabled:
 
 `run_leaderboard_shadow_worker.sh` uses a non-blocking host lock and a protected
 environment file. It is intended for a one-minute schedule after production
-authorization. The default batch processes at most 1,000 dirty fixtures, eight
-cohorts and 1,000 generation jobs per run.
+authorization. A run processes at most 250 combined capture/publication fixture
+operations or 30 seconds, whichever is reached first. The remaining time is
+also applied as the PostgreSQL statement timeout and lock waits remain capped
+at two seconds. Unfinished queue and generation work is retained for the next
+scheduled run.
+
+Every run enforces the approved resource guard before work and before
+publication. PostgreSQL measures the shadow footprint, index ratio, WAL and
+temporary writes. Platform disk headroom and source-ingestion p95 are external
+operational measurements and must be refreshed in `pipeline_state` within 15
+minutes. Before each production run the worker reads the exact four-field JSON
+document at `LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE` (default
+`/var/lib/oddssearch/leaderboard-shadow-resource.json`). The file must be a
+regular file and cannot be group/world writable. Its producer owns the
+authoritative Supabase platform-disk measurement and the independently measured
+source-ingestion baseline/current p95. The database rejects evidence older than
+five minutes; Operations fails evidence older than 15 minutes. Missing, stale
+or breached evidence pauses the pipeline and is exposed to Operations; it
+cannot be bypassed by a successful worker process.
+
+The disabled-pipeline override is restricted to a socket-only database whose
+name begins `oddssearch_m3`. It cannot be used against the production Supabase
+connection.
 
 Historical bootstrap uses `backfill-all`. Each call advances bounded batches
 for supported, searchable, non-cup league-season cohorts. The fixed fixture-ID

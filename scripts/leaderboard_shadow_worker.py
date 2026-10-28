@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import socket
+import stat
 import sys
 import time
 import uuid
@@ -23,6 +24,13 @@ from psycopg2.extras import RealDictCursor
 
 DATABASE_URL = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
 RELEASE_SHA = os.environ.get("LEADERBOARD_SHADOW_RELEASE_SHA", "development")
+MAX_FIXTURES_PER_RUN = 250
+MAX_SECONDS_PER_RUN = 30.0
+LOCK_TIMEOUT_MS = 2_000
+RESOURCE_EVIDENCE_FILE = os.environ.get(
+    "LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE",
+    "/var/lib/oddssearch/leaderboard-shadow-resource.json",
+)
 
 
 @dataclass(frozen=True)
@@ -33,6 +41,37 @@ class DirtyClaim:
     claim_fence: int
 
 
+@dataclass
+class RunBudget:
+    fixture_limit: int
+    max_seconds: float
+    started_at: float
+    processed: int = 0
+
+    @classmethod
+    def create(cls, fixture_limit: int, max_seconds: float) -> "RunBudget":
+        if not 1 <= fixture_limit <= MAX_FIXTURES_PER_RUN:
+            raise ValueError(f"fixture limit must be between 1 and {MAX_FIXTURES_PER_RUN}")
+        if not 0 < max_seconds <= MAX_SECONDS_PER_RUN:
+            raise ValueError(f"max seconds must be greater than 0 and at most {MAX_SECONDS_PER_RUN}")
+        return cls(fixture_limit, max_seconds, time.monotonic())
+
+    def remaining_seconds(self) -> float:
+        return max(0.0, self.max_seconds - (time.monotonic() - self.started_at))
+
+    def available(self) -> bool:
+        return self.processed < self.fixture_limit and self.remaining_seconds() > 0.05
+
+    def consume(self) -> None:
+        self.processed += 1
+
+    def apply_database_timeouts(self, conn) -> None:
+        remaining_ms = max(1, int(self.remaining_seconds() * 1000))
+        with conn.cursor() as cur:
+            cur.execute("select set_config('lock_timeout', %s, false)", (f"{LOCK_TIMEOUT_MS}ms",))
+            cur.execute("select set_config('statement_timeout', %s, false)", (f"{remaining_ms}ms",))
+
+
 def connect():
     if not DATABASE_URL:
         raise RuntimeError("SUPABASE_DB_URL_SESSION or SUPABASE_DB_URL is required")
@@ -41,6 +80,51 @@ def connect():
         connect_timeout=20,
         application_name=f"oddssearch-leaderboard-shadow/{RELEASE_SHA[:12]}",
     )
+
+
+def isolated_test_database(conn) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("select current_database(), inet_server_addr() is null")
+        database_name, socket_only = cur.fetchone()
+    return bool(socket_only and str(database_name).startswith("oddssearch_m3"))
+
+
+def validate_activation_override(conn, isolated_test_override: bool) -> bool:
+    if not isolated_test_override:
+        return False
+    if not isolated_test_database(conn):
+        raise RuntimeError(
+            "--isolated-test-override is restricted to socket-only oddssearch_m3* databases"
+        )
+    return True
+
+
+def load_external_resource_evidence(conn, path: str = RESOURCE_EVIDENCE_FILE) -> dict[str, Any]:
+    file_stat = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_mode & 0o022:
+        raise RuntimeError("resource evidence must be a regular, non-group/world-writable file")
+    with open(path, encoding="utf-8") as evidence_file:
+        evidence = json.load(evidence_file)
+    required = {
+        "disk_available_bytes",
+        "source_ingestion_baseline_p95_ms",
+        "source_ingestion_current_p95_ms",
+        "observed_at",
+    }
+    if set(evidence) != required:
+        raise RuntimeError("resource evidence has unexpected or missing fields")
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select leaderboard_shadow_v1.set_external_resource_evidence(%s,%s,%s,%s)",
+                (
+                    int(evidence["disk_available_bytes"]),
+                    float(evidence["source_ingestion_baseline_p95_ms"]),
+                    float(evidence["source_ingestion_current_p95_ms"]),
+                    str(evidence["observed_at"]),
+                ),
+            )
+    return evidence
 
 
 def require_worker_enabled(conn, allow_disabled: bool) -> None:
@@ -63,6 +147,31 @@ def require_backfill_enabled(conn, allow_disabled: bool) -> None:
         row = cur.fetchone()
     if not row or (not row[0] and not allow_disabled):
         raise RuntimeError("leaderboard shadow backfill is not enabled")
+
+
+def enforce_resource_guard(conn, require_external: bool) -> dict[str, Any]:
+    with conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "select leaderboard_shadow_v1.enforce_resource_guard(%s) as evidence",
+                (require_external,),
+            )
+            evidence = cur.fetchone()["evidence"]
+    if not evidence.get("ok"):
+        raise RuntimeError(
+            "leaderboard shadow resource guard paused processing: "
+            + ",".join(evidence.get("breaches", []))
+        )
+    return evidence
+
+
+def apply_recovery_timeouts(conn) -> None:
+    """Give lease/error cleanup a small bound after the processing deadline."""
+    conn.rollback()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute("select set_config('lock_timeout', '2000ms', false)")
+            cur.execute("select set_config('statement_timeout', '5000ms', false)")
 
 
 def start_worker_run(conn, worker_id: str) -> int:
@@ -210,20 +319,27 @@ def fail_dirty_claim(conn, claim: DirtyClaim, error: Exception) -> None:
             )
 
 
-def process_capture_queue(conn, worker_id: str, limit: int) -> dict[str, int]:
+def process_capture_queue(
+    conn, worker_id: str, limit: int, budget: RunBudget, require_external: bool,
+) -> dict[str, int]:
     result = {"claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0}
-    for _ in range(limit):
+    for _ in range(min(limit, budget.fixture_limit - budget.processed)):
+        if not budget.available():
+            break
+        budget.apply_database_timeouts(conn)
+        enforce_resource_guard(conn, require_external)
         claim = claim_dirty(conn, worker_id)
         if claim is None:
             break
         result["claimed"] += 1
+        budget.consume()
         try:
             if process_dirty_claim(conn, claim):
                 result["acknowledged"] += 1
             else:
                 result["redirtied"] += 1
         except Exception as error:
-            conn.rollback()
+            apply_recovery_timeouts(conn)
             fail_dirty_claim(conn, claim, error)
             result["failed"] += 1
     return result
@@ -308,7 +424,7 @@ def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
                 staged = cur.fetchone()
                 return bool(next(iter(staged.values())))
     except Exception as error:
-        conn.rollback()
+        apply_recovery_timeouts(conn)
         conn.set_session(isolation_level="READ COMMITTED")
         with conn:
             with conn.cursor() as cur:
@@ -352,17 +468,33 @@ def finish_generation(conn, generation_id: int) -> bool:
             return bool(cur.fetchone()[0])
 
 
-def process_generations(conn, worker_id: str, cohort_limit: int, job_limit: int) -> dict[str, int]:
+def process_generations(
+    conn, worker_id: str, cohort_limit: int, job_limit: int,
+    budget: RunBudget, require_external: bool,
+) -> dict[str, int]:
     result = {"cohorts": 0, "jobs": 0, "published": 0}
     for league_id, season_id in pending_cohorts(conn, cohort_limit):
+        if not budget.available():
+            break
+        budget.apply_database_timeouts(conn)
+        enforce_resource_guard(conn, require_external)
         generation_id = ensure_generation(conn, league_id, season_id)
         if generation_id is None:
             continue
         result["cohorts"] += 1
         for _ in range(job_limit):
+            if not budget.available():
+                break
+            budget.apply_database_timeouts(conn)
+            enforce_resource_guard(conn, require_external)
             if not process_generation_job(conn, generation_id, worker_id):
                 break
             result["jobs"] += 1
+            budget.consume()
+        if not budget.available():
+            break
+        budget.apply_database_timeouts(conn)
+        enforce_resource_guard(conn, require_external)
         if finish_generation(conn, generation_id):
             result["published"] += 1
     return result
@@ -494,10 +626,12 @@ def status(conn) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("run-once", "backfill", "backfill-all", "status"))
-    parser.add_argument("--allow-disabled", action="store_true")
-    parser.add_argument("--capture-limit", type=int, default=1000)
+    parser.add_argument("--isolated-test-override", action="store_true")
+    parser.add_argument("--fixture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
+    parser.add_argument("--max-seconds", type=float, default=MAX_SECONDS_PER_RUN)
+    parser.add_argument("--capture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
     parser.add_argument("--cohort-limit", type=int, default=8)
-    parser.add_argument("--job-limit", type=int, default=1000)
+    parser.add_argument("--job-limit", type=int, default=MAX_FIXTURES_PER_RUN)
     parser.add_argument("--league-id", type=int)
     parser.add_argument("--season-id", type=int)
     parser.add_argument("--batch-size", type=int, default=250)
@@ -509,34 +643,54 @@ def main() -> int:
         if args.command == "status":
             print(json.dumps(status(conn), default=str, sort_keys=True))
             return 0
-        require_worker_enabled(conn, args.allow_disabled)
+        budget = RunBudget.create(args.fixture_limit, args.max_seconds)
+        allow_disabled = validate_activation_override(conn, args.isolated_test_override)
+        require_worker_enabled(conn, allow_disabled)
+        require_external = not allow_disabled
+        if require_external:
+            load_external_resource_evidence(conn)
+        budget.apply_database_timeouts(conn)
+        resource_evidence = enforce_resource_guard(conn, require_external)
         if args.command in {"backfill", "backfill-all"}:
-            require_backfill_enabled(conn, args.allow_disabled)
+            require_backfill_enabled(conn, allow_disabled)
             if args.command == "backfill":
                 if args.league_id is None or args.season_id is None:
                     parser.error("backfill requires --league-id and --season-id")
                 cohorts = [(args.league_id, args.season_id)]
             else:
                 cohorts = backfill_cohorts(conn, args.cohort_limit)
-            counts = [
-                {
+            counts = []
+            for league_id, season_id in cohorts:
+                if not budget.available():
+                    break
+                budget.apply_database_timeouts(conn)
+                enforce_resource_guard(conn, require_external)
+                batch_size = min(args.batch_size, budget.fixture_limit - budget.processed)
+                enqueued = enqueue_backfill(conn, league_id, season_id, batch_size)
+                budget.processed += enqueued
+                counts.append({
                     "league_id": league_id,
                     "season_id": season_id,
-                    "enqueued": enqueue_backfill(
-                        conn, league_id, season_id, args.batch_size,
-                    ),
-                }
-                for league_id, season_id in cohorts
-            ]
-            print(json.dumps({"cohorts": counts, "enqueued": sum(row["enqueued"] for row in counts)}))
+                    "enqueued": enqueued,
+                })
+            print(json.dumps({
+                "cohorts": counts,
+                "enqueued": sum(row["enqueued"] for row in counts),
+                "processed_fixtures": budget.processed,
+                "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
+                "resource_guard": resource_evidence,
+            }, default=str))
             return 0
 
-        started = time.monotonic()
         run_id = start_worker_run(conn, worker_id)
         try:
             eligibility_count = refresh_eligibility_if_due(conn)
-            capture = process_capture_queue(conn, worker_id, args.capture_limit)
-            generations = process_generations(conn, worker_id, args.cohort_limit, args.job_limit)
+            capture = process_capture_queue(
+                conn, worker_id, args.capture_limit, budget, require_external,
+            )
+            generations = process_generations(
+                conn, worker_id, args.cohort_limit, args.job_limit, budget, require_external,
+            )
             claimed = capture["claimed"] + generations["jobs"]
             succeeded = capture["acknowledged"] + generations["jobs"]
             failed = capture["failed"]
@@ -546,10 +700,13 @@ def main() -> int:
                 "eligibility_count": eligibility_count,
                 "generations": generations,
                 "run_id": run_id,
-                "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
+                "processed_fixtures": budget.processed,
+                "budget_exhausted": not budget.available(),
+                "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
+                "resource_guard": resource_evidence,
             }, sort_keys=True))
         except Exception as error:
-            conn.rollback()
+            apply_recovery_timeouts(conn)
             finish_worker_run(conn, run_id, 0, 0, 1, str(error)[:2000])
             raise
     finally:

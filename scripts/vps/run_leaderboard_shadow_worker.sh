@@ -26,4 +26,6 @@ source "$ENV_FILE"
 set +a
 
 export LEADERBOARD_SHADOW_RELEASE_SHA="${LEADERBOARD_SHADOW_RELEASE_SHA:-$(git -C "$ROOT" rev-parse HEAD)}"
-exec python3 "$ROOT/scripts/leaderboard_shadow_worker.py" run-once
+exec python3 "$ROOT/scripts/leaderboard_shadow_worker.py" run-once \
+  --fixture-limit 250 --max-seconds 30 \
+  --capture-limit 250 --job-limit 250
