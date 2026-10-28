@@ -20,6 +20,9 @@ scripts/refresh_fixture_delivery.py
 scripts/fixture_delivery_dirty_state.py
 scripts/verify_fixture_delivery_parity.py
 scripts/postmatch_fixture_detail_delivery.py
+scripts/leaderboard_shadow_capture.py
+scripts/leaderboard_shadow_worker.py
+scripts/vps/run_leaderboard_shadow_worker.sh
 scripts/reconcile_stats_provider_queue.py
 scripts/vps/run_stats_reconciliation.sh
 scripts/odds_retention_psql.py
