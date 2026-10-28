@@ -131,6 +131,16 @@ def test_run_budget_stops_at_250_fixture_operations():
     assert not budget.available()
 
 
+def test_database_budget_applies_worker_local_temp_file_limit():
+    cursor = FakeCursor()
+    RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN).apply_database_timeouts(
+        FakeConnection(cursor)
+    )
+    statements = "\n".join(statement for statement, _ in cursor.executed)
+    assert "temp_file_limit" in statements
+    assert "leaderboard_shadow_v1.pipeline_state" in statements
+
+
 def test_run_budget_stops_when_30_second_deadline_is_reached(monkeypatch):
     clock = iter([100.0, 129.9, 130.0])
     monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(clock))

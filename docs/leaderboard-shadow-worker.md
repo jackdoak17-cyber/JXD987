@@ -22,10 +22,18 @@ at two seconds. Unfinished queue and generation work is retained for the next
 scheduled run.
 
 Every run enforces the approved resource guard before work and before
-publication. PostgreSQL measures the shadow footprint, index ratio, WAL and
-temporary writes. Platform disk headroom and source-ingestion p95 are external
-operational measurements and must be refreshed in `pipeline_state` within 15
-minutes. Before each production run the worker reads the exact four-field JSON
+publication. PostgreSQL measures the shadow footprint and index ratio directly.
+WAL and temporary writes are attributed from `pg_stat_statements` only for SQL
+that targets the shadow schema; capture-trigger events receive a conservative
+transactional WAL allowance. A reset, eviction or regression of a pinned
+Milestone 3 query's evidence stops processing, while unrelated statement churn
+does not. The worker additionally sets `temp_file_limit` from
+the database's approved maximum, making temporary-file enforcement local to
+its own session rather than charging unrelated database traffic.
+
+Platform disk headroom and source-ingestion p95 are external operational
+measurements and must be refreshed in `pipeline_state` within 15 minutes.
+Before each production run the worker reads the exact four-field JSON
 document at `LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE` (default
 `/var/lib/oddssearch/leaderboard-shadow-resource.json`). The file must be a
 regular file and cannot be group/world writable. Its producer owns the

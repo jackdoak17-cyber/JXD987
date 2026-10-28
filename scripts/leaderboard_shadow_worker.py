@@ -70,6 +70,16 @@ class RunBudget:
         with conn.cursor() as cur:
             cur.execute("select set_config('lock_timeout', %s, false)", (f"{LOCK_TIMEOUT_MS}ms",))
             cur.execute("select set_config('statement_timeout', %s, false)", (f"{remaining_ms}ms",))
+            cur.execute(
+                """
+                select set_config(
+                  'temp_file_limit',
+                  greatest(0, floor(max_temp_bytes / 1024.0))::bigint::text || 'kB',
+                  false
+                )
+                from leaderboard_shadow_v1.pipeline_state where singleton
+                """
+            )
 
 
 def connect():
