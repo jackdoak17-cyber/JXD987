@@ -39,6 +39,9 @@ required_runtime_entries=(
   "scripts/vps/run_fixture_delivery_publisher.sh"
   "scripts/reconcile_stats_provider_queue.py"
   "scripts/vps/run_stats_reconciliation.sh"
+  "scripts/leaderboard_shadow_capture.py"
+  "scripts/leaderboard_shadow_worker.py"
+  "scripts/vps/run_leaderboard_shadow_worker.sh"
 )
 for required_entry in "${required_runtime_entries[@]}"; do
   if [[ ! -f "${REPO_ROOT}/${required_entry}" ]]; then

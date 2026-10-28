@@ -29,6 +29,11 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 import requests
 
 try:
+    from scripts.leaderboard_shadow_capture import capture_fixture_id
+except ModuleNotFoundError:  # Direct `python scripts/export_to_supabase.py` execution.
+    from leaderboard_shadow_capture import capture_fixture_id
+
+try:
     import psycopg2
 except Exception:  # pragma: no cover - optional runtime dependency on some hosts
     psycopg2 = None
@@ -1227,6 +1232,7 @@ def atomic_fixture_detail_publish(
                 cur.execute("""update public.fixture_detail_snapshots
                                set quality_status = 'accepted', accepted_at = coalesce(accepted_at, now())
                                where id = %s and fixture_id = %s""", (snapshot_id, fixture_id))
+            capture_fixture_id(cur, fixture_id)
         target_conn.commit()
         return row[0] if row else {"fixture_id": fixture_id}
     except Exception:

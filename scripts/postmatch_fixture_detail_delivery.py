@@ -37,6 +37,10 @@ from sqlalchemy import create_engine
 
 from jxd import SportMonksClient, SyncService
 from jxd.models import FixturePlayer, FixturePlayerStatistic, FixtureStatistic
+try:
+    from scripts.leaderboard_shadow_capture import capture_fixture_id
+except ModuleNotFoundError:  # Direct script execution with repository PYTHONPATH.
+    from leaderboard_shadow_capture import capture_fixture_id
 
 
 LOG = logging.getLogger("postmatch_fixture_detail_delivery")
@@ -1366,6 +1370,7 @@ def mark_provider_unavailable(
             if assessment and assessment.fixture_status in {"POST", "POSTP", "POSTPONED"}:
                 cur.execute("update public.fixtures set status = %s, status_code = %s, home_score = null, away_score = null where id = %s",
                             (assessment.fixture_status, assessment.fixture_status, fixture_id))
+            capture_fixture_id(cur, fixture_id)
         target.commit()
     except Exception:
         target.rollback()
@@ -1404,6 +1409,7 @@ def clear_provider_unavailable_exclusion(
                 "delete from public.fixture_stats_quality_exclusions where fixture_id = %s and exclusion_type = 'provider_unavailable'",
                 (fixture_id,),
             )
+            capture_fixture_id(cur, fixture_id)
         target.commit()
     except Exception:
         target.rollback()
@@ -1512,6 +1518,7 @@ def activate_provider_snapshot(
                 """,
                 (snapshot_id, fixture_id),
             )
+            capture_fixture_id(cur, fixture_id)
         target.commit()
     except Exception:
         target.rollback()
@@ -1669,6 +1676,7 @@ def publish_delivery_status(
                 """,
                 values,
             )
+            capture_fixture_id(cur, fixture_id)
         target.commit()
     except Exception:
         target.rollback()
