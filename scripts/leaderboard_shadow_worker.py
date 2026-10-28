@@ -70,16 +70,34 @@ class RunBudget:
         with conn.cursor() as cur:
             cur.execute("select set_config('lock_timeout', %s, false)", (f"{LOCK_TIMEOUT_MS}ms",))
             cur.execute("select set_config('statement_timeout', %s, false)", (f"{remaining_ms}ms",))
+
+
+def configure_temp_file_limit_if_permitted(conn) -> bool:
+    """Apply defense-in-depth only when the connected role may set the parameter.
+
+    Supabase's production postgres login owns the application objects but is not
+    a superuser and cannot set temp_file_limit. The attributed resource guard,
+    statement deadline and bounded run remain mandatory in either case.
+    """
+
+    with conn:
+        with conn.cursor() as cur:
             cur.execute(
-                """
-                select set_config(
-                  'temp_file_limit',
-                  greatest(0, floor(max_temp_bytes / 1024.0))::bigint::text || 'kB',
-                  false
-                )
-                from leaderboard_shadow_v1.pipeline_state where singleton
-                """
+                "select has_parameter_privilege(current_user, 'temp_file_limit', 'SET')"
             )
+            permitted = bool(cur.fetchone()[0])
+            if permitted:
+                cur.execute(
+                    """
+                    select set_config(
+                      'temp_file_limit',
+                      greatest(0, floor(max_temp_bytes / 1024.0))::bigint::text || 'kB',
+                      false
+                    )
+                    from leaderboard_shadow_v1.pipeline_state where singleton
+                    """
+                )
+    return permitted
 
 
 def connect():
@@ -659,6 +677,7 @@ def main() -> int:
         require_external = not allow_disabled
         if require_external:
             load_external_resource_evidence(conn)
+        temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
         budget.apply_database_timeouts(conn)
         resource_evidence = enforce_resource_guard(conn, require_external)
         if args.command in {"backfill", "backfill-all"}:
@@ -688,6 +707,7 @@ def main() -> int:
                 "enqueued": sum(row["enqueued"] for row in counts),
                 "processed_fixtures": budget.processed,
                 "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
+                "temp_file_limit_enforced": temp_file_limit_enforced,
                 "resource_guard": resource_evidence,
             }, default=str))
             return 0
@@ -713,6 +733,7 @@ def main() -> int:
                 "processed_fixtures": budget.processed,
                 "budget_exhausted": not budget.available(),
                 "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
+                "temp_file_limit_enforced": temp_file_limit_enforced,
                 "resource_guard": resource_evidence,
             }, sort_keys=True))
         except Exception as error:

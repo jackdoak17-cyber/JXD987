@@ -11,6 +11,7 @@ from scripts.leaderboard_shadow_worker import (
     MAX_SECONDS_PER_RUN,
     DirtyClaim,
     RunBudget,
+    configure_temp_file_limit_if_permitted,
     load_external_resource_evidence,
     process_dirty_claim,
 )
@@ -131,14 +132,24 @@ def test_run_budget_stops_at_250_fixture_operations():
     assert not budget.available()
 
 
-def test_database_budget_applies_worker_local_temp_file_limit():
-    cursor = FakeCursor()
-    RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN).apply_database_timeouts(
-        FakeConnection(cursor)
-    )
-    statements = "\n".join(statement for statement, _ in cursor.executed)
-    assert "temp_file_limit" in statements
+def test_temp_file_limit_is_applied_only_with_parameter_privilege():
+    class CapabilityCursor(FakeCursor):
+        def __init__(self, permitted):
+            super().__init__()
+            self.permitted = permitted
+
+        def fetchone(self):
+            return (self.permitted,)
+
+    denied = CapabilityCursor(False)
+    assert configure_temp_file_limit_if_permitted(FakeConnection(denied)) is False
+    assert sum("temp_file_limit" in query for query, _ in denied.executed) == 1
+
+    permitted = CapabilityCursor(True)
+    assert configure_temp_file_limit_if_permitted(FakeConnection(permitted)) is True
+    statements = "\n".join(statement for statement, _ in permitted.executed)
     assert "leaderboard_shadow_v1.pipeline_state" in statements
+    assert sum("temp_file_limit" in query for query, _ in permitted.executed) == 2
 
 
 def test_run_budget_stops_when_30_second_deadline_is_reached(monkeypatch):
