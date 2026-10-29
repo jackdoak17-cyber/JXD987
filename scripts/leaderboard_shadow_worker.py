@@ -267,18 +267,34 @@ def refresh_eligibility_if_due(conn, max_age_seconds: int = 600) -> int:
             return int(cur.fetchone()[0])
 
 
-def claim_dirty(conn, worker_id: str, lease_seconds: int = 60) -> DirtyClaim | None:
+def claim_dirty(
+    conn,
+    worker_id: str,
+    lease_seconds: int = 60,
+    league_id: int | None = None,
+    season_id: int | None = None,
+) -> DirtyClaim | None:
     token = f"{worker_id}:{uuid.uuid4().hex}"
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
                 with candidate as (
-                  select fixture_id
-                  from leaderboard_shadow_v1.fixture_capture_queue
-                  where claim_token is null or claim_until <= clock_timestamp()
-                  order by last_dirty_at, fixture_id
-                  for update skip locked
+                  select queue.fixture_id
+                  from leaderboard_shadow_v1.fixture_capture_queue queue
+                  left join leaderboard_shadow_v1.fixture_source_versions recorded
+                    on recorded.fixture_id=queue.fixture_id
+                  left join public.fixtures current_fixture
+                    on current_fixture.id=queue.fixture_id
+                  where (queue.claim_token is null
+                         or queue.claim_until <= clock_timestamp())
+                    and (
+                      %s::bigint is null
+                      or (recorded.league_id, recorded.season_id)=(%s,%s)
+                      or (current_fixture.league_id, current_fixture.season_id)=(%s,%s)
+                    )
+                  order by queue.last_dirty_at, queue.fixture_id
+                  for update of queue skip locked
                   limit 1
                 )
                 update leaderboard_shadow_v1.fixture_capture_queue queue
@@ -292,7 +308,15 @@ def claim_dirty(conn, worker_id: str, lease_seconds: int = 60) -> DirtyClaim | N
                 returning queue.fixture_id, queue.dirty_version,
                           queue.claim_token, queue.claim_fence
                 """,
-                (token, lease_seconds),
+                (
+                    league_id,
+                    league_id,
+                    season_id,
+                    league_id,
+                    season_id,
+                    token,
+                    lease_seconds,
+                ),
             )
             row = cur.fetchone()
     return DirtyClaim(**row) if row else None
@@ -348,7 +372,13 @@ def fail_dirty_claim(conn, claim: DirtyClaim, error: Exception) -> None:
 
 
 def process_capture_queue(
-    conn, worker_id: str, limit: int, budget: RunBudget, require_external: bool,
+    conn,
+    worker_id: str,
+    limit: int,
+    budget: RunBudget,
+    require_external: bool,
+    league_id: int | None = None,
+    season_id: int | None = None,
 ) -> dict[str, int]:
     result = {"claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0}
     for _ in range(min(limit, budget.fixture_limit - budget.processed)):
@@ -356,7 +386,12 @@ def process_capture_queue(
             break
         budget.apply_database_timeouts(conn)
         enforce_resource_guard(conn, require_external)
-        claim = claim_dirty(conn, worker_id)
+        claim = claim_dirty(
+            conn,
+            worker_id,
+            league_id=league_id,
+            season_id=season_id,
+        )
         if claim is None:
             break
         result["claimed"] += 1
@@ -681,6 +716,8 @@ def main() -> int:
     parser.add_argument("--season-id", type=int)
     parser.add_argument("--batch-size", type=int, default=250)
     args = parser.parse_args()
+    if (args.league_id is None) != (args.season_id is None):
+        parser.error("league-id and season-id must be supplied together")
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
 
     conn = connect()
@@ -733,7 +770,13 @@ def main() -> int:
         try:
             eligibility_count = refresh_eligibility_if_due(conn)
             capture = process_capture_queue(
-                conn, worker_id, args.capture_limit, budget, require_external,
+                conn,
+                worker_id,
+                args.capture_limit,
+                budget,
+                require_external,
+                league_id=args.league_id,
+                season_id=args.season_id,
             )
             generations = process_generations(
                 conn, worker_id, args.cohort_limit, args.job_limit, budget, require_external,
