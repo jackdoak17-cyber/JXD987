@@ -12,6 +12,7 @@ from scripts.leaderboard_shadow_worker import (
     DirtyClaim,
     RunBudget,
     configure_temp_file_limit_if_permitted,
+    claim_dirty,
     load_external_resource_evidence,
     pending_cohorts,
     process_dirty_claim,
@@ -64,6 +65,16 @@ class CohortCursor(FakeCursor):
         return [(271, 27897)]
 
 
+class ClaimCursor(FakeCursor):
+    def fetchone(self):
+        return {
+            "fixture_id": 1001,
+            "dirty_version": 4,
+            "claim_token": "worker:token",
+            "claim_fence": 7,
+        }
+
+
 def test_capture_hook_is_inert_by_default(monkeypatch):
     monkeypatch.delenv("LEADERBOARD_SHADOW_CAPTURE_ENABLED", raising=False)
     cursor = FakeCursor()
@@ -98,6 +109,30 @@ def test_dirty_acknowledgement_is_fenced_to_claimed_version():
     assert any(query.startswith("update leaderboard_shadow_v1.fixture_capture_queue") for query, _ in redirtied.executed)
     delete_params = next(params for query, params in redirtied.executed if query.startswith("delete from"))
     assert delete_params == (1001, 4, "worker:token", 7)
+
+
+def test_dirty_claim_can_be_bounded_to_recorded_or_current_cohort():
+    cursor = ClaimCursor()
+    claim = claim_dirty(
+        FakeConnection(cursor),
+        "worker",
+        league_id=27,
+        season_id=25654,
+    )
+    assert claim == DirtyClaim(1001, 4, "worker:token", 7)
+    query, params = cursor.executed[0]
+    assert "fixture_source_versions recorded" in query
+    assert "public.fixtures current_fixture" in query
+    assert "for update of queue skip locked" in query
+    assert params[:5] == (27, 27, 25654, 27, 25654)
+
+
+def test_unscoped_dirty_claim_preserves_global_queue_ordering():
+    cursor = ClaimCursor()
+    claim_dirty(FakeConnection(cursor), "worker")
+    query, params = cursor.executed[0]
+    assert "order by queue.last_dirty_at, queue.fixture_id" in query
+    assert params[:5] == (None, None, None, None, None)
 
 
 def test_pending_cohorts_defer_both_recorded_and_current_dirty_cohorts():
