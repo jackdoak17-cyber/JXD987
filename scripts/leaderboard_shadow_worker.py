@@ -31,6 +31,11 @@ LOCK_TIMEOUT_MS = 2_000
 # transaction cleanup.  Starting another fixture with only milliseconds left
 # turns an otherwise healthy bounded run into a statement-timeout failure.
 SAFETY_CHECK_RESERVE_SECONDS = 5.0
+# The run is guarded before processing begins and publication is guarded again
+# separately.  Recheck capture resource use in small bounded groups so a hard
+# limit stops the run promptly without making the pg_stat_statements scan the
+# dominant cost of every individual fixture.
+RESOURCE_GUARD_FIXTURE_INTERVAL = 10
 RESOURCE_EVIDENCE_FILE = os.environ.get(
     "LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE",
     "/var/lib/oddssearch/leaderboard-shadow-resource.json",
@@ -391,8 +396,11 @@ def process_capture_queue(
     for _ in range(min(limit, budget.fixture_limit - budget.processed)):
         if not budget.available():
             break
-        budget.apply_database_timeouts(conn)
-        enforce_resource_guard(conn, require_external)
+        if result["claimed"] > 0 and (
+            result["claimed"] % RESOURCE_GUARD_FIXTURE_INTERVAL == 0
+        ):
+            budget.apply_database_timeouts(conn)
+            enforce_resource_guard(conn, require_external)
         claim = claim_dirty(
             conn,
             worker_id,
@@ -412,6 +420,13 @@ def process_capture_queue(
             apply_recovery_timeouts(conn)
             fail_dirty_claim(conn, claim, error)
             result["failed"] += 1
+    if (
+        result["claimed"] > 0
+        and result["claimed"] % RESOURCE_GUARD_FIXTURE_INTERVAL != 0
+        and budget.available()
+    ):
+        budget.apply_database_timeouts(conn)
+        enforce_resource_guard(conn, require_external)
     return result
 
 

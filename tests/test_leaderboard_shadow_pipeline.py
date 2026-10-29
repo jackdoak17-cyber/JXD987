@@ -9,6 +9,7 @@ from scripts.leaderboard_shadow_capture import capture_fixture_ids
 from scripts.leaderboard_shadow_worker import (
     MAX_FIXTURES_PER_RUN,
     MAX_SECONDS_PER_RUN,
+    RESOURCE_GUARD_FIXTURE_INTERVAL,
     SAFETY_CHECK_RESERVE_SECONDS,
     DirtyClaim,
     RunBudget,
@@ -17,6 +18,7 @@ from scripts.leaderboard_shadow_worker import (
     load_external_resource_evidence,
     pending_cohorts,
     process_dirty_claim,
+    process_capture_queue,
 )
 
 
@@ -134,6 +136,36 @@ def test_unscoped_dirty_claim_preserves_global_queue_ordering():
     query, params = cursor.executed[0]
     assert "order by queue.last_dirty_at, queue.fixture_id" in query
     assert params[:5] == (None, None, None, None, None)
+
+
+def test_capture_resource_guard_is_checked_in_bounded_groups(monkeypatch):
+    claims = iter([
+        DirtyClaim(fixture_id, 1, f"worker:{fixture_id}", 1)
+        for fixture_id in range(1, RESOURCE_GUARD_FIXTURE_INTERVAL * 2 + 2)
+    ] + [None])
+    guard_calls = []
+    monkeypatch.setattr(worker_module, "claim_dirty", lambda *_args, **_kwargs: next(claims))
+    monkeypatch.setattr(worker_module, "process_dirty_claim", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        worker_module,
+        "enforce_resource_guard",
+        lambda *_args, **_kwargs: guard_calls.append(True) or {"ok": True},
+    )
+    budget = RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN)
+    result = process_capture_queue(
+        FakeConnection(FakeCursor()),
+        "worker",
+        MAX_FIXTURES_PER_RUN,
+        budget,
+        True,
+    )
+    assert result == {
+        "claimed": RESOURCE_GUARD_FIXTURE_INTERVAL * 2 + 1,
+        "acknowledged": RESOURCE_GUARD_FIXTURE_INTERVAL * 2 + 1,
+        "redirtied": 0,
+        "failed": 0,
+    }
+    assert len(guard_calls) == 3
 
 
 def test_pending_cohorts_defer_both_recorded_and_current_dirty_cohorts():
