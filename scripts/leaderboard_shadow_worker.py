@@ -382,6 +382,23 @@ def pending_cohorts(conn, limit: int) -> list[tuple[int, int]]:
             left join leaderboard_shadow_v1.cohort_publications publication
               using (league_id, season_id)
             where cursor.committed_version > coalesce(publication.published_cursor, 0)
+              -- A queued fixture may invalidate an older journal event after a
+              -- snapshot-contract upgrade or a cohort transfer.  Defer both
+              -- its recorded and current cohorts until capture acknowledges
+              -- the exact dirty version; publication must never race ahead of
+              -- canonical source capture.
+              and not exists (
+                select 1
+                from leaderboard_shadow_v1.fixture_capture_queue queue
+                left join leaderboard_shadow_v1.fixture_source_versions recorded
+                  on recorded.fixture_id = queue.fixture_id
+                left join public.fixtures current_fixture
+                  on current_fixture.id = queue.fixture_id
+                where (recorded.league_id, recorded.season_id)
+                        = (cursor.league_id, cursor.season_id)
+                   or (current_fixture.league_id, current_fixture.season_id)
+                        = (cursor.league_id, cursor.season_id)
+              )
             order by cursor.updated_at, cursor.league_id, cursor.season_id
             limit %s
             """,
