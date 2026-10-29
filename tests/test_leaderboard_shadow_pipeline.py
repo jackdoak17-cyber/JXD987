@@ -9,6 +9,7 @@ from scripts.leaderboard_shadow_capture import capture_fixture_ids
 from scripts.leaderboard_shadow_worker import (
     MAX_FIXTURES_PER_RUN,
     MAX_SECONDS_PER_RUN,
+    SAFETY_CHECK_RESERVE_SECONDS,
     DirtyClaim,
     RunBudget,
     configure_temp_file_limit_if_permitted,
@@ -212,10 +213,23 @@ def test_temp_file_limit_is_applied_only_with_parameter_privilege():
 
 
 def test_run_budget_stops_when_30_second_deadline_is_reached(monkeypatch):
-    clock = iter([100.0, 129.9, 130.0])
+    clock = iter([
+        100.0,
+        100.0 + MAX_SECONDS_PER_RUN - SAFETY_CHECK_RESERVE_SECONDS - 0.01,
+        100.0 + MAX_SECONDS_PER_RUN - SAFETY_CHECK_RESERVE_SECONDS,
+    ])
     monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(clock))
     budget = RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN)
     assert budget.available()
+    assert not budget.available()
+
+
+def test_run_budget_reserves_time_for_mandatory_safety_checks(monkeypatch):
+    near_deadline = 200.0 + MAX_SECONDS_PER_RUN - 0.1
+    clock = iter([200.0, near_deadline, near_deadline])
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: next(clock))
+    budget = RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN)
+    assert budget.remaining_seconds() == pytest.approx(0.1)
     assert not budget.available()
 
 
