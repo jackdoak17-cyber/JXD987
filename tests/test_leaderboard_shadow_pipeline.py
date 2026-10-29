@@ -13,6 +13,7 @@ from scripts.leaderboard_shadow_worker import (
     RunBudget,
     configure_temp_file_limit_if_permitted,
     load_external_resource_evidence,
+    pending_cohorts,
     process_dirty_claim,
 )
 
@@ -58,6 +59,11 @@ class FakeConnection:
         return self._cursor
 
 
+class CohortCursor(FakeCursor):
+    def fetchall(self):
+        return [(271, 27897)]
+
+
 def test_capture_hook_is_inert_by_default(monkeypatch):
     monkeypatch.delenv("LEADERBOARD_SHADOW_CAPTURE_ENABLED", raising=False)
     cursor = FakeCursor()
@@ -92,6 +98,24 @@ def test_dirty_acknowledgement_is_fenced_to_claimed_version():
     assert any(query.startswith("update leaderboard_shadow_v1.fixture_capture_queue") for query, _ in redirtied.executed)
     delete_params = next(params for query, params in redirtied.executed if query.startswith("delete from"))
     assert delete_params == (1001, 4, "worker:token", 7)
+
+
+def test_pending_cohorts_defer_both_recorded_and_current_dirty_cohorts():
+    cursor = CohortCursor()
+    assert pending_cohorts(FakeConnection(cursor), 3) == [(271, 27897)]
+    query, params = cursor.executed[0]
+    assert params == (3,)
+    assert "fixture_capture_queue queue" in query
+    assert "fixture_source_versions recorded" in query
+    assert "public.fixtures current_fixture" in query
+    assert (
+        "(recorded.league_id, recorded.season_id) = "
+        "(cursor.league_id, cursor.season_id)"
+    ) in query
+    assert (
+        "(current_fixture.league_id, current_fixture.season_id) = "
+        "(cursor.league_id, cursor.season_id)"
+    ) in query
 
 
 def test_worker_and_capture_hooks_are_pinned_in_the_vps_runtime_manifest():
