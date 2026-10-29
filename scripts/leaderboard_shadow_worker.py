@@ -27,6 +27,10 @@ RELEASE_SHA = os.environ.get("LEADERBOARD_SHADOW_RELEASE_SHA", "development")
 MAX_FIXTURES_PER_RUN = 250
 MAX_SECONDS_PER_RUN = 30.0
 LOCK_TIMEOUT_MS = 2_000
+# Leave enough of the hard run deadline for the mandatory resource check and
+# transaction cleanup.  Starting another fixture with only milliseconds left
+# turns an otherwise healthy bounded run into a statement-timeout failure.
+SAFETY_CHECK_RESERVE_SECONDS = 5.0
 RESOURCE_EVIDENCE_FILE = os.environ.get(
     "LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE",
     "/var/lib/oddssearch/leaderboard-shadow-resource.json",
@@ -60,7 +64,10 @@ class RunBudget:
         return max(0.0, self.max_seconds - (time.monotonic() - self.started_at))
 
     def available(self) -> bool:
-        return self.processed < self.fixture_limit and self.remaining_seconds() > 0.05
+        return (
+            self.processed < self.fixture_limit
+            and self.remaining_seconds() > SAFETY_CHECK_RESERVE_SECONDS
+        )
 
     def consume(self) -> None:
         self.processed += 1
