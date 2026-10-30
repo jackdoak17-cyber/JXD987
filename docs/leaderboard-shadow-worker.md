@@ -21,6 +21,16 @@ also applied as the PostgreSQL statement timeout and lock waits remain capped
 at two seconds. Unfinished queue and generation work is retained for the next
 scheduled run.
 
+Leaderboard publication and historical statistics reconciliation share the
+separate `/var/lock/oddssearch-db-heavy.lock` maintenance slot. The source
+reconciler has priority: it waits up to 35 seconds for an already-bounded
+leaderboard run, while a leaderboard run defers immediately when reconciliation
+is active. This does not replace the canonical SQLite writer lock. It prevents
+the two independently safe Supabase-heavy workloads from overlapping after
+production evidence showed that overlap could regress source ingestion beyond
+the 10% safety limit. Lock ownership is process-scoped and is released on exit,
+timeout or signal; durable queues make every deferral resumable.
+
 Every run enforces the approved resource guard before work and before
 publication. PostgreSQL measures the shadow footprint and index ratio directly.
 WAL and temporary writes are attributed from `pg_stat_statements` only for SQL

@@ -51,6 +51,10 @@ export ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS="${STATS_RECONCILE_MIN_LEASE_SECONDS:-
 export STATS_RECONCILE_REPORT="${STATS_RECONCILE_REPORT:-/tmp/stats_reconcile_provider_batch.json}"
 export STATS_RECONCILE_RUN_LOG="${STATS_RECONCILE_RUN_LOG:-/tmp/stats_reconcile_provider_batch.log}"
 export STATS_RECONCILE_SUPERVISOR_LOCK="${STATS_RECONCILE_SUPERVISOR_LOCK:-/var/lock/stats-reconciliation-supervisor.lock}"
+# Existing source reconciliation is the priority workload. If a bounded
+# leaderboard publication is already in flight, wait just beyond its 30-second
+# ceiling; while waiting we do not hold the canonical SQLite writer lock.
+export STATS_RECONCILE_DB_HEAVY_LOCK_WAIT_SECONDS="${STATS_RECONCILE_DB_HEAVY_LOCK_WAIT_SECONDS:-35}"
 export RUNTIME_RELEASE_ID="${RUNTIME_RELEASE_ID:-$(runtime_release_id)}"
 
 mkdir -p "$(dirname "${STATS_RECONCILE_SUPERVISOR_LOCK}")"
@@ -116,9 +120,15 @@ while true; do
   RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   RUN_STARTED_EPOCH="$(date -u +"%s")"
   set +e
-  run_with_global_lock_and_timeout "${RECONCILIATION_COMMAND}"
+  run_with_database_heavy_lock "${STATS_RECONCILE_DB_HEAVY_LOCK_WAIT_SECONDS}" \
+    run_with_global_lock_and_timeout "${RECONCILIATION_COMMAND}"
   status=$?
   set -e
+  if [[ "${status}" -eq 75 ]]; then
+    log_info "stats reconciliation deferred until database-heavy slot is available"
+    sleep "${STATS_RECONCILE_SLEEP_SECONDS}" 9>&-
+    continue
+  fi
   RUN_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   RUN_FINISHED_EPOCH="$(date -u +"%s")"
   PIPELINE_EVIDENCE_FILE="${STATS_RECONCILE_REPORT}" record_pipeline_job_run \
