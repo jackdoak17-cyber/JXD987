@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+import sys
 from datetime import datetime, timezone
 
 from scripts import reconcile_stats_provider_queue as queue
@@ -34,6 +36,40 @@ class FakeSportMonksClient:
         returned = self.responses.get(endpoint, ids)
         rows = [{"id": fixture_id, "statistics": [], "lineups": []} for fixture_id in returned]
         return {"data": rows if "/multi/" in endpoint else rows[0]}
+
+
+def test_no_candidate_run_skips_source_schema_preparation(monkeypatch, tmp_path) -> None:
+    source = sqlite3.connect(":memory:")
+    report_path = tmp_path / "queue.json"
+    sqlite_path = tmp_path / "source.sqlite"
+
+    monkeypatch.setenv("SUPABASE_DB_URL_SESSION", "postgres://unused")
+    monkeypatch.setenv("JXD_DB_PATH", str(sqlite_path))
+    monkeypatch.setattr(queue, "source_connection", lambda: source)
+    monkeypatch.setattr(queue, "acquire_process_lock", lambda: 0)
+    monkeypatch.setattr(queue, "SportMonksClient", FakeSportMonksClient)
+    monkeypatch.setattr(queue, "candidate_target_fixture_ids", lambda *args: [])
+    monkeypatch.setattr(
+        queue,
+        "ensure_source_schema_once",
+        lambda *args: (_ for _ in ()).throw(AssertionError("schema preparation must be lazy")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "reconcile_stats_provider_queue",
+            "--leagues",
+            "8",
+            "--report-json",
+            str(report_path),
+        ],
+    )
+
+    assert queue.main() == 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["fixtures_selected"] == 0
+    assert "source_schema" not in report["stage_seconds"]
 
 
 def test_target_candidate_quotas_reserve_historical_progress() -> None:

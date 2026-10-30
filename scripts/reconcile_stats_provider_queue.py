@@ -29,6 +29,8 @@ from sqlalchemy import create_engine
 import psycopg2
 
 from jxd import SportMonksClient
+from jxd.db import get_session
+from jxd.sync import SyncService
 from scripts.postmatch_fixture_detail_delivery import (
     FINISHED_STATUSES,
     TRACKED_PLAYER_STAT_TYPES,
@@ -86,6 +88,15 @@ DETAIL_INCLUDE = ";".join(
 MAX_BULK_FIXTURE_IDS = 50
 DEFAULT_MAX_COHORTS = 8
 DEFAULT_CANDIDATE_POOL_MULTIPLIER = 5
+
+
+def ensure_source_schema_once(engine: Any, client: SportMonksClient) -> None:
+    """Prepare the SQLite source schema once for the whole reconciliation run."""
+    session = get_session(engine)
+    try:
+        SyncService(client, session).ensure_schema()
+    finally:
+        session.close()
 
 
 @dataclass(frozen=True)
@@ -571,12 +582,34 @@ def main() -> int:
         "stage_seconds": {},
     }
     target_conn: Any | None = None
+    source_schema_ready = False
+    source_schema_error: Exception | None = None
 
     def shared_target_connection() -> Any:
         nonlocal target_conn
         if target_conn is None or target_conn.closed:
             target_conn = psycopg2.connect(target_url, connect_timeout=20)
         return target_conn
+
+    def ensure_source_schema_ready() -> None:
+        """Prepare the source schema only when this run has detail to store."""
+        nonlocal source_schema_ready, source_schema_error
+        if source_schema_ready:
+            return
+        if source_schema_error is not None:
+            raise source_schema_error
+        stage_started = time.perf_counter()
+        try:
+            ensure_source_schema_once(engine, client)
+        except Exception as exc:
+            source_schema_error = exc
+            raise
+        finally:
+            report["stage_seconds"]["source_schema"] = round(
+                time.perf_counter() - stage_started,
+                3,
+            )
+        source_schema_ready = True
 
     # Mirror the self-healing ledger transition immediately.  This uses one
     # target connection for the whole repair so the serving contract and the
@@ -590,6 +623,7 @@ def main() -> int:
             if args.max_batches and report["batches"] >= args.max_batches:
                 break
             batch_size = max(args.batch_size, 1)
+            stage_started = time.perf_counter()
             fixture_ids = candidate_target_fixture_ids(
                 target_url,
                 leagues,
@@ -597,8 +631,15 @@ def main() -> int:
                 args.force,
                 season_ids or None,
             )
+            report["stage_seconds"]["candidate_selection"] = round(
+                report["stage_seconds"].get("candidate_selection", 0.0)
+                + time.perf_counter()
+                - stage_started,
+                3,
+            )
             if not fixture_ids:
                 break
+            stage_started = time.perf_counter()
             target_metadata = target_fixture_metadata(target_url, fixture_ids)
             original_fixture_count = len(fixture_ids)
             fixture_ids = cohort_limited_fixture_ids(fixture_ids, target_metadata, max_cohorts)
@@ -611,6 +652,12 @@ def main() -> int:
                     max_cohorts,
                 )
                 target_metadata = {fixture_id: target_metadata[fixture_id] for fixture_id in fixture_ids}
+            report["stage_seconds"]["target_metadata"] = round(
+                report["stage_seconds"].get("target_metadata", 0.0)
+                + time.perf_counter()
+                - stage_started,
+                3,
+            )
             report["batches"] += 1
             report["fixtures_selected"] += len(fixture_ids)
             LOG.info("Processing stats reconciliation batch %s: %s fixtures", report["batches"], len(fixture_ids))
@@ -618,6 +665,7 @@ def main() -> int:
             # Mark the complete batch as running before fetching so a worker
             # handoff cannot leave a subset looking untouched.  The source
             # ledger is still updated serially because it is SQLite-backed.
+            stage_started = time.perf_counter()
             contexts: dict[int, dict[str, Any]] = {}
             for fixture_id in fixture_ids:
                 source_meta_row = conn.execute(
@@ -658,6 +706,12 @@ def main() -> int:
                     "prior_hash": prior_hash,
                     "prior_stable": prior_stable,
                 }
+            report["stage_seconds"]["source_context"] = round(
+                report["stage_seconds"].get("source_context", 0.0)
+                + time.perf_counter()
+                - stage_started,
+                3,
+            )
 
             stage_started = time.perf_counter()
             fetched, fetch_errors, http_calls = fetch_provider_fixtures(
@@ -696,17 +750,26 @@ def main() -> int:
                     assessment = assess_provider_payload(data)
                     payload_hash = provider_payload_hash(data)
                     normalized_hash = normalized_provider_hash(data)
-                    snapshot_id = persist_provider_snapshot(
-                        target_url,
-                        fixture_id,
-                        int(meta[0]) if meta and meta[0] is not None else None,
-                        int(meta[1]) if meta and meta[1] is not None else None,
-                        data,
-                        assessment,
-                        payload_hash,
-                        normalized_hash,
-                        target_conn=shared_target_connection(),
-                    )
+                    snapshot_started = time.perf_counter()
+                    try:
+                        snapshot_id = persist_provider_snapshot(
+                            target_url,
+                            fixture_id,
+                            int(meta[0]) if meta and meta[0] is not None else None,
+                            int(meta[1]) if meta and meta[1] is not None else None,
+                            data,
+                            assessment,
+                            payload_hash,
+                            normalized_hash,
+                            target_conn=shared_target_connection(),
+                        )
+                    finally:
+                        report["stage_seconds"]["snapshot_persistence"] = round(
+                            report["stage_seconds"].get("snapshot_persistence", 0.0)
+                            + time.perf_counter()
+                            - snapshot_started,
+                            3,
+                        )
                     stable_count = prior_stable + 1 if prior_hash == normalized_hash else 1
                     if is_non_competitive_provider_assessment(assessment):
                         reason = (
@@ -774,7 +837,24 @@ def main() -> int:
                         publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
                         report["provider_pending"].append({"fixture_id": fixture_id, "reason": message})
                         continue
-                    source = store_provider_detail(engine, client, fixture_id, data, assessment)
+                    source_store_started = time.perf_counter()
+                    try:
+                        ensure_source_schema_ready()
+                        source = store_provider_detail(
+                            engine,
+                            client,
+                            fixture_id,
+                            data,
+                            assessment,
+                            ensure_schema=False,
+                        )
+                    finally:
+                        report["stage_seconds"]["source_store"] = round(
+                            report["stage_seconds"].get("source_store", 0.0)
+                            + time.perf_counter()
+                            - source_store_started,
+                            3,
+                        )
                     if assessment.status == "provider_sparse":
                         update_ledger(conn, fixture_id, "running", attempt, assessment, source=source,
                                       payload_hash=payload_hash, normalized_hash=normalized_hash,

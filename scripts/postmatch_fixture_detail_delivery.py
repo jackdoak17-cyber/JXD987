@@ -2070,6 +2070,8 @@ def store_provider_detail(
     fixture_id: int,
     data: dict[str, Any],
     assessment: ProviderAssessment,
+    *,
+    ensure_schema: bool = True,
 ) -> DetailSnapshot:
     session = None
     try:
@@ -2077,7 +2079,8 @@ def store_provider_detail(
 
         session = get_session(engine)
         service = SyncService(client, session)
-        service.ensure_schema()
+        if ensure_schema:
+            service.ensure_schema()
         # The worker already persists row counts and parity evidence.  Avoid
         # emitting one log line per provider stat/player detail on every
         # 15-minute run.
