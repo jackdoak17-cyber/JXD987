@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import copy
 import getpass
+import json
 import shutil
 import socket
 import sqlite3
@@ -536,6 +537,15 @@ def test_real_queue_command_completes_recovery_and_records_eligibility(replay, m
     monkeypatch.setattr(queue, "SportMonksClient", lambda: replay.client)
     monkeypatch.setattr(queue, "acquire_process_lock", lambda: 0)
     monkeypatch.setattr(queue, "fetch_provider_fixtures", lambda *args: ({FIXTURE: data}, {}, 1))
+    ensure_schema_calls = 0
+    original_ensure_schema = queue.SyncService.ensure_schema
+
+    def count_ensure_schema(self):
+        nonlocal ensure_schema_calls
+        ensure_schema_calls += 1
+        return original_ensure_schema(self)
+
+    monkeypatch.setattr(queue.SyncService, "ensure_schema", count_ensure_schema)
 
     def export_batch(ids, leagues, report_path, snapshot_ids=None):
         assert ids == [FIXTURE]
@@ -548,6 +558,12 @@ def test_real_queue_command_completes_recovery_and_records_eligibility(replay, m
     monkeypatch.setattr(sys, "argv", ["reconcile_stats_provider_queue", "--leagues", "8",
                         "--batch-size", "1", "--max-batches", "1", "--report-json", str(tmp_path / "queue.json")])
     assert queue.main() == 0
+    assert ensure_schema_calls == 1
+    report = json.loads((tmp_path / "queue.json").read_text())
+    assert report["stage_seconds"]["source_schema"] >= 0
+    assert report["stage_seconds"]["source_context"] >= 0
+    if not sparse:
+        assert report["stage_seconds"]["source_store"] >= 0
     if sparse:
         assert replay.shots() == []
         assert replay.sql("select count(*) from fixture_stats_quality_exclusions") == [(1,)]
@@ -557,6 +573,9 @@ def test_real_queue_command_completes_recovery_and_records_eligibility(replay, m
             conn.execute("update fixture_detail_deliveries set next_attempt_at=datetime('now','-1 minute'),last_attempted_at=datetime('now','-16 minutes')")
         replay.sql("update fixture_detail_delivery_status set next_attempt_at=now()-interval '1 minute',last_attempted_at=now()-interval '16 minutes'")
         assert queue.main() == 0
+        assert ensure_schema_calls == 2
+        report = json.loads((tmp_path / "queue.json").read_text())
+        assert report["stage_seconds"]["source_store"] >= 0
     assert replay.sql("select status,player_stat_parity,lineup_parity from fixture_detail_delivery_status") == [("provider_sparse" if sparse else "verified", True, True)]
     assert replay.sql("select count(*) from fixture_stats_quality_exclusions") == [(0,)]
     assert replay.shots() == [(2,)]
