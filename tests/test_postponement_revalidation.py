@@ -580,7 +580,11 @@ def test_withdrawn_publication_and_invalid_modes_reject_before_all_access(monkey
 
 def test_observation_busy_lock_prevents_claim_or_request(monkeypatch, tmp_path):
     evidence = tmp_path / "capture.json"
-    evidence.write_text(json.dumps([capture()]))
+    fresh_capture = capture()
+    fresh_capture["observed_at"] = (
+        datetime.now(timezone.utc) - timedelta(hours=1)
+    ).isoformat().replace("+00:00", "Z")
+    evidence.write_text(json.dumps([fresh_capture]))
     monkeypatch.setattr(sys, "argv", ["delivery", "--postponement-status-evidence", str(evidence),
         "--postponement-observe-status", "--postponement-provider-budget", "1"])
     monkeypatch.setenv("SUPABASE_DB_URL_SESSION", "offline")

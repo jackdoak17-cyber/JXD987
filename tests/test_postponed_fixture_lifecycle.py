@@ -558,13 +558,15 @@ def test_real_queue_command_completes_recovery_and_records_eligibility(replay, m
     monkeypatch.setattr(sys, "argv", ["reconcile_stats_provider_queue", "--leagues", "8",
                         "--batch-size", "1", "--max-batches", "1", "--report-json", str(tmp_path / "queue.json")])
     assert queue.main() == 0
-    assert ensure_schema_calls == 1
     report = json.loads((tmp_path / "queue.json").read_text())
-    assert report["stage_seconds"]["source_schema"] >= 0
     assert report["stage_seconds"]["source_context"] >= 0
     if not sparse:
+        assert ensure_schema_calls == 1
+        assert report["stage_seconds"]["source_schema"] >= 0
         assert report["stage_seconds"]["source_store"] >= 0
     if sparse:
+        assert ensure_schema_calls == 0
+        assert "source_schema" not in report["stage_seconds"]
         assert replay.shots() == []
         assert replay.sql("select count(*) from fixture_stats_quality_exclusions") == [(1,)]
         assert replay.sql("select status,stable_fetch_count from fixture_detail_delivery_status") == [("provider_pending", 1)]
@@ -573,8 +575,9 @@ def test_real_queue_command_completes_recovery_and_records_eligibility(replay, m
             conn.execute("update fixture_detail_deliveries set next_attempt_at=datetime('now','-1 minute'),last_attempted_at=datetime('now','-16 minutes')")
         replay.sql("update fixture_detail_delivery_status set next_attempt_at=now()-interval '1 minute',last_attempted_at=now()-interval '16 minutes'")
         assert queue.main() == 0
-        assert ensure_schema_calls == 2
+        assert ensure_schema_calls == 1
         report = json.loads((tmp_path / "queue.json").read_text())
+        assert report["stage_seconds"]["source_schema"] >= 0
         assert report["stage_seconds"]["source_store"] >= 0
     assert replay.sql("select status,player_stat_parity,lineup_parity from fixture_detail_delivery_status") == [("provider_sparse" if sparse else "verified", True, True)]
     assert replay.sql("select count(*) from fixture_stats_quality_exclusions") == [(0,)]

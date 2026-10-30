@@ -582,12 +582,34 @@ def main() -> int:
         "stage_seconds": {},
     }
     target_conn: Any | None = None
+    source_schema_ready = False
+    source_schema_error: Exception | None = None
 
     def shared_target_connection() -> Any:
         nonlocal target_conn
         if target_conn is None or target_conn.closed:
             target_conn = psycopg2.connect(target_url, connect_timeout=20)
         return target_conn
+
+    def ensure_source_schema_ready() -> None:
+        """Prepare the source schema only when this run has detail to store."""
+        nonlocal source_schema_ready, source_schema_error
+        if source_schema_ready:
+            return
+        if source_schema_error is not None:
+            raise source_schema_error
+        stage_started = time.perf_counter()
+        try:
+            ensure_source_schema_once(engine, client)
+        except Exception as exc:
+            source_schema_error = exc
+            raise
+        finally:
+            report["stage_seconds"]["source_schema"] = round(
+                time.perf_counter() - stage_started,
+                3,
+            )
+        source_schema_ready = True
 
     # Mirror the self-healing ledger transition immediately.  This uses one
     # target connection for the whole repair so the serving contract and the
@@ -597,12 +619,6 @@ def main() -> int:
         publish_delivery_status(target_url, conn, fixture_id, target_conn=shared_target_connection())
 
     try:
-        stage_started = time.perf_counter()
-        ensure_source_schema_once(engine, client)
-        report["stage_seconds"]["source_schema"] = round(
-            time.perf_counter() - stage_started,
-            3,
-        )
         while True:
             if args.max_batches and report["batches"] >= args.max_batches:
                 break
@@ -823,6 +839,7 @@ def main() -> int:
                         continue
                     source_store_started = time.perf_counter()
                     try:
+                        ensure_source_schema_ready()
                         source = store_provider_detail(
                             engine,
                             client,
