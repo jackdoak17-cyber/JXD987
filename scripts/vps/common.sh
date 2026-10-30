@@ -366,6 +366,39 @@ healthcheck_ping() {
   return 0
 }
 
+# Serialise database-heavy maintenance that is safe independently but causes
+# measurable ingestion regressions when it overlaps. This lock is deliberately
+# separate from ODDS_SYNC_LOCK_FILE: the latter protects the canonical SQLite
+# writer, while this slot protects Supabase-heavy reconciliation/publication.
+#
+# Return 75 (EX_TEMPFAIL) when the slot is unavailable so callers can defer
+# without recording a failed data run. The file descriptor is owned by the
+# subshell and is therefore released on normal exit, error, timeout, or signal.
+run_with_database_heavy_lock() {
+  local wait_seconds="$1"
+  shift
+  local lock_file="${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-/var/lock/oddssearch-db-heavy.lock}"
+
+  if [[ ! "${wait_seconds}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    log_error "database-heavy lock wait must be a non-negative number"
+    return 1
+  fi
+  if [[ "$#" -eq 0 ]]; then
+    log_error "database-heavy lock command is required"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "${lock_file}")"
+  (
+    exec 8>"${lock_file}"
+    if ! flock --wait "${wait_seconds}" 8; then
+      log_info "[SKIPPED] database-heavy maintenance slot unavailable"
+      exit 75
+    fi
+    "$@"
+  )
+}
+
 run_with_global_lock_and_timeout() {
   local chain_command="$1"
   local lock_file="${ODDS_SYNC_LOCK_FILE:-/var/lock/odds-sync.lock}"

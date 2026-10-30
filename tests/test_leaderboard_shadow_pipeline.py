@@ -1,5 +1,8 @@
 import os
 import json
+import shutil
+import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -205,6 +208,79 @@ def test_worker_and_capture_hooks_are_pinned_in_the_vps_runtime_manifest():
     assert "--fixture-limit 250" in wrapper
     assert "--max-seconds 30" in wrapper
     assert "--isolated-test-override" not in wrapper
+    assert "run_with_database_heavy_lock" in wrapper
+    assert "LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS:-0" in wrapper
+
+
+def test_database_heavy_lock_defers_overlap_then_releases(tmp_path):
+    if shutil.which("flock") is None:
+        pytest.skip("Linux flock is unavailable on this host")
+
+    lock_file = tmp_path / "database-heavy.lock"
+    ready_file = tmp_path / "holder-ready"
+    env = {
+        **os.environ,
+        "ODDSSEARCH_DB_HEAVY_LOCK_FILE": str(lock_file),
+        "COMMON_SH": str(ROOT / "scripts/vps/common.sh"),
+        "READY_FILE": str(ready_file),
+    }
+    holder = subprocess.Popen(
+        [
+            "bash",
+            "-lc",
+            'source "$COMMON_SH"; run_with_database_heavy_lock 0 '
+            'bash -c \'printf ready > "$READY_FILE"; sleep 1\'',
+        ],
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while not ready_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert ready_file.exists(), "lock holder did not start"
+
+        deferred = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                'source "$COMMON_SH"; run_with_database_heavy_lock 0 true',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert deferred.returncode == 75
+        assert "database-heavy maintenance slot unavailable" in deferred.stdout
+
+        waited = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                'source "$COMMON_SH"; run_with_database_heavy_lock 2 true',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=4,
+        )
+        assert waited.returncode == 0, waited.stderr
+        assert holder.wait(timeout=2) == 0
+
+        released = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                'source "$COMMON_SH"; run_with_database_heavy_lock 0 true',
+            ],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert released.returncode == 0
+    finally:
+        if holder.poll() is None:
+            holder.terminate()
+            holder.wait(timeout=2)
 
 
 def test_run_budget_rejects_unbounded_fixture_and_time_limits():

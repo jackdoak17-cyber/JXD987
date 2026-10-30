@@ -114,6 +114,16 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("STATS_RECONCILE_LOCK_HELD", source)
         self.assertIn("export REPO_ROOT", source)
         self.assertIn("export RUNTIME_RELEASE_ID", source)
+        self.assertIn("run_with_database_heavy_lock", source)
+        self.assertIn("STATS_RECONCILE_DB_HEAVY_LOCK_WAIT_SECONDS:-35", source)
+        self.assertIn('if [[ "${status}" -eq 75 ]]', source)
+
+    def test_database_heavy_coordination_is_fail_closed_and_releases_on_exit(self) -> None:
+        source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")
+        self.assertIn("run_with_database_heavy_lock()", source)
+        self.assertIn("ODDSSEARCH_DB_HEAVY_LOCK_FILE", source)
+        self.assertIn('flock --wait "${wait_seconds}" 8', source)
+        self.assertIn("exit 75", source)
 
     def test_shared_lock_has_priority_aware_settlement_handoff(self) -> None:
         source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")
