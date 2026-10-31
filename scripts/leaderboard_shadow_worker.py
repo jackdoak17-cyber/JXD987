@@ -147,8 +147,6 @@ def load_external_resource_evidence(conn, path: str = RESOURCE_EVIDENCE_FILE) ->
         evidence = json.load(evidence_file)
     required = {
         "disk_available_bytes",
-        "source_ingestion_baseline_p95_ms",
-        "source_ingestion_current_p95_ms",
         "observed_at",
     }
     if set(evidence) != required:
@@ -156,11 +154,9 @@ def load_external_resource_evidence(conn, path: str = RESOURCE_EVIDENCE_FILE) ->
     with conn:
         with conn.cursor() as cur:
             cur.execute(
-                "select leaderboard_shadow_v1.set_external_resource_evidence(%s,%s,%s,%s)",
+                "select leaderboard_shadow_v1.refresh_external_resource_evidence_v2(%s,%s)",
                 (
                     int(evidence["disk_available_bytes"]),
-                    float(evidence["source_ingestion_baseline_p95_ms"]),
-                    float(evidence["source_ingestion_current_p95_ms"]),
                     str(evidence["observed_at"]),
                 ),
             )

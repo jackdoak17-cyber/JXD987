@@ -44,17 +44,36 @@ escalation: attributed temporary-I/O, statement/lock deadlines and bounded runs
 remain mandatory, and publication is blocked after a breach. Worker output
 records whether the optional session cap was enforced.
 
-Platform disk headroom and source-ingestion p95 are external operational
-measurements and must be refreshed in `pipeline_state` within 15 minutes.
-Before each production run the worker reads the exact four-field JSON
-document at `LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE` (default
+Platform disk headroom and source-ingestion performance must be refreshed in
+`pipeline_state` within 15 minutes. Importer timing is split into end-to-end
+latency, database-heavy-slot wait, provider time and non-provider processing.
+End-to-end latency remains an acceptance alert and freshness signal; a
+non-provider processing regression over the approved 10% limit is a hard
+processing stop. This prevents deliberate importer-priority waiting or
+provider latency from masquerading as slower database processing while still
+failing closed on real processing regression, stale evidence or importer
+failures.
+
+Before each production run the worker reads the exact two-field JSON document
+(`disk_available_bytes` and `observed_at`) at
+`LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE` (default
 `/var/lib/oddssearch/leaderboard-shadow-resource.json`). The file must be a
-regular file and cannot be group/world writable. Its producer owns the
-authoritative Supabase platform-disk measurement and the independently measured
-source-ingestion baseline/current p95. The database rejects evidence older than
-five minutes; Operations fails evidence older than 15 minutes. Missing, stale
-or breached evidence pauses the pipeline and is exposed to Operations; it
-cannot be bypassed by a successful worker process.
+regular file and cannot be group/world writable. Its producer owns only the
+authoritative Supabase platform-disk measurement. Importer p95 values are
+derived inside PostgreSQL from at least 20 successful runs of the same release
+and non-empty fixture workload. The baseline can be pinned only while worker
+and backfill processing are disabled; normal evidence refreshes cannot replace
+it. A new importer release or workload requires another explicit disabled-state
+arm. The database rejects disk evidence older than five minutes and importer
+evidence older than 15 minutes. Missing, stale, undersampled or breached
+processing evidence pauses the pipeline and is exposed to Operations. Total
+latency and full execution regressions remain explicit Operations warnings;
+lock waiting and provider time stay visible and cannot be silently discarded.
+After the historical reconciliation queue drains, its scheduled successful
+zero-work run becomes a fresh idle heartbeat. That keeps hourly leaderboard
+publication admissible without fabricating a performance comparison; a failed
+or stale idle heartbeat still fails closed, and renewed non-empty work must
+again match the pinned release and workload evidence.
 
 The disabled-pipeline override is restricted to a socket-only database whose
 name begins `oddssearch_m3`. It cannot be used against the production Supabase
@@ -69,6 +88,13 @@ Operational evidence is written to `worker_runs` and `pipeline_state`; the
 Operations application reads only the restricted health function. Failed
 claims are released, expired leases are reclaimable and publication does not
 advance until every immutable generation job succeeds.
+
+Initial publication catch-up uses the same one-minute tick, importer-priority
+slot and 250-operation/30-second bound. Steady state keeps that small resumable
+tick but adopts a one-hour publication freshness objective; the worker does no
+work when the durable queue is empty. Operations alerts before queued changes
+can silently exceed that objective, while the last complete atomic generation
+remains customer-visible.
 
 Production activation, trigger enablement, backfill and the 48-hour soak are
 outside this candidate and require their own approved runbook.

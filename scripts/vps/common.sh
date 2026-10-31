@@ -211,6 +211,11 @@ record_pipeline_job_run() {
   local started_at="$4"
   local finished_at="$5"
   local duration_ms="$6"
+  local queue_wait_ms="${7:-}"
+  local execution_duration_ms="${8:-}"
+  local work_units="${9:-}"
+  local provider_duration_ms="${10:-}"
+  local processing_duration_ms="${11:-}"
 
   if [[ -z "${OPERATIONS_CHECK_RUNNER_DATABASE_URL:-}" && -f "${REPO_ROOT}/.env" ]]; then
     set -a
@@ -231,6 +236,9 @@ record_pipeline_job_run() {
   run_status="$(pipeline_job_status_name "${status_code}")"
   release_id="$(runtime_release_id)"
   evidence="exit status: ${status_code}; completion status: ${run_status}"
+  if [[ -n "${queue_wait_ms}" || -n "${execution_duration_ms}" || -n "${work_units}" ]]; then
+    evidence="${evidence}; queue_wait_ms=${queue_wait_ms:-unknown}; execution_duration_ms=${execution_duration_ms:-unknown}; provider_duration_ms=${provider_duration_ms:-unknown}; processing_duration_ms=${processing_duration_ms:-unknown}; work_units=${work_units:-unknown}"
+  fi
   evidence_file="${PIPELINE_EVIDENCE_FILE:-}"
   if [[ -n "${evidence_file}" && -f "${evidence_file}" ]]; then
     # Do not use a truncating pipeline here. With pipefail enabled, `tr | head`
@@ -261,15 +269,26 @@ PY
     -v started_at="${started_at}" \
     -v finished_at="${finished_at}" \
     -v duration_ms="${duration_ms}" \
+    -v queue_wait_ms="${queue_wait_ms}" \
+    -v execution_duration_ms="${execution_duration_ms}" \
+    -v work_units="${work_units}" \
+    -v provider_duration_ms="${provider_duration_ms}" \
+    -v processing_duration_ms="${processing_duration_ms}" \
     -v release_id="${release_id}" \
     -v evidence="${evidence}" <<'SQL' >/dev/null
 insert into operations.pipeline_job_runs (
   job_id, job_name, status, started_at, finished_at, duration_ms,
-  release_id, evidence_summary
+  release_id, evidence_summary, queue_wait_ms, execution_duration_ms, work_units,
+  provider_duration_ms, processing_duration_ms
 )
 values (
   :'job_id', :'job_name', :'run_status', :'started_at'::timestamptz,
-  :'finished_at'::timestamptz, :'duration_ms'::integer, :'release_id', :'evidence'
+  :'finished_at'::timestamptz, :'duration_ms'::integer, :'release_id', :'evidence',
+  nullif(:'queue_wait_ms', '')::integer,
+  nullif(:'execution_duration_ms', '')::integer,
+  nullif(:'work_units', '')::integer,
+  nullif(:'provider_duration_ms', '')::integer,
+  nullif(:'processing_duration_ms', '')::integer
 );
 SQL
   then
@@ -396,6 +415,48 @@ run_with_database_heavy_lock() {
       exit 75
     fi
     "$@"
+  )
+}
+
+epoch_milliseconds() {
+  python3 -c 'import time; print(time.time_ns() // 1_000_000)'
+}
+
+# Acquire the same importer-priority slot while recording only the time spent
+# after admission as execution. The caller keeps end-to-end duration separately
+# so scheduler/lock delay remains visible without masquerading as slower work.
+run_with_database_heavy_lock_timed() {
+  local wait_seconds="$1"
+  local timing_file="$2"
+  shift 2
+  local lock_file="${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-/var/lock/oddssearch-db-heavy.lock}"
+
+  if [[ ! "${wait_seconds}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    log_error "database-heavy lock wait must be a non-negative number"
+    return 1
+  fi
+  if [[ "$#" -eq 0 ]]; then
+    log_error "database-heavy lock command is required"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "${lock_file}")" "$(dirname "${timing_file}")"
+  (
+    local status acquired_ms finished_ms
+    exec 8>"${lock_file}"
+    if ! flock --wait "${wait_seconds}" 8; then
+      log_info "[SKIPPED] database-heavy maintenance slot unavailable"
+      exit 75
+    fi
+    acquired_ms="$(epoch_milliseconds)"
+    printf '%s\n' "${acquired_ms}" >"${timing_file}"
+    set +e
+    "$@"
+    status=$?
+    set -e
+    finished_ms="$(epoch_milliseconds)"
+    printf '%s\n' "${finished_ms}" >>"${timing_file}"
+    exit "${status}"
   )
 }
 

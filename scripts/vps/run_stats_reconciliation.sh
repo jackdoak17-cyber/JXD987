@@ -50,6 +50,7 @@ export STATS_RECONCILE_MAX_HOLD_SECONDS="${STATS_RECONCILE_MAX_HOLD_SECONDS:-600
 export ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS="${STATS_RECONCILE_MIN_LEASE_SECONDS:-270}"
 export STATS_RECONCILE_REPORT="${STATS_RECONCILE_REPORT:-/tmp/stats_reconcile_provider_batch.json}"
 export STATS_RECONCILE_RUN_LOG="${STATS_RECONCILE_RUN_LOG:-/tmp/stats_reconcile_provider_batch.log}"
+export STATS_RECONCILE_TIMING_FILE="${STATS_RECONCILE_TIMING_FILE:-/tmp/stats_reconcile_provider_batch.timing.$$}"
 export STATS_RECONCILE_SUPERVISOR_LOCK="${STATS_RECONCILE_SUPERVISOR_LOCK:-/var/lock/stats-reconciliation-supervisor.lock}"
 # Existing source reconciliation is the priority workload. If a bounded
 # leaderboard publication is already in flight, wait just beyond its 30-second
@@ -116,11 +117,12 @@ while true; do
   # every bounded batch so hot deployments cannot leave delivery reports and
   # ledger rows attributed to the release that started the parent shell.
   export RUNTIME_RELEASE_ID="$(runtime_release_id)"
-  rm -f "${STATS_RECONCILE_REPORT}" "${STATS_RECONCILE_RUN_LOG}"
+  rm -f "${STATS_RECONCILE_REPORT}" "${STATS_RECONCILE_RUN_LOG}" "${STATS_RECONCILE_TIMING_FILE}"
   RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  RUN_STARTED_EPOCH="$(date -u +"%s")"
+  RUN_STARTED_EPOCH_MS="$(epoch_milliseconds)"
   set +e
-  run_with_database_heavy_lock "${STATS_RECONCILE_DB_HEAVY_LOCK_WAIT_SECONDS}" \
+  run_with_database_heavy_lock_timed "${STATS_RECONCILE_DB_HEAVY_LOCK_WAIT_SECONDS}" \
+    "${STATS_RECONCILE_TIMING_FILE}" \
     run_with_global_lock_and_timeout "${RECONCILIATION_COMMAND}"
   status=$?
   set -e
@@ -130,16 +132,25 @@ while true; do
     continue
   fi
   RUN_FINISHED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-  RUN_FINISHED_EPOCH="$(date -u +"%s")"
-  PIPELINE_EVIDENCE_FILE="${STATS_RECONCILE_REPORT}" record_pipeline_job_run \
-    "run_stats_reconciliation" \
-    "Stats reconciliation" \
-    "${status}" \
-    "${RUN_STARTED_AT}" \
-    "${RUN_FINISHED_AT}" \
-    "$(((RUN_FINISHED_EPOCH - RUN_STARTED_EPOCH) * 1000))"
+  RUN_FINISHED_EPOCH_MS="$(epoch_milliseconds)"
+  TOTAL_DURATION_MS=$((RUN_FINISHED_EPOCH_MS - RUN_STARTED_EPOCH_MS))
+
+  QUEUE_WAIT_MS=""
+  EXECUTION_DURATION_MS=""
+  if [[ -f "${STATS_RECONCILE_TIMING_FILE}" ]]; then
+    timing_acquired_ms="$(sed -n '1p' "${STATS_RECONCILE_TIMING_FILE}")"
+    timing_finished_ms="$(sed -n '2p' "${STATS_RECONCILE_TIMING_FILE}")"
+    if [[ "${timing_acquired_ms}" =~ ^[0-9]+$ && "${timing_finished_ms}" =~ ^[0-9]+$ ]]; then
+      QUEUE_WAIT_MS=$((timing_acquired_ms - RUN_STARTED_EPOCH_MS))
+      EXECUTION_DURATION_MS=$((timing_finished_ms - timing_acquired_ms))
+    fi
+  fi
 
   if [[ ! -f "${STATS_RECONCILE_REPORT}" ]]; then
+    record_pipeline_job_run \
+      "run_stats_reconciliation" "Stats reconciliation" "${status}" \
+      "${RUN_STARTED_AT}" "${RUN_FINISHED_AT}" "${TOTAL_DURATION_MS}" \
+      "${QUEUE_WAIT_MS}" "${EXECUTION_DURATION_MS}" "" "" ""
     # The Python worker exits without a report when another SQLite writer owns
     # the canonical lock. Wait and retry without contending or spinning.
     sleep "${STATS_RECONCILE_SLEEP_SECONDS}" 9>&-
@@ -155,6 +166,37 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 print(int(report.get("batches", 0)))
 PY
 )"
+
+  read -r work_units provider_duration_ms < <(${REPO_ROOT}/.venv/bin/python - "${STATS_RECONCILE_REPORT}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    report = json.load(handle)
+provider_ms = round(float(report.get("stage_seconds", {}).get("provider_fetch", 0)) * 1000)
+print(int(report.get("fixtures_selected", 0)), provider_ms)
+PY
+)
+  processing_duration_ms=""
+  if [[ "${EXECUTION_DURATION_MS}" =~ ^[0-9]+$ && "${provider_duration_ms}" =~ ^[0-9]+$ ]]; then
+    processing_duration_ms=$((EXECUTION_DURATION_MS - provider_duration_ms))
+    if (( processing_duration_ms < 0 )); then
+      processing_duration_ms=0
+    fi
+  fi
+
+  PIPELINE_EVIDENCE_FILE="${STATS_RECONCILE_REPORT}" record_pipeline_job_run \
+    "run_stats_reconciliation" \
+    "Stats reconciliation" \
+    "${status}" \
+    "${RUN_STARTED_AT}" \
+    "${RUN_FINISHED_AT}" \
+    "${TOTAL_DURATION_MS}" \
+    "${QUEUE_WAIT_MS}" \
+    "${EXECUTION_DURATION_MS}" \
+    "${work_units}" \
+    "${provider_duration_ms}" \
+    "${processing_duration_ms}"
 
   if [[ "${status}" -ne 0 ]]; then
     tail -n 20 "${STATS_RECONCILE_RUN_LOG}" >&2 || true
