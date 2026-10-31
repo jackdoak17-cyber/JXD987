@@ -521,12 +521,27 @@ def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
                 excluded = job["change_kind"] == "exclude"
                 if excluded:
                     facts: list[dict[str, Any]] = []
-                    observed_hash = job["expected_source_hash"]
+                    observed_hash = (
+                        snapshot["source_hash"]
+                        if snapshot else job["expected_source_hash"]
+                    )
                 else:
                     if not snapshot:
                         raise RuntimeError("canonical fixture source is missing")
                     facts = snapshot["facts"]
                     observed_hash = snapshot["source_hash"]
+                if observed_hash != job["expected_source_hash"]:
+                    # Historical publication keeps the automatic source
+                    # triggers disabled. If authoritative source data changed
+                    # after this immutable generation was materialized, record
+                    # the consistent snapshot before locking the generation
+                    # job. This preserves the cursor-first locking contract and
+                    # lets the replacement generation use the newer version.
+                    cur.execute(
+                        "select leaderboard_shadow_v1.capture_fixture_source_changes(%s::bigint[])",
+                        ([job["fixture_id"]],),
+                    )
+                    cur.fetchone()
                 cur.execute(
                     "select leaderboard_shadow_v1.stage_fixture_result(%s,%s,%s,%s,%s,%s,%s::jsonb)",
                     (
@@ -539,8 +554,7 @@ def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
                         json.dumps(facts),
                     ),
                 )
-                staged = cur.fetchone()
-                return bool(next(iter(staged.values())))
+                return bool(next(iter(cur.fetchone().values())))
     except Exception as error:
         apply_recovery_timeouts(conn)
         conn.set_session(isolation_level="READ COMMITTED")
