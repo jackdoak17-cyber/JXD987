@@ -345,15 +345,28 @@ def test_external_resource_evidence_is_exact_and_protected(tmp_path):
     path = tmp_path / "resource.json"
     path.write_text(json.dumps({
         "disk_available_bytes": 30 * 1024**3,
-        "source_ingestion_baseline_p95_ms": 10,
-        "source_ingestion_current_p95_ms": 10.5,
+        "source_ingestion_baseline_total_p95_ms": 130_000,
+        "source_ingestion_current_total_p95_ms": 149_000,
+        "source_ingestion_baseline_execution_p95_ms": 129_000,
+        "source_ingestion_current_execution_p95_ms": 130_000,
+        "source_ingestion_current_queue_wait_p95_ms": 19_000,
+        "source_ingestion_current_provider_p95_ms": 80_000,
+        "source_ingestion_baseline_processing_p95_ms": 49_000,
+        "source_ingestion_current_processing_p95_ms": 50_000,
+        "source_ingestion_sample_count": 40,
+        "source_ingestion_work_units": 20,
+        "source_ingestion_release_id": "abc123",
         "observed_at": "2026-10-28T18:00:00Z",
     }))
     path.chmod(0o600)
     cursor = FakeCursor()
     evidence = load_external_resource_evidence(FakeConnection(cursor), str(path))
     assert evidence["disk_available_bytes"] == 30 * 1024**3
-    assert "set_external_resource_evidence" in cursor.executed[0][0]
+    assert "set_external_resource_evidence_v2" in cursor.executed[0][0]
+    assert cursor.executed[0][1][5:] == (
+        19_000.0, 80_000.0, 49_000.0, 50_000.0, 40, 20,
+        "abc123", "2026-10-28T18:00:00Z",
+    )
 
     path.chmod(0o622)
     with pytest.raises(RuntimeError, match="non-group/world-writable"):
@@ -364,8 +377,17 @@ def test_external_resource_evidence_rejects_unknown_fields(tmp_path):
     path = tmp_path / "resource.json"
     path.write_text(json.dumps({
         "disk_available_bytes": 30 * 1024**3,
-        "source_ingestion_baseline_p95_ms": 10,
-        "source_ingestion_current_p95_ms": 10.5,
+        "source_ingestion_baseline_total_p95_ms": 130_000,
+        "source_ingestion_current_total_p95_ms": 149_000,
+        "source_ingestion_baseline_execution_p95_ms": 129_000,
+        "source_ingestion_current_execution_p95_ms": 130_000,
+        "source_ingestion_current_queue_wait_p95_ms": 19_000,
+        "source_ingestion_current_provider_p95_ms": 80_000,
+        "source_ingestion_baseline_processing_p95_ms": 49_000,
+        "source_ingestion_current_processing_p95_ms": 50_000,
+        "source_ingestion_sample_count": 40,
+        "source_ingestion_work_units": 20,
+        "source_ingestion_release_id": "abc123",
         "observed_at": "2026-10-28T18:00:00Z",
         "unreviewed_override": True,
     }))

@@ -4,6 +4,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -117,13 +119,44 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertIn("run_with_database_heavy_lock", source)
         self.assertIn("STATS_RECONCILE_DB_HEAVY_LOCK_WAIT_SECONDS:-35", source)
         self.assertIn('if [[ "${status}" -eq 75 ]]', source)
+        self.assertIn("QUEUE_WAIT_MS", source)
+        self.assertIn("EXECUTION_DURATION_MS", source)
+        self.assertIn("provider_duration_ms", source)
+        self.assertIn("processing_duration_ms", source)
+        self.assertIn("work_units", source)
 
     def test_database_heavy_coordination_is_fail_closed_and_releases_on_exit(self) -> None:
         source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")
         self.assertIn("run_with_database_heavy_lock()", source)
+        self.assertIn("run_with_database_heavy_lock_timed()", source)
         self.assertIn("ODDSSEARCH_DB_HEAVY_LOCK_FILE", source)
         self.assertIn('flock --wait "${wait_seconds}" 8', source)
         self.assertIn("exit 75", source)
+
+    def test_database_heavy_timing_separates_wait_from_execution(self) -> None:
+        if subprocess.run(["sh", "-c", "command -v flock"], capture_output=True).returncode != 0:
+            self.skipTest("flock is unavailable")
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "heavy.lock"
+            timing = Path(directory) / "timing"
+            script = f'''set -euo pipefail
+source "{ROOT / 'scripts/vps/common.sh'}"
+exec 7>"{lock}"
+flock 7
+(sleep 0.25; flock -u 7) &
+ODDSSEARCH_DB_HEAVY_LOCK_FILE="{lock}" \\
+  run_with_database_heavy_lock_timed 2 "{timing}" bash -c 'sleep 0.12'
+wait
+'''
+            started = time.monotonic()
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            total_ms = (time.monotonic() - started) * 1000
+            self.assertEqual(result.returncode, 0, result.stderr)
+            acquired_ms, finished_ms = [int(value) for value in timing.read_text().splitlines()]
+            execution_ms = finished_ms - acquired_ms
+            self.assertGreaterEqual(total_ms - execution_ms, 180)
+            self.assertGreaterEqual(execution_ms, 90)
+            self.assertLess(execution_ms, 500)
 
     def test_shared_lock_has_priority_aware_settlement_handoff(self) -> None:
         source = (ROOT / "scripts/vps/common.sh").read_text(encoding="utf-8")

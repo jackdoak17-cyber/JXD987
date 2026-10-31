@@ -147,8 +147,17 @@ def load_external_resource_evidence(conn, path: str = RESOURCE_EVIDENCE_FILE) ->
         evidence = json.load(evidence_file)
     required = {
         "disk_available_bytes",
-        "source_ingestion_baseline_p95_ms",
-        "source_ingestion_current_p95_ms",
+        "source_ingestion_baseline_total_p95_ms",
+        "source_ingestion_current_total_p95_ms",
+        "source_ingestion_baseline_execution_p95_ms",
+        "source_ingestion_current_execution_p95_ms",
+        "source_ingestion_current_queue_wait_p95_ms",
+        "source_ingestion_current_provider_p95_ms",
+        "source_ingestion_baseline_processing_p95_ms",
+        "source_ingestion_current_processing_p95_ms",
+        "source_ingestion_sample_count",
+        "source_ingestion_work_units",
+        "source_ingestion_release_id",
         "observed_at",
     }
     if set(evidence) != required:
@@ -156,11 +165,20 @@ def load_external_resource_evidence(conn, path: str = RESOURCE_EVIDENCE_FILE) ->
     with conn:
         with conn.cursor() as cur:
             cur.execute(
-                "select leaderboard_shadow_v1.set_external_resource_evidence(%s,%s,%s,%s)",
+                "select leaderboard_shadow_v1.set_external_resource_evidence_v2(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (
                     int(evidence["disk_available_bytes"]),
-                    float(evidence["source_ingestion_baseline_p95_ms"]),
-                    float(evidence["source_ingestion_current_p95_ms"]),
+                    float(evidence["source_ingestion_baseline_total_p95_ms"]),
+                    float(evidence["source_ingestion_current_total_p95_ms"]),
+                    float(evidence["source_ingestion_baseline_execution_p95_ms"]),
+                    float(evidence["source_ingestion_current_execution_p95_ms"]),
+                    float(evidence["source_ingestion_current_queue_wait_p95_ms"]),
+                    float(evidence["source_ingestion_current_provider_p95_ms"]),
+                    float(evidence["source_ingestion_baseline_processing_p95_ms"]),
+                    float(evidence["source_ingestion_current_processing_p95_ms"]),
+                    int(evidence["source_ingestion_sample_count"]),
+                    int(evidence["source_ingestion_work_units"]),
+                    str(evidence["source_ingestion_release_id"]),
                     str(evidence["observed_at"]),
                 ),
             )
