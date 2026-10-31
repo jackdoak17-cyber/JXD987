@@ -565,14 +565,24 @@ def finish_generation(conn, generation_id: int) -> bool:
     with conn.cursor() as cur:
         cur.execute(
             """
-            select count(*) filter (where status in ('pending','processing')),
-                   count(*) filter (where status='failed')
-            from leaderboard_shadow_v1.cohort_generation_jobs
-            where generation_id=%s
+            select generation.status,
+                   count(*) filter (where job.status in ('pending','processing')),
+                   count(*) filter (where job.status='failed')
+            from leaderboard_shadow_v1.cohort_pending_publications generation
+            left join leaderboard_shadow_v1.cohort_generation_jobs job
+              on job.generation_id=generation.generation_id
+            where generation.generation_id=%s
+            group by generation.status
             """,
             (generation_id,),
         )
-        outstanding, failed = cur.fetchone()
+        generation_status, outstanding, failed = cur.fetchone()
+    # Source drift deliberately supersedes the immutable generation. Its
+    # failed staging job is evidence that the stale snapshot was not exposed,
+    # not an operational failure. The next bounded run creates a replacement
+    # generation from the cohort's newer committed cursor.
+    if generation_status == "superseded":
+        return False
     if failed:
         raise RuntimeError(f"generation {generation_id} has {failed} failed jobs")
     if outstanding:

@@ -18,6 +18,7 @@ from scripts.leaderboard_shadow_worker import (
     RunBudget,
     configure_temp_file_limit_if_permitted,
     claim_dirty,
+    finish_generation,
     finish_worker_run_with_resource_check,
     load_external_resource_evidence,
     pending_cohorts,
@@ -80,6 +81,15 @@ class ClaimCursor(FakeCursor):
             "claim_token": "worker:token",
             "claim_fence": 7,
         }
+
+
+class GenerationFinishCursor(FakeCursor):
+    def __init__(self, row):
+        super().__init__()
+        self.row = row
+
+    def fetchone(self):
+        return self.row
 
 
 def test_capture_hook_is_inert_by_default(monkeypatch):
@@ -196,6 +206,21 @@ def test_worker_finish_is_included_in_final_resource_evidence(monkeypatch):
 
     assert evidence == {"ok": True}
     assert calls == ["finish", "timeouts", "guard"]
+
+
+def test_superseded_generation_defers_to_a_replacement_without_worker_failure():
+    cursor = GenerationFinishCursor(("superseded", 138, 1))
+
+    assert finish_generation(FakeConnection(cursor), 1000016) is False
+    assert len(cursor.executed) == 1
+    assert "cohort_pending_publications generation" in cursor.executed[0][0]
+
+
+def test_failed_active_generation_remains_fatal():
+    cursor = GenerationFinishCursor(("processing", 0, 1))
+
+    with pytest.raises(RuntimeError, match="generation 1000016 has 1 failed jobs"):
+        finish_generation(FakeConnection(cursor), 1000016)
 
 
 def test_pending_cohorts_defer_both_recorded_and_current_dirty_cohorts():
