@@ -22,6 +22,7 @@ from scripts.leaderboard_shadow_worker import (
     finish_worker_run_with_resource_check,
     load_external_resource_evidence,
     pending_cohorts,
+    process_generation_job,
     process_dirty_claim,
     process_capture_queue,
 )
@@ -90,6 +91,42 @@ class GenerationFinishCursor(FakeCursor):
 
     def fetchone(self):
         return self.row
+
+
+class GenerationJobCursor(FakeCursor):
+    def __init__(self, staged, snapshot_hash="fresh-hash"):
+        super().__init__()
+        rows = [
+            {
+                "fixture_id": 19729028,
+                "expected_source_hash": "stale-hash",
+                "change_kind": "upsert",
+                "fencing_number": 4,
+            },
+            {"snapshot": {
+                "source_hash": snapshot_hash,
+                "facts": [{"player_id": 1}],
+            }},
+        ]
+        if snapshot_hash != "stale-hash":
+            rows.append({"capture_fixture_source_changes": [{
+                "fixture_id": 19729028,
+                "source_version": 2,
+            }]})
+        rows.append({"stage_fixture_result": staged})
+        self.rows = iter(rows)
+
+    def fetchone(self):
+        return next(self.rows)
+
+
+class GenerationJobConnection(FakeConnection):
+    def __init__(self, cursor):
+        super().__init__(cursor)
+        self.isolation_levels = []
+
+    def set_session(self, isolation_level):
+        self.isolation_levels.append(isolation_level)
 
 
 def test_capture_hook_is_inert_by_default(monkeypatch):
@@ -214,6 +251,31 @@ def test_superseded_generation_defers_to_a_replacement_without_worker_failure():
     assert finish_generation(FakeConnection(cursor), 1000016) is False
     assert len(cursor.executed) == 1
     assert "cohort_pending_publications generation" in cursor.executed[0][0]
+
+
+def test_source_drift_is_recaptured_before_replacement_generation():
+    cursor = GenerationJobCursor(staged=False)
+    connection = GenerationJobConnection(cursor)
+
+    assert process_generation_job(connection, 1000023, "worker") is False
+
+    queries = [query for query, _params in cursor.executed]
+    assert "claim_generation_job" in queries[0]
+    assert "fixture_source_snapshot" in queries[1]
+    assert "capture_fixture_source_changes" in queries[2]
+    assert "stage_fixture_result" in queries[3]
+    assert cursor.executed[2][1] == ([19729028],)
+    assert connection.isolation_levels == ["REPEATABLE READ", "READ COMMITTED"]
+
+
+def test_successful_staging_does_not_create_a_duplicate_source_event():
+    cursor = GenerationJobCursor(staged=True, snapshot_hash="stale-hash")
+    connection = GenerationJobConnection(cursor)
+
+    assert process_generation_job(connection, 1000023, "worker") is True
+
+    queries = [query for query, _params in cursor.executed]
+    assert not any("capture_fixture_source_changes" in query for query in queries)
 
 
 def test_failed_active_generation_remains_fatal():
