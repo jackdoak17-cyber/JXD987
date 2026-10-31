@@ -18,6 +18,7 @@ from scripts.leaderboard_shadow_worker import (
     RunBudget,
     configure_temp_file_limit_if_permitted,
     claim_dirty,
+    finish_worker_run_with_resource_check,
     load_external_resource_evidence,
     pending_cohorts,
     process_dirty_claim,
@@ -169,6 +170,32 @@ def test_capture_resource_guard_is_checked_in_bounded_groups(monkeypatch):
         "failed": 0,
     }
     assert len(guard_calls) == 3
+
+
+def test_worker_finish_is_included_in_final_resource_evidence(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "finish_worker_run",
+        lambda *_args, **_kwargs: calls.append("finish"),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "apply_recovery_timeouts",
+        lambda *_args, **_kwargs: calls.append("timeouts"),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "enforce_resource_guard",
+        lambda *_args, **_kwargs: calls.append("guard") or {"ok": True},
+    )
+
+    evidence = finish_worker_run_with_resource_check(
+        object(), 7, 11, 11, 0, True,
+    )
+
+    assert evidence == {"ok": True}
+    assert calls == ["finish", "timeouts", "guard"]
 
 
 def test_pending_cohorts_defer_both_recorded_and_current_dirty_cohorts():
