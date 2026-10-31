@@ -258,6 +258,26 @@ def finish_worker_run(
             )
 
 
+def finish_worker_run_with_resource_check(
+    conn,
+    run_id: int,
+    claimed: int,
+    succeeded: int,
+    failed: int,
+    require_external: bool,
+) -> dict[str, Any]:
+    """Record the run, then persist a resource snapshot after final writes.
+
+    The post-finish snapshot makes a later pg_stat_statements attribution
+    rollover lossless: no leaderboard worker transaction can sit between the
+    last accepted resource evidence and the completed worker run.
+    """
+
+    finish_worker_run(conn, run_id, claimed, succeeded, failed)
+    apply_recovery_timeouts(conn)
+    return enforce_resource_guard(conn, require_external)
+
+
 def refresh_eligibility_if_due(conn, max_age_seconds: int = 600) -> int:
     with conn:
         with conn.cursor() as cur:
@@ -802,7 +822,9 @@ def main() -> int:
             claimed = capture["claimed"] + generations["jobs"]
             succeeded = capture["acknowledged"] + generations["jobs"]
             failed = capture["failed"]
-            finish_worker_run(conn, run_id, claimed, succeeded, failed)
+            resource_evidence = finish_worker_run_with_resource_check(
+                conn, run_id, claimed, succeeded, failed, require_external,
+            )
             print(json.dumps({
                 "capture": capture,
                 "eligibility_count": eligibility_count,
