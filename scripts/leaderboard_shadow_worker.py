@@ -206,6 +206,17 @@ def enforce_resource_guard(conn, require_external: bool) -> dict[str, Any]:
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
+                "select nullif(current_setting('oddssearch.worker_run_id',true),'')::bigint "
+                "as active_run_id"
+            )
+            active_run_id = cur.fetchone()["active_run_id"]
+            if active_run_id is not None:
+                cur.execute(
+                    "select leaderboard_shadow_v1.checkpoint_worker_resource_window(%s,false)",
+                    (active_run_id,),
+                )
+                cur.fetchone()
+            cur.execute(
                 "select leaderboard_shadow_v1.enforce_resource_guard(%s) as evidence",
                 (require_external,),
             )
@@ -239,6 +250,14 @@ def start_worker_run(conn, worker_id: str) -> int:
             )
             run_id = int(cur.fetchone()[0])
             cur.execute(
+                "select leaderboard_shadow_v1.begin_worker_resource_window(%s)",
+                (run_id,),
+            )
+            cur.execute(
+                "select set_config('oddssearch.worker_run_id',%s,false)",
+                (str(run_id),),
+            )
+            cur.execute(
                 """
                 update leaderboard_shadow_v1.pipeline_state
                 set release_sha=%s, last_worker_heartbeat_at=clock_timestamp(),
@@ -250,12 +269,28 @@ def start_worker_run(conn, worker_id: str) -> int:
     return run_id
 
 
+def recover_unfinished_worker_runs(conn) -> dict[str, Any]:
+    """Close a prior killed worker's durable resource window before new work."""
+    with conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "select leaderboard_shadow_v1."
+                "recover_unfinished_worker_resource_windows() as evidence"
+            )
+            return cur.fetchone()["evidence"]
+
+
 def finish_worker_run(
     conn, run_id: int, claimed: int, succeeded: int, failed: int,
     failure_summary: str | None = None,
 ) -> None:
     with conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "select leaderboard_shadow_v1.checkpoint_worker_resource_window(%s,true)",
+                (run_id,),
+            )
+            cur.fetchone()
             cur.execute(
                 """
                 update leaderboard_shadow_v1.worker_runs
@@ -266,6 +301,7 @@ def finish_worker_run(
                 """,
                 (claimed, succeeded, failed, failure_summary, run_id),
             )
+            cur.execute("select set_config('oddssearch.worker_run_id','',false)")
             cur.execute(
                 """
                 update leaderboard_shadow_v1.pipeline_state
@@ -806,9 +842,10 @@ def main() -> int:
             return 0
         budget = RunBudget.create(args.fixture_limit, args.max_seconds)
         allow_disabled = validate_activation_override(conn, args.isolated_test_override)
-        require_worker_enabled(conn, allow_disabled)
         require_external = not allow_disabled
         apply_preflight_timeouts(conn)
+        recovery_evidence = recover_unfinished_worker_runs(conn)
+        require_worker_enabled(conn, allow_disabled)
         if require_external:
             load_external_resource_evidence(conn)
         temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
@@ -843,6 +880,7 @@ def main() -> int:
                 "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
                 "temp_file_limit_enforced": temp_file_limit_enforced,
                 "resource_guard": resource_evidence,
+                "interrupted_run_recovery": recovery_evidence,
             }, default=str))
             return 0
 
@@ -877,10 +915,21 @@ def main() -> int:
                 "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
                 "temp_file_limit_enforced": temp_file_limit_enforced,
                 "resource_guard": resource_evidence,
+                "interrupted_run_recovery": recovery_evidence,
             }, sort_keys=True))
         except Exception as error:
             apply_recovery_timeouts(conn)
-            finish_worker_run(conn, run_id, 0, 0, 1, str(error)[:2000])
+            # budget.processed advances only after a capture or generation job
+            # committed successfully. Preserve that authoritative progress in
+            # run evidence even when a later guard or publication check fails.
+            finish_worker_run(
+                conn,
+                run_id,
+                budget.processed,
+                budget.processed,
+                1,
+                str(error)[:2000],
+            )
             raise
     finally:
         conn.close()
