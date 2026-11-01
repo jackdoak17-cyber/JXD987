@@ -14,8 +14,10 @@ from scripts.leaderboard_shadow_worker import (
     MAX_SECONDS_PER_RUN,
     RESOURCE_GUARD_FIXTURE_INTERVAL,
     SAFETY_CHECK_RESERVE_SECONDS,
+    PREFLIGHT_STATEMENT_TIMEOUT_MS,
     DirtyClaim,
     RunBudget,
+    apply_preflight_timeouts,
     configure_temp_file_limit_if_permitted,
     claim_dirty,
     finish_generation,
@@ -243,6 +245,24 @@ def test_worker_finish_is_included_in_final_resource_evidence(monkeypatch):
 
     assert evidence == {"ok": True}
     assert calls == ["finish", "timeouts", "guard"]
+
+
+def test_preflight_is_bounded_before_the_processing_budget_starts():
+    cursor = FakeCursor()
+
+    apply_preflight_timeouts(FakeConnection(cursor))
+
+    assert cursor.executed == [
+        (
+            "select set_config('lock_timeout', %s, false)",
+            ("2000ms",),
+        ),
+        (
+            "select set_config('statement_timeout', %s, false)",
+            (f"{PREFLIGHT_STATEMENT_TIMEOUT_MS}ms",),
+        ),
+    ]
+    assert PREFLIGHT_STATEMENT_TIMEOUT_MS == 5_000
 
 
 def test_superseded_generation_defers_to_a_replacement_without_worker_failure():

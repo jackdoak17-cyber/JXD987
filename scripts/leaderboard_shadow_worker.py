@@ -27,6 +27,7 @@ RELEASE_SHA = os.environ.get("LEADERBOARD_SHADOW_RELEASE_SHA", "development")
 MAX_FIXTURES_PER_RUN = 250
 MAX_SECONDS_PER_RUN = 30.0
 LOCK_TIMEOUT_MS = 2_000
+PREFLIGHT_STATEMENT_TIMEOUT_MS = 5_000
 # Leave enough of the hard run deadline for the mandatory resource check and
 # transaction cleanup.  Starting another fixture with only milliseconds left
 # turns an otherwise healthy bounded run into a statement-timeout failure.
@@ -110,6 +111,22 @@ def configure_temp_file_limit_if_permitted(conn) -> bool:
                     """
                 )
     return permitted
+
+
+def apply_preflight_timeouts(conn) -> None:
+    """Bound fail-closed evidence checks before the processing budget starts.
+
+    The worker owns the shared database-heavy slot while these checks run. A
+    congested statistics view must therefore defer quickly instead of delaying
+    the higher-priority source importer at its next scheduled boundary.
+    """
+
+    with conn.cursor() as cur:
+        cur.execute("select set_config('lock_timeout', %s, false)", (f"{LOCK_TIMEOUT_MS}ms",))
+        cur.execute(
+            "select set_config('statement_timeout', %s, false)",
+            (f"{PREFLIGHT_STATEMENT_TIMEOUT_MS}ms",),
+        )
 
 
 def connect():
@@ -791,6 +808,7 @@ def main() -> int:
         allow_disabled = validate_activation_override(conn, args.isolated_test_override)
         require_worker_enabled(conn, allow_disabled)
         require_external = not allow_disabled
+        apply_preflight_timeouts(conn)
         if require_external:
             load_external_resource_evidence(conn)
         temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
