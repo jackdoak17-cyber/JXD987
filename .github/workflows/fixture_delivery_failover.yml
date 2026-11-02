@@ -4,11 +4,6 @@ on:
   schedule:
     - cron: "35 * * * *"
   workflow_dispatch:
-  push:
-    branches:
-      - diagnostic/fixture-core-recovery-20261102
-    paths:
-      - ".github/workflows/fixture_delivery_failover.yml"
 
 concurrency:
   group: fixture-delivery-production-failover
