@@ -1,0 +1,28 @@
+name: VPS Access Presence Diagnostic
+
+on:
+  push:
+    branches:
+      - diagnostic/vps-access-20261102
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report configured VPS connection inputs
+        env:
+          SECRET_VPS_HOST: ${{ secrets.VPS_HOST != '' }}
+          SECRET_VPS_USER: ${{ secrets.VPS_USER != '' }}
+          SECRET_VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY != '' }}
+          SECRET_VPS_REPO_ROOT: ${{ secrets.VPS_REPO_ROOT != '' }}
+          SECRET_ODDS_DELIVERY_DB_PATH: ${{ secrets.ODDS_DELIVERY_DB_PATH != '' }}
+          VAR_VPS_HOST: ${{ vars.VPS_HOST != '' }}
+          VAR_VPS_USER: ${{ vars.VPS_USER != '' }}
+          VAR_VPS_REPO_ROOT: ${{ vars.VPS_REPO_ROOT != '' }}
+          VAR_ODDS_DELIVERY_DB_PATH: ${{ vars.ODDS_DELIVERY_DB_PATH != '' }}
+        run: |
+          printf 'VPS_HOST secret=%s var=%s\n' "$SECRET_VPS_HOST" "$VAR_VPS_HOST"
+          printf 'VPS_USER secret=%s var=%s\n' "$SECRET_VPS_USER" "$VAR_VPS_USER"
+          printf 'VPS_SSH_KEY secret=%s\n' "$SECRET_VPS_SSH_KEY"
+          printf 'VPS_REPO_ROOT secret=%s var=%s\n' "$SECRET_VPS_REPO_ROOT" "$VAR_VPS_REPO_ROOT"
+          printf 'ODDS_DELIVERY_DB_PATH secret=%s var=%s\n' "$SECRET_ODDS_DELIVERY_DB_PATH" "$VAR_ODDS_DELIVERY_DB_PATH"
