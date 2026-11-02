@@ -78,10 +78,10 @@ Runtime drift protection:
 
 The fixture-delivery cron in production must deploy to the same checkout used
 by both the P3 and settlement entries. For the current production schedule that
-target is `/opt/odds-sync/JXD987-fixture-metrics-closeout-release`:
+target is `/opt/odds-sync/JXD987-fixture-core-900d1ca-release`:
 
 ```bash
-scripts/vps/deploy_runtime.sh <host> /opt/odds-sync/JXD987-fixture-metrics-closeout-release
+scripts/vps/deploy_runtime.sh <host> /opt/odds-sync/JXD987-fixture-core-900d1ca-release
 ```
 
 ## 4) Phase 1 schedule (parity mode)
