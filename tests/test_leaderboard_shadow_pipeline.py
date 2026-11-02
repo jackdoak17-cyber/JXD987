@@ -21,12 +21,15 @@ from scripts.leaderboard_shadow_worker import (
     configure_temp_file_limit_if_permitted,
     claim_dirty,
     finish_generation,
+    finish_worker_run,
     finish_worker_run_with_resource_check,
     load_external_resource_evidence,
     pending_cohorts,
     process_generation_job,
     process_dirty_claim,
     process_capture_queue,
+    recover_unfinished_worker_runs,
+    start_worker_run,
 )
 
 
@@ -129,6 +132,15 @@ class GenerationJobConnection(FakeConnection):
 
     def set_session(self, isolation_level):
         self.isolation_levels.append(isolation_level)
+
+
+class WorkerAccountingCursor(FakeCursor):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = iter(rows)
+
+    def fetchone(self):
+        return next(self.rows)
 
 
 def test_capture_hook_is_inert_by_default(monkeypatch):
@@ -245,6 +257,56 @@ def test_worker_finish_is_included_in_final_resource_evidence(monkeypatch):
 
     assert evidence == {"ok": True}
     assert calls == ["finish", "timeouts", "guard"]
+
+
+def test_resource_guard_checkpoints_an_active_run_before_enforcement():
+    class GuardCursor(FakeCursor):
+        def __init__(self):
+            super().__init__()
+            self.rows = iter([
+                {"active_run_id": 73},
+                ({"ok": True},),
+                {"evidence": {"ok": True, "breaches": []}},
+            ])
+
+        def fetchone(self):
+            return next(self.rows)
+
+    cursor = GuardCursor()
+    evidence = worker_module.enforce_resource_guard(FakeConnection(cursor), False)
+
+    assert evidence == {"ok": True, "breaches": []}
+    assert "checkpoint_worker_resource_window" in cursor.executed[1][0]
+    assert cursor.executed[1][1] == (73,)
+    assert "enforce_resource_guard" in cursor.executed[2][0]
+
+
+def test_worker_run_opens_and_closes_the_durable_resource_window():
+    cursor = WorkerAccountingCursor([(73,), ({"ok": True},)])
+    connection = FakeConnection(cursor)
+
+    assert start_worker_run(connection, "worker:test") == 73
+    finish_worker_run(connection, 73, 4, 4, 0)
+
+    statements = [query for query, _ in cursor.executed]
+    assert any("begin_worker_resource_window" in query for query in statements)
+    assert any("set_config('oddssearch.worker_run_id'" in query for query in statements)
+    assert any("checkpoint_worker_resource_window" in query for query in statements)
+    assert any("set_config('oddssearch.worker_run_id',''" in query for query in statements)
+    assert statements.index(next(q for q in statements if "begin_worker_resource_window" in q)) \
+        < statements.index(next(q for q in statements if "checkpoint_worker_resource_window" in q))
+
+
+def test_interrupted_windows_are_recovered_before_new_work():
+    evidence = {
+        "ok": True,
+        "recovered_count": 1,
+        "database_window_fallback_count": 1,
+    }
+    cursor = WorkerAccountingCursor([{"evidence": evidence}])
+
+    assert recover_unfinished_worker_runs(FakeConnection(cursor)) == evidence
+    assert "recover_unfinished_worker_resource_windows" in cursor.executed[0][0]
 
 
 def test_preflight_is_bounded_before_the_processing_budget_starts():

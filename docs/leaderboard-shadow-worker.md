@@ -33,11 +33,21 @@ timeout or signal; durable queues make every deferral resumable.
 
 Every run enforces the approved resource guard before work and before
 publication. PostgreSQL measures the shadow footprint and index ratio directly.
-WAL and temporary writes are attributed from `pg_stat_statements` only for SQL
-that targets the shadow schema; capture-trigger events receive a conservative
-transactional WAL allowance. A reset, eviction or regression of a pinned
-Milestone 3 query's evidence stops processing, while unrelated statement churn
-does not. The worker probes `has_parameter_privilege` once and sets
+Each bounded run opens a durable resource-accounting window and checkpoints it
+at every existing guard boundary. While `pg_stat_statements` remains
+continuous, only shadow SQL WAL and temporary writes are charged. If its
+bounded cache evicts an entry during the window, the checkpoint conservatively
+charges all database WAL and temporary I/O generated during that same short
+window. The cumulative accepted amount is stored independently of the cache,
+so later evictions cannot erase usage. Capture-trigger events retain their
+conservative transactional WAL allowance. A statistics reset, regressed
+database temporary-I/O counter or hard limit still stops processing. The
+next non-overlapping worker also closes any resource window left unfinished by
+a killed process before it starts new work. The interrupted run is recorded as
+failed, and its resource use is charged exactly when possible or conservatively
+from its bounded database window, so a crash cannot create an accounting gap.
+The
+worker probes `has_parameter_privilege` once and sets
 `temp_file_limit` from the approved maximum only when the connected role may do
 so. Supabase's non-superuser `postgres` owner is supported without privilege
 escalation: attributed temporary-I/O, statement/lock deadlines and bounded runs
