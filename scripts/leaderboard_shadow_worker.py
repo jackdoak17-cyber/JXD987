@@ -140,7 +140,7 @@ def connect():
     )
 
 
-def acquire_database_heavy_lock_after_connect(wait_seconds: float):
+def acquire_database_heavy_lock_after_connect():
     """Hold the importer-priority slot only after session-pool admission.
 
     A failed pool checkout can take 15 seconds or more during congestion. It
@@ -148,22 +148,15 @@ def acquire_database_heavy_lock_after_connect(wait_seconds: float):
     executed between connecting and acquiring this lock.
     """
 
-    if not 0 <= wait_seconds <= 60:
-        raise ValueError("database-heavy lock wait must be between 0 and 60 seconds")
     lock_path = os.environ.get("ODDSSEARCH_DB_HEAVY_LOCK_FILE", "/var/lock/oddssearch-db-heavy.lock")
     os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
     lock_file = open(lock_path, "a+")
-    deadline = time.monotonic() + wait_seconds
-    while True:
-        try:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return lock_file
-        except BlockingIOError:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                lock_file.close()
-                return None
-            time.sleep(min(0.05, remaining))
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return lock_file
+    except BlockingIOError:
+        lock_file.close()
+        return None
 
 
 def isolated_test_database(conn) -> bool:
@@ -859,6 +852,11 @@ def main() -> int:
     parser.add_argument("--season-id", type=int)
     parser.add_argument("--batch-size", type=int, default=250)
     args = parser.parse_args()
+    if (
+        args.db_heavy_lock_after_connect
+        and os.environ.get("LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS", "0") != "0"
+    ):
+        parser.error("post-connection database-heavy lock wait must be 0")
     if (args.league_id is None) != (args.season_id is None):
         parser.error("league-id and season-id must be supplied together")
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
@@ -867,8 +865,7 @@ def main() -> int:
     heavy_lock_file = None
     try:
         if args.db_heavy_lock_after_connect:
-            wait_seconds = float(os.environ.get("LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS", "0"))
-            heavy_lock_file = acquire_database_heavy_lock_after_connect(wait_seconds)
+            heavy_lock_file = acquire_database_heavy_lock_after_connect()
             if heavy_lock_file is None:
                 print("[SKIPPED] database-heavy maintenance slot unavailable", flush=True)
                 return 75

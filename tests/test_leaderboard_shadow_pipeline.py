@@ -468,6 +468,16 @@ def test_worker_defers_without_sql_when_importer_holds_heavy_lock(tmp_path, monk
     assert conn.closed
 
 
+def test_worker_rejects_positive_post_connection_lock_wait_before_connect(monkeypatch):
+    monkeypatch.setenv("LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS", "1")
+    monkeypatch.setattr(sys, "argv", ["worker", "run-once", "--db-heavy-lock-after-connect"])
+    monkeypatch.setattr(worker_module, "connect", lambda: pytest.fail("connected before validating lock wait"))
+
+    with pytest.raises(SystemExit) as error:
+        worker_module.main()
+    assert error.value.code == 2
+
+
 def test_database_heavy_lock_defers_overlap_then_releases(tmp_path):
     if shutil.which("flock") is None:
         pytest.skip("Linux flock is unavailable on this host")
