@@ -7,7 +7,8 @@ source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
 require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
-  "scripts/reconcile_stats_provider_queue.py"
+  "scripts/reconcile_stats_provider_queue.py" \
+  "scripts/vps/select_stats_reconciliation_leagues.py"
 
 if [[ -f "${REPO_ROOT}/.env" ]]; then
   set -a
@@ -19,6 +20,15 @@ fi
 export PYTHONPATH="${REPO_ROOT}"
 export REPO_ROOT
 export STATS_RECONCILE_LEAGUES="${STATS_RECONCILE_LEAGUES:-$(supported_league_csv)}"
+# The full 30-league revalidation sort has timed out under production
+# pressure. Two-league scopes let the existing fixture index narrow each
+# candidate query; a durable cursor gives every configured league a turn.
+export STATS_RECONCILE_LEAGUE_GROUP_SIZE="${STATS_RECONCILE_LEAGUE_GROUP_SIZE:-2}"
+export STATS_RECONCILE_LEAGUE_CURSOR_FILE="${STATS_RECONCILE_LEAGUE_CURSOR_FILE:-/var/lib/odds-sync/stats-reconciliation-league-cursor.json}"
+STATS_RECONCILE_GROUP_COUNT="$("${REPO_ROOT}/.venv/bin/python" \
+  "${REPO_ROOT}/scripts/vps/select_stats_reconciliation_leagues.py" count \
+  --leagues "${STATS_RECONCILE_LEAGUES}" \
+  --group-size "${STATS_RECONCILE_LEAGUE_GROUP_SIZE}")"
 # Keep each historical lock hold below the live settlement cadence, then leave
 # a real handoff window for the scheduled writers. Operators can raise these
 # values for an isolated maintenance window, but the production defaults are
@@ -75,14 +85,23 @@ export ODDS_SYNC_LIVE_TICK_SECONDS="${STATS_RECONCILE_LIVE_TICK_SECONDS}"
 export ODDS_SYNC_LIVE_GRACE_SECONDS="${STATS_RECONCILE_LIVE_GRACE_SECONDS}"
 
 RECONCILIATION_COMMAND=$(cat <<'CHAIN'
+set -euo pipefail
+selected_leagues="$("${REPO_ROOT}/.venv/bin/python" \
+  "${REPO_ROOT}/scripts/vps/select_stats_reconciliation_leagues.py" next \
+  --leagues "${STATS_RECONCILE_LEAGUES}" \
+  --group-size "${STATS_RECONCILE_LEAGUE_GROUP_SIZE}" \
+  --cursor-file "${STATS_RECONCILE_LEAGUE_CURSOR_FILE}" \
+  2>>"${STATS_RECONCILE_RUN_LOG}")"
+printf 'stats reconciliation selected leagues=%s\n' "${selected_leagues}" >>"${STATS_RECONCILE_RUN_LOG}"
+printf 'stats reconciliation selected leagues=%s\n' "${selected_leagues}" >&2
 exec "${REPO_ROOT}/.venv/bin/python" \
   "${REPO_ROOT}/scripts/reconcile_stats_provider_queue.py" \
-  --leagues "${STATS_RECONCILE_LEAGUES}" \
+  --leagues "${selected_leagues}" \
   --batch-size "${STATS_RECONCILE_BATCH_SIZE}" \
   --max-cohorts "${STATS_RECONCILE_MAX_COHORTS}" \
   --max-batches 1 \
   --report-json "${STATS_RECONCILE_REPORT}" \
-  >"${STATS_RECONCILE_RUN_LOG}" 2>&1
+  >>"${STATS_RECONCILE_RUN_LOG}" 2>&1
 CHAIN
 )
 
@@ -111,6 +130,7 @@ wait_for_live_window() {
   fi
 }
 
+empty_group_count=0
 while true; do
   wait_for_live_window
   # The supervisor is intentionally long-lived. Refresh the release label for
@@ -147,6 +167,7 @@ while true; do
   fi
 
   if [[ ! -f "${STATS_RECONCILE_REPORT}" ]]; then
+    empty_group_count=0
     # The worker may fail before it can write a JSON report. Preserve a bounded
     # error excerpt (20 lines, at most 8 KiB) before the next loop deletes the
     # temporary run log; the ledger's status/duration alone cannot name the
@@ -213,16 +234,24 @@ PY
     "${processing_duration_ms}"
 
   if [[ "${status}" -ne 0 ]]; then
+    empty_group_count=0
     tail -n 20 "${STATS_RECONCILE_RUN_LOG}" >&2 || true
     sleep "${STATS_RECONCILE_SLEEP_SECONDS}" 9>&-
     continue
   fi
 
   if [[ "${batches}" -eq 0 ]]; then
-    log_info "stats reconciliation queue drained"
-    exit 0
+    empty_group_count=$((empty_group_count + 1))
+    if (( empty_group_count >= STATS_RECONCILE_GROUP_COUNT )); then
+      log_info "stats reconciliation queue drained across all ${STATS_RECONCILE_GROUP_COUNT} league groups"
+      exit 0
+    fi
+    log_info "stats reconciliation group empty (${empty_group_count}/${STATS_RECONCILE_GROUP_COUNT}); checking next group"
+    sleep "${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS}" 9>&-
+    continue
   fi
 
+  empty_group_count=0
   tail -n 8 "${STATS_RECONCILE_RUN_LOG}" || true
   sleep "${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS}" 9>&-
 done
