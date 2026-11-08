@@ -79,6 +79,11 @@ a separate coordinated five-checkout rollout.
 
 ## Rollback
 
+This section applies only to rolling back the installed **#80 cutover itself**.
+Rollback of stacked [draft #81](https://github.com/jackdoak17-cyber/JXD987/pull/81)
+preserves #80's minute `17` schedule and uses that draft's separate two-stage
+drain procedure.
+
 Restore the exact source-release fixture-core entry at minute `4` and source
 publisher entry at minute `11`; verify both. Keep the old release untouched.
 Do not delete a target while an invocation is using it. An already published
