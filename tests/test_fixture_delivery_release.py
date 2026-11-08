@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import unittest
+import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
+from scripts import refresh_fixture_delivery as publisher
 from scripts.refresh_fixture_delivery import (
     bounded_release_pin_expires_at,
     build_season_scoped_history,
     compute_standings,
+    current_resolved_publication_state,
     finalize_release,
     iso_date,
     publish_release,
+    publication_skip_reason,
     record_verified_noop,
+    validate_session_capable_dsn,
+    verify_superseded_core_skip,
 )
 
 
@@ -19,6 +25,177 @@ UTC = timezone.utc
 
 
 class FixtureDeliveryReleaseContractTests(unittest.TestCase):
+    def test_resolver_and_release_evidence_share_one_statement(self) -> None:
+        cursor = Mock()
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        cursor.fetchone.return_value = (
+            "release-id", now, now, now + timedelta(hours=2), {}, "release-id", "current",
+        )
+        state = current_resolved_publication_state(cursor)
+        cursor.execute.assert_called_once()
+        sql = cursor.execute.call_args.args[0]
+        self.assertIn("fixture_delivery_release_resolve(null::uuid)", sql)
+        self.assertIn("fixture_delivery_releases", sql)
+        self.assertEqual(state["resolver_state"], "current")
+
+    def test_superseded_primary_skip_requires_current_supported_release(self) -> None:
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        current = {
+            "release_id": "current-release",
+            "resolver_release_id": "current-release",
+            "resolver_state": "current",
+            "published_at": now - timedelta(hours=2),
+            "health_checked_at": now,
+            "pin_expires_at": now + timedelta(hours=2),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(minutes=5)).isoformat(),
+                "max_age_minutes": 540,
+            }},
+        }
+        report = {
+            "skipped": True,
+            "published": False,
+            "skip_reason": "newer_current_source",
+            "current_release_id": "current-release",
+            "pin_expires_at": (now + timedelta(minutes=90)).isoformat(),
+            "source_freshness": {"verified_at": (now - timedelta(hours=7)).isoformat()},
+        }
+        verify_superseded_core_skip(report, current, now=now)
+        for malformed in (
+            {**report, "skip_reason": "publication_active"},
+            {**report, "skip_reason": "unknown"},
+            {**report, "skipped": False},
+            {**report, "published": True},
+            {**report, "current_release_id": "other-release"},
+            {**report, "source_freshness": {}},
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises((RuntimeError, KeyError)):
+                    verify_superseded_core_skip(malformed, current, now=now)
+        current["pin_expires_at"] = now + timedelta(minutes=10)
+        with self.assertRaisesRegex(RuntimeError, "runway"):
+            verify_superseded_core_skip(report, current, now=now)
+        current["pin_expires_at"] = now + timedelta(hours=2)
+        current["health_checked_at"] = None
+        current["resolver_state"] = "stale"
+        with self.assertRaisesRegex(RuntimeError, "resolver"):
+            verify_superseded_core_skip(report, current, now=now)
+
+    def test_session_lock_rejects_supabase_transaction_pooler(self) -> None:
+        validate_session_capable_dsn("postgresql://user:pass@aws-0.pooler.supabase.com:5432/postgres")
+        validate_session_capable_dsn("postgresql://user:pass@db.example.com:5432/postgres")
+        with self.assertRaisesRegex(RuntimeError, "session-pooler"):
+            validate_session_capable_dsn("postgresql://user:pass@aws-0.pooler.supabase.com:6543/postgres")
+        with self.assertRaisesRegex(RuntimeError, "session-pooler"):
+            validate_session_capable_dsn("postgresql://user:pass@custom-pooler.example.com:6543/postgres")
+        for dsn in (
+            "postgresql://user:pass@aws-0.pooler.supabase.com:5432/postgres?port=6543",
+            "postgresql:///postgres?host=aws-0.pooler.supabase.com&port=6543",
+            "host=aws-0.pooler.supabase.com port=6543 dbname=postgres",
+        ):
+            with self.subTest(dsn=dsn):
+                with self.assertRaisesRegex(RuntimeError, "session-pooler"):
+                    validate_session_capable_dsn(dsn)
+        with patch.dict("os.environ", {"PGPORT": "6543"}):
+            with self.assertRaisesRegex(RuntimeError, "session-pooler"):
+                validate_session_capable_dsn("postgresql://user:pass@aws-0.pooler.supabase.com/postgres")
+        with patch.dict("os.environ", {"PGSERVICE": "uninspected"}):
+            with self.assertRaisesRegex(RuntimeError, "explicit database endpoint"):
+                validate_session_capable_dsn("postgresql:///postgres")
+
+    def test_older_fallback_cannot_shorten_primary_noop_before_heartbeat(self) -> None:
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        current = {
+            "release_id": "primary-release",
+            "published_at": now - timedelta(hours=2),
+            "health_checked_at": now,
+            "pin_expires_at": now + timedelta(hours=2),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(minutes=27)).isoformat(),
+            }},
+        }
+        fallback = {"verified_at": (now - timedelta(minutes=450)).isoformat()}
+        self.assertEqual(
+            publication_skip_reason(
+                current, fallback, now + timedelta(minutes=90),
+                guarded=True, min_interval_seconds=3600, now=now,
+            ),
+            "newer_current_source",
+        )
+
+    def test_recent_publication_with_short_pin_allows_fresh_recovery(self) -> None:
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        current = {
+            "release_id": "short-pin-release",
+            "published_at": now - timedelta(minutes=20),
+            "health_checked_at": now - timedelta(minutes=20),
+            "pin_expires_at": now + timedelta(minutes=10),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(hours=8)).isoformat(),
+            }},
+        }
+        fresh = {"verified_at": (now - timedelta(minutes=2)).isoformat()}
+        self.assertIsNone(publication_skip_reason(
+            current, fresh, now + timedelta(hours=2),
+            guarded=True, min_interval_seconds=3600, now=now,
+        ))
+        current["pin_expires_at"] = now + timedelta(hours=2)
+        self.assertEqual(publication_skip_reason(
+            current, fresh, now + timedelta(hours=2),
+            guarded=True, min_interval_seconds=3600, now=now,
+        ), "recent_publication_satisfies_guard")
+
+    def test_current_full_publication_evidence_blocks_older_candidate(self) -> None:
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        current = {
+            "release_id": "new-full-release",
+            "published_at": now - timedelta(hours=2),
+            "health_checked_at": now - timedelta(hours=2),
+            "pin_expires_at": now + timedelta(hours=2),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(minutes=27)).isoformat(),
+            }},
+        }
+        self.assertEqual(publication_skip_reason(
+            current, {"verified_at": (now - timedelta(hours=7)).isoformat()},
+            now + timedelta(minutes=90), guarded=True,
+            min_interval_seconds=3600, now=now,
+        ), "newer_current_source")
+
+    def test_guard_reads_committed_state_after_session_lock(self) -> None:
+        now = datetime.now(UTC)
+        conn = MagicMock()
+        cursor = Mock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        stale_after_lock = {
+            "release_id": "just-renewed",
+            "published_at": now - timedelta(hours=2),
+            "health_checked_at": now,
+            "pin_expires_at": now + timedelta(hours=2),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(minutes=5)).isoformat(),
+            }},
+        }
+        def committed_state(_cur):
+            self.assertEqual(conn.commit.call_count, 1)
+            return stale_after_lock
+        with (
+            patch.object(publisher, "connection", return_value=conn),
+            patch.object(publisher, "try_lock_refresh_publication", return_value=True),
+            patch.object(publisher, "validate_delivery_schema"),
+            patch.object(publisher, "verify_fixture_source_freshness", return_value={
+                "verified_at": (now - timedelta(hours=7)).isoformat(),
+            }),
+            patch.object(publisher, "bounded_release_pin_expires_at", return_value=now + timedelta(minutes=90)),
+            patch.object(publisher, "current_publication_guard_state", side_effect=committed_state),
+            patch.object(publisher, "source_fixtures") as source_rows,
+        ):
+            args = publisher.build_parser().parse_args(["--skip-if-publication-active"])
+            report = publisher.run(args)
+        self.assertEqual(report["skip_reason"], "newer_current_source")
+        source_rows.assert_not_called()
+        conn.close.assert_called_once_with()
+
     def test_verified_noop_writes_health_evidence_but_no_projection_rows(self) -> None:
         cursor = Mock()
         cursor.fetchone.return_value = ("run-id",)
@@ -123,6 +300,18 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         queries = [call.args[0] for call in cursor.execute.call_args_list]
         self.assertIn("fixture_delivery_releases", queries[0])
         self.assertIn("fixture_delivery_current_publication", queries[1])
+
+    def test_full_publication_persists_source_evidence(self) -> None:
+        cursor = Mock()
+        cursor.rowcount = 1
+        evidence = {"verified_at": "2026-11-08T15:33:53+00:00", "max_age_minutes": 540}
+        publish_release(
+            cursor, "release-id", {"schedule": 1}, None,
+            semantic_fingerprint={"sha256": "abc"},
+            source_freshness=evidence,
+        )
+        metadata = json.loads(cursor.execute.call_args_list[0].args[1][-2])
+        self.assertEqual(metadata["last_source_freshness_evidence"], evidence)
 
     def test_fixture_date_is_derived_in_europe_london(self) -> None:
         # 23:30 UTC is already the next calendar day in London during BST.
