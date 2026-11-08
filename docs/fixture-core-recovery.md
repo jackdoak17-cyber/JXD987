@@ -34,6 +34,9 @@ windows instead of ten. Actual elapsed time also includes attempt overhead;
 this is not a strict 40-minute deadline. It invokes the
 provider and export only after acquiring a safe lease, so this does not add
 scheduled source runs or bypass the quarter-hour settlement guard.
+If an admitted source run reaches its shortened settlement lease, this caller
+records a skip and stops instead of repeating provider/export work within the
+same invocation. It still retries pre-admission lock and schedule deferrals.
 
 The proposed production cron adjustment is to move the six-hour fixture-core
 entry from minute `4` to minute `17` (`17 */6 * * *`), leaving the same
