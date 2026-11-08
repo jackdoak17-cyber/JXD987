@@ -243,8 +243,8 @@ same `.env`, `.venv` and `data` targets as active core. Archive SHA-256, all
 43 manifest files, runtime ID, links, shell syntax and a no-write dry run
 passed on the VPS. The staged verifier also accepted the live older-source
 guard report after one read of the current release and customer resolver.
-**No cron entry
-points to this package yet.**
+It was inactive through the final source review; the activation is recorded
+below.
 
 After loading each active package's `.env`, core/settlement, matcher, stats
 and squad all resolve `JXD_DB_PATH` to the same real SQLite database, inode
@@ -292,3 +292,45 @@ remain frozen and re-enable GitHub only after its main ref matches the
 selected rollback publisher. Check the current resolver and normal worker
 resumption before ending the freeze. The broader two-stage rollback above
 remains available if the #81 protocol itself fails.
+
+## Live publisher-guard cutover and immediate result
+
+The pre-cutover resolver was `current` for release
+`6d5b5d32-fc24-4fa2-a9fc-88d57217c2a1`, primary source evidence
+15:33:53 UTC and pin 17:51:02. GitHub workflow
+`fixture_delivery_failover.yml` was disabled and read back as
+`disabled_manually`; no queued, waiting or in-progress runs remained.
+The three active core/settlement/publisher cron entries were frozen at
+16:53:30 UTC. The entire pre-freeze crontab is
+`/root/crontab-before-publication-guard-20261108T1653Z.txt`, SHA-256
+`1b34152bf11a886bcdaf260331ebaedf3c1b5eec8e876651b2feedce4ac140b6`.
+The frozen crontab was read back; process and inherited environment scans
+found zero affected processes, and a nonblocking probe acquired and released
+the actual fixture-publication advisory lock.
+
+PR #83 was then squash-merged to JXD main as
+`8ca6c0bba6531da2ed153c848fa64cf431a61bd9`, while the workflow stayed
+disabled and no older run was queued. At 16:54:46 UTC exactly the three
+frozen entries were restored with the v4 package path. Their schedules and
+all 38 unrelated cron lines stayed identical; the activated crontab is
+`/root/crontab-publication-guard-v4-20261108T1653Z.txt`, SHA-256
+`9ffb76daa93a9585502fb44b09ddaa72c048e20dbe0f01280d3bff963b4d358e`.
+The old `85450e` path no longer appears in the active crontab.
+
+One controlled invocation of the new hourly publisher started at 16:55:20
+UTC under manifest `4b89de8d5131`, built and published release
+`5cc7a3b3-1b2e-45cf-8713-776c03467af1` with the genuine primary source
+evidence from 15:33:53, and exited zero. The release has 1,228 schedule,
+1,341 standings, 108,064 metrics and 2,616 odds rows, and is pinned to
+18:55:21 UTC; retention cleanup succeeded. A separate read-only check found
+the same release as `current` in the actual customer resolver. Signed-in
+production requests to the schedule and list endpoints both returned HTTP
+200 with this exact release header: 19 groups/87 nested fixtures and 22
+groups/123 nested fixtures respectively. The GitHub fallback workflow was
+then re-enabled and verified `active` on main `8ca6c0b`.
+
+The next scheduled settlement, 17:11 hourly publisher, later fallback run
+and 18:17 primary core run still require observation. This confirms the
+immediate publisher handover and customer Fixtures read path, not sustained
+ingestion or full website/scaling acceptance. No paid service, capacity,
+disk size, spend-cap setting or job frequency changed.
