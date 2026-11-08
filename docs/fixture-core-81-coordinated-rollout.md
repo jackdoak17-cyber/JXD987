@@ -66,12 +66,20 @@ certification of each older release's unrelated jobs.
    time and keep it as short as a safe drain permits. A path change alone
    leaves old processes and their in-memory functions alive.
 4. Inventory all affected old wrapper processes and descendants, including
-   ones waiting in a lock retry. Wait for them to finish. At an observed idle
-   boundary for the long-lived stats supervisor, confirm it has no active
-   child and holds neither the canonical nor database-heavy lock before
-   stopping it; then verify every descendant has exited. The supervisor has
-   **no graceful drain command**. Check the canonical lock, heavy lock and
-   reservation sidecar after the drain. Do not activate new entries while any
+   ones waiting in a lock retry. Wait for them to finish. After cron has been
+   frozen, send `SIGSTOP` to the long-lived stats supervisor **itself** so its
+   loop cannot start another batch during the idle check. Inspect its process
+   tree and the canonical and database-heavy locks while it is stopped. If it
+   has an active worker child or holds either work lock, send `SIGCONT` and let
+   it finish, then repeat the stop-and-inspect check at a later handoff. A
+   sleep child may finish while the parent is stopped. Once there is no worker
+   child, no work lock and no remaining descendant, send `SIGKILL` to the
+   stopped supervisor and verify its exit and the release of its supervisor
+   lock before activating a new supervisor.
+   The supervisor has **no graceful drain command**; do not infer idleness
+   from a momentary childless snapshot while its loop is running. Check the
+   canonical lock, heavy lock and reservation sidecar after the drain. Do not
+   activate new entries while any
    old protocol process is still alive. If quiescence cannot be proved, restore
    the backed-up crontab and postpone the cutover. The freeze may skip a
    scheduled settlement or publication; record any missed run and verify its
@@ -97,8 +105,10 @@ certification of each older release's unrelated jobs.
 
 Rollback also uses a two-stage barrier. First remove all affected candidate
 cron entries atomically, leaving unrelated entries in place; read them back
-and wait for every new wrapper and descendant to exit. Hand off the new stats
-supervisor only at a verified idle boundary. Do not delete any release
+and wait for every new wrapper and descendant to exit. Quiesce the new stats
+supervisor with the same stop-and-inspect procedure before checking for active
+children and work locks; release it to finish if it is busy. Do not delete any
+release
 directory while a process uses it. An old normal writer ignores the
 reservation, so do not leave a mixed protocol operating and describe it as a
 successful rollback. If a reservation exists, identify its owner and expiry,
