@@ -62,8 +62,9 @@ composition. The archive contains no `.env`, `.venv`, SQLite data or secrets.
    remained `current` for release
    `bda3d455-74bf-455b-aee7-6db158843a77` at 14:44 UTC.
 
-The next regular publisher at 15:11 UTC may also skip because it precedes the
-one-hour minimum from 14:13. The 16:11 run has a narrow window before the
+The 15:11 UTC scheduled publisher ran from the new release, verified its
+manifest and skipped under the same guard: 3,463 seconds had elapsed, short
+of the 3,600-second minimum. The 16:11 run has a narrow window before the
 current 16:13:24 pin expires and before fallback evidence becomes too old at
 16:56:25. The next regular primary source attempt is 18:17. A genuinely fresh
 source is therefore still needed before 16:56; the GitHub fallback schedule
