@@ -15,6 +15,8 @@ from scripts.refresh_fixture_delivery import (
     publish_release,
     publication_skip_reason,
     record_verified_noop,
+    validate_session_capable_dsn,
+    verify_superseded_core_skip,
 )
 
 
@@ -22,6 +24,50 @@ UTC = timezone.utc
 
 
 class FixtureDeliveryReleaseContractTests(unittest.TestCase):
+    def test_superseded_primary_skip_requires_current_supported_release(self) -> None:
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        current = {
+            "release_id": "current-release",
+            "published_at": now - timedelta(hours=2),
+            "health_checked_at": now,
+            "pin_expires_at": now + timedelta(hours=2),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(minutes=5)).isoformat(),
+                "max_age_minutes": 540,
+            }},
+        }
+        report = {
+            "skipped": True,
+            "published": False,
+            "skip_reason": "newer_current_source",
+            "current_release_id": "current-release",
+            "pin_expires_at": (now + timedelta(minutes=90)).isoformat(),
+            "source_freshness": {"verified_at": (now - timedelta(hours=7)).isoformat()},
+        }
+        verify_superseded_core_skip(report, current, now=now)
+        for malformed in (
+            {**report, "skip_reason": "publication_active"},
+            {**report, "skip_reason": "unknown"},
+            {**report, "skipped": False},
+            {**report, "published": True},
+            {**report, "current_release_id": "other-release"},
+            {**report, "source_freshness": {}},
+        ):
+            with self.subTest(malformed=malformed):
+                with self.assertRaises((RuntimeError, KeyError)):
+                    verify_superseded_core_skip(malformed, current, now=now)
+        current["pin_expires_at"] = now + timedelta(minutes=10)
+        with self.assertRaisesRegex(RuntimeError, "runway"):
+            verify_superseded_core_skip(report, current, now=now)
+
+    def test_session_lock_rejects_supabase_transaction_pooler(self) -> None:
+        validate_session_capable_dsn("postgresql://user:pass@aws-0.pooler.supabase.com:5432/postgres")
+        validate_session_capable_dsn("postgresql://user:pass@db.example.com:5432/postgres")
+        with self.assertRaisesRegex(RuntimeError, "session-pooler"):
+            validate_session_capable_dsn("postgresql://user:pass@aws-0.pooler.supabase.com:6543/postgres")
+        with self.assertRaisesRegex(RuntimeError, "session-pooler"):
+            validate_session_capable_dsn("postgresql://user:pass@custom-pooler.example.com:6543/postgres")
+
     def test_older_fallback_cannot_shorten_primary_noop_before_heartbeat(self) -> None:
         now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
         current = {
