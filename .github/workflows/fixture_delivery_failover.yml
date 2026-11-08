@@ -181,8 +181,13 @@ jobs:
             --skip-if-publication-active \
             --min-publish-interval-seconds 3600 \
             2>&1 | tee /tmp/fixture_failover_delivery.log
-          publish_status=${PIPESTATUS[0]}
+          publish_statuses=("${PIPESTATUS[@]}")
           set -e
+          publish_status="${publish_statuses[0]}"
+          if (( publish_statuses[1] != 0 )); then
+            echo "Unable to capture fixture publication log." >&2
+            exit "${publish_statuses[1]}"
+          fi
           if (( publish_status == 2 )); then
             echo "Guarded publisher skip: a current publication was recent or another publisher was active."
           elif (( publish_status != 0 )); then
