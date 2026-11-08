@@ -203,33 +203,44 @@ post-lock commit is required to see the preceding publisher's committed row.
 
 Review R21 identified one caller defect in the first staged package: a
 correct benign supersession exit 2 would mark the admitted core job failed.
-That first package (`38a77ccc7a39`) is **superseded and must not be activated**.
+That first package (`38a77ccc7a39`) is superseded. R21 follow-up found two
+more verifier defects in the second staged package (`36221bc38dea`): it did
+not call the customer resolver and its URL check could miss libpq connection
+overrides. **Neither earlier package may be activated.**
+
 The corrected #81 backport is commit
-`2e0d2c373fc3950553d464ad7599adc6e95a081b`. Its primary core wrapper
+`20a88309377f40c90366c2a775343bc9b7e0e08c`. Its primary core wrapper
 removes the prior publisher report, and accepts exit 2 only after a fresh
-database read verifies the same live release, at least 45 minutes of pin
-runway, source-bounded evidence and the exact benign skip reason. Unknown,
+single-statement database read verifies the actual customer resolver says
+`current` for the same release, at least 45 minutes of pin runway,
+source-bounded evidence and the exact benign skip reason. Unknown,
 malformed and missing reports and real publisher failures remain failures.
 The shared admission/exit handling in `common.sh` is unchanged. An extracted
 admitted-command-chain test exercises these paths with the real verifier and a
-stubbed database. The 79 fixture tests completed with 14 environment-gated
-skips; shell syntax, Python compile and diff checks passed. The publisher
-also rejects Supabase's transaction-pooler port 6543 for its session lock;
-the effective VPS URL is a Supabase pooler on port 5432 without exposing
-credentials in the record.
+stubbed database, including the null-health/stale-resolver case. The 80 fixture
+tests completed with 14 environment-gated skips; shell syntax, Python
+compile, complete source manifest and diff checks passed. The publisher uses
+libpq's parsed effective connection parameters to reject Supabase's
+transaction-pooler port 6543, including URI/query and keyword DSN overrides.
+The effective VPS URL is a Supabase pooler on port 5432 without exposing
+credentials in the record. A unique-key two-connection production probe
+verified that this exact connection preserves a session advisory lock after
+commit, blocks a second connection and releases the lock on close. No data
+rows or settings were changed by the probe.
 
 The corrected immutable package was derived from the active core archive by
 replacing only `scripts/refresh_fixture_delivery.py` and
 `scripts/vps/run_p3_fixture_core.sh`, then updating their manifest entries
 and source identity. Its manifest is
-`36221bc38deae6ef6920f415647fdaa300fe2e65` and archive SHA-256 is
-`9e1a0aead856251aa6b0e3fcd818cd4e58a552c0e620f2126dfb9801428b2352`.
+`29be41a595c850b42b944c03fcc50b8d7a9825fd` and archive SHA-256 is
+`ce2348e3f2ca4e562404df6897e7205770133759e72c1cd471f6c94881cfee6b`.
 It is staged at
-`/opt/odds-sync/JXD987-fixture-core-81-guard-v2-36221b-release` with the
+`/opt/odds-sync/JXD987-fixture-core-81-guard-v3-29be41-release` with the
 same `.env`, `.venv` and `data` targets as active core. Archive SHA-256, all
 43 manifest files, runtime ID, links, shell syntax and a no-write dry run
 passed on the VPS. The staged verifier also accepted the live older-source
-guard report after a fresh read of the current release. **No cron entry
+guard report after one read of the current release and customer resolver.
+**No cron entry
 points to this package yet.**
 
 After loading each active package's `.env`, core/settlement, matcher, stats
@@ -249,7 +260,7 @@ settlement process, then atomically replace only the three core-package
 paths (fixture core, hourly publisher and settlement) with the staged path.
 Keep all schedules, all other worker entries and all database/configuration
 settings identical. Read back all entries and verify the next scheduled
-settlement and publisher against manifest `36221bc38dea`. If either fails,
+settlement and publisher against manifest `29be41a595c8`. If either fails,
 restore the backed-up three paths atomically to the still-installed
 `JXD987-fixture-core-81-85450e-release`, then verify writer quiescence and
 the current release before retrying. The broader two-stage rollback above
