@@ -1,4 +1,4 @@
-# Fixture-core recovery candidate — 8 November 2026
+# Fixture-core recovery and admission candidate — 8 November 2026
 
 ## Observed failure
 
@@ -38,12 +38,15 @@ If an admitted source run reaches its shortened settlement lease, this caller
 records a skip and stops instead of repeating provider/export work within the
 same invocation. It still retries pre-admission lock and schedule deferrals.
 
-The proposed production cron adjustment is to move the six-hour fixture-core
+The approved production cron adjustment moved the six-hour fixture-core
 entry from minute `4` to minute `17` (`17 */6 * * *`), leaving the same
 six-hour frequency. This separates its first lock attempt from website odds
 delivery at minute `4`; the longer retry horizon covers a delayed
 quarter-hour settlement or another writer at minute `17`. The existing
-publisher remains hourly. This cron adjustment has **not** been applied.
+publisher remains hourly. The cutover was installed at 14:42 UTC with no
+new paid capacity. Its one-time immediate publisher invocation safely skipped
+under the existing one-hour minimum interval; the next real renewal and a
+fresh fixture source are still outstanding.
 The quarter-hour settlement can still hold the lock past minute `17`, and
 an odds matcher starts at minute `19` every six hours. Recent successful
 fixture-core runs took 70–112 seconds, but that history is not a guarantee;
@@ -51,7 +54,8 @@ the first two revised runs need observation for knock-on skips or delay.
 
 ## Stacked admission-reservation candidate
 
-The next change removes the need to shift the fixture-core cron. The core
+The next change can restore the fixture-core cron to minute `4` under a
+coordinated five-writer admission protocol. The core
 caller claims an expiring, unique-owner reservation before waiting for the
 canonical writer lock. At the lock admission boundary, newly arriving
 normal writers check that reservation under a short guard lock and yield.
@@ -63,12 +67,15 @@ dies; release removes only the matching owner's token. The claim and release
 guard waits are bounded at two seconds. The actual admission check confirms
 the same owner still holds a reservation long enough for the planned lease,
 then rechecks the retry deadline and settlement window before provider work
-starts. The reservation is released as soon as admitted work ends, before the
-database heartbeat or healthcheck can stall; exit cleanup remains a fallback.
-The source frequency and
-the existing `4 */6 * * *` schedule remain unchanged if this candidate is
-chosen. The minute-17 adjustment above is an alternative for the smaller
-candidate, not an action to combine automatically with this reservation.
+starts. It recalculates the usable execution lease after the guard wait, so
+the timeout cannot consume seconds that the wait already used. The
+reservation is released when admission ends, including a deferral before
+provider work, before the database heartbeat or healthcheck can stall; exit
+cleanup remains a fallback.
+The source frequency stays six-hourly. The exact coordinated rollout can
+retain minute `17` first, then consider returning to minute `4` only after
+measured success; do not combine a schedule change with protocol activation
+without recording and verifying it separately.
 
 Every active checkout using the canonical lock must adopt the admission
 check together: the odds matcher, fixture core, website odds delivery, squad
@@ -77,8 +84,10 @@ settlement runs from the fixture-core checkout and retains its special
 priority. The stats reconciliation supervisor is long lived and must be
 handed off so it loads the new common functions. Stage and verify each
 checkout's own runtime manifest; do not copy the new `common.sh` over an
-older release with a different manifest or code shape. Until that coordinated
-cutover is prepared and reviewed, the reservation is only a local candidate.
+older release with a different manifest or code shape. The exact five-package
+composition, test evidence, forward map and rollback map are in
+`docs/fixture-core-81-coordinated-rollout.md`. The reservation remains an
+unapplied candidate.
 
 ## Production sequence and remaining approval boundaries
 
@@ -91,15 +100,14 @@ cutover is prepared and reviewed, the reservation is only a local candidate.
    website incident evidence. This approval did not cover deploying #80/#81.
 2. Before any future renewal, recheck genuine source freshness and scope. Do
    not renew from stale or missing evidence.
-3. If releasing only the smaller publisher/retry candidate, stage an
-   immutable worker release with the existing `.env`, `.venv` and SQLite
-   links. Verify its manifest, repoint the fixture-core and hourly publisher
-   cron entries, and move the former from minute `4` to `17`.
-4. If releasing the stacked reservation candidate, keep fixture-core at
-   minute `4`. Stage and verify compatible versions of all five active
-   canonical-writer checkouts, cut them over together, and hand off the
-   long-lived reconciliation supervisor. Verify each runtime manifest and
-   crontab entry before allowing the next source run.
+3. Jack separately approved the smaller publisher/retry cutover. It was
+   installed at 14:42 UTC with the original release retained for rollback.
+   The core schedule is now `17 */6`; the publisher is still hourly at `:11`.
+   Its immediate invocation skipped under the one-hour minimum interval.
+4. The stacked reservation candidate requires another owner approval. Stage
+   and verify the five exact packages in the rollout map, cut all canonical
+   writers over together, and hand off the long-lived reconciliation
+   supervisor at a verified idle boundary. Preserve `17 */6` initially.
 5. Confirm a successful primary source run, an hourly publisher renewal and
    authenticated fixture schedule and detail responses. Watch the next two
    six-hour runs for skipped admissions and fresh publication. Keep the
