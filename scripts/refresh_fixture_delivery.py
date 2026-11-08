@@ -420,7 +420,7 @@ def get_dates(args: argparse.Namespace) -> tuple[date, date]:
 def validate_session_capable_dsn(url: str) -> None:
     """Reject Supabase transaction pooling for a cross-commit session lock."""
     params = parse_dsn(url)
-    if params.get("service") or params.get("servicefile"):
+    if params.get("service") or params.get("servicefile") or os.environ.get("PGSERVICE"):
         raise RuntimeError("fixture publisher requires an explicit database endpoint")
     host = (params.get("host") or os.environ.get("PGHOST") or "localhost").lower()
     raw_port = params.get("port") or os.environ.get("PGPORT") or "5432"
