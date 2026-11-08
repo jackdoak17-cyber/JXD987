@@ -136,11 +136,20 @@ export FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES="${FIXTURE_CORE_JOB_MAX_AGE_MINUT
 # Publish with the existing release-aware, schema-preflighted delivery path.
 # London date boundaries match the public fixture-card contract; the source
 # identity contract itself remains UTC/date-only.
+rm -f /tmp/fixture_core_delivery_report.json
+publisher_status=0
 python scripts/refresh_fixture_delivery.py \
   --start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)" \
   --end-date "$(TZ=Europe/London date -d "+${FIXTURE_CORE_DELIVERY_DAYS_FORWARD} days" +%F)" \
   --leagues "${STATS_LEAGUES}" \
-  --report-out "/tmp/fixture_core_delivery_report.json"
+  --report-out "/tmp/fixture_core_delivery_report.json" || publisher_status=$?
+if [[ "${publisher_status}" -eq 2 ]]; then
+  # The source export succeeded, but a newer supported publication won the
+  # race. Recheck the live resolver before recording this core run as healthy.
+  python -c 'from scripts.refresh_fixture_delivery import verify_superseded_core_skip_report; verify_superseded_core_skip_report("/tmp/fixture_core_delivery_report.json")'
+elif [[ "${publisher_status}" -ne 0 ]]; then
+  exit "${publisher_status}"
+fi
 CHAIN
 )
 

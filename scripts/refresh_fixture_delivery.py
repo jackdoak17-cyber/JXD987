@@ -19,6 +19,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import psycopg2
@@ -416,6 +417,14 @@ def get_dates(args: argparse.Namespace) -> tuple[date, date]:
     return start, end
 
 
+def validate_session_capable_dsn(url: str) -> None:
+    """Reject Supabase transaction pooling for a cross-commit session lock."""
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.port == 6543 or ("pooler" in host and parsed.port not in (None, 5432)):
+        raise RuntimeError("fixture publisher requires a direct or session-pooler database URL")
+
+
 def connection():
     url = (
         os.environ.get("SUPABASE_DB_URL_SESSION")
@@ -424,6 +433,7 @@ def connection():
     )
     if not url:
         raise SystemExit("SUPABASE_DB_URL_SESSION, SUPABASE_DB_URL_POOLER, or SUPABASE_DB_URL is required")
+    validate_session_capable_dsn(url)
     return psycopg2.connect(url, connect_timeout=20)
 
 
@@ -618,6 +628,63 @@ def publication_skip_reason(
     ):
         return "recent_publication_satisfies_guard"
     return None
+
+
+def verify_superseded_core_skip(
+    report: dict[str, Any],
+    current: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Accept only a superseded primary publication with a supported live pin."""
+    if report.get("skipped") is not True or report.get("published") is not False:
+        raise RuntimeError("primary publisher did not report a verified skip")
+    reason = report.get("skip_reason")
+    if reason not in {"newer_current_source", "would_shorten_current_pin"}:
+        raise RuntimeError("primary publisher skip reason is not benign")
+    if current is None or current["release_id"] != report.get("current_release_id"):
+        raise RuntimeError("current fixture publication changed after the skip")
+    observed_at = now or datetime.now(UTC)
+    pin = current.get("pin_expires_at")
+    if pin is None or pin < observed_at + timedelta(minutes=45):
+        raise RuntimeError("current fixture publication lacks 45 minutes of runway")
+    evidence = current.get("metadata", {}).get("last_source_freshness_evidence")
+    if not isinstance(evidence, dict):
+        raise RuntimeError("current fixture publication lacks source evidence")
+    try:
+        verified_at = datetime.fromisoformat(str(evidence["verified_at"]).replace("Z", "+00:00"))
+        max_age_minutes = int(evidence["max_age_minutes"])
+        candidate_pin = datetime.fromisoformat(str(report["pin_expires_at"]).replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("fixture publication evidence is malformed") from error
+    if max_age_minutes <= 0 or pin > verified_at + timedelta(minutes=max_age_minutes):
+        raise RuntimeError("current fixture pin exceeds its source evidence")
+    observed_reason = publication_skip_reason(
+        current,
+        report.get("source_freshness") or {},
+        candidate_pin,
+        guarded=False,
+        min_interval_seconds=0,
+        now=observed_at,
+    )
+    if observed_reason != reason:
+        raise RuntimeError("primary skip decision no longer matches the current release")
+
+
+def verify_superseded_core_skip_report(report_path: str) -> None:
+    """Recheck the committed resolver before a primary wrapper reports success."""
+    with open(report_path, encoding="utf-8") as handle:
+        report = json.load(handle)
+    conn = connection()
+    try:
+        conn.set_session(isolation_level="READ COMMITTED", readonly=True, autocommit=False)
+        with conn.cursor() as cur:
+            cur.execute("set local statement_timeout = '3000ms'")
+            cur.execute("set local lock_timeout = '500ms'")
+            current = current_publication_guard_state(cur)
+        verify_superseded_core_skip(report, current)
+    finally:
+        conn.close()
 
 
 def guarded_skip_report(report: dict[str, Any], reason: str, **extra: Any) -> dict[str, Any]:
