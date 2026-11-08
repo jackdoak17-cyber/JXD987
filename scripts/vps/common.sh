@@ -321,6 +321,11 @@ run_recorded_pipeline_job() {
   else
     run_with_global_lock_and_timeout "${chain_command}" || status=$?
   fi
+  # A caller may explicitly disable retries. The settlement handoff still
+  # means admitted work was stopped deliberately, not that the run failed.
+  if [[ "${status}" -eq 76 && "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
+    status=2
+  fi
   finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   finished_epoch="$(date -u +%s)"
 

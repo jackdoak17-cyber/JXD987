@@ -35,4 +35,17 @@ set -e
 [[ "${retry_status}" -eq 2 ]]
 [[ "$(wc -c <"${CHAIN_MARKER}")" -eq 1 ]]
 grep -q 'normal-writer lease ended for settlement handoff' "${tmp}/run.log"
+
+# With retries disabled, the recorded wrapper must preserve the same planned
+# handoff result and write a skipped heartbeat rather than a failure.
+rm -f "${CHAIN_MARKER}"
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS=0
+record_pipeline_job_run() { printf 'heartbeat:%s\n' "$3"; }
+set +e
+run_recorded_pipeline_job 'test_fixture_core' 'test fixture core' 'printf x >> "${CHAIN_MARKER}"; sleep 3' '' >"${tmp}/zero-retry.log" 2>&1
+zero_retry_status=$?
+set -e
+[[ "${zero_retry_status}" -eq 2 ]]
+[[ "$(wc -c <"${CHAIN_MARKER}")" -eq 1 ]]
+grep -q 'heartbeat:2' "${tmp}/zero-retry.log"
 echo "fixture-core admitted-work retry guard passed"
