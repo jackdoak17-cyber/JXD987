@@ -20,6 +20,8 @@ class FixtureCorePublisherExitContractTests(unittest.TestCase):
         now = datetime.now(UTC)
         current = {
             "release_id": "current-release",
+            "resolver_release_id": "current-release",
+            "resolver_state": "current",
             "published_at": (now - timedelta(hours=2)).isoformat(),
             "health_checked_at": now.isoformat(),
             "pin_expires_at": (now + timedelta(hours=2)).isoformat(),
@@ -73,9 +75,11 @@ if sys.argv[1] == '-c':
             return (
                 payload['release_id'],
                 datetime.fromisoformat(payload['published_at']),
-                datetime.fromisoformat(payload['health_checked_at']),
+                datetime.fromisoformat(payload['health_checked_at']) if payload['health_checked_at'] else None,
                 datetime.fromisoformat(payload['pin_expires_at']),
                 payload['metadata'],
+                payload['resolver_release_id'],
+                payload['resolver_state'],
             )
     class Connection:
         def set_session(self, **_): pass
@@ -118,6 +122,13 @@ sys.exit(0)
             status, commands = execute(2, valid_report)
             self.assertEqual(status, 0)
             self.assertIn("-c", commands)
+            current["health_checked_at"] = None
+            current["resolver_state"] = "stale"
+            status, commands = execute(2, valid_report)
+            self.assertNotEqual(status, 0)
+            self.assertIn("-c", commands)
+            current["health_checked_at"] = now.isoformat()
+            current["resolver_state"] = "current"
             for malformed in (
                 {**valid_report, "skip_reason": "publication_active"},
                 {**valid_report, "skip_reason": "unknown"},
