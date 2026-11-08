@@ -172,8 +172,13 @@ remained. **The #81 cron cutover is currently active, not yet fully verified.**
 The 16:00 scheduled settlement used manifest `85450ebeada0`, reconciled 158
 recent fixtures, exported 162 and finished with a durable `success` ledger
 row at 16:01:23. The new stats supervisor started from manifest `563d92e85772`
-at 15:55. The hourly publisher at 16:11, odds delivery and longer-running
-source/settlement continuity remain to be observed.
+at 15:55. The 16:11 hourly publisher made the expected guarded skip because
+the 15:51 renewal was recent. The 16:15 settlement then exported 167
+fixtures; 16:17 P1 matched 13 fixtures and 15,235 odds outcomes; 16:19 odds
+delivery exported 127,217 rows; and the 16:20 squad run wrote 720
+memberships. The stats supervisor remained active. Sustained source and
+settlement continuity and the next 18:17 fixture-core run remain to be
+observed.
 
 One controlled #81 publisher invocation at 15:50:59 corrected a concurrent
 fallback overwrite. It reused identical published projection rows (zero
@@ -183,3 +188,49 @@ guard was merged to JXD main at `acbee957`; its next scheduled execution
 still requires observation. If a candidate job fails, use the two-stage
 rollback above before calling #81 fully verified. No paid capacity, disk,
 spend-cap setting, service or job frequency changed.
+
+## R20 publication guard follow-up — staged, not cut over
+
+PR #83 corrects two publication races left by the merged GitHub workflow
+guard. Its publisher acquires a session advisory lock across the intermediate
+build-marker commit, resets the repeatable-read snapshot after acquiring the
+lock, and compares the selected source evidence and proposed pin with the
+committed current release. The hourly throttle applies only while the current
+pin has at least 45 minutes remaining. Full publications persist source
+evidence, as no-op renewals already do. A local PostgreSQL 17 two-connection
+replay verified that the second publisher blocks on the lock and that the
+post-lock commit is required to see the preceding publisher's committed row.
+
+The #81 backport is commit `f79715c58bf2a08ea7754f37c79f9673b6d104a9`.
+Its 44 fixture-delivery tests completed with 13 environment-gated skips. The
+immutable package was derived from the active core archive by replacing only
+`scripts/refresh_fixture_delivery.py` and updating the manifest and source
+identity. Its manifest is `38a77ccc7a393a3541e655b5c71801f8edb686ca`
+and its archive SHA-256 is
+`45c092e67d1feee6f39671c5bb12b8da951f5ea6c684feedff2395f8779380a7`.
+It is staged at
+`/opt/odds-sync/JXD987-fixture-core-81-guard-38a77c-release` with the same
+`.env`, `.venv` and `data` link targets as active core. Archive SHA-256,
+all 43 manifest files, runtime ID, links and a no-write dry run passed.
+**No cron entry points to this staged package yet.**
+
+After loading each active package's `.env`, core/settlement, matcher, stats
+and squad all resolve `JXD_DB_PATH` to the same real SQLite database, inode
+`1072986`, 11,915,935,744 bytes and 20,643 fixture rows. Odds delivery's
+explicit cron database path resolves to the same inode. This is stronger
+evidence than checking candidate `data` links alone. At 16:28, two guarded
+production reads through the staged publisher both exited 2 without a
+publication: the selected primary source skipped a healthy release, and the
+older fallback source was rejected as `newer_current_source`, preventing a
+candidate 16:56 pin from replacing the current 17:51 pin.
+
+For cutover, back up the current crontab, confirm no active core/publisher or
+settlement process, then atomically replace only the three core-package
+paths (fixture core, hourly publisher and settlement) with the staged path.
+Keep all schedules, all other worker entries and all database/configuration
+settings identical. Read back all entries and verify the next scheduled
+settlement and publisher against manifest `38a77ccc7a39`. If either fails,
+restore the backed-up three paths atomically to the still-installed
+`JXD987-fixture-core-81-85450e-release`, then verify writer quiescence and
+the current release before retrying. The broader two-stage rollback above
+remains available if the #81 protocol itself fails.
