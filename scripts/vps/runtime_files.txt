@@ -24,6 +24,7 @@ scripts/leaderboard_shadow_capture.py
 scripts/leaderboard_shadow_worker.py
 scripts/vps/run_leaderboard_shadow_worker.sh
 scripts/reconcile_stats_provider_queue.py
+scripts/vps/select_stats_reconciliation_leagues.py
 scripts/vps/run_stats_reconciliation.sh
 scripts/odds_retention_psql.py
 scripts/preflight_supabase_psql.py
