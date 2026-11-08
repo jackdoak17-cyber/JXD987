@@ -57,6 +57,9 @@ export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SE
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-160}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"
 export ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF=true
+# The 45-minute reservation spans the 40-minute retry horizon. An admitted
+# source run keeps the canonical writer lock for its bounded execution.
+export FIXTURE_CORE_RESERVATION_TTL_SECONDS="${FIXTURE_CORE_RESERVATION_TTL_SECONDS:-2700}"
 # The exporter treats zero as an unbounded completed-fixture selection. Keep
 # the historical side of this identity refresh bounded by the shared contract
 # as well; the future identity contract is still controlled by the source
@@ -138,10 +141,26 @@ python scripts/refresh_fixture_delivery.py \
 CHAIN
 )
 
+reservation_status=0
+reservation_owner="$(fixture_core_reservation_claim)" || reservation_status=$?
+if [[ "${reservation_status}" -ne 0 ]]; then
+  started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  PIPELINE_EVIDENCE_FILE="" record_pipeline_job_run \
+    "${FIXTURE_CORE_JOB_ID}" "Fixture core export" "${reservation_status}" \
+    "${started_at}" "${started_at}" "0"
+  if [[ "${reservation_status}" -eq 2 ]]; then
+    log_info "[SKIPPED] another fixture-core invocation owns the reservation"
+  else
+    log_error "fixture-core reservation could not be claimed"
+  fi
+  finalize_with_healthcheck "${reservation_status}" "${HEALTHCHECK_PING_URL_FIXTURE_CORE:-${HEALTHCHECK_PING_URL:-}}"
+fi
+trap 'fixture_core_reservation_release "${reservation_owner}" || log_error "fixture-core reservation release failed"' EXIT
+
 status=0
 ODDS_SYNC_P3_MAX_DURATION_SECONDS="${FIXTURE_CORE_MAX_RUNTIME_SECONDS}" \
 ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS}" \
-ODDS_SYNC_JOB_PRIORITY="normal" \
+ODDS_SYNC_JOB_PRIORITY="fixture_core" \
   run_recorded_pipeline_job \
     "${FIXTURE_CORE_JOB_ID}" \
     "Fixture core export" \

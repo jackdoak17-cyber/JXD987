@@ -471,6 +471,71 @@ run_with_database_heavy_lock_timed() {
   )
 }
 
+# The fixture-core source must be admitted before it ages out, but the
+# quarter-hour settlement still has priority. A short-lived reservation keeps
+# newly arriving normal writers from overtaking an already waiting fixture
+# core. Both files are derived from the canonical writer lock path, so an
+# unrelated lock domain (for example Models) is unaffected.
+fixture_core_reservation_file() {
+  printf '%s.fixture-core-reservation' "${ODDS_SYNC_LOCK_FILE:-/var/lock/odds-sync.lock}"
+}
+
+fixture_core_reservation_active() {
+  local reservation_file="$1" owner expires now
+  [[ -f "${reservation_file}" ]] || return 1
+  read -r owner expires <"${reservation_file}" || return 1
+  if [[ ! "${owner}" =~ ^[0-9a-f-]{36}$ || ! "${expires}" =~ ^[0-9]+$ ]]; then
+    log_error "ignoring malformed fixture-core reservation at ${reservation_file}"
+    return 1
+  fi
+  now="$(date -u +%s)"
+  (( expires > now ))
+}
+
+fixture_core_reservation_claim() {
+  local reservation_file guard_file ttl
+  reservation_file="$(fixture_core_reservation_file)"
+  guard_file="${reservation_file}.guard"
+  ttl="${FIXTURE_CORE_RESERVATION_TTL_SECONDS:-2700}"
+  if [[ ! "${ttl}" =~ ^[1-9][0-9]*$ ]] || (( ttl > 3600 )); then
+    log_error "fixture-core reservation TTL must be between 1 and 3600 seconds"
+    return 1
+  fi
+  mkdir -p "$(dirname "${reservation_file}")" || return 1
+  (
+    local owner expires tmp
+    umask 077
+    flock -x 7 || exit 1
+    if fixture_core_reservation_active "${reservation_file}"; then
+      exit 2
+    fi
+    owner="$(python3 -c 'import uuid; print(uuid.uuid4())')" || exit 1
+    expires=$(( $(date -u +%s) + ttl ))
+    tmp="$(mktemp "${reservation_file}.tmp.XXXXXXXX")" || exit 1
+    if ! printf '%s %s\n' "${owner}" "${expires}" >"${tmp}" ||
+       ! mv -f "${tmp}" "${reservation_file}"; then
+      rm -f "${tmp}"
+      exit 1
+    fi
+    printf '%s\n' "${owner}"
+  ) 7>"${guard_file}"
+}
+
+fixture_core_reservation_release() {
+  local expected_owner="$1" reservation_file guard_file owner expires
+  reservation_file="$(fixture_core_reservation_file)"
+  guard_file="${reservation_file}.guard"
+  [[ -f "${reservation_file}" ]] || return 0
+  (
+    flock -x 7 || exit 1
+    [[ -f "${reservation_file}" ]] || exit 0
+    read -r owner expires <"${reservation_file}" || exit 1
+    if [[ "${owner}" == "${expected_owner}" ]]; then
+      rm -f "${reservation_file}"
+    fi
+  ) 7>"${guard_file}"
+}
+
 run_with_global_lock_and_timeout() {
   local chain_command="$1"
   local lock_file="${ODDS_SYNC_LOCK_FILE:-/var/lock/odds-sync.lock}"
@@ -483,6 +548,7 @@ run_with_global_lock_and_timeout() {
   local live_grace_seconds="${ODDS_SYNC_LIVE_GRACE_SECONDS:-120}"
   local min_normal_lease_seconds="${ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS:-0}"
   local live_schedule_enabled="${ODDS_SYNC_LIVE_SCHEDULE_ENABLED:-true}"
+  local reservation_file
 
   mkdir -p "$(dirname "${lock_file}")"
 
@@ -500,6 +566,19 @@ run_with_global_lock_and_timeout() {
       exit 2
     fi
 
+    # Use the same short guard as fixture-core reservation creation. A normal
+    # writer admitted before a reservation claim may finish; one arriving
+    # afterward yields before it can take the canonical writer lock.
+    if [[ "${job_priority}" == "normal" ]]; then
+      reservation_file="$(fixture_core_reservation_file)"
+      exec 7>"${reservation_file}.guard"
+      flock -x 7 || exit 1
+      if fixture_core_reservation_active "${reservation_file}"; then
+        log_info "[SKIPPED] fixture-core reservation active"
+        exit 2
+      fi
+    fi
+
     wait_started="$(date -u +%s)"
     while ! flock --nonblock 9; do
       if [[ "${job_priority}" != "settlement" ]]; then
@@ -513,6 +592,10 @@ run_with_global_lock_and_timeout() {
       fi
       sleep "${lock_poll_seconds}" 9>&-
     done
+    if [[ "${job_priority}" == "normal" ]]; then
+      flock -u 7
+      exec 7>&-
+    fi
 
     local effective_runtime="${max_runtime}"
     if [[ "${live_schedule_enabled}" == "true" && "${job_priority}" != "settlement" ]]; then

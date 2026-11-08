@@ -49,31 +49,66 @@ an odds matcher starts at minute `19` every six hours. Recent successful
 fixture-core runs took 70–112 seconds, but that history is not a guarantee;
 the first two revised runs need observation for knock-on skips or delay.
 
-## Production sequence and remaining approval boundary
+## Stacked admission-reservation candidate
 
-1. Jack approved the separate one-time guarded publisher renewal. It ran at
-   14:13 UTC using the verified fallback source and published release
-   `bda3d455-74bf-455b-aee7-6db158843a77`. The resolver returned `current`;
-   the signed-in schedule returned HTTP 200, with all 88 fixture identities
-   and team values matching the database release. The pin expires at 16:13
-   UTC. The complete source report is saved in the website incident evidence.
-   This approval did not cover deploying this draft PR or changing cron.
-2. Before any future renewal, recheck genuine source freshness and scope.
-   Do not renew from stale or missing evidence.
-3. Stage an immutable worker release with the existing `.env`, `.venv` and
-   SQLite links, deploy the reviewed runtime files into it, and verify its
-   manifest before cutover. Repoint only the fixture-core and hourly fixture
-   publisher cron entries to that release, and move the former from minute
-   `4` to `17`. Verify both crontab entries.
-4. Confirm a successful primary source run, an hourly publisher renewal and
+The next change removes the need to shift the fixture-core cron. The core
+caller claims an expiring, unique-owner reservation before waiting for the
+canonical writer lock. At the lock admission boundary, newly arriving
+normal writers check that reservation under a short guard lock and yield.
+Already admitted work drains, and settlement still takes priority. The core
+will not begin another admission attempt after its 40-minute retry deadline,
+covering the later safe window after a slow minute-four
+odds delivery. The reservation expires after at most one hour if the caller
+dies; release removes only the matching owner's token. The claim and release
+guard waits are bounded at two seconds. The actual admission check confirms
+the same owner still holds a reservation long enough for the planned lease,
+then rechecks the retry deadline and settlement window before provider work
+starts. The reservation is released as soon as admitted work ends, before the
+database heartbeat or healthcheck can stall; exit cleanup remains a fallback.
+The source frequency and
+the existing `4 */6 * * *` schedule remain unchanged if this candidate is
+chosen. The minute-17 adjustment above is an alternative for the smaller
+candidate, not an action to combine automatically with this reservation.
+
+Every active checkout using the canonical lock must adopt the admission
+check together: the odds matcher, fixture core, website odds delivery, squad
+reconciliation and leaderboard stats reconciliation. The post-match
+settlement runs from the fixture-core checkout and retains its special
+priority. The stats reconciliation supervisor is long lived and must be
+handed off so it loads the new common functions. Stage and verify each
+checkout's own runtime manifest; do not copy the new `common.sh` over an
+older release with a different manifest or code shape. Until that coordinated
+cutover is prepared and reviewed, the reservation is only a local candidate.
+
+## Production sequence and remaining approval boundaries
+
+1. Jack approved the separate one-time guarded publisher renewal, which ran
+   at 14:13 UTC with the verified `run_fixture_core_fallback` source. It
+   published release `bda3d455-74bf-455b-aee7-6db158843a77`; the resolver
+   returned `current`, and the authenticated schedule returned HTTP 200 with
+   all 88 returned fixture identities and team values matching the release.
+   Its pin expires at 16:13 UTC. The full source report is preserved in the
+   website incident evidence. This approval did not cover deploying #80/#81.
+2. Before any future renewal, recheck genuine source freshness and scope. Do
+   not renew from stale or missing evidence.
+3. If releasing only the smaller publisher/retry candidate, stage an
+   immutable worker release with the existing `.env`, `.venv` and SQLite
+   links. Verify its manifest, repoint the fixture-core and hourly publisher
+   cron entries, and move the former from minute `4` to `17`.
+4. If releasing the stacked reservation candidate, keep fixture-core at
+   minute `4`. Stage and verify compatible versions of all five active
+   canonical-writer checkouts, cut them over together, and hand off the
+   long-lived reconciliation supervisor. Verify each runtime manifest and
+   crontab entry before allowing the next source run.
+5. Confirm a successful primary source run, an hourly publisher renewal and
    authenticated fixture schedule and detail responses. Watch the next two
    six-hour runs for skipped admissions and fresh publication. Keep the
    source age guard and settlement lease unchanged.
 
-If the new publisher fails, repoint both cron entries to the untouched prior
-worker release and restore fixture-core minute `4`; the last valid fixture
-release remains in the database and still obeys
-its own expiry. The current code changes do not resize Supabase, alter disk
+If the new publisher fails, repoint the affected cron entries to the
+untouched prior releases; restore fixture-core minute `4` if it was shifted.
+The last valid fixture release remains in the database and still obeys its
+own expiry. The current code changes do not resize Supabase, alter disk
 or spend-cap settings, add services, or increase the scheduled job frequency.
 Recovery of Prop Search and the leaderboard website release needs separate
 end-to-end verification.
