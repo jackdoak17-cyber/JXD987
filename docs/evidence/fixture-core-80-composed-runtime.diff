@@ -1,0 +1,230 @@
+--- a/scripts/refresh_fixture_delivery.py
++++ b/scripts/refresh_fixture_delivery.py
+@@ -62,6 +62,11 @@
+ METRIC_MODES = ("overall", "venue")
+ METRIC_SEASON_SCOPES = ("all", "current")
+ DEFAULT_FIXTURE_SOURCE_JOB_ID = "run_p3_fixture_core_export"
++LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID = "latest_verified_fixture_core"
++VERIFIED_FIXTURE_SOURCE_JOB_IDS = (
++    DEFAULT_FIXTURE_SOURCE_JOB_ID,
++    "run_fixture_core_fallback",
++)
+ DEFAULT_FIXTURE_SOURCE_MAX_AGE_MINUTES = 540
+ 
+ SCHEDULE_SEMANTIC_FIELDS = (
+@@ -292,6 +297,8 @@
+     evidence_kind = "fixture_core_pipeline_job"
+ 
+     if refreshed_at_override:
++        if job_id == LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID:
++            raise RuntimeError("current fixture-core export requires an explicit source job ID")
+         raw = refreshed_at_override.strip().replace("Z", "+00:00")
+         try:
+             observed = datetime.fromisoformat(raw)
+@@ -299,22 +306,45 @@
+             raise RuntimeError("fixture source refresh evidence is malformed") from error
+         evidence_kind = "current_fixture_core_export"
+     else:
+-        cur.execute(
+-            """
+-            select finished_at
+-              from operations.pipeline_job_runs
+-             where job_id = %s and status = 'success'
+-             order by finished_at desc
+-             limit 1
+-            """,
+-            (job_id,),
+-        )
+-        row = cur.fetchone()
+-        if not row or row[0] is None:
+-            raise RuntimeError(
+-                f"fixture source freshness is unverified: no successful {job_id} run"
++        if job_id == LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID:
++            # The GitHub failover already trusts these same two source jobs.
++            # Return the selected job ID so the published release retains the
++            # provenance of the actual successful export.
++            cur.execute(
++                """
++                select job_id, finished_at
++                  from operations.pipeline_job_runs
++                 where job_id = any(%s)
++                   and status = 'success'
++                   and finished_at is not null
++                 order by finished_at desc
++                 limit 1
++                """,
++                (list(VERIFIED_FIXTURE_SOURCE_JOB_IDS),),
+             )
+-        observed = row[0]
++            row = cur.fetchone()
++            if not row or row[1] is None:
++                raise RuntimeError(
++                    "fixture source freshness is unverified: no successful verified fixture-core run"
++                )
++            job_id, observed = row
++        else:
++            cur.execute(
++                """
++                select finished_at
++                  from operations.pipeline_job_runs
++                 where job_id = %s and status = 'success'
++                 order by finished_at desc
++                 limit 1
++                """,
++                (job_id,),
++            )
++            row = cur.fetchone()
++            if not row or row[0] is None:
++                raise RuntimeError(
++                    f"fixture source freshness is unverified: no successful {job_id} run"
++                )
++            observed = row[0]
+ 
+     observed = observed if observed.tzinfo is not None else observed.replace(tzinfo=UTC)
+     age = current.astimezone(UTC) - observed.astimezone(UTC)
+@@ -821,8 +851,14 @@
+     source_watermark: datetime | None,
+     semantic_fingerprint: dict[str, Any] | None = None,
+     pin_expires_at: datetime | None = None,
++    source_freshness: dict[str, Any] | None = None,
+ ) -> None:
+     """Switch the sole customer-visible pointer inside the caller's transaction."""
++    publication_metadata: dict[str, Any] = {}
++    if semantic_fingerprint is not None:
++        publication_metadata["semantic_projection_fingerprint"] = semantic_fingerprint
++    if source_freshness is not None:
++        publication_metadata["last_source_freshness_evidence"] = source_freshness
+     cur.execute(
+         """
+         update public.fixture_delivery_releases
+@@ -842,8 +878,7 @@
+             counts.get("standings", 0),
+             counts.get("metrics", 0),
+             counts.get("odds", 0),
+-            json.dumps({"semantic_projection_fingerprint": semantic_fingerprint})
+-            if semantic_fingerprint is not None else "{}",
++            json.dumps(publication_metadata),
+             release_id,
+         ),
+     )
+@@ -869,6 +904,7 @@
+     report: dict[str, Any],
+     semantic_fingerprint: dict[str, Any] | None = None,
+     pin_expires_at: datetime | None = None,
++    source_freshness: dict[str, Any] | None = None,
+ ) -> None:
+     """Publish durably before best-effort retention cleanup.
+ 
+@@ -881,8 +917,9 @@
+         release_id,
+         counts,
+         source_watermark,
+-        semantic_fingerprint,
+-        pin_expires_at,
++        semantic_fingerprint=semantic_fingerprint,
++        pin_expires_at=pin_expires_at,
++        source_freshness=source_freshness,
+     )
+     report["release_id"] = release_id
+     report["published"] = True
+@@ -1648,6 +1685,7 @@
+                 report,
+                 semantic_fingerprint,
+                 pin_expires_at,
++                source_freshness,
+             )
+     except Exception as error:
+         conn.rollback()
+--- a/scripts/vps/common.sh
++++ b/scripts/vps/common.sh
+@@ -302,6 +302,9 @@
+   else
+     run_with_global_lock_and_timeout "${chain_command}" || status=$?
+   fi
++  if [[ "${status}" -eq 76 && "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
++    status=2
++  fi
+   finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+   finished_epoch="$(date -u +%s)"
+ 
+@@ -341,6 +344,9 @@
+   while (( attempt <= retry_attempts )); do
+     run_with_global_lock_and_timeout "${chain_command}" && return 0
+     status=$?
++    if [[ "${status}" -eq 76 && "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
++      return 2
++    fi
+     if [[ "${status}" -ne 2 ]]; then
+       return "${status}"
+     fi
+@@ -441,6 +447,9 @@
+     if [[ ${status} -eq 124 || ${status} -eq 137 ]]; then
+       if [[ "${job_priority}" != "settlement" && "${effective_runtime}" -lt "${max_runtime}" ]]; then
+         log_info "[SKIPPED] normal-writer lease ended for settlement handoff after ${effective_runtime}s"
++        if [[ "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
++          exit 76
++        fi
+         exit 2
+       fi
+       log_error "process killed after ${max_runtime}s overrun"
+--- a/scripts/vps/run_fixture_delivery_publisher.sh
++++ b/scripts/vps/run_fixture_delivery_publisher.sh
+@@ -31,7 +31,10 @@
+ validate_supported_leagues "${STATS_LEAGUES}"
+ export FIXTURE_DELIVERY_DAYS_BACK="${FIXTURE_DELIVERY_DAYS_BACK:-$(contract_value history_window_days)}"
+ export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-$(contract_value delivery_window_days)}"
+-export FIXTURE_DELIVERY_SOURCE_JOB_ID="${FIXTURE_DELIVERY_SOURCE_JOB_ID:-$(contract_value job_id)}"
++# The independent failover refresh is a verified source too. Use whichever
++# successful source export is newest; refresh_fixture_delivery still enforces
++# the contract age and retains the selected job ID in publication evidence.
++export FIXTURE_DELIVERY_SOURCE_JOB_ID="${FIXTURE_DELIVERY_SOURCE_JOB_ID:-latest_verified_fixture_core}"
+ export FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES="${FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES:-$(contract_value max_job_age_minutes)}"
+ export FIXTURE_DELIVERY_DIRTY_STATE_PATH="${FIXTURE_DELIVERY_DIRTY_STATE_PATH:-/var/lib/oddssearch/fixture-delivery/dirty-state.json}"
+ export FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS="${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS:-3600}"
+--- a/scripts/vps/run_p3_fixture_core.sh
++++ b/scripts/vps/run_p3_fixture_core.sh
+@@ -49,8 +49,14 @@
+ validate_supported_leagues "${STATS_LEAGUES}"
+ export FIXTURE_CORE_MAX_RUNTIME_SECONDS="${FIXTURE_CORE_MAX_RUNTIME_SECONDS:-900}"
+ export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS:-300}"
+-export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-40}"
++# A ten-minute retry sleep budget can end inside an odds-delivery lock hold followed
++# by the live-settlement reservation. Keep retrying across later safe writer
++# windows; 160 pauses of 15 seconds total 40 minutes of sleep, plus attempt
++# overhead. This is an opportunity, not a strict admission guarantee.
++# The next scheduled fixture-core invocation is six hours away.
++export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-160}"
+ export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"
++export ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF=true
+ # The exporter treats zero as an unbounded completed-fixture selection. Keep
+ # the historical side of this identity refresh bounded by the shared contract
+ # as well; the future identity contract is still controlled by the source
+--- a/scripts/vps/runtime_manifest.sha1
++++ b/scripts/vps/runtime_manifest.sha1
+@@ -12,7 +12,7 @@
+ 1e6eff1af5574c3fa68e05c749e4de1e858bbe75  scripts/reconcile_fixture_delivery_odds.py
+ c3393578ac4635eb248f637fedb3135bcc4175c1  scripts/export_to_supabase.py
+ aa70601da9c295d2fcda026c08888aa02faa1cb6  scripts/fixture_detail_export_policy.py
+-f90056173a87d651929e61fab0a547b176c0ba9e  scripts/refresh_fixture_delivery.py
++a890e78cf72d66bd01459f7ac6dbe026a419f186  scripts/refresh_fixture_delivery.py
+ e05dfd2464677dc3ce72a90b8751dfda1aafed0d  scripts/fixture_delivery_dirty_state.py
+ 1e6195b397b2fcc6eb9e7ad1b5db0ccdaacf1d8e  scripts/verify_fixture_delivery_parity.py
+ d8b0bf725d61e5b6601ae07dc2efa4dfb4facfdf  scripts/postmatch_fixture_detail_delivery.py
+@@ -25,14 +25,14 @@
+ 2c4213e3bdc79fa0685cdb57c396d8da49059480  scripts/sync_confirmed_lineups.py
+ 89707d0bf6a77e27686295a5f6356a5eb23f88f5  scripts/sync_odds.py
+ fa3c102f14664a9d38ac677ea5a967183e58dd8f  scripts/fixture_core_contract.py
+-fab07d5e8b5f8735eddc53e0412ebbc2a5042384  scripts/vps/common.sh
++4e654c04de7512e8e40ed39346745ed1a5401e7d  scripts/vps/common.sh
+ 88553394246c253623f0c0ae90279c2209fec552  scripts/vps/run_odds_delivery.sh
+ 431b2ab84dbd21e62bbe7b63031c7316e0ac2757  scripts/vps/run_p1.sh
+ 916a6612eedd078f07ae711fd1c9a4a2142718d9  scripts/vps/run_p2.sh
+ 34f87a4db3466a28324e658952e29b2c7b9b5975  scripts/vps/run_p3.sh
+-f52ca9dcff6de34892190ee97ac69a5151f39a30  scripts/vps/run_p3_fixture_core.sh
++c55cf4834c802fc5f8d7d56bc1db2314c68aca78  scripts/vps/run_p3_fixture_core.sh
+ ec3f0718bc348c50124cc4b60832d54942c613e0  scripts/vps/run_postmatch_settlement.sh
+-4d11664b7dcf6c4fb533b1a557c65a0ddab7c019  scripts/vps/run_fixture_delivery_publisher.sh
++b2400337a9abb691f68321f2f89344f7b49f59d9  scripts/vps/run_fixture_delivery_publisher.sh
+ 6be24ddcdc916264fc0fed8357622ff2885de29c  scripts/vps/run_models.sh
+ b71d2898c69df480ae835c86c80c52aff2525d41  scripts/vps/run_sync.sh
+ 30d7b00595442e0909a4c35fd0ad66d0c7443fbf  scripts/sync_sparse_squads.py
