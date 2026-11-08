@@ -93,6 +93,21 @@ def _validate(state: Any) -> None:
             for key, entry in value.items()
         ):
             raise ValueError(f"invalid reconciliation {field}")
+    for completion in state["last_completed"].values():
+        try:
+            completed_at = datetime.fromisoformat(completion["at"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("invalid saved reconciliation completion time") from error
+        if (completed_at.tzinfo is None
+                or completion.get("outcome") not in ("empty", "processed")
+                or type(completion.get("selected")) is not int
+                or type(completion.get("accepted")) is not int
+                or completion["selected"] < 0
+                or completion["accepted"] < 0
+                or completion["accepted"] > completion["selected"]
+                or not isinstance(completion.get("attempt_id"), str)
+                or not completion["attempt_id"]):
+            raise ValueError("invalid saved reconciliation completion")
     pending = state.get("pending")
     if pending is not None:
         if not isinstance(pending, dict) or not isinstance(pending.get("attempt_id"), str):
@@ -208,7 +223,7 @@ def _aggregate(state: dict[str, Any], max_scope_age_seconds: int) -> dict[str, A
     stale: list[int] = []
     for league in state["leagues"]:
         completion = state["last_completed"].get(str(league))
-        if completion:
+        if completion is not None:
             try:
                 age = (now - datetime.fromisoformat(completion["at"])).total_seconds()
             except (TypeError, ValueError, KeyError) as error:
@@ -252,7 +267,7 @@ def finish_attempt(leagues: list[int], group_size: int, cursor_file: Path, relea
                                              "attempt_id": attempt_id}
             state["unresolved"].pop(key, None)
         if outcome == "empty":
-            state["empty_streak"] += 1
+            state["empty_streak"] = min(state["empty_streak"] + 1, len(groups_for(leagues, group_size)))
             if state["empty_streak"] >= len(groups_for(leagues, group_size)):
                 state["empty_sweep_at"] = _now()
         else:
