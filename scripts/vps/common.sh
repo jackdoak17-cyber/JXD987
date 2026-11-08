@@ -321,6 +321,11 @@ run_recorded_pipeline_job() {
   else
     run_with_global_lock_and_timeout "${chain_command}" || status=$?
   fi
+  # A caller may explicitly disable retries. The settlement handoff still
+  # means admitted work was stopped deliberately, not that the run failed.
+  if [[ "${status}" -eq 76 && "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
+    status=2
+  fi
   finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   finished_epoch="$(date -u +%s)"
 
@@ -360,6 +365,12 @@ run_with_global_lock_and_retry() {
   while (( attempt <= retry_attempts )); do
     run_with_global_lock_and_timeout "${chain_command}" && return 0
     status=$?
+    if [[ "${status}" -eq 76 && "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
+      # The job already acquired the canonical lock and began provider work.
+      # A later settlement handoff is a skip, but should not repeat that work
+      # inside this same invocation when the caller opts out of such retries.
+      return 2
+    fi
     if [[ "${status}" -ne 2 ]]; then
       return "${status}"
     fi
@@ -535,6 +546,9 @@ run_with_global_lock_and_timeout() {
     if [[ ${status} -eq 124 || ${status} -eq 137 ]]; then
       if [[ "${job_priority}" != "settlement" && "${effective_runtime}" -lt "${max_runtime}" ]]; then
         log_info "[SKIPPED] normal-writer lease ended for settlement handoff after ${effective_runtime}s"
+        if [[ "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
+          exit 76
+        fi
         exit 2
       fi
       log_error "process killed after ${max_runtime}s overrun"

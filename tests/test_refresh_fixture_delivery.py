@@ -7,6 +7,7 @@ import inspect
 
 from scripts.refresh_fixture_delivery import (
     COMPLETED_SEMANTIC_FIELDS,
+    LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID,
     SCHEDULE_SEMANTIC_FIELDS,
     add_metrics_provenance,
     all_completed_fixtures,
@@ -54,6 +55,15 @@ class FreshnessCursor:
         return (self.observed,) if self.observed is not None else None
 
 
+class VerifiedSourceCursor(FreshnessCursor):
+    def __init__(self, job_id, observed):
+        super().__init__(observed)
+        self.job_id = job_id
+
+    def fetchone(self):
+        return (self.job_id, self.observed) if self.observed is not None else None
+
+
 class FixtureDeliveryMetricsTests(unittest.TestCase):
     def test_source_freshness_accepts_recent_durable_pipeline_evidence(self) -> None:
         now = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
@@ -62,6 +72,46 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
         self.assertEqual(evidence["kind"], "fixture_core_pipeline_job")
         self.assertEqual(evidence["age_seconds"], 1800)
         self.assertEqual(cursor.params, ("run_p3_fixture_core_export",))
+
+    def test_hourly_publisher_accepts_newest_verified_fallback_source(self) -> None:
+        now = datetime(2026, 11, 8, 13, 11, tzinfo=UTC)
+        cursor = VerifiedSourceCursor(
+            "run_fixture_core_fallback", now - timedelta(hours=5, minutes=15)
+        )
+        evidence = verify_fixture_source_freshness(
+            cursor, 540, job_id=LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID, now=now
+        )
+        self.assertEqual(evidence["job_id"], "run_fixture_core_fallback")
+        self.assertEqual(evidence["age_seconds"], 18900)
+        self.assertIn("order by finished_at desc", cursor.query)
+        self.assertEqual(
+            cursor.params,
+            (["run_p3_fixture_core_export", "run_fixture_core_fallback"],),
+        )
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            verify_fixture_source_freshness(
+                VerifiedSourceCursor(
+                    "run_fixture_core_fallback", now - timedelta(minutes=541)
+                ),
+                540,
+                job_id=LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID,
+                now=now,
+            )
+        with self.assertRaisesRegex(RuntimeError, "no successful verified fixture-core run"):
+            verify_fixture_source_freshness(
+                VerifiedSourceCursor("run_fixture_core_fallback", None),
+                540,
+                job_id=LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID,
+                now=now,
+            )
+        with self.assertRaisesRegex(RuntimeError, "explicit source job ID"):
+            verify_fixture_source_freshness(
+                cursor,
+                540,
+                refreshed_at_override=now.isoformat(),
+                job_id=LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID,
+                now=now,
+            )
 
     def test_source_freshness_rejects_missing_stale_or_future_evidence(self) -> None:
         now = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)

@@ -1,0 +1,88 @@
+# Fixture-core recovery candidate — 8 November 2026
+
+> This is the historical candidate record. For the installed #80 release and
+> rollback, use [the exact #80 record](fixture-core-80-release-candidate.md).
+> For a coordinated #81 cutover or rollback, use [draft #81's five-writer
+> procedure](https://github.com/jackdoak17-cyber/JXD987/pull/81), which
+> preserves the installed minute `:17` schedule. Jack later authorised
+> necessary no-added-cost programme work without repeated approval requests;
+> the earlier approval wording below is historical. Added spending still
+> requires his approval.
+
+## Observed failure
+
+Production fixture schedule returned HTTP 409 because the current fixture
+release pin expired at 09:56 UTC. The hourly publisher failed its nine-hour
+source-freshness check at 13:11. Its default source job was the six-hour VPS
+`run_p3_fixture_core_export`, last successful at 18:05 UTC on 7 November.
+
+The primary fixture-core run and website odds delivery both start at minute
+four. At 00:04 and 12:04 on 8 November, odds delivery took about seven and
+six minutes respectively, while fixture core exhausted its ten-minute lock
+retry window and skipped. The later settlement reservation left no safe
+lease to start. Historical stats reconciliation was also waiting on the
+lock at 12:07–12:09; it was not the demonstrated winner at 12:04.
+
+An independent GitHub failover refreshed and strictly exported the source at
+07:56, and published the release then. The failover's source job is
+`run_fixture_core_fallback`. The hourly VPS publisher checks only the
+primary job, so it does not use that newer verified source to renew the
+two-hour release pin. The failover workflow already considers the newest
+success of both source IDs. Its scheduled invocations have been delayed by
+hours, so it cannot be the only renewal mechanism.
+
+## Candidate change
+
+The hourly publisher selects the latest successful record from exactly the
+primary and existing fallback source jobs, then applies the existing
+nine-hour age limit. It records the actual selected job ID in publication
+evidence. An in-process source refresh still requires its explicit job ID.
+The primary fixture-core worker makes 160 retries separated by 15-second
+pauses, providing 40 minutes of retry sleep across subsequent safe lock
+windows instead of ten. Actual elapsed time also includes attempt overhead;
+this is not a strict 40-minute deadline. It invokes the
+provider and export only after acquiring a safe lease, so this does not add
+scheduled source runs or bypass the quarter-hour settlement guard.
+If an admitted source run reaches its shortened settlement lease, this caller
+records a skip and stops instead of repeating provider/export work within the
+same invocation. It still retries pre-admission lock and schedule deferrals.
+
+The proposed production cron adjustment is to move the six-hour fixture-core
+entry from minute `4` to minute `17` (`17 */6 * * *`), leaving the same
+six-hour frequency. This separates its first lock attempt from website odds
+delivery at minute `4`; the longer retry horizon covers a delayed
+quarter-hour settlement or another writer at minute `17`. The existing
+publisher remains hourly. This cron adjustment has **not** been applied.
+The quarter-hour settlement can still hold the lock past minute `17`, and
+an odds matcher starts at minute `19` every six hours. Recent successful
+fixture-core runs took 70–112 seconds, but that history is not a guarantee;
+the first two revised runs need observation for knock-on skips or delay.
+
+## Production sequence and remaining approval boundary
+
+1. Jack approved the separate one-time guarded publisher renewal. It ran at
+   14:13 UTC using the verified fallback source and published release
+   `bda3d455-74bf-455b-aee7-6db158843a77`. The resolver returned `current`;
+   the signed-in schedule returned HTTP 200, with all 88 fixture identities
+   and team values matching the database release. The pin expires at 16:13
+   UTC. The complete source report is saved in the website incident evidence.
+   This approval did not cover deploying this draft PR or changing cron.
+2. Before any future renewal, recheck genuine source freshness and scope.
+   Do not renew from stale or missing evidence.
+3. Stage an immutable worker release with the existing `.env`, `.venv` and
+   SQLite links, deploy the reviewed runtime files into it, and verify its
+   manifest before cutover. Repoint only the fixture-core and hourly fixture
+   publisher cron entries to that release, and move the former from minute
+   `4` to `17`. Verify both crontab entries.
+4. Confirm a successful primary source run, an hourly publisher renewal and
+   authenticated fixture schedule and detail responses. Watch the next two
+   six-hour runs for skipped admissions and fresh publication. Keep the
+   source age guard and settlement lease unchanged.
+
+If the new publisher fails, repoint both cron entries to the untouched prior
+worker release and restore fixture-core minute `4`; the last valid fixture
+release remains in the database and still obeys
+its own expiry. The current code changes do not resize Supabase, alter disk
+or spend-cap settings, add services, or increase the scheduled job frequency.
+Recovery of Prop Search and the leaderboard website release needs separate
+end-to-end verification.

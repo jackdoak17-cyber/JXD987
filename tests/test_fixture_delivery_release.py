@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock
@@ -123,6 +124,28 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         queries = [call.args[0] for call in cursor.execute.call_args_list]
         self.assertIn("fixture_delivery_releases", queries[0])
         self.assertIn("fixture_delivery_current_publication", queries[1])
+
+    def test_new_release_persists_selected_source_provenance(self) -> None:
+        cursor = Mock()
+        cursor.rowcount = 1
+        evidence = {
+            "kind": "fixture_core_pipeline_job",
+            "job_id": "run_fixture_core_fallback",
+            "verified_at": "2026-11-08T07:56:25+00:00",
+            "age_seconds": 18900,
+            "max_age_minutes": 540,
+        }
+        publish_release(
+            cursor,
+            "00000000-0000-4000-8000-000000000001",
+            {"schedule": 1, "standings": 0, "metrics": 44, "odds": 0},
+            datetime(2026, 11, 8, tzinfo=UTC),
+            semantic_fingerprint={"sha256": "abc"},
+            source_freshness=evidence,
+        )
+        metadata = json.loads(cursor.execute.call_args_list[0].args[1][-2])
+        self.assertEqual(metadata["last_source_freshness_evidence"], evidence)
+        self.assertEqual(metadata["semantic_projection_fingerprint"], {"sha256": "abc"})
 
     def test_fixture_date_is_derived_in_europe_london(self) -> None:
         # 23:30 UTC is already the next calendar day in London during BST.

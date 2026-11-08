@@ -49,8 +49,14 @@ export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUE_IDS:-$(supported_leag
 validate_supported_leagues "${STATS_LEAGUES}"
 export FIXTURE_CORE_MAX_RUNTIME_SECONDS="${FIXTURE_CORE_MAX_RUNTIME_SECONDS:-900}"
 export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS:-300}"
-export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-40}"
+# A ten-minute retry sleep budget can end inside an odds-delivery lock hold followed
+# by the live-settlement reservation. Keep retrying across later safe writer
+# windows; 160 pauses of 15 seconds total 40 minutes of sleep, plus attempt
+# overhead. This is an opportunity, not a strict admission guarantee.
+# The next scheduled fixture-core invocation is six hours away.
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-160}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"
+export ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF=true
 # The exporter treats zero as an unbounded completed-fixture selection. Keep
 # the historical side of this identity refresh bounded by the shared contract
 # as well; the future identity contract is still controlled by the source
