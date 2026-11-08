@@ -1,56 +1,86 @@
-# Bounded league scopes for stats reconciliation
+# Durable league-scoped stats reconciliation
 
-**State:** draft, local verification only. No worker, database or paid service
-has been changed in production.
+**State:** draft on existing VPS resources. The worker, database, website and paid
+infrastructure are unchanged in production. This draft requires the paired
+website aggregate-health migration and Jack's production approval before use.
 
-## Evidence and intended effect
+## Evidence and scheduling choice
 
-A live 2026-11-08 11:39–11:40 UTC reconciliation attempt failed with a PostgreSQL
-statement timeout while selecting revalidation fixture IDs. The existing
-selector issues six sequential queries against all 30 configured leagues for
-each batch. A non-executing production `EXPLAIN` of that exact revalidation
-shape estimated cost 69,262 for all 30 leagues, 25,537 for five, 9,264 for
-leagues 8 and 9, and 4,129 for league 8 alone. The two-league plan starts from
-the existing fixtures league index and estimates about 1,740 qualifying rows
-before the final sort, versus about 18,079 in the all-league plan. These costs
-and row counts are planner estimates, not execution measurements or proof that
-this change alone restores the website.
+A genuine 8 November 11:39–11:40 UTC reconciliation attempt timed out in the
+revalidation fixture selector before producing a batch. A non-executing
+production plan estimated cost 69,262 for all 30 leagues and 4,129 for league
+8 alone. These are planner estimates, not measured speedups. A previous
+materialized-CTE rewrite was slower in a local replay and was discarded.
 
-The supervisor now passes two configured leagues per bounded reconciliation
-attempt. The worker's scored/rediscovered eligibility, exclusions, due and
-quality conditions, six lane queries, quotas and final selection stay
-unchanged *within that scope*. A small file under `/var/lib/odds-sync` records
-the next league group across supervisor and deployment restarts. The cursor is
-advanced only after both production locks admit the attempt. A failed attempt
-advances to the next group; it can be retried on the next cycle. The cursor is
-written before the Python worker acquires its separate source-store lock, so a
-worker refusal or crash can also skip that group until the next rotation. An empty group
-does not end the supervisor until every group has been checked without a
-successful batch between them.
+The supervisor now passes **one supported league per admitted attempt**. This
+prevents the current two-cohort post-selection cap from repeatedly admitting
+both cohorts of one league while another league in the same group receives no
+work. It does not prove every season within a league progresses or that the
+full rotation has enough throughput. The supervised path requires the exact
+supported league list and group size one; manual, season-specific and force
+calls retain their existing behaviour. The existing candidate rules, urgency
+probes, quotas, exclusions and ordering remain unchanged *within the selected
+league*. Global priority between leagues changes intentionally.
 
-This intentionally changes priority between leagues: work in a different
-group waits for its turn. With 30 configured leagues and the default group size
-of two, a full pass requires 15 admitted attempts. Actual revisit time depends
-on batch durations, live settlement reservations and lock contention; there is
-no proven wall-clock guarantee. The current worker fails before making a
-batch, so this is a bounded recovery candidate, not a claim that freshness or
-the 24-hour delivery SLA is already met.
+## Durable state and health
+
+A private cursor under `/var/lib/odds-sync` contains the release/configuration
+fingerprint, coverage epoch, next league, a unique admitted attempt and its
+scope, last validated completion by league, unresolved failures and the last
+failure event. The supervisor writes a pending attempt after acquiring the
+existing database-heavy and canonical locks. The Python worker inherits the
+canonical lock; it does not acquire a second source-store process lock. The
+worker report carries the attempt and epoch IDs. A completion only counts
+when its report matches that pending identity, league and release. A missing,
+stale or malformed report cannot mark the scope successful.
+
+Failures, planned-lease interruptions and crashes remain unresolved for the
+affected league while other leagues continue. A later valid completion for
+that same league clears its unresolved state; the last failure remains in the
+file for diagnosis. An interrupted attempt is detected on the next admitted
+claim. A release or league-list change starts an unknown coverage epoch and
+retains unresolved failures for leagues still configured. Cursor and outcome
+updates use a private temporary file, file and directory sync, and atomic
+replacement while the supervisor lock is held.
+
+An empty league never terminates the supervisor by itself. Only a complete
+sequence of empty scopes across all configured leagues, without intervening
+work or unresolved failure, produces an `empty_sweep`. The state also marks
+coverage unknown until every league has a valid completion, or degraded if a
+league is failed, interrupted or more than twelve hours since inspection.
+This **inspection** age is separate from accepted provider data, cohort
+publication and the customer delivery SLA; those must be measured separately.
+
+Actual attempts remain `run_stats_reconciliation` ledger rows with real
+status, selected work and timing. A distinct
+`run_stats_reconciliation_scope_health` ledger row records aggregate unknown,
+degraded or healthy state and complete-empty-sweep evidence. The paired
+website migration makes the leaderboard health consumer read this aggregate
+record. It does not add synthetic rows to the actual performance sample. A
+successful league B cannot clear an unresolved failure in league A, and an
+empty B cannot mark the whole importer idle. The existing release-baseline
+transition remains required when the runtime manifest changes.
 
 ## Local evidence and release boundary
 
-- The helper's 12 focused tests cover full-cycle coverage, restart persistence,
-  changed configuration, invalid input, cursor handling and the selected scope
-  passed to the supervisor. The related fixture-core, settlement and
-  reconciliation suites passed 56 tests with one skip.
-- Shell syntax and the complete runtime manifest hash check passed.
-- No production runtime or data query was executed with the new scheduler.
-- This change is stacked on the unmerged reconciliation failure-log draft. A
-  release must include both runtime manifest entries and the independent
-  leaderboard lock-order change, then pass exact integrated worker checks.
+- The helper tests cover wrap, missing/failed scope, restart, interruption,
+  stale or wrong report identity, release/list changes, and selected work with
+  zero accepted fixtures. A Linux container with no network executes the real
+  supervisor, lock wrapper and stub worker for mixed empty, failed and
+  interrupted sequences. Its stub ledger shows real attempts and separate
+  aggregate outcomes.
+- The paired website SQL migration and local tests verify aggregate-health
+  checks without adding aggregate rows to performance samples. The exact
+  migration must be integrated with the worker release and retested together.
+- No production run with a scoped selector has occurred. The complete
+  rotation's selector time, admission delay, useful accepted data, published
+  cohorts and oldest due fixture age remain unmeasured. There is no proven
+  wall-clock revisit or 24-hour freshness guarantee.
 
-After an approved release, compare actual candidate-selection duration,
-successful/failed batches, selected leagues, fixture backlog and publication
-freshness. If it does not improve progress or causes unacceptable league delay,
-restore the previous supervisor and manifest. The cursor file can remain
-unused; rollback needs no database migration. Any production deployment or
-worker restart still needs Jack's approval under the website delivery protocol.
+After an approved release, compare full-rotation throughput, per-league
+selected/accepted/published progress, overdue age, normal customer results and
+leaderboard publication. If the scheduler harms freshness or does not recover
+progress, restore the prior supervisor and manifest. The cursor file becomes
+unused; rollback needs no data migration. The aggregate-health SQL should be
+rolled back only with the coordinated worker release, because its guard
+intentionally rejects a worker that emits no aggregate row.
