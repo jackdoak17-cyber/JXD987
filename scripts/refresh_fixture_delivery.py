@@ -519,20 +519,75 @@ def try_lock_refresh_publication(cur) -> bool:
     return bool(cur.fetchone()[0])
 
 
-def latest_publication_age_seconds(cur) -> int | None:
+def lock_refresh_publication_session(cur) -> None:
+    """Hold publication ownership across the build marker's intermediate commit."""
+    cur.execute("select pg_advisory_lock(hashtextextended('fixture_delivery_refresh', 0))")
+
+
+def current_publication_guard_state(cur) -> dict[str, Any] | None:
     cur.execute(
         """
-        select extract(epoch from (now() - published_at))::integer
-          from public.fixture_delivery_releases
-         where status = 'published' and published_at is not null
-         order by published_at desc
+        select r.id, r.published_at, r.health_checked_at, r.pin_expires_at, r.metadata
+          from public.fixture_delivery_current_publication p
+          join public.fixture_delivery_releases r on r.id = p.release_id
+         where p.publication_key = 'fixtures' and r.status = 'published'
          limit 1
         """
     )
     row = cur.fetchone()
-    if row is None or row[0] is None:
+    if not row:
         return None
-    return int(row[0])
+    return {
+        "release_id": str(row[0]),
+        "published_at": row[1],
+        "health_checked_at": row[2],
+        "pin_expires_at": row[3],
+        "metadata": row[4] if isinstance(row[4], dict) else {},
+    }
+
+
+def publication_skip_reason(
+    current: dict[str, Any] | None,
+    candidate_evidence: dict[str, Any],
+    candidate_pin_expires_at: datetime,
+    *,
+    guarded: bool,
+    min_interval_seconds: int,
+    now: datetime | None = None,
+) -> str | None:
+    """Decide only from the committed current release while owning the lock."""
+    if current is None:
+        return None
+    observed_at = now or datetime.now(UTC)
+    pin = current.get("pin_expires_at")
+    if pin is None or pin <= observed_at:
+        return None
+
+    existing_evidence = current.get("metadata", {}).get("last_source_freshness_evidence")
+    if isinstance(existing_evidence, dict) and existing_evidence.get("verified_at"):
+        existing_source_at = datetime.fromisoformat(str(existing_evidence["verified_at"]).replace("Z", "+00:00"))
+        candidate_source_at = datetime.fromisoformat(str(candidate_evidence["verified_at"]).replace("Z", "+00:00"))
+        if candidate_source_at < existing_source_at:
+            return "newer_current_source"
+
+    if candidate_pin_expires_at < pin:
+        return "would_shorten_current_pin"
+
+    # The fallback's one-hour throttle is safe only when the current release
+    # has the same minimum runway verified by the workflow after publication.
+    last_activity = max(
+        (value for value in (current.get("published_at"), current.get("health_checked_at")) if value),
+        default=None,
+    )
+    if (
+        guarded
+        and min_interval_seconds > 0
+        and last_activity is not None
+        and (observed_at - last_activity).total_seconds() < min_interval_seconds
+        and (pin - observed_at).total_seconds() >= 45 * 60
+    ):
+        return "recent_publication_satisfies_guard"
+    return None
 
 
 def guarded_skip_report(report: dict[str, Any], reason: str, **extra: Any) -> dict[str, Any]:
@@ -821,8 +876,14 @@ def publish_release(
     source_watermark: datetime | None,
     semantic_fingerprint: dict[str, Any] | None = None,
     pin_expires_at: datetime | None = None,
+    source_freshness: dict[str, Any] | None = None,
 ) -> None:
     """Switch the sole customer-visible pointer inside the caller's transaction."""
+    publication_metadata: dict[str, Any] = {}
+    if semantic_fingerprint is not None:
+        publication_metadata["semantic_projection_fingerprint"] = semantic_fingerprint
+    if source_freshness is not None:
+        publication_metadata["last_source_freshness_evidence"] = source_freshness
     cur.execute(
         """
         update public.fixture_delivery_releases
@@ -842,8 +903,7 @@ def publish_release(
             counts.get("standings", 0),
             counts.get("metrics", 0),
             counts.get("odds", 0),
-            json.dumps({"semantic_projection_fingerprint": semantic_fingerprint})
-            if semantic_fingerprint is not None else "{}",
+            json.dumps(publication_metadata),
             release_id,
         ),
     )
@@ -869,6 +929,7 @@ def finalize_release(
     report: dict[str, Any],
     semantic_fingerprint: dict[str, Any] | None = None,
     pin_expires_at: datetime | None = None,
+    source_freshness: dict[str, Any] | None = None,
 ) -> None:
     """Publish durably before best-effort retention cleanup.
 
@@ -883,6 +944,7 @@ def finalize_release(
         source_watermark,
         semantic_fingerprint,
         pin_expires_at,
+        source_freshness,
     )
     report["release_id"] = release_id
     report["published"] = True
@@ -1506,24 +1568,19 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     conn.set_session(isolation_level="REPEATABLE READ", readonly=False, autocommit=False)
     release_id: str | None = None
     try:
-        if args.skip_if_publication_active:
-            with conn.cursor() as cur:
+        with conn.cursor() as cur:
+            if args.skip_if_publication_active:
                 if not try_lock_refresh_publication(cur):
                     return guarded_skip_report(report, "publication_active")
-                min_interval = max(int(args.min_publish_interval_seconds or 0), 0)
-                if min_interval:
-                    age_seconds = latest_publication_age_seconds(cur)
-                    if age_seconds is not None and age_seconds < min_interval:
-                        return guarded_skip_report(
-                            report,
-                            "recent_publication_satisfies_guard",
-                            latest_publication_age_seconds=age_seconds,
-                            min_publish_interval_seconds=min_interval,
-                        )
+            else:
+                lock_refresh_publication_session(cur)
+        # A blocking lock query can begin with a pre-lock repeatable-read
+        # snapshot. Start a new transaction after ownership so the decision
+        # sees the preceding publisher's committed renewal or release.
+        conn.commit()
 
         with conn.cursor() as cur:
             validate_delivery_schema(cur)
-            lock_refresh_publication(cur)
             source_freshness = verify_fixture_source_freshness(
                 cur,
                 int(
@@ -1541,6 +1598,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             report["source_freshness"] = source_freshness
             pin_expires_at = bounded_release_pin_expires_at(source_freshness)
             report["pin_expires_at"] = pin_expires_at.isoformat()
+            current_publication = current_publication_guard_state(cur)
+            skip_reason = publication_skip_reason(
+                current_publication,
+                source_freshness,
+                pin_expires_at,
+                guarded=bool(args.skip_if_publication_active),
+                min_interval_seconds=max(int(args.min_publish_interval_seconds or 0), 0),
+            )
+            if skip_reason:
+                return guarded_skip_report(
+                    report,
+                    skip_reason,
+                    current_release_id=current_publication["release_id"],
+                    current_pin_expires_at=current_publication["pin_expires_at"].isoformat(),
+                )
             source = source_fixtures(cur, start, end, leagues)
             validate_source_fixture_identity(source)
             valid_schedule = [
@@ -1595,7 +1667,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         conn.commit()
 
         with conn.cursor() as cur:
-            lock_refresh_publication(cur)
             schedule_run = start_run(cur, "schedule", start, end, release_id)
             rejected_cups = sum(row["league_id"] in EXCLUDED_CUPS for row in source)
             schedule_written = upsert_schedule(cur, valid_schedule, start, end, release_id)
@@ -1648,6 +1719,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 report,
                 semantic_fingerprint,
                 pin_expires_at,
+                source_freshness,
             )
     except Exception as error:
         conn.rollback()

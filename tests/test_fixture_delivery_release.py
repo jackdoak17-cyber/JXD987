@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
+from scripts import refresh_fixture_delivery as publisher
 from scripts.refresh_fixture_delivery import (
     bounded_release_pin_expires_at,
     build_season_scoped_history,
@@ -11,6 +13,7 @@ from scripts.refresh_fixture_delivery import (
     finalize_release,
     iso_date,
     publish_release,
+    publication_skip_reason,
     record_verified_noop,
 )
 
@@ -19,6 +22,99 @@ UTC = timezone.utc
 
 
 class FixtureDeliveryReleaseContractTests(unittest.TestCase):
+    def test_older_fallback_cannot_shorten_primary_noop_before_heartbeat(self) -> None:
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        current = {
+            "release_id": "primary-release",
+            "published_at": now - timedelta(hours=2),
+            "health_checked_at": now,
+            "pin_expires_at": now + timedelta(hours=2),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(minutes=27)).isoformat(),
+            }},
+        }
+        fallback = {"verified_at": (now - timedelta(minutes=450)).isoformat()}
+        self.assertEqual(
+            publication_skip_reason(
+                current, fallback, now + timedelta(minutes=90),
+                guarded=True, min_interval_seconds=3600, now=now,
+            ),
+            "newer_current_source",
+        )
+
+    def test_recent_publication_with_short_pin_allows_fresh_recovery(self) -> None:
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        current = {
+            "release_id": "short-pin-release",
+            "published_at": now - timedelta(minutes=20),
+            "health_checked_at": now - timedelta(minutes=20),
+            "pin_expires_at": now + timedelta(minutes=10),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(hours=8)).isoformat(),
+            }},
+        }
+        fresh = {"verified_at": (now - timedelta(minutes=2)).isoformat()}
+        self.assertIsNone(publication_skip_reason(
+            current, fresh, now + timedelta(hours=2),
+            guarded=True, min_interval_seconds=3600, now=now,
+        ))
+        current["pin_expires_at"] = now + timedelta(hours=2)
+        self.assertEqual(publication_skip_reason(
+            current, fresh, now + timedelta(hours=2),
+            guarded=True, min_interval_seconds=3600, now=now,
+        ), "recent_publication_satisfies_guard")
+
+    def test_current_full_publication_evidence_blocks_older_candidate(self) -> None:
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        current = {
+            "release_id": "new-full-release",
+            "published_at": now - timedelta(hours=2),
+            "health_checked_at": now - timedelta(hours=2),
+            "pin_expires_at": now + timedelta(hours=2),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(minutes=27)).isoformat(),
+            }},
+        }
+        self.assertEqual(publication_skip_reason(
+            current, {"verified_at": (now - timedelta(hours=7)).isoformat()},
+            now + timedelta(minutes=90), guarded=True,
+            min_interval_seconds=3600, now=now,
+        ), "newer_current_source")
+
+    def test_guard_reads_committed_state_after_session_lock(self) -> None:
+        now = datetime.now(UTC)
+        conn = MagicMock()
+        cursor = Mock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        stale_after_lock = {
+            "release_id": "just-renewed",
+            "published_at": now - timedelta(hours=2),
+            "health_checked_at": now,
+            "pin_expires_at": now + timedelta(hours=2),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(minutes=5)).isoformat(),
+            }},
+        }
+        def committed_state(_cur):
+            self.assertEqual(conn.commit.call_count, 1)
+            return stale_after_lock
+        with (
+            patch.object(publisher, "connection", return_value=conn),
+            patch.object(publisher, "try_lock_refresh_publication", return_value=True),
+            patch.object(publisher, "validate_delivery_schema"),
+            patch.object(publisher, "verify_fixture_source_freshness", return_value={
+                "verified_at": (now - timedelta(hours=7)).isoformat(),
+            }),
+            patch.object(publisher, "bounded_release_pin_expires_at", return_value=now + timedelta(minutes=90)),
+            patch.object(publisher, "current_publication_guard_state", side_effect=committed_state),
+            patch.object(publisher, "source_fixtures") as source_rows,
+        ):
+            args = publisher.build_parser().parse_args(["--skip-if-publication-active"])
+            report = publisher.run(args)
+        self.assertEqual(report["skip_reason"], "newer_current_source")
+        source_rows.assert_not_called()
+        conn.close.assert_called_once_with()
+
     def test_verified_noop_writes_health_evidence_but_no_projection_rows(self) -> None:
         cursor = Mock()
         cursor.fetchone.return_value = ("run-id",)
@@ -123,6 +219,18 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         queries = [call.args[0] for call in cursor.execute.call_args_list]
         self.assertIn("fixture_delivery_releases", queries[0])
         self.assertIn("fixture_delivery_current_publication", queries[1])
+
+    def test_full_publication_persists_source_evidence(self) -> None:
+        cursor = Mock()
+        cursor.rowcount = 1
+        evidence = {"verified_at": "2026-11-08T15:33:53+00:00", "max_age_minutes": 540}
+        publish_release(
+            cursor, "release-id", {"schedule": 1}, None,
+            semantic_fingerprint={"sha256": "abc"},
+            source_freshness=evidence,
+        )
+        metadata = json.loads(cursor.execute.call_args_list[0].args[1][-2])
+        self.assertEqual(metadata["last_source_freshness_evidence"], evidence)
 
     def test_fixture_date_is_derived_in_europe_london(self) -> None:
         # 23:30 UTC is already the next calendar day in London during BST.
