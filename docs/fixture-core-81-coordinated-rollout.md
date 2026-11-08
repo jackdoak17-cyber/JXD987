@@ -169,7 +169,17 @@ still verify. Website odds delivery keeps its explicit database path. A
 second complete nine-entry freeze and activation occurred at 15:49:46 and
 15:50:07 respectively after proving no old protocol process or reservation
 remained. **The #81 cron cutover is currently active, not yet fully verified.**
-The next settlement at 16:00, hourly publisher at 16:11, odds delivery and
-longer-running source/settlement continuity remain to be observed. If a
-candidate job fails, use the two-stage rollback above before calling #81
-successful. No paid capacity, disk, spend-cap setting or service changed.
+The 16:00 scheduled settlement used manifest `85450ebeada0`, reconciled 158
+recent fixtures, exported 162 and finished with a durable `success` ledger
+row at 16:01:23. The new stats supervisor started from manifest `563d92e85772`
+at 15:55. The hourly publisher at 16:11, odds delivery and longer-running
+source/settlement continuity remain to be observed.
+
+One controlled #81 publisher invocation at 15:50:59 corrected a concurrent
+fallback overwrite. It reused identical published projection rows (zero
+projection writes), recorded the fresh primary source in release metadata
+and renewed the current pin to 17:51:02. The separate GitHub fallback race
+guard was merged to JXD main at `acbee957`; its next scheduled execution
+still requires observation. If a candidate job fails, use the two-stage
+rollback above before calling #81 fully verified. No paid capacity, disk,
+spend-cap setting, service or job frequency changed.
