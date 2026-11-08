@@ -561,6 +561,8 @@ def main() -> int:
             "provider_pending": 0,
         },
         "release_id": os.environ.get("RUNTIME_RELEASE_ID", "local"),
+        "scope_attempt_id": os.environ.get("STATS_RECONCILE_SCOPE_ATTEMPT_ID"),
+        "scope_epoch": os.environ.get("STATS_RECONCILE_SCOPE_EPOCH"),
         "leagues": leagues,
         "season_ids": season_ids,
         "batches": 0,
