@@ -19,10 +19,10 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable
-from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import psycopg2
+from psycopg2.extensions import parse_dsn
 from psycopg2.extras import Json, execute_values
 
 
@@ -419,9 +419,16 @@ def get_dates(args: argparse.Namespace) -> tuple[date, date]:
 
 def validate_session_capable_dsn(url: str) -> None:
     """Reject Supabase transaction pooling for a cross-commit session lock."""
-    parsed = urlsplit(url)
-    host = (parsed.hostname or "").lower()
-    if parsed.port == 6543 or ("pooler" in host and parsed.port not in (None, 5432)):
+    params = parse_dsn(url)
+    if params.get("service") or params.get("servicefile"):
+        raise RuntimeError("fixture publisher requires an explicit database endpoint")
+    host = (params.get("host") or os.environ.get("PGHOST") or "localhost").lower()
+    raw_port = params.get("port") or os.environ.get("PGPORT") or "5432"
+    try:
+        port = int(raw_port)
+    except ValueError as error:
+        raise RuntimeError("fixture publisher requires one explicit database port") from error
+    if port == 6543 or ("pooler" in host and port != 5432):
         raise RuntimeError("fixture publisher requires a direct or session-pooler database URL")
 
 
@@ -586,6 +593,33 @@ def current_publication_guard_state(cur) -> dict[str, Any] | None:
     }
 
 
+def current_resolved_publication_state(cur) -> dict[str, Any] | None:
+    """Read the release and the website resolver from one statement snapshot."""
+    cur.execute(
+        """
+        select r.id, r.published_at, r.health_checked_at, r.pin_expires_at,
+               r.metadata, resolved.release_id, resolved.state
+          from public.fixture_delivery_current_publication p
+          left join public.fixture_delivery_releases r on r.id = p.release_id
+          cross join lateral public.fixture_delivery_release_resolve(null::uuid) resolved
+         where p.publication_key = 'fixtures'
+         limit 1
+        """
+    )
+    row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    return {
+        "release_id": str(row[0]),
+        "published_at": row[1],
+        "health_checked_at": row[2],
+        "pin_expires_at": row[3],
+        "metadata": row[4] if isinstance(row[4], dict) else {},
+        "resolver_release_id": str(row[5]) if row[5] is not None else None,
+        "resolver_state": str(row[6]) if row[6] is not None else None,
+    }
+
+
 def publication_skip_reason(
     current: dict[str, Any] | None,
     candidate_evidence: dict[str, Any],
@@ -644,6 +678,12 @@ def verify_superseded_core_skip(
         raise RuntimeError("primary publisher skip reason is not benign")
     if current is None or current["release_id"] != report.get("current_release_id"):
         raise RuntimeError("current fixture publication changed after the skip")
+    if (
+        current.get("resolver_state") != "current"
+        or current.get("resolver_release_id") != current["release_id"]
+        or current.get("health_checked_at") is None
+    ):
+        raise RuntimeError("fixture resolver does not report this release as current")
     observed_at = now or datetime.now(UTC)
     pin = current.get("pin_expires_at")
     if pin is None or pin < observed_at + timedelta(minutes=45):
@@ -681,7 +721,7 @@ def verify_superseded_core_skip_report(report_path: str) -> None:
         with conn.cursor() as cur:
             cur.execute("set local statement_timeout = '3000ms'")
             cur.execute("set local lock_timeout = '500ms'")
-            current = current_publication_guard_state(cur)
+            current = current_resolved_publication_state(cur)
         verify_superseded_core_skip(report, current)
     finally:
         conn.close()

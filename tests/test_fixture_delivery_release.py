@@ -11,6 +11,7 @@ from scripts.refresh_fixture_delivery import (
     bounded_release_pin_expires_at,
     build_season_scoped_history,
     compute_standings,
+    current_resolved_publication_state,
     finalize_release,
     iso_date,
     publish_release,
@@ -25,10 +26,25 @@ UTC = timezone.utc
 
 
 class FixtureDeliveryReleaseContractTests(unittest.TestCase):
+    def test_resolver_and_release_evidence_share_one_statement(self) -> None:
+        cursor = Mock()
+        now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
+        cursor.fetchone.return_value = (
+            "release-id", now, now, now + timedelta(hours=2), {}, "release-id", "current",
+        )
+        state = current_resolved_publication_state(cursor)
+        cursor.execute.assert_called_once()
+        sql = cursor.execute.call_args.args[0]
+        self.assertIn("fixture_delivery_release_resolve(null::uuid)", sql)
+        self.assertIn("fixture_delivery_releases", sql)
+        self.assertEqual(state["resolver_state"], "current")
+
     def test_superseded_primary_skip_requires_current_supported_release(self) -> None:
         now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
         current = {
             "release_id": "current-release",
+            "resolver_release_id": "current-release",
+            "resolver_state": "current",
             "published_at": now - timedelta(hours=2),
             "health_checked_at": now,
             "pin_expires_at": now + timedelta(hours=2),
@@ -60,6 +76,11 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         current["pin_expires_at"] = now + timedelta(minutes=10)
         with self.assertRaisesRegex(RuntimeError, "runway"):
             verify_superseded_core_skip(report, current, now=now)
+        current["pin_expires_at"] = now + timedelta(hours=2)
+        current["health_checked_at"] = None
+        current["resolver_state"] = "stale"
+        with self.assertRaisesRegex(RuntimeError, "resolver"):
+            verify_superseded_core_skip(report, current, now=now)
 
     def test_session_lock_rejects_supabase_transaction_pooler(self) -> None:
         validate_session_capable_dsn("postgresql://user:pass@aws-0.pooler.supabase.com:5432/postgres")
@@ -68,6 +89,17 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             validate_session_capable_dsn("postgresql://user:pass@aws-0.pooler.supabase.com:6543/postgres")
         with self.assertRaisesRegex(RuntimeError, "session-pooler"):
             validate_session_capable_dsn("postgresql://user:pass@custom-pooler.example.com:6543/postgres")
+        for dsn in (
+            "postgresql://user:pass@aws-0.pooler.supabase.com:5432/postgres?port=6543",
+            "postgresql:///postgres?host=aws-0.pooler.supabase.com&port=6543",
+            "host=aws-0.pooler.supabase.com port=6543 dbname=postgres",
+        ):
+            with self.subTest(dsn=dsn):
+                with self.assertRaisesRegex(RuntimeError, "session-pooler"):
+                    validate_session_capable_dsn(dsn)
+        with patch.dict("os.environ", {"PGPORT": "6543"}):
+            with self.assertRaisesRegex(RuntimeError, "session-pooler"):
+                validate_session_capable_dsn("postgresql://user:pass@aws-0.pooler.supabase.com/postgres")
 
     def test_older_fallback_cannot_shorten_primary_noop_before_heartbeat(self) -> None:
         now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
