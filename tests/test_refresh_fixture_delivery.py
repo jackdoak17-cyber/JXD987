@@ -97,6 +97,13 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
                 job_id=LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID,
                 now=now,
             )
+        with self.assertRaisesRegex(RuntimeError, "no successful verified fixture-core run"):
+            verify_fixture_source_freshness(
+                VerifiedSourceCursor("run_fixture_core_fallback", None),
+                540,
+                job_id=LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID,
+                now=now,
+            )
         with self.assertRaisesRegex(RuntimeError, "explicit source job ID"):
             verify_fixture_source_freshness(
                 cursor,
