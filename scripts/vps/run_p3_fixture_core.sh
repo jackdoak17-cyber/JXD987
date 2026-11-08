@@ -57,6 +57,9 @@ export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SE
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-160}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"
 export ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF=true
+# Bound total retry time as well as retry count so the reservation outlives
+# a waiting caller even when individual checks take longer than expected.
+export ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DEADLINE_SECONDS:-2400}"
 # The 45-minute reservation spans the 40-minute retry horizon. An admitted
 # source run keeps the canonical writer lock for its bounded execution.
 export FIXTURE_CORE_RESERVATION_TTL_SECONDS="${FIXTURE_CORE_RESERVATION_TTL_SECONDS:-2700}"

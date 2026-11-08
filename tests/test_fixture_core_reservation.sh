@@ -104,4 +104,21 @@ set -e
 [[ "${core_live_status}" -eq 2 ]]
 ODDS_SYNC_JOB_PRIORITY=settlement run_with_global_lock_and_timeout 'true'
 fixture_core_reservation_release "${owner}"
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS=100
+export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS=0.05
+export ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS=1
+retry_started="$(date -u +%s)"
+set +e
+ODDS_SYNC_JOB_PRIORITY=fixture_core run_with_global_lock_and_retry 'true' >"${tmp}/deadline" 2>&1
+deadline_status=$?
+set -e
+retry_elapsed=$(( $(date -u +%s) - retry_started ))
+[[ "${deadline_status}" -eq 2 ]]
+[[ "${retry_elapsed}" -le 3 ]]
+grep -q 'retry deadline reached' "${tmp}/deadline"
+set +e
+ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS=invalid run_with_global_lock_and_retry 'true' >"${tmp}/invalid-deadline" 2>&1
+invalid_deadline_status=$?
+set -e
+[[ "${invalid_deadline_status}" -eq 1 ]]
 echo "fixture-core reservation contention checks passed"

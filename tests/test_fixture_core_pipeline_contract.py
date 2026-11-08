@@ -41,6 +41,7 @@ class FixtureCorePipelineContractTests(unittest.TestCase):
         self.assertIn('ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-160}"', wrapper)
         self.assertIn('ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"', wrapper)
         self.assertIn("ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF=true", wrapper)
+        self.assertIn('ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DEADLINE_SECONDS:-2400}"', wrapper)
         self.assertIn('reservation_owner="$(fixture_core_reservation_claim)"', wrapper)
         self.assertIn('fixture_core_reservation_release "${reservation_owner}"', wrapper)
         self.assertIn('ODDS_SYNC_JOB_PRIORITY="fixture_core"', wrapper)

@@ -351,6 +351,8 @@ run_with_global_lock_and_retry() {
   local chain_command="$1"
   local retry_attempts="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-0}"
   local retry_delay_seconds="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-15}"
+  local retry_deadline_seconds="${ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS:-0}"
+  local retry_started_epoch
   local attempt=0 status=2
 
   if [[ ! "${retry_attempts}" =~ ^[0-9]+$ ]]; then
@@ -361,8 +363,17 @@ run_with_global_lock_and_retry() {
     log_error "ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS must be a non-negative number"
     return 1
   fi
+  if [[ ! "${retry_deadline_seconds}" =~ ^[0-9]+$ ]]; then
+    log_error "ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS must be a non-negative integer"
+    return 1
+  fi
+  retry_started_epoch="$(date -u +%s)"
 
   while (( attempt <= retry_attempts )); do
+    if (( retry_deadline_seconds > 0 && $(date -u +%s) - retry_started_epoch >= retry_deadline_seconds )); then
+      log_info "[SKIPPED] writer-lock retry deadline reached"
+      return 2
+    fi
     run_with_global_lock_and_timeout "${chain_command}" && return 0
     status=$?
     if [[ "${status}" -eq 76 && "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
@@ -376,6 +387,10 @@ run_with_global_lock_and_retry() {
     fi
     attempt=$((attempt + 1))
     if (( attempt > retry_attempts )); then
+      return 2
+    fi
+    if (( retry_deadline_seconds > 0 && $(date -u +%s) - retry_started_epoch >= retry_deadline_seconds )); then
+      log_info "[SKIPPED] writer-lock retry deadline reached"
       return 2
     fi
     log_info "[RETRY] lock handoff; retry ${attempt}/${retry_attempts} in ${retry_delay_seconds}s"
