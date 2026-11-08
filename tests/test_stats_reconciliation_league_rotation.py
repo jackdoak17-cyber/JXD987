@@ -50,6 +50,31 @@ def test_rotation_covers_each_league_and_survives_restart(tmp_path: Path) -> Non
     assert cursor.stat().st_mode & 0o777 == 0o600
 
 
+def test_full_empty_sweep_stays_valid_after_restart_and_another_empty_scope(tmp_path: Path) -> None:
+    cursor = tmp_path / "cursor.json"
+    for _ in range(3):
+        pending = next_group([8, 9, 12], 1, cursor, "test-release")
+        result = finish(tmp_path, pending)
+    assert result["aggregate"]["empty_sweep"] is True
+    restarted = next_group([8, 9, 12], 1, cursor, "test-release")
+    again = finish(tmp_path, restarted)
+    assert again["aggregate"]["empty_sweep"] is True
+    assert json.loads(cursor.read_text())["empty_streak"] == 3
+    assert next_group([8, 9, 12], 1, cursor, "test-release")["leagues"] == [9]
+
+
+def test_malformed_completion_cannot_count_as_healthy_coverage(tmp_path: Path) -> None:
+    cursor = tmp_path / "cursor.json"
+    for _ in range(3):
+        pending = next_group([8, 9, 12], 1, cursor, "test-release")
+        finish(tmp_path, pending)
+    state = json.loads(cursor.read_text())
+    state["last_completed"]["8"] = {}
+    cursor.write_text(json.dumps(state))
+    with pytest.raises(ValueError, match="completion time"):
+        next_group([8, 9, 12], 1, cursor, "test-release")
+
+
 def test_empty_first_scope_does_not_end_sweep_before_work_later(tmp_path: Path) -> None:
     cursor = tmp_path / "cursor.json"
     a = next_group([8, 9, 12], 1, cursor, "test-release")
