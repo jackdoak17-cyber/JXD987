@@ -62,6 +62,11 @@ METRIC_WINDOWS = tuple(range(5, 16))
 METRIC_MODES = ("overall", "venue")
 METRIC_SEASON_SCOPES = ("all", "current")
 DEFAULT_FIXTURE_SOURCE_JOB_ID = "run_p3_fixture_core_export"
+LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID = "latest_verified_fixture_core"
+VERIFIED_FIXTURE_SOURCE_JOB_IDS = (
+    DEFAULT_FIXTURE_SOURCE_JOB_ID,
+    "run_fixture_core_fallback",
+)
 DEFAULT_FIXTURE_SOURCE_MAX_AGE_MINUTES = 540
 
 SCHEDULE_SEMANTIC_FIELDS = (
@@ -292,6 +297,8 @@ def verify_fixture_source_freshness(
     evidence_kind = "fixture_core_pipeline_job"
 
     if refreshed_at_override:
+        if job_id == LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID:
+            raise RuntimeError("current fixture-core export requires an explicit source job ID")
         raw = refreshed_at_override.strip().replace("Z", "+00:00")
         try:
             observed = datetime.fromisoformat(raw)
@@ -299,22 +306,43 @@ def verify_fixture_source_freshness(
             raise RuntimeError("fixture source refresh evidence is malformed") from error
         evidence_kind = "current_fixture_core_export"
     else:
-        cur.execute(
-            """
-            select finished_at
-              from operations.pipeline_job_runs
-             where job_id = %s and status = 'success'
-             order by finished_at desc
-             limit 1
-            """,
-            (job_id,),
-        )
-        row = cur.fetchone()
-        if not row or row[0] is None:
-            raise RuntimeError(
-                f"fixture source freshness is unverified: no successful {job_id} run"
+        if job_id == LATEST_VERIFIED_FIXTURE_SOURCE_JOB_ID:
+            # The GitHub failover already trusts these same two source jobs.
+            # Return the selected job ID so the published release retains the
+            # provenance of the actual successful export.
+            cur.execute(
+                """
+                select job_id, finished_at
+                  from operations.pipeline_job_runs
+                 where job_id = any(%s) and status = 'success'
+                 order by finished_at desc
+                 limit 1
+                """,
+                (list(VERIFIED_FIXTURE_SOURCE_JOB_IDS),),
             )
-        observed = row[0]
+            row = cur.fetchone()
+            if not row or row[1] is None:
+                raise RuntimeError(
+                    "fixture source freshness is unverified: no successful verified fixture-core run"
+                )
+            job_id, observed = row
+        else:
+            cur.execute(
+                """
+                select finished_at
+                  from operations.pipeline_job_runs
+                 where job_id = %s and status = 'success'
+                 order by finished_at desc
+                 limit 1
+                """,
+                (job_id,),
+            )
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                raise RuntimeError(
+                    f"fixture source freshness is unverified: no successful {job_id} run"
+                )
+            observed = row[0]
 
     observed = observed if observed.tzinfo is not None else observed.replace(tzinfo=UTC)
     age = current.astimezone(UTC) - observed.astimezone(UTC)

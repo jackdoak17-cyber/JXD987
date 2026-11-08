@@ -31,7 +31,10 @@ export STATS_LEAGUES="${FIXTURE_LEAGUE_IDS:-${STATS_LEAGUES:-$(supported_league_
 validate_supported_leagues "${STATS_LEAGUES}"
 export FIXTURE_DELIVERY_DAYS_BACK="${FIXTURE_DELIVERY_DAYS_BACK:-$(contract_value history_window_days)}"
 export FIXTURE_DELIVERY_DAYS_FORWARD="${FIXTURE_DELIVERY_DAYS_FORWARD:-$(contract_value delivery_window_days)}"
-export FIXTURE_DELIVERY_SOURCE_JOB_ID="${FIXTURE_DELIVERY_SOURCE_JOB_ID:-$(contract_value job_id)}"
+# The independent failover refresh is a verified source too. Use whichever
+# successful source export is newest; refresh_fixture_delivery still enforces
+# the contract age and retains the selected job ID in publication evidence.
+export FIXTURE_DELIVERY_SOURCE_JOB_ID="${FIXTURE_DELIVERY_SOURCE_JOB_ID:-latest_verified_fixture_core}"
 export FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES="${FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES:-$(contract_value max_job_age_minutes)}"
 export FIXTURE_DELIVERY_DIRTY_STATE_PATH="${FIXTURE_DELIVERY_DIRTY_STATE_PATH:-/var/lib/oddssearch/fixture-delivery/dirty-state.json}"
 export FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS="${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS:-3600}"

@@ -27,6 +27,7 @@ class FixtureDeliveryPublisherContractTests(unittest.TestCase):
         self.assertIn("--min-publish-interval-seconds", source)
         self.assertIn("FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES", source)
         self.assertIn("FIXTURE_DELIVERY_SOURCE_JOB_ID", source)
+        self.assertIn("FIXTURE_DELIVERY_SOURCE_JOB_ID:-latest_verified_fixture_core", source)
         self.assertIn("record_pipeline_job_run", source)
         self.assertIn('"run_fixture_delivery_publisher"', source)
         self.assertIn('if [[ "${publisher_status}" -eq 2 ]]; then', source)
