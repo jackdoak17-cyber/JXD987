@@ -206,10 +206,12 @@ correct benign supersession exit 2 would mark the admitted core job failed.
 That first package (`38a77ccc7a39`) is superseded. R21 follow-up found two
 more verifier defects in the second staged package (`36221bc38dea`): it did
 not call the customer resolver and its URL check could miss libpq connection
-overrides. **Neither earlier package may be activated.**
+overrides. The third staged package (`29be41a595c8`) corrected these, but
+did not reject an implicit `PGSERVICE` endpoint. **These earlier packages
+are superseded and may not be activated.**
 
 The corrected #81 backport is commit
-`20a88309377f40c90366c2a775343bc9b7e0e08c`. Its primary core wrapper
+`cc301813c0125262a3cf6eab4de88a683eaadc9e`. Its primary core wrapper
 removes the prior publisher report, and accepts exit 2 only after a fresh
 single-statement database read verifies the actual customer resolver says
 `current` for the same release, at least 45 minutes of pin runway,
@@ -221,7 +223,8 @@ stubbed database, including the null-health/stale-resolver case. The 80 fixture
 tests completed with 14 environment-gated skips; shell syntax, Python
 compile, complete source manifest and diff checks passed. The publisher uses
 libpq's parsed effective connection parameters to reject Supabase's
-transaction-pooler port 6543, including URI/query and keyword DSN overrides.
+transaction-pooler port 6543, including URI/query and keyword DSN overrides,
+and rejects an implicit service-file endpoint that cannot be checked here.
 The effective VPS URL is a Supabase pooler on port 5432 without exposing
 credentials in the record. A unique-key two-connection production probe
 verified that this exact connection preserves a session advisory lock after
@@ -232,10 +235,10 @@ The corrected immutable package was derived from the active core archive by
 replacing only `scripts/refresh_fixture_delivery.py` and
 `scripts/vps/run_p3_fixture_core.sh`, then updating their manifest entries
 and source identity. Its manifest is
-`29be41a595c850b42b944c03fcc50b8d7a9825fd` and archive SHA-256 is
-`ce2348e3f2ca4e562404df6897e7205770133759e72c1cd471f6c94881cfee6b`.
+`4b89de8d5131607680da1cac9bf79ac200056d8b` and archive SHA-256 is
+`5bea0395ac772e76eb0e04435d0655b6ea0d30667edc76e5cfb1d4a94c8f38b8`.
 It is staged at
-`/opt/odds-sync/JXD987-fixture-core-81-guard-v3-29be41-release` with the
+`/opt/odds-sync/JXD987-fixture-core-81-guard-v4-4b89de-release` with the
 same `.env`, `.venv` and `data` targets as active core. Archive SHA-256, all
 43 manifest files, runtime ID, links, shell syntax and a no-write dry run
 passed on the VPS. The staged verifier also accepted the live older-source
@@ -260,7 +263,7 @@ settlement process, then atomically replace only the three core-package
 paths (fixture core, hourly publisher and settlement) with the staged path.
 Keep all schedules, all other worker entries and all database/configuration
 settings identical. Read back all entries and verify the next scheduled
-settlement and publisher against manifest `29be41a595c8`. If either fails,
+settlement and publisher against manifest `4b89de8d5131`. If either fails,
 restore the backed-up three paths atomically to the still-installed
 `JXD987-fixture-core-81-85450e-release`, then verify writer quiescence and
 the current release before retrying. The broader two-stage rollback above
