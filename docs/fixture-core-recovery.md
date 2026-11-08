@@ -28,8 +28,10 @@ The hourly publisher selects the latest successful record from exactly the
 primary and existing fallback source jobs, then applies the existing
 nine-hour age limit. It records the actual selected job ID in publication
 evidence. An in-process source refresh still requires its explicit job ID.
-The primary fixture-core worker waits up to 40 minutes across subsequent
-safe lock windows instead of giving up after ten minutes. It invokes the
+The primary fixture-core worker makes 160 retries separated by 15-second
+pauses, providing 40 minutes of retry sleep across subsequent safe lock
+windows instead of ten. Actual elapsed time also includes attempt overhead;
+this is not a strict 40-minute deadline. It invokes the
 provider and export only after acquiring a safe lease, so this does not add
 scheduled source runs or bypass the quarter-hour settlement guard.
 

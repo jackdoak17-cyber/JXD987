@@ -851,8 +851,14 @@ def publish_release(
     source_watermark: datetime | None,
     semantic_fingerprint: dict[str, Any] | None = None,
     pin_expires_at: datetime | None = None,
+    source_freshness: dict[str, Any] | None = None,
 ) -> None:
     """Switch the sole customer-visible pointer inside the caller's transaction."""
+    publication_metadata: dict[str, Any] = {}
+    if semantic_fingerprint is not None:
+        publication_metadata["semantic_projection_fingerprint"] = semantic_fingerprint
+    if source_freshness is not None:
+        publication_metadata["last_source_freshness_evidence"] = source_freshness
     cur.execute(
         """
         update public.fixture_delivery_releases
@@ -872,8 +878,7 @@ def publish_release(
             counts.get("standings", 0),
             counts.get("metrics", 0),
             counts.get("odds", 0),
-            json.dumps({"semantic_projection_fingerprint": semantic_fingerprint})
-            if semantic_fingerprint is not None else "{}",
+            json.dumps(publication_metadata),
             release_id,
         ),
     )
@@ -899,6 +904,7 @@ def finalize_release(
     report: dict[str, Any],
     semantic_fingerprint: dict[str, Any] | None = None,
     pin_expires_at: datetime | None = None,
+    source_freshness: dict[str, Any] | None = None,
 ) -> None:
     """Publish durably before best-effort retention cleanup.
 
@@ -911,8 +917,9 @@ def finalize_release(
         release_id,
         counts,
         source_watermark,
-        semantic_fingerprint,
-        pin_expires_at,
+        semantic_fingerprint=semantic_fingerprint,
+        pin_expires_at=pin_expires_at,
+        source_freshness=source_freshness,
     )
     report["release_id"] = release_id
     report["published"] = True
@@ -1678,6 +1685,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 report,
                 semantic_fingerprint,
                 pin_expires_at,
+                source_freshness,
             )
     except Exception as error:
         conn.rollback()
