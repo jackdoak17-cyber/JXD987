@@ -1,5 +1,14 @@
 # Fixture-core recovery candidate — 8 November 2026
 
+> This is the historical candidate record. For the installed #80 release and
+> rollback, use [the exact #80 record](fixture-core-80-release-candidate.md).
+> For a coordinated #81 cutover or rollback, use [draft #81's five-writer
+> procedure](https://github.com/jackdoak17-cyber/JXD987/pull/81), which
+> preserves the installed minute `:17` schedule. Jack later authorised
+> necessary no-added-cost programme work without repeated approval requests;
+> the earlier approval wording below is historical. Added spending still
+> requires his approval.
+
 ## Observed failure
 
 Production fixture schedule returned HTTP 409 because the current fixture
