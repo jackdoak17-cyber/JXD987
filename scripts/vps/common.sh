@@ -326,6 +326,14 @@ run_recorded_pipeline_job() {
   if [[ "${status}" -eq 76 && "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
     status=2
   fi
+  # Deferral before admission also ends this invocation's claim. Drop it
+  # before the database heartbeat, just as admitted work does on exit.
+  if [[ "${ODDS_SYNC_JOB_PRIORITY:-normal}" == "fixture_core" && -n "${FIXTURE_CORE_RESERVATION_OWNER:-}" ]]; then
+    fixture_core_reservation_release "${FIXTURE_CORE_RESERVATION_OWNER}" || {
+      log_error "fixture-core reservation release failed before heartbeat"
+      status=1
+    }
+  fi
   finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   finished_epoch="$(date -u +%s)"
 
@@ -695,6 +703,23 @@ run_with_global_lock_and_timeout() {
     }; then
       log_info "[SKIPPED] live settlement reservation active before admission (phase=${live_phase}s)"
       exit 2
+    fi
+    if [[ "${live_schedule_enabled}" == "true" && "${job_priority}" != "settlement" ]]; then
+      # The owner-guard wait may consume part of the lease calculated above.
+      # Recompute from the actual admission instant before starting the chain.
+      available_runtime=$((live_tick_seconds - live_phase - live_grace_seconds))
+      if (( available_runtime <= 0 )); then
+        log_info "[SKIPPED] no writer lease before settlement grace window after admission wait"
+        exit 2
+      fi
+      if (( min_normal_lease_seconds > 0 && available_runtime < min_normal_lease_seconds )); then
+        log_info "[SKIPPED] writer lease too short after admission wait (available=${available_runtime}s minimum=${min_normal_lease_seconds}s)"
+        exit 2
+      fi
+      if (( available_runtime < effective_runtime )); then
+        effective_runtime="${available_runtime}"
+        log_info "writer lease shortened to ${effective_runtime}s after admission wait"
+      fi
     fi
 
     # The full chain must execute as one subshell so timeout covers every step.

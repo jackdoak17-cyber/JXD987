@@ -28,14 +28,16 @@ set -e
 [[ "${duplicate_status}" -eq 2 ]]
 [[ "${normal_status}" -eq 2 ]]
 [[ ! -e "${MARKER}" ]]
-export ODDSSEARCH_DB_HEAVY_LOCK_FILE="${tmp}/db-heavy.lock"
-set +e
-ODDS_SYNC_JOB_PRIORITY=normal run_with_database_heavy_lock 1 \
-  run_with_global_lock_and_timeout 'touch "${MARKER}"' >"${tmp}/db-heavy" 2>&1
-db_heavy_status=$?
-set -e
-[[ "${db_heavy_status}" -eq 2 ]]
-[[ ! -e "${MARKER}" ]]
+if declare -F run_with_database_heavy_lock >/dev/null; then
+  export ODDSSEARCH_DB_HEAVY_LOCK_FILE="${tmp}/db-heavy.lock"
+  set +e
+  ODDS_SYNC_JOB_PRIORITY=normal run_with_database_heavy_lock 1 \
+    run_with_global_lock_and_timeout 'touch "${MARKER}"' >"${tmp}/db-heavy" 2>&1
+  db_heavy_status=$?
+  set -e
+  [[ "${db_heavy_status}" -eq 2 ]]
+  [[ ! -e "${MARKER}" ]]
+fi
 ODDS_SYNC_LOCK_FILE="${tmp}/other-writer.lock" ODDS_SYNC_JOB_PRIORITY=normal \
   run_with_global_lock_and_timeout 'touch "${MARKER}"'
 [[ -e "${MARKER}" ]]
@@ -141,6 +143,8 @@ set -e
 # The admitted source releases priority before its database heartbeat. A slow
 # heartbeat must not keep ordinary writer work paused after the source exits.
 export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=false
+export ODDS_SYNC_LIVE_RESERVE_SECONDS=0
+export ODDS_SYNC_LIVE_GRACE_SECONDS=0
 export FIXTURE_CORE_RESERVATION_TTL_SECONDS=30
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS=0
 export FIXTURE_CORE_RESERVATION_OWNER="$(fixture_core_reservation_claim)"
@@ -159,6 +163,27 @@ done
 ODDS_SYNC_JOB_PRIORITY=normal run_with_global_lock_and_timeout 'touch "${NORMAL_HEARTBEAT_MARKER}"'
 [[ -e "${NORMAL_HEARTBEAT_MARKER}" ]]
 wait "${core_pid}"
+
+# A core job that never reaches provider work must likewise release priority
+# before its outcome heartbeat can stall.
+export ODDS_SYNC_LOCK_RETRY_STARTED_EPOCH="$(( $(date -u +%s) - 2 ))"
+export ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS=1
+export FIXTURE_CORE_RESERVATION_OWNER="$(fixture_core_reservation_claim)"
+rm -f "${tmp}/heartbeat-start" "${MARKER}"
+ODDS_SYNC_JOB_PRIORITY=fixture_core run_recorded_pipeline_job \
+  test_fixture_core 'test fixture core' 'touch "${MARKER}"' '' >"${tmp}/deferred-heartbeat.log" 2>&1 &
+core_pid=$!
+for _ in $(seq 1 100); do
+  [[ -e "${tmp}/heartbeat-start" ]] && break
+  sleep 0.02
+done
+[[ -e "${tmp}/heartbeat-start" ]]
+[[ ! -f "$(fixture_core_reservation_file)" ]]
+[[ ! -e "${MARKER}" ]]
+export ODDS_SYNC_LOCK_RETRY_STARTED_EPOCH=0
+export ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS=0
+ODDS_SYNC_JOB_PRIORITY=normal run_with_global_lock_and_timeout 'touch "${NORMAL_HEARTBEAT_MARKER}"'
+wait "${core_pid}" || [[ "$?" -eq 2 ]]
 
 # A guard delay counts toward admission's deadline. It cannot permit work to
 # start after the deadline just because the first check happened earlier.
@@ -226,6 +251,8 @@ grep -q 'live settlement reservation active before admission' "${tmp}/late-settl
 # behind a paused contender.
 export ODDS_SYNC_LOCK_FILE="${tmp}/bounded-guard.lock"
 export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=false
+export ODDS_SYNC_LIVE_RESERVE_SECONDS=0
+export ODDS_SYNC_LIVE_GRACE_SECONDS=0
 guard_file="$(fixture_core_reservation_file).guard"
 (
   exec 7>"${guard_file}"
@@ -269,4 +296,42 @@ release_elapsed=$(( $(date -u +%s) - release_started ))
 [[ "${release_status}" -eq 1 && "${release_elapsed}" -le 3 ]]
 wait "${guard_pid}"
 fixture_core_reservation_release "${owner}"
+
+# The owner check can advance the clock after the first settlement lease is
+# computed. The actual timeout must use the shorter lease at final admission.
+export ODDS_SYNC_LOCK_FILE="${tmp}/recomputed-lease.lock"
+export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=true
+export ODDS_SYNC_LIVE_TICK_SECONDS=900
+export ODDS_SYNC_LIVE_RESERVE_SECONDS=0
+export ODDS_SYNC_LIVE_GRACE_SECONDS=0
+export ODDS_SYNC_P3_MAX_DURATION_SECONDS=300
+export FIXTURE_CORE_RESERVATION_TTL_SECONDS=3600
+export FIXTURE_CORE_RESERVATION_OWNER="$(fixture_core_reservation_claim)"
+cat >"${tmp}/clock-bin/date" <<'DATE'
+#!/usr/bin/env bash
+if [[ "$#" -eq 2 && "$1" == "-u" && "$2" == "+%s" ]]; then
+  n=0
+  [[ ! -f "${FAKE_DATE_COUNT}" ]] || n="$(cat "${FAKE_DATE_COUNT}")"
+  n=$((n + 1))
+  printf '%s\n' "${n}" >"${FAKE_DATE_COUNT}"
+  if (( n <= 3 )); then printf '700\n'; else printf '750\n'; fi
+else
+  exec /bin/date "$@"
+fi
+DATE
+cat >"${tmp}/clock-bin/timeout" <<'TIMEOUT'
+#!/usr/bin/env bash
+printf '%s\n' "$3" >"${FAKE_TIMEOUT_RUNTIME}"
+shift 3
+"$@"
+TIMEOUT
+chmod +x "${tmp}/clock-bin/date" "${tmp}/clock-bin/timeout"
+export FAKE_DATE_COUNT="${tmp}/lease-date-count"
+export FAKE_TIMEOUT_RUNTIME="${tmp}/actual-lease"
+rm -f "${MARKER}"
+PATH="${tmp}/clock-bin:${PATH}" ODDS_SYNC_JOB_PRIORITY=fixture_core \
+  run_with_global_lock_and_timeout 'touch "${MARKER}"'
+[[ -e "${MARKER}" ]]
+[[ "$(cat "${FAKE_TIMEOUT_RUNTIME}")" == "150" ]]
+[[ ! -f "$(fixture_core_reservation_file)" ]]
 echo "fixture-core reservation contention checks passed"
