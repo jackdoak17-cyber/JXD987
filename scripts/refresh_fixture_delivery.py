@@ -314,7 +314,9 @@ def verify_fixture_source_freshness(
                 """
                 select job_id, finished_at
                   from operations.pipeline_job_runs
-                 where job_id = any(%s) and status = 'success'
+                 where job_id = any(%s)
+                   and status = 'success'
+                   and finished_at is not null
                  order by finished_at desc
                  limit 1
                 """,
