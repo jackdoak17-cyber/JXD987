@@ -60,9 +60,9 @@ export ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF=true
 # Bound total retry time as well as retry count so the reservation outlives
 # a waiting caller even when individual checks take longer than expected.
 export ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DEADLINE_SECONDS:-2400}"
-# The 45-minute reservation spans the 40-minute retry horizon. An admitted
-# source run keeps the canonical writer lock for its bounded execution.
-export FIXTURE_CORE_RESERVATION_TTL_SECONDS="${FIXTURE_CORE_RESERVATION_TTL_SECONDS:-2700}"
+# The one-hour reservation spans the 40-minute retry horizon and the bounded
+# admitted source run. Priority is released as soon as admitted work ends.
+export FIXTURE_CORE_RESERVATION_TTL_SECONDS="${FIXTURE_CORE_RESERVATION_TTL_SECONDS:-3600}"
 # The exporter treats zero as an unbounded completed-fixture selection. Keep
 # the historical side of this identity refresh bounded by the shared contract
 # as well; the future identity contract is still controlled by the source
@@ -144,6 +144,8 @@ python scripts/refresh_fixture_delivery.py \
 CHAIN
 )
 
+# Include the bounded guard claim in the admission deadline.
+export ODDS_SYNC_LOCK_RETRY_STARTED_EPOCH="$(date -u +%s)"
 reservation_status=0
 reservation_owner="$(fixture_core_reservation_claim)" || reservation_status=$?
 if [[ "${reservation_status}" -ne 0 ]]; then
@@ -159,6 +161,7 @@ if [[ "${reservation_status}" -ne 0 ]]; then
   finalize_with_healthcheck "${reservation_status}" "${HEALTHCHECK_PING_URL_FIXTURE_CORE:-${HEALTHCHECK_PING_URL:-}}"
 fi
 trap 'fixture_core_reservation_release "${reservation_owner}" || log_error "fixture-core reservation release failed"' EXIT
+export FIXTURE_CORE_RESERVATION_OWNER="${reservation_owner}"
 
 status=0
 ODDS_SYNC_P3_MAX_DURATION_SECONDS="${FIXTURE_CORE_MAX_RUNTIME_SECONDS}" \

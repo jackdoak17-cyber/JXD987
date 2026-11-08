@@ -30,12 +30,12 @@ a1b2e580c78cc5cbc26705c9144fd6b4d2d2b05b  scripts/rest_preflight.py
 2c4213e3bdc79fa0685cdb57c396d8da49059480  scripts/sync_confirmed_lineups.py
 89707d0bf6a77e27686295a5f6356a5eb23f88f5  scripts/sync_odds.py
 fa3c102f14664a9d38ac677ea5a967183e58dd8f  scripts/fixture_core_contract.py
-43ba687662c69b585992b2595e1ce09b2d5aed52  scripts/vps/common.sh
+a762846742d6be1a9a5ddf18d119ebb2f4934d10  scripts/vps/common.sh
 3dc8516ae3a2876b2eb66023d66e701ab026ca3d  scripts/vps/run_odds_delivery.sh
 431b2ab84dbd21e62bbe7b63031c7316e0ac2757  scripts/vps/run_p1.sh
 916a6612eedd078f07ae711fd1c9a4a2142718d9  scripts/vps/run_p2.sh
 34f87a4db3466a28324e658952e29b2c7b9b5975  scripts/vps/run_p3.sh
-751d6606c6a4a40c6c7fa061e1749a2463ed5f20  scripts/vps/run_p3_fixture_core.sh
+045e7b81a23a6345a4d8f3c2da0a63ddf9d490ea  scripts/vps/run_p3_fixture_core.sh
 ec3f0718bc348c50124cc4b60832d54942c613e0  scripts/vps/run_postmatch_settlement.sh
 b2400337a9abb691f68321f2f89344f7b49f59d9  scripts/vps/run_fixture_delivery_publisher.sh
 6be24ddcdc916264fc0fed8357622ff2885de29c  scripts/vps/run_models.sh

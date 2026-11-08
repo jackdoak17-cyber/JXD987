@@ -7,7 +7,7 @@ trap 'rm -rf "${tmp}"' EXIT
 export ODDS_SYNC_LOCK_FILE="${tmp}/odds-sync.lock"
 export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=false
 export ODDS_SYNC_P3_MAX_DURATION_SECONDS=5
-export FIXTURE_CORE_RESERVATION_TTL_SECONDS=10
+export FIXTURE_CORE_RESERVATION_TTL_SECONDS=30
 export MARKER="${tmp}/marker"
 
 set +e
@@ -17,6 +17,7 @@ set -e
 [[ "${invalid_ttl_status}" -eq 1 ]]
 [[ ! -e "$(fixture_core_reservation_file)" ]]
 owner="$(fixture_core_reservation_claim)"
+export FIXTURE_CORE_RESERVATION_OWNER="${owner}"
 [[ -n "${owner}" ]]
 set +e
 fixture_core_reservation_claim >"${tmp}/duplicate" 2>&1
@@ -59,6 +60,7 @@ for _ in $(seq 1 100); do
 done
 [[ -e "${INCUMBENT_MARKER}" ]]
 owner="$(fixture_core_reservation_claim)"
+export FIXTURE_CORE_RESERVATION_OWNER="${owner}"
 set +e
 ODDS_SYNC_JOB_PRIORITY=normal run_with_global_lock_and_timeout 'touch "${MARKER}"' >"${tmp}/late-normal" 2>&1
 late_status=$?
@@ -80,15 +82,28 @@ rm "${MARKER}"
 export FIXTURE_CORE_RESERVATION_TTL_SECONDS=2
 old_owner="$(fixture_core_reservation_claim)"
 sleep 3
+export FIXTURE_CORE_RESERVATION_TTL_SECONDS=30
 new_owner="$(fixture_core_reservation_claim)"
 fixture_core_reservation_release "${old_owner}"
 [[ -f "$(fixture_core_reservation_file)" ]]
+set +e
+FIXTURE_CORE_RESERVATION_OWNER="${old_owner}" ODDS_SYNC_JOB_PRIORITY=fixture_core \
+  run_with_global_lock_and_timeout 'touch "${MARKER}"' >"${tmp}/old-core" 2>&1
+old_core_status=$?
+set -e
+[[ "${old_core_status}" -eq 2 ]]
+[[ "$(cat "$(fixture_core_reservation_file)")" == "${new_owner} "* ]]
+[[ ! -e "${MARKER}" ]]
 set +e
 ODDS_SYNC_JOB_PRIORITY=normal run_with_global_lock_and_timeout 'touch "${MARKER}"' >"${tmp}/new-owner" 2>&1
 new_owner_status=$?
 set -e
 [[ "${new_owner_status}" -eq 2 ]]
-fixture_core_reservation_release "${new_owner}"
+FIXTURE_CORE_RESERVATION_OWNER="${new_owner}" ODDS_SYNC_JOB_PRIORITY=fixture_core \
+  run_with_global_lock_and_timeout 'touch "${MARKER}"'
+[[ -e "${MARKER}" ]]
+[[ ! -f "$(fixture_core_reservation_file)" ]]
+rm "${MARKER}"
 ODDS_SYNC_JOB_PRIORITY=normal run_with_global_lock_and_timeout 'touch "${MARKER}"'
 [[ -e "${MARKER}" ]]
 
@@ -97,6 +112,7 @@ export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=true
 export ODDS_SYNC_LIVE_TICK_SECONDS=900
 export ODDS_SYNC_LIVE_RESERVE_SECONDS=900
 owner="$(fixture_core_reservation_claim)"
+export FIXTURE_CORE_RESERVATION_OWNER="${owner}"
 set +e
 ODDS_SYNC_JOB_PRIORITY=fixture_core run_with_global_lock_and_timeout 'true' >"${tmp}/core-live" 2>&1
 core_live_status=$?
@@ -121,4 +137,136 @@ ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS=invalid run_with_global_lock_and_retry 'tr
 invalid_deadline_status=$?
 set -e
 [[ "${invalid_deadline_status}" -eq 1 ]]
+
+# The admitted source releases priority before its database heartbeat. A slow
+# heartbeat must not keep ordinary writer work paused after the source exits.
+export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=false
+export FIXTURE_CORE_RESERVATION_TTL_SECONDS=30
+export ODDS_SYNC_LOCK_RETRY_ATTEMPTS=0
+export FIXTURE_CORE_RESERVATION_OWNER="$(fixture_core_reservation_claim)"
+export NORMAL_HEARTBEAT_MARKER="${tmp}/normal-during-heartbeat"
+rm -f "${MARKER}"
+record_pipeline_job_run() { touch "${tmp}/heartbeat-start"; sleep 2; }
+ODDS_SYNC_JOB_PRIORITY=fixture_core run_recorded_pipeline_job \
+  test_fixture_core 'test fixture core' 'touch "${MARKER}"' '' >"${tmp}/heartbeat.log" 2>&1 &
+core_pid=$!
+for _ in $(seq 1 100); do
+  [[ -e "${tmp}/heartbeat-start" ]] && break
+  sleep 0.02
+done
+[[ -e "${tmp}/heartbeat-start" ]]
+[[ ! -f "$(fixture_core_reservation_file)" ]]
+ODDS_SYNC_JOB_PRIORITY=normal run_with_global_lock_and_timeout 'touch "${NORMAL_HEARTBEAT_MARKER}"'
+[[ -e "${NORMAL_HEARTBEAT_MARKER}" ]]
+wait "${core_pid}"
+
+# A guard delay counts toward admission's deadline. It cannot permit work to
+# start after the deadline just because the first check happened earlier.
+export ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS=1
+export ODDS_SYNC_LOCK_RETRY_STARTED_EPOCH="$(date -u +%s)"
+export FIXTURE_CORE_RESERVATION_OWNER="$(fixture_core_reservation_claim)"
+rm -f "${MARKER}"
+(
+  exec 7>"$(fixture_core_reservation_file).guard"
+  flock -x 7
+  touch "${tmp}/guard-held"
+  sleep 1.5
+) &
+guard_pid=$!
+for _ in $(seq 1 100); do
+  [[ -e "${tmp}/guard-held" ]] && break
+  sleep 0.02
+done
+[[ -e "${tmp}/guard-held" ]]
+set +e
+ODDS_SYNC_JOB_PRIORITY=fixture_core run_with_global_lock_and_timeout 'touch "${MARKER}"' >"${tmp}/late-admission" 2>&1
+late_admission_status=$?
+set -e
+wait "${guard_pid}"
+[[ "${late_admission_status}" -eq 2 ]]
+[[ ! -e "${MARKER}" ]]
+grep -q 'retry deadline reached before admission' "${tmp}/late-admission"
+fixture_core_reservation_release "${FIXTURE_CORE_RESERVATION_OWNER}"
+export ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS=0
+export ODDS_SYNC_LOCK_RETRY_STARTED_EPOCH=0
+
+# A settlement window can begin while the normal writer waits for its guard.
+# The final admission check must catch the changed clock.
+mkdir -p "${tmp}/clock-bin"
+cat >"${tmp}/clock-bin/date" <<'DATE'
+#!/usr/bin/env bash
+if [[ "$#" -eq 2 && "$1" == "-u" && "$2" == "+%s" ]]; then
+  n=0
+  [[ ! -f "${FAKE_DATE_COUNT}" ]] || n="$(cat "${FAKE_DATE_COUNT}")"
+  n=$((n + 1))
+  printf '%s\n' "${n}" >"${FAKE_DATE_COUNT}"
+  if (( n <= 2 )); then printf '700\n'; else printf '850\n'; fi
+else
+  exec /bin/date "$@"
+fi
+DATE
+chmod +x "${tmp}/clock-bin/date"
+export FAKE_DATE_COUNT="${tmp}/date-count"
+export ODDS_SYNC_LOCK_FILE="${tmp}/settlement-clock.lock"
+export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=true
+export ODDS_SYNC_LIVE_TICK_SECONDS=900
+export ODDS_SYNC_LIVE_RESERVE_SECONDS=100
+export ODDS_SYNC_LIVE_GRACE_SECONDS=0
+rm -f "${MARKER}"
+set +e
+PATH="${tmp}/clock-bin:${PATH}" ODDS_SYNC_JOB_PRIORITY=normal \
+  run_with_global_lock_and_timeout 'touch "${MARKER}"' >"${tmp}/late-settlement" 2>&1
+late_settlement_status=$?
+set -e
+[[ "${late_settlement_status}" -eq 2 ]]
+[[ ! -e "${MARKER}" ]]
+grep -q 'live settlement reservation active before admission' "${tmp}/late-settlement"
+
+# Claim and cleanup use the same bounded guard; neither can stall forever
+# behind a paused contender.
+export ODDS_SYNC_LOCK_FILE="${tmp}/bounded-guard.lock"
+export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=false
+guard_file="$(fixture_core_reservation_file).guard"
+(
+  exec 7>"${guard_file}"
+  flock -x 7
+  touch "${tmp}/claim-guard-held"
+  sleep 3
+) &
+guard_pid=$!
+for _ in $(seq 1 100); do
+  [[ -e "${tmp}/claim-guard-held" ]] && break
+  sleep 0.02
+done
+[[ -e "${tmp}/claim-guard-held" ]]
+claim_started="$(date -u +%s)"
+set +e
+fixture_core_reservation_claim >"${tmp}/claim-timeout" 2>&1
+claim_status=$?
+set -e
+claim_elapsed=$(( $(date -u +%s) - claim_started ))
+[[ "${claim_status}" -eq 2 && "${claim_elapsed}" -le 3 ]]
+wait "${guard_pid}"
+owner="$(fixture_core_reservation_claim)"
+(
+  exec 7>"${guard_file}"
+  flock -x 7
+  touch "${tmp}/release-guard-held"
+  sleep 3
+) &
+guard_pid=$!
+for _ in $(seq 1 100); do
+  [[ -e "${tmp}/release-guard-held" ]] && break
+  sleep 0.02
+done
+[[ -e "${tmp}/release-guard-held" ]]
+release_started="$(date -u +%s)"
+set +e
+fixture_core_reservation_release "${owner}" >"${tmp}/release-timeout" 2>&1
+release_status=$?
+set -e
+release_elapsed=$(( $(date -u +%s) - release_started ))
+[[ "${release_status}" -eq 1 && "${release_elapsed}" -le 3 ]]
+wait "${guard_pid}"
+fixture_core_reservation_release "${owner}"
 echo "fixture-core reservation contention checks passed"
