@@ -32,11 +32,11 @@ be recreated to their **unchanged** targets at installation.
 
 | Writer checkout | Current rollback release | Candidate release | Manifest SHA-1 | Archive SHA-256 |
 | --- | --- | --- | --- | --- |
-| Fixture core, hourly publisher and post-match settlement | `JXD987-fixture-core-80-aae97d-release` for core/publisher; `JXD987-fixture-core-900d1ca-release` for settlement | `JXD987-fixture-core-81-d3aa9c-release` | `d3aa9ced4752448768ae44604e5f47415c960368` | `96d4c2eb184ba1829df431dbcbab814f0fd9360d436981e71d5d0caa80a72d2a` |
-| Odds matcher P1/P2/P3 | `JXD987-odds-matcher-48d251e-release` | `JXD987-odds-matcher-81-9653c9-release` | `9653c9e3eab9a73352db426ef2442ec778ad2bb6` | `e59c26146199a0579ba06faae97b6d5ffb4dfb8f53e19ab5bc02e633b54b63c0` |
-| Leaderboard stats reconciliation | `JXD987-leaderboard-65e105b-release` | `JXD987-leaderboard-81-9227a0-release` | `9227a0f3eec117397f7ef586333f42895cc874d7` | `62fb3926015eaccbc6c364bb94caeb4e6d866d0f09f97d58a81f549964bd92fa` |
-| Website odds delivery | `odds-delivery-5b315fb-release` | `odds-delivery-81-721e96-release` | `721e9620f49acefaa7eb23acaa5ed3c47224c497` | `443107374208e9b082744df06e40b9425ce77f58dbdc8c4b0cce5960d69dd7d2` |
-| Squad reconciliation | `JXD987-runtime-7e74d46-release` | `JXD987-runtime-81-af2053-release` | `af205351fbb694ba43e3a3b3c8f452cf7ae70bf5` | `003c6b1e5d82048b0d64f3f3cb6b57e894610996e92c79919b53dc186e40112d` |
+| Fixture core, hourly publisher and post-match settlement | `JXD987-fixture-core-80-aae97d-release` for core/publisher; `JXD987-fixture-core-900d1ca-release` for settlement | `JXD987-fixture-core-81-85450e-release` | `85450ebeada00bd06d67cc8d3b82cb45947481e4` | `8f5e9f13c2898d0f14554b52d363af148769439a9194007b0569e434f8d53ea9` |
+| Odds matcher P1/P2/P3 | `JXD987-odds-matcher-48d251e-release` | `JXD987-odds-matcher-81-3148fb-release` | `3148fb66d0652785cd2243c3942e87b3e51f3267` | `2d949c5bcf2ad86c9e7514e40c2d5ad13f9d905b5190c1a5450935c80ace57a2` |
+| Leaderboard stats reconciliation | `JXD987-leaderboard-65e105b-release` | `JXD987-leaderboard-81-563d92-release` | `563d92e85772539beb82c9f3e662ca52f61244b5` | `b2f4ba405f494c3aa6facc3e7d80bdb63ab7154cb5f0ce0d073a73197078431b` |
+| Website odds delivery | `odds-delivery-5b315fb-release` | `odds-delivery-81-925ae5-release` | `925ae5a0c124669094f9d2c257e4edc033df7f48` | `a4e24b6352e01e59d4a8acab6490a13c1f61fda86acfda3ef06d9fee1d911b59` |
+| Squad reconciliation | `JXD987-runtime-7e74d46-release` | `JXD987-runtime-81-700c64-release` | `700c64178cb58512fb05ee9cf4ff593cb2644f71` | `602a691aaf944428f85b04d889633fbc1fbc60a1322b2a0db0569dd38cd90847` |
 
 The five corresponding archives are in the local `release-artifacts/`
 directory with names `fixture-core-81-{core,matcher,leaderboard,delivery,runtime}-<manifest-prefix>.tar.gz`.

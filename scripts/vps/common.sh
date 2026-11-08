@@ -681,6 +681,21 @@ run_with_global_lock_and_timeout() {
         log_info "[SKIPPED] fixture-core owner guard unavailable"
         exit 2
       fi
+      if [[ "${live_schedule_enabled}" == "true" ]]; then
+        # Owner validation must use the lease left after acquiring this guard,
+        # not the longer lease calculated before the wait.
+        now_epoch="$(date -u +%s)"
+        live_phase=$((now_epoch % live_tick_seconds))
+        available_runtime=$((live_tick_seconds - live_phase - live_grace_seconds))
+        if (( available_runtime <= 0 ||
+              (min_normal_lease_seconds > 0 && available_runtime < min_normal_lease_seconds) )); then
+          log_info "[SKIPPED] fixture-core lease too short after owner guard"
+          exit 2
+        fi
+        if (( available_runtime < effective_runtime )); then
+          effective_runtime="${available_runtime}"
+        fi
+      fi
       if ! fixture_core_reservation_owned_for "${reservation_file}" "${reservation_owner}" "$((effective_runtime + 10))"; then
         log_info "[SKIPPED] fixture-core reservation owner expired or changed before admission"
         exit 2

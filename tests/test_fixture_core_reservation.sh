@@ -328,6 +328,9 @@ TIMEOUT
 chmod +x "${tmp}/clock-bin/date" "${tmp}/clock-bin/timeout"
 export FAKE_DATE_COUNT="${tmp}/lease-date-count"
 export FAKE_TIMEOUT_RUNTIME="${tmp}/actual-lease"
+# At fake time 750 this owner can cover the recomputed 150-second lease plus
+# kill grace, but cannot cover the earlier 200-second estimate.
+printf '%s 940\n' "${FIXTURE_CORE_RESERVATION_OWNER}" >"$(fixture_core_reservation_file)"
 rm -f "${MARKER}"
 PATH="${tmp}/clock-bin:${PATH}" ODDS_SYNC_JOB_PRIORITY=fixture_core \
   run_with_global_lock_and_timeout 'touch "${MARKER}"'
