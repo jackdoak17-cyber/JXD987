@@ -39,6 +39,10 @@ six-hour frequency. This separates its first lock attempt from website odds
 delivery at minute `4`; the longer retry horizon covers a delayed
 quarter-hour settlement or another writer at minute `17`. The existing
 publisher remains hourly. This cron adjustment has **not** been applied.
+The quarter-hour settlement can still hold the lock past minute `17`, and
+an odds matcher starts at minute `19` every six hours. Recent successful
+fixture-core runs took 70–112 seconds, but that history is not a guarantee;
+the first two revised runs need observation for knock-on skips or delay.
 
 ## Reviewed production action, pending Jack's approval
 
