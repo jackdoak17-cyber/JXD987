@@ -329,8 +329,18 @@ production requests to the schedule and list endpoints both returned HTTP
 groups/123 nested fixtures respectively. The GitHub fallback workflow was
 then re-enabled and verified `active` on main `8ca6c0b`.
 
-The next scheduled settlement, 17:11 hourly publisher, later fallback run
-and 18:17 primary core run still require observation. This confirms the
-immediate publisher handover and customer Fixtures read path, not sustained
-ingestion or full website/scaling acceptance. No paid service, capacity,
-disk size, spend-cap setting or job frequency changed.
+The first scheduled v4 settlement completed successfully at 17:01:20 UTC:
+166 recent fixtures reconciled and 174 exported. Its production pipeline
+record reported success under release identity `4b89de8d5131`. The first
+scheduled v4 publisher started at 17:11:07 UTC, verified the same runtime
+manifest and made the expected guarded skip
+`recent_publication_satisfies_guard`. An independent read-only database check
+found the customer resolver still `current` for
+`5cc7a3b3-1b2e-45cf-8713-776c03467af1`, with the original 18:55:21 pin
+and primary source evidence from 15:33:53. The skip did not shorten the pin.
+
+A later GitHub fallback run and the 18:17 primary core run still require
+observation. The current evidence confirms the immediate handover, one
+settlement cycle, one guarded hourly publisher cycle and customer Fixtures
+read path, not sustained ingestion or full website/scaling acceptance. No
+paid service, capacity, disk size, spend-cap setting or job frequency changed.
