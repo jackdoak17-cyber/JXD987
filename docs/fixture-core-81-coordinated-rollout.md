@@ -1,9 +1,11 @@
 # Fixture-core #81 coordinated admission rollout candidate — 8 November 2026
 
 This is a prepared, **unapplied** five-checkout change. Jack approved and we
-executed the narrower #80 cutover at 14:42 UTC. That approval does not cover
-this broader reservation cutover. No additional infrastructure or spend is
-proposed.
+executed the narrower #80 cutover at 14:42 UTC. Jack subsequently authorised
+necessary no-added-cost programme work without repeated approval requests.
+This rollout still requires the exact package, drain, verification and rollback
+checks below; any added spending requires Jack's approval. No additional
+infrastructure or spend is proposed.
 
 ## Why all five releases must move together
 
@@ -48,7 +50,7 @@ lease tests passed on **all five** compositions, as did the admitted-work
 handoff test. This is focused admission evidence, not complete end-to-end
 certification of each older release's unrelated jobs.
 
-## Forward map for a separately approved rollout
+## Forward map for a no-added-cost rollout after the evidence gates
 
 1. Recheck all active releases and manifests, archive hashes, symlink targets,
    cron entries and the currently held locks. Confirm no candidate target
@@ -72,15 +74,19 @@ certification of each older release's unrelated jobs.
    tree and the canonical and database-heavy locks while it is stopped. If it
    has an active worker child or holds either work lock, send `SIGCONT` and let
    it finish, then repeat the stop-and-inspect check at a later handoff. A
-   sleep child may finish while the parent is stopped. Once there is no worker
-   child, no work lock and no remaining descendant, send `SIGKILL` to the
-   stopped supervisor and verify its exit and the release of its supervisor
-   lock before activating a new supervisor.
+   sleep child may finish while the parent is stopped. A child confirmed in
+   zombie (`Z`) state has exited and holds no work lock; do not mistake it for
+   live work. If a child state is uncertain, resume the parent to reap it and
+   repeat the stop-and-inspect check. Once there is no live worker child, no
+   work lock and no live descendant, send `SIGKILL` to the stopped supervisor
+   and verify its exit and the release of its supervisor lock before
+   activating a new supervisor. If the transition is abandoned while the
+   supervisor is stopped, send `SIGCONT` before restoring the old cron.
    The supervisor has **no graceful drain command**; do not infer idleness
    from a momentary childless snapshot while its loop is running. Check the
    canonical lock, heavy lock and reservation sidecar after the drain. Do not
-   activate new entries while any
-   old protocol process is still alive. If quiescence cannot be proved, restore
+   activate new entries while any old protocol process is still alive. If
+   quiescence cannot be proved, resume a stopped supervisor, then restore
    the backed-up crontab and postpone the cutover. The freeze may skip a
    scheduled settlement or publication; record any missed run and verify its
    next normal scheduled execution after activation.
@@ -107,9 +113,9 @@ Rollback also uses a two-stage barrier. First remove all affected candidate
 cron entries atomically, leaving unrelated entries in place; read them back
 and wait for every new wrapper and descendant to exit. Quiesce the new stats
 supervisor with the same stop-and-inspect procedure before checking for active
-children and work locks; release it to finish if it is busy. Do not delete any
-release
-directory while a process uses it. An old normal writer ignores the
+children and work locks; release it to finish if it is busy, and resume it if
+the rollback is abandoned. Do not delete any release directory while a
+process uses it. An old normal writer ignores the
 reservation, so do not leave a mixed protocol operating and describe it as a
 successful rollback. If a reservation exists, identify its owner and expiry,
 let an admitted core invocation drain, and clear only that owner after it
@@ -121,5 +127,5 @@ normal writers, settlement and the current release resolver. Record any
 scheduled run missed during the freeze. Rollback cannot make expired fixture
 source evidence fresh or extend an expired release pin.
 
-The #81 cutover requires a separate owner approval and an operationally safe
-supervisor handoff. Neither has occurred.
+The #81 cutover has not occurred. Verify that it adds no cost, then complete
+the operationally safe supervisor handoff and all release evidence above.

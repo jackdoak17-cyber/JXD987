@@ -1,5 +1,13 @@
 # Fixture-core recovery and admission candidate — 8 November 2026
 
+> This is the historical design record. For the installed #80 release and
+> rollback, use [the exact #80 record](fixture-core-80-release-candidate.md).
+> For a coordinated #81 cutover or rollback, use [the current five-writer
+> procedure](fixture-core-81-coordinated-rollout.md), which preserves the
+> installed minute `:17` schedule. Jack's later no-added-cost authorisation
+> supersedes the separate-approval wording below; added spending still needs
+> his approval.
+
 ## Observed failure
 
 Production fixture schedule returned HTTP 409 because the current fixture
@@ -104,7 +112,8 @@ unapplied candidate.
    installed at 14:42 UTC with the original release retained for rollback.
    The core schedule is now `17 */6`; the publisher is still hourly at `:11`.
    Its immediate invocation skipped under the one-hour minimum interval.
-4. The stacked reservation candidate requires another owner approval. Stage
+4. The stacked reservation candidate may proceed without another approval if
+   it adds no cost and passes its release gates. Stage
    and verify the five exact packages in the rollout map, cut all canonical
    writers over together, and hand off the long-lived reconciliation
    supervisor at a verified idle boundary. Preserve `17 */6` initially.
