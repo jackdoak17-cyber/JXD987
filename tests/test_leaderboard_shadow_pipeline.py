@@ -1,7 +1,9 @@
+import fcntl
 import os
 import json
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -404,8 +406,66 @@ def test_worker_and_capture_hooks_are_pinned_in_the_vps_runtime_manifest():
     assert "--fixture-limit 250" in wrapper
     assert "--max-seconds 30" in wrapper
     assert "--isolated-test-override" not in wrapper
-    assert "run_with_database_heavy_lock" in wrapper
-    assert "LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS:-0" in wrapper
+    assert "--db-heavy-lock-after-connect" in wrapper
+    assert "run_with_database_heavy_lock" not in wrapper
+
+
+def test_worker_acquires_heavy_lock_after_connection_and_releases_on_failure(tmp_path, monkeypatch):
+    lock_path = tmp_path / "database-heavy.lock"
+    monkeypatch.setenv("ODDSSEARCH_DB_HEAVY_LOCK_FILE", str(lock_path))
+    monkeypatch.setenv("LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS", "0")
+    monkeypatch.setattr(sys, "argv", ["worker", "run-once", "--db-heavy-lock-after-connect"])
+
+    class Connection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    conn = Connection()
+
+    def connect():
+        with lock_path.open("a+") as probe:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return conn
+
+    def stop_after_lock(_conn):
+        with lock_path.open("a+") as probe:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        raise RuntimeError("preflight stopped for test")
+
+    monkeypatch.setattr(worker_module, "connect", connect)
+    monkeypatch.setattr(worker_module, "apply_preflight_timeouts", lambda _conn: None)
+    monkeypatch.setattr(worker_module, "recover_unfinished_worker_runs", stop_after_lock)
+
+    with pytest.raises(RuntimeError, match="preflight stopped for test"):
+        worker_module.main()
+    assert conn.closed
+    with lock_path.open("a+") as probe:
+        fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_worker_defers_without_sql_when_importer_holds_heavy_lock(tmp_path, monkeypatch):
+    lock_path = tmp_path / "database-heavy.lock"
+    monkeypatch.setenv("ODDSSEARCH_DB_HEAVY_LOCK_FILE", str(lock_path))
+    monkeypatch.setenv("LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS", "0")
+    monkeypatch.setattr(sys, "argv", ["worker", "run-once", "--db-heavy-lock-after-connect"])
+
+    class Connection:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    conn = Connection()
+    monkeypatch.setattr(worker_module, "connect", lambda: conn)
+    monkeypatch.setattr(worker_module, "apply_preflight_timeouts", lambda _conn: pytest.fail("SQL ran before lock"))
+
+    with lock_path.open("a+") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert worker_module.main() == 75
+    assert conn.closed
 
 
 def test_database_heavy_lock_defers_overlap_then_releases(tmp_path):

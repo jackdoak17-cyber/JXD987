@@ -8,6 +8,7 @@ paid provider API. Production activation is separately gated by pipeline_state.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import socket
@@ -137,6 +138,32 @@ def connect():
         connect_timeout=20,
         application_name=f"oddssearch-leaderboard-shadow/{RELEASE_SHA[:12]}",
     )
+
+
+def acquire_database_heavy_lock_after_connect(wait_seconds: float):
+    """Hold the importer-priority slot only after session-pool admission.
+
+    A failed pool checkout can take 15 seconds or more during congestion. It
+    must not hold the slot needed by the source importer to recover. No SQL is
+    executed between connecting and acquiring this lock.
+    """
+
+    if not 0 <= wait_seconds <= 60:
+        raise ValueError("database-heavy lock wait must be between 0 and 60 seconds")
+    lock_path = os.environ.get("ODDSSEARCH_DB_HEAVY_LOCK_FILE", "/var/lock/oddssearch-db-heavy.lock")
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    lock_file = open(lock_path, "a+")
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_file
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                lock_file.close()
+                return None
+            time.sleep(min(0.05, remaining))
 
 
 def isolated_test_database(conn) -> bool:
@@ -821,6 +848,7 @@ def status(conn) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("run-once", "backfill", "backfill-all", "status"))
+    parser.add_argument("--db-heavy-lock-after-connect", action="store_true")
     parser.add_argument("--isolated-test-override", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
     parser.add_argument("--max-seconds", type=float, default=MAX_SECONDS_PER_RUN)
@@ -836,7 +864,14 @@ def main() -> int:
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
 
     conn = connect()
+    heavy_lock_file = None
     try:
+        if args.db_heavy_lock_after_connect:
+            wait_seconds = float(os.environ.get("LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS", "0"))
+            heavy_lock_file = acquire_database_heavy_lock_after_connect(wait_seconds)
+            if heavy_lock_file is None:
+                print("[SKIPPED] database-heavy maintenance slot unavailable", flush=True)
+                return 75
         if args.command == "status":
             print(json.dumps(status(conn), default=str, sort_keys=True))
             return 0
@@ -932,7 +967,11 @@ def main() -> int:
             )
             raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        finally:
+            if heavy_lock_file is not None:
+                heavy_lock_file.close()
     return 0
 
 
