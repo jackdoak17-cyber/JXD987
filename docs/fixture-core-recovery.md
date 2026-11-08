@@ -49,14 +49,17 @@ an odds matcher starts at minute `19` every six hours. Recent successful
 fixture-core runs took 70–112 seconds, but that history is not a guarantee;
 the first two revised runs need observation for knock-on skips or delay.
 
-## Reviewed production action, pending Jack's approval
+## Production sequence and remaining approval boundary
 
-1. Recheck the latest successful primary/fallback source and its age. If one
-   is within the nine-hour limit, run the existing guarded publisher once
-   with that exact source job ID. Do not renew from stale or missing evidence.
-2. Verify `fixture_delivery_release_resolve(null::uuid)` returns `current`
-   and a signed-in fixture schedule request returns HTTP 200 with expected
-   values. Inspect the release's source provenance and pin expiry.
+1. Jack approved the separate one-time guarded publisher renewal. It ran at
+   14:13 UTC using the verified fallback source and published release
+   `bda3d455-74bf-455b-aee7-6db158843a77`. The resolver returned `current`;
+   the signed-in schedule returned HTTP 200, with all 88 fixture identities
+   and team values matching the database release. The pin expires at 16:13
+   UTC. The complete source report is saved in the website incident evidence.
+   This approval did not cover deploying this draft PR or changing cron.
+2. Before any future renewal, recheck genuine source freshness and scope.
+   Do not renew from stale or missing evidence.
 3. Stage an immutable worker release with the existing `.env`, `.venv` and
    SQLite links, deploy the reviewed runtime files into it, and verify its
    manifest before cutover. Repoint only the fixture-core and hourly fixture
