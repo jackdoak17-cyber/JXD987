@@ -24,41 +24,65 @@ VPS archive and overlay only the reviewed publisher source and wrapper.
 
 The guarded recent-publication skip now requires a declared minimum runway.
 The hourly VPS wrapper supplies 3,600 seconds to the next scheduled start,
-the existing 1,800-second maximum publisher runtime, and a 300-second margin:
-5,700 seconds total. Missing runway disables only the recent-publication
+two bounded dirty-state calls of at most 60 seconds plus 5 seconds termination
+grace each, the existing 1,800-second maximum publisher runtime plus its
+5-second termination grace, and a 300-second margin: **5,835 seconds total**.
+All effective time settings must be positive whole seconds at most 86,400;
+zero cannot silently make `timeout` unlimited. Missing runway disables only the recent-publication
 skip, so a verified no-op or a new release can renew the lease. The other
 guards against an older source, a shorter proposed pin and a concurrent
 publisher remain intact. The source freshness check still precedes a renewal.
 
 The 21:11 boundary is covered by a deterministic unit test, together with
-the exact 5,700/5,699-second boundary and a missing-runway case. The fixture
+the exact 5,835/5,834-second boundary and a missing-runway case. The fixture
 delivery suite passed 48 tests with 13 skips, including 19 release tests and
-three wrapper contract tests. The runtime manifest checksum, shell syntax and
+three wrapper contract tests before the bounded-preparation correction.
+The wrapper now bounds each dirty-state call with a 60-second timeout and
+5-second termination grace; a held-lock test on the staged Linux runtime is
+required before cutover. The runtime manifest checksum, shell syntax and
 `git diff --check` pass. The test suite does not reproduce the full VPS cron
 environment; stage the copied archive and verify its manifest before a cutover.
+
+At 21:20 UTC the **active VPS archive**, rather than this source branch, had
+40 manifest paths. The staged copy has exactly the same 40 paths and the
+same `.env`, `.venv` and `data` symlink targets. Only the publisher source
+and hourly wrapper had changed entry hashes before the bounded-preparation
+revision; regenerate and repeat the comparison at the exact final head.
+The earlier 43-entry v4 count refers to a different package checkpoint.
 
 ## No-cost cutover and rollback
 
 1. Confirm the current customer release, genuine source age, disk headroom,
-   the three active cron entries, no affected publisher process and no active
-   fixture-delivery publication lock. Save the current crontab and SHA-256 of
-   the active archive manifest. Do not alter the core or settlement entries.
+   the three active cron entries and the active archive. Save the full
+   crontab, its SHA-256, and the active manifest SHA-256. Do not alter the
+   core or settlement entries.
 2. Copy the **active** 1.2 MB VPS archive to a new immutable release directory,
    preserving its `.venv` symlink. Overlay only
    `scripts/refresh_fixture_delivery.py` and
    `scripts/vps/run_fixture_delivery_publisher.sh` from the reviewed commit.
-   Rebuild the 40-entry SHA-1 runtime manifest in the new archive and run
-   `shasum -c`/`sha1sum -c` there. Compare all paths and hashes except those
-   two changed files and the manifest against the original archive.
-3. Replace only the hourly publisher crontab path with the staged archive;
-   preserve the other lines byte for byte. Observe the next scheduled run and
-   the database resolver/pin. A guarded skip is acceptable only with at least
-   5,700 seconds of remaining pin at the decision time. A successful no-op or
+   Rebuild the runtime manifest from the **active package's actual path set**
+   and run `shasum -c`/`sha1sum -c` there. Compare all paths and hashes except
+   those two changed files and the manifest against the original archive.
+   Verify the external `.env`, `.venv` and `data` links, the installed Python
+   CLI, and the executable held-dirty-lock deadline test before handoff.
+3. Freeze **only** the hourly publisher cron entry while retaining all other
+   lines byte for byte. Verify the frozen crontab, wait until the old hourly
+   invocation and publication lock are drained, then replace that one entry
+   with the staged path. Verify the complete installed crontab against the
+   saved file with only this path substitution. Do not rely on a pre-staging
+   no-process check as the handoff barrier.
+4. Observe the next scheduled run and the database resolver/pin. Only
+   `recent_publication_satisfies_guard` certifies the new 5,835-second runway;
+   `publication_active`, `newer_current_source` and
+   `would_shorten_current_pin` are distinct deferrals and must be checked
+   against their own live resolver/source evidence. A successful no-op or
    publication must show genuine source evidence and a renewed live pin.
-4. If the staged wrapper/manifest check, cron verification or live publication
-   fails, restore the saved publisher cron entry to the original archive under
-   the same no-process barrier. Keep the staged archive for diagnosis. The
-   active database release is never rolled back by changing the wrapper path.
+5. If the staged wrapper/manifest check, cron verification or live renewal
+   fails, freeze only the hourly publisher entry again, drain its process and
+   publication lock, restore the saved publisher entry to the original
+   archive, and verify byte-for-byte preservation of all other lines. Keep
+   the staged archive for diagnosis. The active database release is never
+   rolled back by changing the wrapper path.
 
 This changes no provider subscription, paid service, compute tier, provisioned
 disk, spend cap, or job frequency. It may cause a normal hourly publisher to

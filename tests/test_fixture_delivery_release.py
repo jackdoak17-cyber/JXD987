@@ -161,11 +161,12 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         candidate = {"verified_at": source_at}
         candidate_pin = now + timedelta(hours=2)
         # Actual 21:11 run: 60 minutes remain, but the next hourly job may
-        # take up to 30 minutes after it starts. It must renew now.
+        # take up to 30 minutes after it starts, after up to two bounded
+        # dirty-state calls. It must renew now.
         self.assertIsNone(publication_skip_reason(
             current, candidate, candidate_pin,
             guarded=True, min_interval_seconds=3600,
-            min_skip_runway_seconds=3600 + 1800 + 300, now=now,
+            min_skip_runway_seconds=3600 + 2 * (60 + 5) + 1800 + 5 + 300, now=now,
         ))
         # An unconfigured caller must fail open to publication, not to a
         # customer lease gap.
@@ -173,17 +174,17 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             current, candidate, candidate_pin,
             guarded=True, min_interval_seconds=3600, now=now,
         ))
-        current["pin_expires_at"] = now + timedelta(seconds=5700)
+        current["pin_expires_at"] = now + timedelta(seconds=5835)
         self.assertEqual(publication_skip_reason(
             current, candidate, candidate_pin,
             guarded=True, min_interval_seconds=3600,
-            min_skip_runway_seconds=5700, now=now,
+            min_skip_runway_seconds=5835, now=now,
         ), "recent_publication_satisfies_guard")
-        current["pin_expires_at"] = now + timedelta(seconds=5699)
+        current["pin_expires_at"] = now + timedelta(seconds=5834)
         self.assertIsNone(publication_skip_reason(
             current, candidate, candidate_pin,
             guarded=True, min_interval_seconds=3600,
-            min_skip_runway_seconds=5700, now=now,
+            min_skip_runway_seconds=5835, now=now,
         ))
 
     def test_current_full_publication_evidence_blocks_older_candidate(self) -> None:
