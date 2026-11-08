@@ -32,6 +32,23 @@ the #81 core wrapper. No archive contains `.env`, `.venv`, tests, SQLite data
 or credentials. The existing credential and virtual-environment links must
 be recreated to their **unchanged** targets at installation.
 
+Each data-using candidate must also resolve to the same shared SQLite file
+as its active predecessor. The core candidate must use the **old settlement**
+checkout's `data` target, not #80 core's isolated `data` directory: settlement
+and fixture source must see the shared production database.
+
+| Candidate | Required `data` target before cron activation |
+| --- | --- |
+| Core/settlement | `/opt/odds-sync/JXD987-fixture-core-900d1ca-release/data` |
+| Odds matcher | `/opt/odds-sync/JXD987-odds-matcher-48d251e-release/data` |
+| Stats reconciliation | Existing link to `/opt/odds-sync/JXD987-runtime-9aa3015-release/data` |
+| Squad runtime | `/opt/odds-sync/JXD987-runtime-7e74d46-release/data` |
+| Website odds delivery | No local `data` directory; preserve the cron's explicit `ODDS_DELIVERY_DB_PATH`. |
+
+Check the resolved device/inode of each candidate's `data/jxd.sqlite`
+against the old settlement's shared file. A new small SQLite file in a
+candidate release is a failed preflight even if its runtime manifest passes.
+
 | Writer checkout | Current rollback release | Candidate release | Manifest SHA-1 | Archive SHA-256 |
 | --- | --- | --- | --- | --- |
 | Fixture core, hourly publisher and post-match settlement | `JXD987-fixture-core-80-aae97d-release` for core/publisher; `JXD987-fixture-core-900d1ca-release` for settlement | `JXD987-fixture-core-81-85450e-release` | `85450ebeada00bd06d67cc8d3b82cb45947481e4` | `8f5e9f13c2898d0f14554b52d363af148769439a9194007b0569e434f8d53ea9` |
@@ -57,8 +74,10 @@ certification of each older release's unrelated jobs.
    path already exists. Do not start the rollout during a fixture-core source
    run, settlement batch or data-heavy maintenance hold.
 2. Install the five immutable packages side by side, restore each release's
-   existing `.env` and `.venv` symlink targets, and verify their entire
-   manifests on the VPS. Keep all rollback directories untouched.
+   existing `.env` and `.venv` symlink targets and the exact shared `data`
+   links above, and verify their entire manifests on the VPS. Compare all
+   data-using candidates' resolved SQLite device/inode to the old settlement
+   file before freezing cron. Keep all rollback directories untouched.
 3. Back up the complete root crontab, then make a **first atomic crontab
    replacement** that removes every affected old entry: P1, P2, odds P3,
    fixture core, hourly publisher, settlement, stats supervisor, website odds
@@ -127,5 +146,30 @@ normal writers, settlement and the current release resolver. Record any
 scheduled run missed during the freeze. Rollback cannot make expired fixture
 source evidence fresh or extend an expired release pin.
 
-The #81 cutover has not occurred. Verify that it adds no cost, then complete
-the operationally safe supervisor handoff and all release evidence above.
+## Live execution and current verification boundary
+
+All five archives passed their recorded SHA-256 checks on the VPS, and all
+five installed directories passed full runtime-manifest verification. The
+first two-stage cutover froze nine entries at 15:41:40 UTC, drained the old
+stopped stats supervisor at 15:42:59 and activated nine new entries at
+15:43:41. The new supervisor started at 15:45. The first new settlement at
+15:45 failed: it found zero fixtures and `No seasons to export`. Its wrapper
+and exporter matched the old settlement byte for byte, but the core candidate
+had created a 147 KB local SQLite file while the old settlement read the
+11.9 GB shared SQLite file. This was a deployment-link error, not evidence
+that the reservation algorithm failed. We froze the candidate entries at
+15:47:18, drained the stopped new supervisor and restored the full #80/old
+crontab at 15:47:59, with no mixed-protocol process or reservation remaining.
+
+We moved the candidate's empty local `data` directory into private staging,
+linked core, matcher and squad runtime to their old shared data targets,
+and verified that core, matcher, stats and squad candidates all resolve
+`data/jxd.sqlite` to the same device/inode as old settlement; their manifests
+still verify. Website odds delivery keeps its explicit database path. A
+second complete nine-entry freeze and activation occurred at 15:49:46 and
+15:50:07 respectively after proving no old protocol process or reservation
+remained. **The #81 cron cutover is currently active, not yet fully verified.**
+The next settlement at 16:00, hourly publisher at 16:11, odds delivery and
+longer-running source/settlement continuity remain to be observed. If a
+candidate job fails, use the two-stage rollback above before calling #81
+successful. No paid capacity, disk, spend-cap setting or service changed.
