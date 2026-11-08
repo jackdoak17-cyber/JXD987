@@ -146,15 +146,48 @@ jobs:
         env:
           SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL_SESSION }}
-          FIXTURE_DELIVERY_SOURCE_JOB_ID: ${{ env.SOURCE_JOB_ID }}
           FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES: ${{ env.FIXTURE_CORE_JOB_MAX_AGE_MINUTES }}
         run: |
           set -euo pipefail
-          if [[ -z "${FIXTURE_DELIVERY_SOURCE_JOB_ID}" ]]; then
-            echo "No verified fixture source job is available." >&2
+          # Setup and source recovery may take longer than a primary core run.
+          # Select the newest completed source immediately before publication
+          # so a delayed fallback cannot pin a release to older evidence.
+          row="$(
+            psql "${SUPABASE_DB_URL_SESSION}" -At -F '|' -v ON_ERROR_STOP=1 <<'SQL'
+          select job_id,
+                 floor(extract(epoch from (now() - finished_at)) / 60)::integer
+            from operations.pipeline_job_runs
+           where job_id in ('run_p3_fixture_core_export', 'run_fixture_core_fallback')
+             and status = 'success'
+             and finished_at is not null
+           order by finished_at desc
+           limit 1;
+          SQL
+          )"
+          IFS='|' read -r FIXTURE_DELIVERY_SOURCE_JOB_ID source_age_minutes <<<"${row}"
+          if [[ -z "${FIXTURE_DELIVERY_SOURCE_JOB_ID}" || ! "${source_age_minutes:-}" =~ ^[0-9]+$ ]] ||
+             (( source_age_minutes >= FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES )); then
+            echo "No currently verified fixture source is available." >&2
             exit 1
           fi
-          python scripts/refresh_fixture_delivery.py             --start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)"             --end-date "$(TZ=Europe/London date -d "+${FIXTURE_CORE_DELIVERY_DAYS_FORWARD} days" +%F)"             --leagues "${STATS_LEAGUES}"             --report-out "/tmp/fixture_failover_delivery_report.json"             2>&1 | tee /tmp/fixture_failover_delivery.log
+          export FIXTURE_DELIVERY_SOURCE_JOB_ID
+          echo "Publishing with freshest source: job=${FIXTURE_DELIVERY_SOURCE_JOB_ID} age_minutes=${source_age_minutes}"
+          set +e
+          python scripts/refresh_fixture_delivery.py \
+            --start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)" \
+            --end-date "$(TZ=Europe/London date -d "+${FIXTURE_CORE_DELIVERY_DAYS_FORWARD} days" +%F)" \
+            --leagues "${STATS_LEAGUES}" \
+            --report-out "/tmp/fixture_failover_delivery_report.json" \
+            --skip-if-publication-active \
+            --min-publish-interval-seconds 3600 \
+            2>&1 | tee /tmp/fixture_failover_delivery.log
+          publish_status=${PIPESTATUS[0]}
+          set -e
+          if (( publish_status == 2 )); then
+            echo "Guarded publisher skip: a current publication was recent or another publisher was active."
+          elif (( publish_status != 0 )); then
+            exit "${publish_status}"
+          fi
 
       - name: Verify customer release is current
         env:
