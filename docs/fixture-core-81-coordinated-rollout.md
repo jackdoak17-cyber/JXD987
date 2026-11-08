@@ -57,15 +57,26 @@ certification of each older release's unrelated jobs.
 2. Install the five immutable packages side by side, restore each release's
    existing `.env` and `.venv` symlink targets, and verify their entire
    manifests on the VPS. Keep all rollback directories untouched.
-3. Back up the complete root crontab. Pause new starts of the long-lived
-   stats supervisor, then wait for an observed batch handoff or natural queue
-   drain. The current supervisor has **no graceful drain command**. A signal
-   is acceptable only after checking that it has no active child and does not
-   hold the canonical or database-heavy lock; verify all descendants are
-   gone before starting the new supervisor. If that safe state cannot be
-   established, postpone the cutover. Merely repointing cron leaves the old
-   in-memory admission functions running.
-4. In one crontab replacement, repoint P1 (`17 *`), P2 (`37 */2`) and odds
+3. Back up the complete root crontab, then make a **first atomic crontab
+   replacement** that removes every affected old entry: P1, P2, odds P3,
+   fixture core, hourly publisher, settlement, stats supervisor, website odds
+   delivery and squad reconciliation. Leave unrelated entries exactly as
+   found. Read back the resulting crontab and prove none of the affected
+   entries remains. This is a temporary admission freeze; record its start
+   time and keep it as short as a safe drain permits. A path change alone
+   leaves old processes and their in-memory functions alive.
+4. Inventory all affected old wrapper processes and descendants, including
+   ones waiting in a lock retry. Wait for them to finish. At an observed idle
+   boundary for the long-lived stats supervisor, confirm it has no active
+   child and holds neither the canonical nor database-heavy lock before
+   stopping it; then verify every descendant has exited. The supervisor has
+   **no graceful drain command**. Check the canonical lock, heavy lock and
+   reservation sidecar after the drain. Do not activate new entries while any
+   old protocol process is still alive. If quiescence cannot be proved, restore
+   the backed-up crontab and postpone the cutover. The freeze may skip a
+   scheduled settlement or publication; record any missed run and verify its
+   next normal scheduled execution after activation.
+5. In a **second atomic crontab replacement**, repoint P1 (`17 *`), P2 (`37 */2`) and odds
    P3 (`19 */6`) to the matcher package; fixture core (`17 */6`), hourly
    publisher (`11 *`) and settlement (`*/15`) to the core package; stats
    supervisor (`*/5`) to the leaderboard package; website odds delivery
@@ -73,7 +84,7 @@ certification of each older release's unrelated jobs.
    (`20,50 *`) to the runtime package. Preserve every existing environment
    prefix, argument, frequency and log path. Leave unrelated Models,
    Operations and other lock domains untouched.
-5. Read back each exact cron entry, verify the new supervisor starts from the
+6. Read back each exact cron entry, verify the new supervisor starts from the
    new release, and inspect the canonical lock and reservation owner. Observe
    a real fixture-core attempt while normal odds delivery and reconciliation
    are active; confirm one admissible source refresh, ordinary writer
@@ -84,17 +95,21 @@ certification of each older release's unrelated jobs.
 
 ## Rollback and partial-cutover safety
 
-Restore the backed-up **entire** crontab, including #80's `17 */6` core and
-its hourly publisher, and the old settlement path. Pause the new supervisor
-and hand it off only at a verified idle boundary as above; verify that the old
-supervisor is again the only holder of its own supervisor lock. Do not delete
-any release directory while a process uses it. An old normal writer ignores
-the reservation, so do not leave a mixed protocol operating and describe it
-as a successful rollback. If a reservation exists, identify its owner and
-expiry, let an admitted core invocation drain, and clear only that owner after
-it exits; otherwise wait for its bounded expiry. Then verify normal writers,
-settlement and the current release resolver. Rollback cannot make expired
-fixture source evidence fresh or extend an expired release pin.
+Rollback also uses a two-stage barrier. First remove all affected candidate
+cron entries atomically, leaving unrelated entries in place; read them back
+and wait for every new wrapper and descendant to exit. Hand off the new stats
+supervisor only at a verified idle boundary. Do not delete any release
+directory while a process uses it. An old normal writer ignores the
+reservation, so do not leave a mixed protocol operating and describe it as a
+successful rollback. If a reservation exists, identify its owner and expiry,
+let an admitted core invocation drain, and clear only that owner after it
+exits; otherwise wait for its bounded expiry. Only after proving the new
+protocol has quiesced, restore the backed-up **entire** crontab, including
+#80's `17 */6` core and hourly publisher and the old settlement path. Verify
+the old supervisor is again the only holder of its own supervisor lock, then
+normal writers, settlement and the current release resolver. Record any
+scheduled run missed during the freeze. Rollback cannot make expired fixture
+source evidence fresh or extend an expired release pin.
 
 The #81 cutover requires a separate owner approval and an operationally safe
 supervisor handoff. Neither has occurred.
