@@ -148,7 +148,7 @@ while true; do
 
   if [[ ! -f "${STATS_RECONCILE_REPORT}" ]]; then
     # The worker may fail before it can write a JSON report. Preserve a bounded
-    # error excerpt in the supervisor log before the next loop deletes the
+    # error excerpt (20 lines, at most 8 KiB) before the next loop deletes the
     # temporary run log; the ledger's status/duration alone cannot name the
     # failing stage.
     if [[ "${status}" -ne 0 ]]; then
@@ -157,7 +157,7 @@ while true; do
       log_info "stats reconciliation returned without report release=${RUNTIME_RELEASE_ID}"
     fi
     if [[ -f "${STATS_RECONCILE_RUN_LOG}" ]]; then
-      tail -n 20 "${STATS_RECONCILE_RUN_LOG}" >&2 || true
+      tail -n 20 "${STATS_RECONCILE_RUN_LOG}" | tail -c 8192 >&2 || true
     else
       log_error "stats reconciliation run log missing before report release=${RUNTIME_RELEASE_ID}"
     fi
