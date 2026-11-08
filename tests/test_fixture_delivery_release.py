@@ -99,6 +99,9 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         with patch.dict("os.environ", {"PGPORT": "6543"}):
             with self.assertRaisesRegex(RuntimeError, "session-pooler"):
                 validate_session_capable_dsn("postgresql://user:pass@aws-0.pooler.supabase.com/postgres")
+        with patch.dict("os.environ", {"PGSERVICE": "uninspected"}):
+            with self.assertRaisesRegex(RuntimeError, "explicit database endpoint"):
+                validate_session_capable_dsn("postgresql:///postgres")
 
     def test_older_fallback_cannot_shorten_primary_noop_before_heartbeat(self) -> None:
         now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
