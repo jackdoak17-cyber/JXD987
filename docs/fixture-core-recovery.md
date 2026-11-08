@@ -48,15 +48,19 @@ publisher remains hourly. This cron adjustment has **not** been applied.
 2. Verify `fixture_delivery_release_resolve(null::uuid)` returns `current`
    and a signed-in fixture schedule request returns HTTP 200 with expected
    values. Inspect the release's source provenance and pin expiry.
-3. Deploy the reviewed worker release and adjust only the fixture-core cron
-   minute to `17`. Verify the runtime manifest and crontab entry.
+3. Stage an immutable worker release with the existing `.env`, `.venv` and
+   SQLite links, deploy the reviewed runtime files into it, and verify its
+   manifest before cutover. Repoint only the fixture-core and hourly fixture
+   publisher cron entries to that release, and move the former from minute
+   `4` to `17`. Verify both crontab entries.
 4. Confirm a successful primary source run, an hourly publisher renewal and
    authenticated fixture schedule and detail responses. Watch the next two
    six-hour runs for skipped admissions and fresh publication. Keep the
    source age guard and settlement lease unchanged.
 
-If the new publisher fails, restore the prior worker release and cron minute
-`4`; the last valid fixture release remains in the database and still obeys
+If the new publisher fails, repoint both cron entries to the untouched prior
+worker release and restore fixture-core minute `4`; the last valid fixture
+release remains in the database and still obeys
 its own expiry. The current code changes do not resize Supabase, alter disk
 or spend-cap settings, add services, or increase the scheduled job frequency.
 Recovery of Prop Search and the leaderboard website release needs separate
