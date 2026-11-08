@@ -39,11 +39,41 @@ export FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES="${FIXTURE_DELIVERY_SOURCE_MAX_AG
 export FIXTURE_DELIVERY_DIRTY_STATE_PATH="${FIXTURE_DELIVERY_DIRTY_STATE_PATH:-/var/lib/oddssearch/fixture-delivery/dirty-state.json}"
 export FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS="${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS:-3600}"
 export FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS="${FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS:-1800}"
+export FIXTURE_DELIVERY_PUBLISH_SCHEDULE_INTERVAL_SECONDS="${FIXTURE_DELIVERY_PUBLISH_SCHEDULE_INTERVAL_SECONDS:-3600}"
+export FIXTURE_DELIVERY_PUBLISH_RUNWAY_MARGIN_SECONDS="${FIXTURE_DELIVERY_PUBLISH_RUNWAY_MARGIN_SECONDS:-300}"
+export FIXTURE_DELIVERY_DIRTY_STATE_TIMEOUT_SECONDS="${FIXTURE_DELIVERY_DIRTY_STATE_TIMEOUT_SECONDS:-60}"
 export PIPELINE_EVIDENCE_FILE="${PIPELINE_EVIDENCE_FILE:-/tmp/fixture_delivery_publisher_report.json}"
 
 cd "${REPO_ROOT}"
 source .venv/bin/activate
 export PYTHONPATH="${REPO_ROOT}"
+
+require_positive_seconds() {
+  local name="$1" value="$2"
+  if [[ ! "$value" =~ ^[1-9][0-9]{0,4}$ ]] || ((value > 86400)); then
+    log_error "${name} must be a positive whole number of seconds at most 86400"
+    exit 1
+  fi
+}
+require_positive_seconds FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS "${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS}"
+require_positive_seconds FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS "${FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS}"
+require_positive_seconds FIXTURE_DELIVERY_PUBLISH_SCHEDULE_INTERVAL_SECONDS "${FIXTURE_DELIVERY_PUBLISH_SCHEDULE_INTERVAL_SECONDS}"
+require_positive_seconds FIXTURE_DELIVERY_PUBLISH_RUNWAY_MARGIN_SECONDS "${FIXTURE_DELIVERY_PUBLISH_RUNWAY_MARGIN_SECONDS}"
+require_positive_seconds FIXTURE_DELIVERY_DIRTY_STATE_TIMEOUT_SECONDS "${FIXTURE_DELIVERY_DIRTY_STATE_TIMEOUT_SECONDS}"
+
+# Dirty-state helpers use a blocking file lock. Bound each preparatory call
+# before the publisher's own timeout begins; include both calls and their
+# five-second termination grace in the lease runway below.
+run_dirty_state() {
+  timeout --signal=TERM --kill-after=5s "${FIXTURE_DELIVERY_DIRTY_STATE_TIMEOUT_SECONDS}" \
+    python scripts/fixture_delivery_dirty_state.py "$@"
+}
+min_skip_runway_seconds=$((
+  FIXTURE_DELIVERY_PUBLISH_SCHEDULE_INTERVAL_SECONDS
+  + 2 * (FIXTURE_DELIVERY_DIRTY_STATE_TIMEOUT_SECONDS + 5)
+  + FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTIME_SECONDS + 5
+  + FIXTURE_DELIVERY_PUBLISH_RUNWAY_MARGIN_SECONDS
+))
 
 publisher_status=0
 dirty_revision=""
@@ -51,15 +81,23 @@ RUN_STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 RUN_STARTED_EPOCH="$(date -u +%s)"
 rm -f "${PIPELINE_EVIDENCE_FILE}"
 
-if python scripts/fixture_delivery_dirty_state.py status > /tmp/fixture_delivery_dirty_status.json; then
-  python scripts/fixture_delivery_dirty_state.py attempt >/tmp/fixture_delivery_dirty_attempt.json
-  dirty_revision="$(python3 - <<'PY'
+if run_dirty_state status > /tmp/fixture_delivery_dirty_status.json; then
+  if run_dirty_state attempt >/tmp/fixture_delivery_dirty_attempt.json; then
+    dirty_revision="$(python3 - <<'PY'
 import json
 with open('/tmp/fixture_delivery_dirty_attempt.json', encoding='utf-8') as handle:
     payload = json.load(handle)
 print(int(payload['state']['revision']))
 PY
 )"
+  else
+    log_error "fixture dirty-state attempt did not finish within its bounded call"
+  fi
+else
+  status_rc=$?
+  if [[ "${status_rc}" -ne 2 ]]; then
+    log_error "fixture dirty-state status failed or timed out (status=${status_rc})"
+  fi
 fi
 
 # A clean dirty-state still needs bounded validation. The fixture-core cadence
@@ -72,11 +110,14 @@ if timeout --signal=TERM --kill-after=5s "${FIXTURE_DELIVERY_PUBLISHER_MAX_RUNTI
     --leagues "${STATS_LEAGUES}" \
     --report-out "${PIPELINE_EVIDENCE_FILE}" \
     --skip-if-publication-active \
-    --min-publish-interval-seconds "${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS}"; then
+    --min-publish-interval-seconds "${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS}" \
+    --min-skip-runway-seconds "${min_skip_runway_seconds}"; then
   if [[ -n "${dirty_revision}" ]]; then
-    python scripts/fixture_delivery_dirty_state.py clear \
+    if ! run_dirty_state clear \
       --expected-revision "${dirty_revision}" \
-      >/tmp/fixture_delivery_dirty_clear.json
+      >/tmp/fixture_delivery_dirty_clear.json; then
+      log_error "fixture dirty-state clear failed or timed out after publication"
+    fi
   fi
   publisher_status=0
 else
@@ -86,7 +127,7 @@ else
     true
   else
     if [[ -n "${dirty_revision}" ]]; then
-      python scripts/fixture_delivery_dirty_state.py failure --error "refresh_fixture_delivery exit status ${publisher_status}" >/tmp/fixture_delivery_dirty_failure.json || true
+      run_dirty_state failure --error "refresh_fixture_delivery exit status ${publisher_status}" >/tmp/fixture_delivery_dirty_failure.json || true
     fi
   fi
 fi

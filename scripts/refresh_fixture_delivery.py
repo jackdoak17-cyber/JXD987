@@ -406,6 +406,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="Guarded publisher only: skip when the latest complete publication is newer than this many seconds.",
     )
+    parser.add_argument(
+        "--min-skip-runway-seconds",
+        type=int,
+        default=0,
+        help="Guarded publisher only: current pin must outlast the next scheduled run and its maximum runtime by this many seconds; zero disables the recent-publication skip.",
+    )
     return parser
 
 
@@ -627,6 +633,7 @@ def publication_skip_reason(
     *,
     guarded: bool,
     min_interval_seconds: int,
+    min_skip_runway_seconds: int = 0,
     now: datetime | None = None,
 ) -> str | None:
     """Decide only from the committed current release while owning the lock."""
@@ -647,8 +654,9 @@ def publication_skip_reason(
     if candidate_pin_expires_at < pin:
         return "would_shorten_current_pin"
 
-    # The fallback's one-hour throttle is safe only when the current release
-    # has the same minimum runway verified by the workflow after publication.
+    # The recent-publication throttle must leave time for the next scheduled
+    # publisher to finish before this pin expires. Missing cadence/runtime
+    # evidence disables this skip; a verified no-op can still renew the pin.
     last_activity = max(
         (value for value in (current.get("published_at"), current.get("health_checked_at")) if value),
         default=None,
@@ -656,9 +664,10 @@ def publication_skip_reason(
     if (
         guarded
         and min_interval_seconds > 0
+        and min_skip_runway_seconds > 0
         and last_activity is not None
         and (observed_at - last_activity).total_seconds() < min_interval_seconds
-        and (pin - observed_at).total_seconds() >= 45 * 60
+        and (pin - observed_at).total_seconds() >= max(45 * 60, min_skip_runway_seconds)
     ):
         return "recent_publication_satisfies_guard"
     return None
@@ -1742,6 +1751,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 pin_expires_at,
                 guarded=bool(args.skip_if_publication_active),
                 min_interval_seconds=max(int(args.min_publish_interval_seconds or 0), 0),
+                min_skip_runway_seconds=max(int(args.min_skip_runway_seconds or 0), 0),
             )
             if skip_reason:
                 return guarded_skip_report(

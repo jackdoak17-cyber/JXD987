@@ -138,13 +138,54 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         fresh = {"verified_at": (now - timedelta(minutes=2)).isoformat()}
         self.assertIsNone(publication_skip_reason(
             current, fresh, now + timedelta(hours=2),
-            guarded=True, min_interval_seconds=3600, now=now,
+            guarded=True, min_interval_seconds=3600,
+            min_skip_runway_seconds=5700, now=now,
         ))
         current["pin_expires_at"] = now + timedelta(hours=2)
         self.assertEqual(publication_skip_reason(
             current, fresh, now + timedelta(hours=2),
-            guarded=True, min_interval_seconds=3600, now=now,
+            guarded=True, min_interval_seconds=3600,
+            min_skip_runway_seconds=5700, now=now,
         ), "recent_publication_satisfies_guard")
+
+    def test_recent_skip_requires_next_hourly_run_and_max_runtime_runway(self) -> None:
+        now = datetime(2026, 11, 8, 21, 11, 7, tzinfo=UTC)
+        source_at = datetime(2026, 11, 8, 18, 18, 20, tzinfo=UTC).isoformat()
+        current = {
+            "release_id": "live-release",
+            "published_at": datetime(2026, 11, 8, 20, 11, 9, tzinfo=UTC),
+            "health_checked_at": datetime(2026, 11, 8, 20, 11, 41, tzinfo=UTC),
+            "pin_expires_at": datetime(2026, 11, 8, 22, 11, 8, tzinfo=UTC),
+            "metadata": {"last_source_freshness_evidence": {"verified_at": source_at}},
+        }
+        candidate = {"verified_at": source_at}
+        candidate_pin = now + timedelta(hours=2)
+        # Actual 21:11 run: 60 minutes remain, but the next hourly job may
+        # take up to 30 minutes after it starts, after up to two bounded
+        # dirty-state calls. It must renew now.
+        self.assertIsNone(publication_skip_reason(
+            current, candidate, candidate_pin,
+            guarded=True, min_interval_seconds=3600,
+            min_skip_runway_seconds=3600 + 2 * (60 + 5) + 1800 + 5 + 300, now=now,
+        ))
+        # An unconfigured caller must fail open to publication, not to a
+        # customer lease gap.
+        self.assertIsNone(publication_skip_reason(
+            current, candidate, candidate_pin,
+            guarded=True, min_interval_seconds=3600, now=now,
+        ))
+        current["pin_expires_at"] = now + timedelta(seconds=5835)
+        self.assertEqual(publication_skip_reason(
+            current, candidate, candidate_pin,
+            guarded=True, min_interval_seconds=3600,
+            min_skip_runway_seconds=5835, now=now,
+        ), "recent_publication_satisfies_guard")
+        current["pin_expires_at"] = now + timedelta(seconds=5834)
+        self.assertIsNone(publication_skip_reason(
+            current, candidate, candidate_pin,
+            guarded=True, min_interval_seconds=3600,
+            min_skip_runway_seconds=5835, now=now,
+        ))
 
     def test_current_full_publication_evidence_blocks_older_candidate(self) -> None:
         now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
