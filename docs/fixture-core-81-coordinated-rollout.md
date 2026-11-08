@@ -1,11 +1,14 @@
-# Fixture-core #81 coordinated admission rollout candidate — 8 November 2026
+# Fixture-core #81 coordinated admission rollout — 8 November 2026
 
-This is a prepared, **unapplied** five-checkout change. Jack approved and we
-executed the narrower #80 cutover at 14:42 UTC. Jack subsequently authorised
-necessary no-added-cost programme work without repeated approval requests.
-This rollout still requires the exact package, drain, verification and rollback
-checks below; any added spending requires Jack's approval. No additional
-infrastructure or spend is proposed.
+The five-checkout admission change was activated at 15:43:41 UTC after the
+freeze and drain below. Its core, publisher and settlement paths were then
+replaced by the v4 publication-guard package at 16:54:46 UTC. A readback of
+the current crontab shows the four other #81 packages and the v4 core paths
+still active. This document retains the staged package details and executed
+procedure for audit and rollback. Jack authorised necessary no-added-cost
+programme work without repeated approval requests; any added spending still
+requires his explicit approval. No additional infrastructure or spend was
+introduced by either cutover.
 
 ## Why all five releases must move together
 
@@ -67,7 +70,7 @@ lease tests passed on **all five** compositions, as did the admitted-work
 handoff test. This is focused admission evidence, not complete end-to-end
 certification of each older release's unrelated jobs.
 
-## Forward map for a no-added-cost rollout after the evidence gates
+## Executed forward procedure for the no-added-cost #81 rollout
 
 1. Recheck all active releases and manifests, archive hashes, symlink targets,
    cron entries and the currently held locks. Confirm no candidate target
