@@ -258,13 +258,37 @@ candidate 16:56 pin from replacing the current 17:51 pin. Those two reads
 used the superseded first staged package; its publication decision is
 unchanged in the corrected package.
 
-For cutover, back up the current crontab, confirm no active core/publisher or
-settlement process, then atomically replace only the three core-package
-paths (fixture core, hourly publisher and settlement) with the staged path.
-Keep all schedules, all other worker entries and all database/configuration
-settings identical. Read back all entries and verify the next scheduled
-settlement and publisher against manifest `4b89de8d5131`. If either fails,
-restore the backed-up three paths atomically to the still-installed
-`JXD987-fixture-core-81-85450e-release`, then verify writer quiescence and
-the current release before retrying. The broader two-stage rollback above
+For cutover, first verify the current resolver/pin has enough runway and
+recheck the v4 archive, manifest and effective database link. Back up the
+complete current crontab. Disable the GitHub
+`fixture_delivery_failover.yml` workflow temporarily and verify it is
+disabled; inspect its queued, waiting and in-progress runs, including older
+commit refs, and wait for all of them to finish. Atomically remove only the
+three active core-package cron entries (fixture core, hourly publisher and
+settlement) and read back the frozen crontab. With both start sources frozen,
+drain every affected wrapper/child process and confirm the fixture-publication
+advisory lock is free. A single idle snapshot before the freeze is not a
+drain barrier.
+
+Only after that stable barrier, merge PR #83 and verify the exact new JXD main
+commit while the GitHub workflow remains disabled. Atomically install the
+three v4 cron paths from the backed-up entries, preserving their schedules
+and all unrelated entries, then read back the entire crontab. Verify the
+runtime manifest is `4b89de8d5131`, the current release resolves, and a
+guarded publisher either renews with genuine fresh evidence or makes an
+explained safe skip. Re-enable the GitHub workflow only after the VPS path is
+verified, and check that it is active on the merged main ref. Observe the
+next settlement and publisher jobs, the resolver/source/pin and authenticated
+customer schedule/list agreement. No frequency, capacity or cost setting
+changes in this swap.
+
+For rollback, freeze GitHub fallback starts and the three v4 cron entries
+again, then drain all candidate wrappers and descendants and verify the
+publication lock is free. Only then restore the three old paths atomically
+from the backed-up crontab to the installed
+`JXD987-fixture-core-81-85450e-release`; verify all other entries stayed
+identical. If PR #83 itself must be reverted, do so while both start sources
+remain frozen and re-enable GitHub only after its main ref matches the
+selected rollback publisher. Check the current resolver and normal worker
+resumption before ending the freeze. The broader two-stage rollback above
 remains available if the #81 protocol itself fails.
