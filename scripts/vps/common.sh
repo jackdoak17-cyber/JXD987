@@ -216,6 +216,8 @@ record_pipeline_job_run() {
   local work_units="${9:-}"
   local provider_duration_ms="${10:-}"
   local processing_duration_ms="${11:-}"
+  local evidence_override="${12:-}"
+  local heartbeat_required="${13:-0}"
 
   if [[ -z "${OPERATIONS_CHECK_RUNNER_DATABASE_URL:-}" && -f "${REPO_ROOT}/.env" ]]; then
     set -a
@@ -225,10 +227,12 @@ record_pipeline_job_run() {
   fi
   if [[ -z "${OPERATIONS_CHECK_RUNNER_DATABASE_URL:-}" ]]; then
     log_error "pipeline heartbeat skipped for ${job_id}; missing OPERATIONS_CHECK_RUNNER_DATABASE_URL"
+    if [[ "${heartbeat_required}" == "1" ]]; then return 1; fi
     return 0
   fi
   if ! command -v psql >/dev/null 2>&1; then
     log_error "pipeline heartbeat skipped for ${job_id}; psql unavailable"
+    if [[ "${heartbeat_required}" == "1" ]]; then return 1; fi
     return 0
   fi
 
@@ -254,6 +258,15 @@ PY
 )"
     if [[ -n "${evidence_payload}" ]]; then
       evidence="${evidence}; report: ${evidence_payload}"
+    fi
+  fi
+  # A caller may supply compact structured evidence for a distinct aggregate
+  # health row. Ordinary job rows retain their existing human-readable form.
+  if [[ -n "${evidence_override}" ]]; then
+    if (( ${#evidence_override} > 500 )); then
+      evidence='{"scope_health":"unknown","reason":"aggregate_evidence_too_large"}'
+    else
+      evidence="${evidence_override}"
     fi
   fi
   # operations.pipeline_job_runs.evidence_summary is intentionally bounded so
@@ -293,6 +306,7 @@ values (
 SQL
   then
     log_error "pipeline heartbeat write failed for ${job_id}"
+    if [[ "${heartbeat_required}" == "1" ]]; then return 1; fi
   fi
 }
 
