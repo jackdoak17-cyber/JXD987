@@ -19,6 +19,9 @@ with the private rolling SQL in website PR #103. It is not an activation record.
 - The production wrapper requires exact database, worker release, runtime
   manifest, policy, and numeric limit pins before invoking the supervisor.
   It also runs the existing source/worker cron and descendant cutover check.
+- The rolling worker uploads the host's fresh disk sample before admission.
+  The paused normal worker cannot upload it; the installed database function
+  rejects invalid or stale samples.
 
 ## Verification
 
@@ -30,7 +33,7 @@ with the private rolling SQL in website PR #103. It is not an activation record.
   `M3_ROLLING_LEDGER_TEST=1`, `M3_ROLLING_GUARDED_TEST=1`,
   `M3_ROLLING_BOUND_TEST=1`, and the worker/supervisor paths set: exit 0.
   Its new test `73_python_rolling_supervised_full_workload.sh` captured a
-  real fixture, executed a generation job, published, and settled the bound
+  real fixture, uploaded disk evidence, executed a generation job, published, and settled the bound
   reservation. A second run deliberately timed out after admission; the
   supervisor drained the owner backend, recovered the reservation using the
   physical WAL fallback, and removed both quarantine markers. The old paused
@@ -41,9 +44,16 @@ with the private rolling SQL in website PR #103. It is not an activation record.
 - The isolated workload is small. It does not establish a safe production
   allowance or catch-up rate for the current 1,336 queued fixtures across 24
   cohorts, and it does not prove a six-hour/day resource window.
-- A cohort with more jobs than the 250-operation ceiling cannot materialize
-  with this implementation. Measure the actual current cohort event counts;
-  if needed, add a bounded incremental generation path before activation.
+- A read-only production measurement at 10:49 UTC found at most 44 existing
+  event jobs and 107 queued fixtures per cohort. The largest conservative
+  combined bound was 151 jobs, below 250. This is a moving count; a future
+  cohort over the ceiling still needs bounded incremental generation.
+- The strict source-health gate currently refuses genuine low-volume runs:
+  the latest success at 10:39 had 5 work units, while the last comparable
+  20-unit run was at 10:23. The host disk file was fresh at 10:50, but the
+  database disk observation had aged since 06:44 while the normal worker was
+  disabled. The new disk preflight closes the latter gap only. Source-health
+  semantics need a reviewed fail-closed solution for sparse batches.
 - Review the exact website SQL and worker release together, set a numeric
   rolling policy from measured WAL/temp/source headroom, and verify the VPS
   archive and current source evidence. Keep the customer leaderboard reader

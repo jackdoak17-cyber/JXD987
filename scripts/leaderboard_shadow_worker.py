@@ -1267,6 +1267,10 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
         raise RuntimeError("rolling test path requires socket-only oddssearch_m3")
     budget = RunBudget.create(args.fixture_limit, args.max_seconds)
     apply_preflight_timeouts(conn)
+    # The normal worker is paused, so it cannot upload the host's fresh disk
+    # sample. Refresh it before admission; the installed function validates
+    # both the sample age and current source identity without rearming debt.
+    load_external_resource_evidence(conn)
     temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
     budget.apply_database_timeouts(conn)
     with conn:
