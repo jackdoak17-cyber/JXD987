@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.leaderboard_finite_trial_supervisor import acquire_lock
+import scripts.leaderboard_finite_trial_supervisor as supervisor_module
 import scripts.leaderboard_shadow_worker as worker_module
 from scripts.leaderboard_shadow_capture import capture_fixture_ids
 from scripts.leaderboard_shadow_worker import (
@@ -37,6 +39,26 @@ from scripts.leaderboard_shadow_worker import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_finite_trial_wrapper_rejects_unreviewed_release_before_connection(tmp_path):
+    environment_file = tmp_path / "finite-trial.env"
+    environment_file.write_text(
+        "LEADERBOARD_FINITE_TRIAL_POLICY_ID=local-policy\n"
+        "LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256=" + "0" * 64 + "\n"
+        "LEADERBOARD_FINITE_TRIAL_RELEASE_SHA=" + "1" * 40 + "\n"
+        "LEADERBOARD_FINITE_TRIAL_OPERATOR_NOTE='local wrapper rejection'\n"
+    )
+    environment = os.environ.copy()
+    environment["LEADERBOARD_SHADOW_ENV_FILE"] = str(environment_file)
+    environment.pop("SUPABASE_DB_URL", None)
+    environment.pop("SUPABASE_DB_URL_SESSION", None)
+    process = subprocess.run(
+        ["bash", str(ROOT / "scripts/vps/run_leaderboard_finite_trial.sh")],
+        env=environment, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert process.returncode != 0
+    assert "checkout differs from the reviewed release" in process.stderr
 
 
 def test_finite_trial_commands_reject_a_non_disposable_database(monkeypatch):
@@ -87,6 +109,51 @@ def test_finite_trial_child_keeps_flock_after_parent_exit(tmp_path):
         time.sleep(0.05)
     else:
         pytest.fail("orphaned child did not release inherited flock")
+
+
+@pytest.mark.parametrize("signal_during_spawn", [1, 2])
+def test_supervisor_delivers_signal_arriving_before_child_assignment(
+    tmp_path, monkeypatch, signal_during_spawn,
+):
+    worker = tmp_path / "fake_worker.py"
+    worker.write_text(
+        "import json,sys,time\n"
+        f"if (sys.argv[1] == 'trial-once') == {signal_during_spawn == 1}:\n"
+        "    time.sleep(10)\n"
+        "else:\n"
+        "    print(json.dumps({'state':'no_reservation'}), flush=True)\n"
+    )
+    monkeypatch.setattr(supervisor_module, "database_url", lambda: "disposable")
+    monkeypatch.setattr(supervisor_module, "assert_disposable_database", lambda _url: None)
+    monkeypatch.setattr(supervisor_module, "drain_token_backends", lambda *_args: None)
+    monkeypatch.setattr(supervisor_module, "drain_exact_backend", lambda *_args, **_kw: None)
+    real_popen = subprocess.Popen
+    children = []
+
+    def inject_signal(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        if len(children) == signal_during_spawn:
+            signal.raise_signal(signal.SIGTERM)
+        return child
+
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", inject_signal)
+    args = SimpleNamespace(
+        production=False, production_trial_isolated_test=False,
+        worker_lock_file=str(tmp_path / "worker.lock"),
+        database_heavy_lock_file=str(tmp_path / "heavy.lock"),
+        worker_path=str(worker), policy_id="local-signal",
+        test_pg_sleep_after_admission=0, test_pg_sleep_after_capture=0,
+        test_recovery_pg_sleep=0, test_force_uncertain_drain=False,
+        deadline_seconds=3, grace_seconds=1, drain_seconds=1,
+        recovery_seconds=3,
+    )
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="finite trial liability remains|finite trial recovery failed"):
+        supervisor_module.run_trial(args)
+    assert time.monotonic() - started < 3
+    assert children[signal_during_spawn - 1].poll() is not None
+    assert (tmp_path / "worker.lock.quarantine").exists()
 
 
 def test_trial_capture_progress_survives_a_later_guard_failure(monkeypatch):
@@ -590,6 +657,50 @@ def test_database_heavy_lock_defers_overlap_then_releases(tmp_path):
         if holder.poll() is None:
             holder.terminate()
             holder.wait(timeout=2)
+
+
+def test_database_heavy_gates_refuse_durable_trial_quarantine(tmp_path):
+    # macOS lacks flock(1); a no-op command still exercises the post-lock
+    # quarantine decision. The Linux lock test above verifies real exclusion.
+    fake_bin = tmp_path / "bin"
+    if shutil.which("flock") is None:
+        fake_bin.mkdir()
+        fake_flock = fake_bin / "flock"
+        fake_flock.write_text("#!/bin/sh\nexit 0\n")
+        fake_flock.chmod(0o755)
+    leaderboard_lock = tmp_path / "leaderboard.lock"
+    marker = Path(str(leaderboard_lock) + ".quarantine")
+    marker.write_text('{"policy_id":"local-test"}')
+    launched = tmp_path / "launched"
+    timing = tmp_path / "timing"
+    env = {
+        **os.environ,
+        "ODDSSEARCH_DB_HEAVY_LOCK_FILE": str(tmp_path / "heavy.lock"),
+        "LEADERBOARD_SHADOW_LOCK_FILE": str(leaderboard_lock),
+        "COMMON_SH": str(ROOT / "scripts/vps/common.sh"),
+        "LAUNCHED": str(launched),
+        "TIMING": str(timing),
+        "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+    }
+    for gate in (
+        'run_with_database_heavy_lock 0 bash -c \'touch "$LAUNCHED"\'',
+        'run_with_database_heavy_lock_timed 0 "$TIMING" bash -c \'touch "$LAUNCHED"\'',
+    ):
+        result = subprocess.run(
+            ["bash", "-lc", f'source "$COMMON_SH"; {gate}'],
+            env=env, capture_output=True, text=True, timeout=5, check=False,
+        )
+        assert result.returncode == 75, result.stderr
+        assert "finite-trial quarantine blocks" in result.stdout
+        assert not launched.exists()
+        assert not timing.exists()
+    marker.unlink()
+    result = subprocess.run(
+        ["bash", "-lc", 'source "$COMMON_SH"; run_with_database_heavy_lock 0 bash -c \'touch "$LAUNCHED"\''],
+        env=env, capture_output=True, text=True, timeout=5, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert launched.exists()
 
 
 def test_run_budget_rejects_unbounded_fixture_and_time_limits():

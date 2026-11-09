@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Disposable-only whole-process trial supervisor; not a production entrypoint."""
+"""Bounded whole-process finite trial supervisor and explicit recovery entrypoint."""
 
 from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -40,6 +42,20 @@ def assert_disposable_database(url: str) -> None:
         raise RuntimeError("finite trial supervisor requires a socket-only oddssearch_m3 database")
 
 
+def assert_production_database(url: str) -> None:
+    expected_hash = os.environ.get("LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+        raise RuntimeError("production finite trial requires a pinned database URL hash")
+    if hashlib.sha256(url.encode()).hexdigest() != expected_hash:
+        raise RuntimeError("production finite trial database URL does not match its pin")
+    with bounded_connection(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("select current_database(), inet_server_addr() is not null, current_user")
+            database_name, network_connection, database_role = cur.fetchone()
+    if database_name != "postgres" or not network_connection or database_role != "postgres":
+        raise RuntimeError("production finite trial database identity is invalid")
+
+
 def acquire_lock(path: str):
     if not path or not Path(path).parent.is_dir():
         raise RuntimeError("finite trial lock directory is missing")
@@ -67,9 +83,15 @@ def stop_process_group(process: subprocess.Popen, grace_seconds: float) -> tuple
         return process.communicate(timeout=grace_seconds)
 
 
-def write_quarantine_marker(path: Path, policy_id: str, state: str) -> None:
+def write_quarantine_marker(path: Path, policy_id: str, state: str,
+                            tokens: list[str]) -> None:
+    if not tokens or len(tokens) != len(set(tokens)) or any(
+        not re.fullmatch(r"[0-9a-f]{16}", token) for token in tokens
+    ):
+        raise RuntimeError("finite trial quarantine tokens are invalid")
     payload = json.dumps({
-        "policy_id": policy_id, "state": state, "recorded_at": time.time(),
+        "policy_id": policy_id, "state": state, "tokens": tokens,
+        "recorded_at": time.time(),
     }, sort_keys=True).encode("utf-8")
     temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
     try:
@@ -94,6 +116,19 @@ def clear_quarantine_marker(path: Path) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def read_quarantine_marker(path: Path, policy_id: str) -> list[str]:
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("finite trial quarantine marker is missing or invalid")
+    marker = json.loads(path.read_text(encoding="utf-8"))
+    tokens = marker.get("tokens")
+    if (marker.get("policy_id") != policy_id or not isinstance(tokens, list)
+            or not tokens or len(tokens) != len(set(tokens))
+            or any(not isinstance(token, str) or
+                   not re.fullmatch(r"[0-9a-f]{16}", token) for token in tokens)):
+        raise RuntimeError("finite trial quarantine marker identity is invalid")
+    return tokens
 
 
 def drain_token_backends(url: str, token: str, seconds: float) -> None:
@@ -123,7 +158,7 @@ def drain_token_backends(url: str, token: str, seconds: float) -> None:
         conn.close()
 
 
-def drain_exact_backend(url: str, policy_id: str, seconds: float) -> None:
+def drain_exact_backend(url: str, policy_id: str, seconds: float, *, production: bool) -> None:
     deadline = time.monotonic() + seconds
     conn = bounded_connection(url)
     try:
@@ -134,17 +169,24 @@ def drain_exact_backend(url: str, policy_id: str, seconds: float) -> None:
                 # The client process has exited while both host locks remain
                 # held. Terminate only the still-open reservation's exact
                 # backend PID/start identity, never another database process.
-                cur.execute(
+                query = (
                     """
+                    select pg_terminate_backend(activity.pid)
+                    from leaderboard_trial_v1.reservations reservation
+                    join pg_catalog.pg_stat_activity activity
+                      on activity.pid=reservation.owner_backend_pid
+                     and activity.backend_start=reservation.owner_backend_started_at
+                    where reservation.policy_id=%s and reservation.settled_at is null
+                    """ if production else """
                     select pg_terminate_backend(activity.pid)
                     from admission_proto.reservations reservation
                     join pg_catalog.pg_stat_activity activity
                       on activity.pid=reservation.owner_backend_pid
                      and activity.backend_start=reservation.owner_backend_started_at
                     where reservation.policy_id=%s and reservation.settled_at is null
-                    """,
-                    (policy_id,),
+                    """
                 )
+                cur.execute(query, (policy_id,))
                 terminated = cur.fetchall()
             if not terminated:
                 return
@@ -155,9 +197,16 @@ def drain_exact_backend(url: str, policy_id: str, seconds: float) -> None:
         conn.close()
 
 
-def run_trial(args) -> int:
+def reconcile_quarantine(args) -> int:
+    """Explicit operator action; never reopens a policy with no reservation."""
     url = database_url()
-    assert_disposable_database(url)
+    if args.production:
+        if args.production_trial_isolated_test:
+            assert_disposable_database(url)
+        else:
+            assert_production_database(url)
+    else:
+        assert_disposable_database(url)
     worker_lock = acquire_lock(args.worker_lock_file)
     if worker_lock is None:
         return 75
@@ -167,34 +216,146 @@ def run_trial(args) -> int:
             return 75
         try:
             marker = Path(args.worker_lock_file + ".quarantine")
-            if marker.exists():
+            tokens = read_quarantine_marker(marker, args.policy_id)
+            for token in tokens:
+                drain_token_backends(url, token, args.drain_seconds)
+            drain_exact_backend(url, args.policy_id, args.drain_seconds,
+                                production=args.production)
+            recovery_token = uuid.uuid4().hex[:16]
+            tokens.append(recovery_token)
+            write_quarantine_marker(marker, args.policy_id,
+                                    "operator_recovery_inflight", tokens)
+            lock_fds = (worker_lock.fileno(), heavy_lock.fileno())
+            environment = os.environ.copy()
+            environment.update({
+                "LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN": recovery_token,
+                "LEADERBOARD_FINITE_TRIAL_SUPERVISOR_PID": str(os.getpid()),
+                "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_FD": str(lock_fds[0]),
+                "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_PATH": args.worker_lock_file,
+                "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_FD": str(lock_fds[1]),
+                "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_PATH": args.database_heavy_lock_file,
+            })
+            recovery = [
+                sys.executable, args.worker_path,
+                "finite-recover" if args.production else "trial-recover",
+                "--trial-policy-id", args.policy_id,
+            ]
+            if args.production_trial_isolated_test:
+                recovery.append("--production-trial-isolated-test")
+            elif not args.production:
+                recovery.append("--isolated-test-override")
+            process = subprocess.Popen(
+                recovery, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, start_new_session=True, pass_fds=lock_fds,
+                env=environment,
+            )
+            try:
+                output, errors = process.communicate(timeout=args.recovery_seconds)
+            except subprocess.TimeoutExpired:
+                output, errors = stop_process_group(process, args.grace_seconds)
+                raise RuntimeError("finite trial operator recovery timed out")
+            for token in tokens:
+                drain_token_backends(url, token, args.drain_seconds)
+            drain_exact_backend(url, args.policy_id, args.drain_seconds,
+                                production=args.production)
+            if process.returncode != 0:
+                raise RuntimeError("finite trial operator recovery failed: " + errors[-1000:])
+            state = json.loads(output)["state"]
+            if state not in {"recovered", "already_settled"}:
+                raise RuntimeError(f"finite trial liability remains: {state}")
+            clear_quarantine_marker(marker)
+            print(json.dumps({"event": "finite_trial_quarantine_reconciled",
+                              "policy_id": args.policy_id,
+                              "recovery_state": state}, sort_keys=True), flush=True)
+            return 0
+        finally:
+            heavy_lock.close()
+    finally:
+        worker_lock.close()
+
+
+def run_trial(args) -> int:
+    url = database_url()
+    if args.production:
+        if args.production_trial_isolated_test:
+            assert_disposable_database(url)
+        else:
+            assert_production_database(url)
+            if (args.test_pg_sleep_after_admission or args.test_pg_sleep_after_capture
+                    or args.test_recovery_pg_sleep or args.test_force_uncertain_drain):
+                raise RuntimeError("production finite trial rejects test fault hooks")
+    else:
+        if args.production_trial_isolated_test:
+            raise RuntimeError("production trial test mode requires --production")
+        assert_disposable_database(url)
+    worker_lock = acquire_lock(args.worker_lock_file)
+    if worker_lock is None:
+        return 75
+    try:
+        heavy_lock = acquire_lock(args.database_heavy_lock_file)
+        if heavy_lock is None:
+            return 75
+        try:
+            marker = Path(args.worker_lock_file + ".quarantine")
+            if os.path.lexists(marker):
                 raise RuntimeError("finite trial quarantine marker requires operator reconciliation")
             main_token = uuid.uuid4().hex[:16]
             recovery_token = uuid.uuid4().hex[:16]
-            write_quarantine_marker(marker, args.policy_id, "inflight")
+            marker_tokens = [main_token, recovery_token]
+            write_quarantine_marker(marker, args.policy_id, "inflight", marker_tokens)
             active_process: subprocess.Popen | None = None
             active_token: str | None = None
             interrupted_signal: int | None = None
+            pending_signal_delivery = False
 
             def on_signal(signum, _frame):
-                nonlocal interrupted_signal
+                nonlocal interrupted_signal, pending_signal_delivery
                 interrupted_signal = signum
                 if active_process is not None and active_process.poll() is None:
                     try:
                         os.killpg(active_process.pid, signal.SIGTERM)
                     except ProcessLookupError:
                         pass
+                else:
+                    pending_signal_delivery = True
+
+            def deliver_pending_signal() -> None:
+                nonlocal pending_signal_delivery
+                if pending_signal_delivery and active_process is not None:
+                    pending_signal_delivery = False
+                    if active_process.poll() is None:
+                        try:
+                            os.killpg(active_process.pid, signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
 
             prior_term = signal.signal(signal.SIGTERM, on_signal)
             prior_int = signal.signal(signal.SIGINT, on_signal)
             lock_fds = (worker_lock.fileno(), heavy_lock.fileno())
+            def child_environment(token: str) -> dict[str, str]:
+                environment = os.environ.copy()
+                environment.update({
+                    "LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN": token,
+                    "LEADERBOARD_FINITE_TRIAL_SUPERVISOR_PID": str(os.getpid()),
+                    "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_FD": str(lock_fds[0]),
+                    "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_PATH": args.worker_lock_file,
+                    "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_FD": str(lock_fds[1]),
+                    "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_PATH": args.database_heavy_lock_file,
+                })
+                return environment
             worker = [
-                sys.executable, args.worker_path, "trial-once",
-                "--isolated-test-override", "--trial-policy-id", args.policy_id,
+                sys.executable, args.worker_path,
+                "finite-once" if args.production else "trial-once",
+                "--trial-policy-id", args.policy_id,
                 "--fixture-limit", "10", "--capture-limit", "10",
                 "--cohort-limit", "0", "--job-limit", "0",
                 "--max-seconds", "30",
             ]
+            if args.production:
+                if args.production_trial_isolated_test:
+                    worker.append("--production-trial-isolated-test")
+            else:
+                worker.append("--isolated-test-override")
             if args.test_pg_sleep_after_admission:
                 worker += [
                     "--trial-test-pg-sleep-after-admission",
@@ -206,14 +367,13 @@ def run_trial(args) -> int:
                     str(args.test_pg_sleep_after_capture),
                 ]
             try:
-                child_env = os.environ.copy()
-                child_env["LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN"] = main_token
                 active_process = subprocess.Popen(
                     worker, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, start_new_session=True, pass_fds=lock_fds,
-                    env=child_env,
+                    env=child_environment(main_token),
                 )
                 active_token = main_token
+                deliver_pending_signal()
                 timed_out = False
                 try:
                     output, errors = active_process.communicate(
@@ -236,25 +396,32 @@ def run_trial(args) -> int:
                 # The token finds even a preflight/admission backend that never
                 # committed a reservation. Keep both flocks until it is gone.
                 drain_token_backends(url, main_token, args.drain_seconds)
-                drain_exact_backend(url, args.policy_id, args.drain_seconds)
+                drain_exact_backend(
+                    url, args.policy_id, args.drain_seconds, production=args.production
+                )
 
                 recovery = [
-                    sys.executable, args.worker_path, "trial-recover",
-                    "--isolated-test-override", "--trial-policy-id", args.policy_id,
+                    sys.executable, args.worker_path,
+                    "finite-recover" if args.production else "trial-recover",
+                    "--trial-policy-id", args.policy_id,
                 ]
+                if args.production:
+                    if args.production_trial_isolated_test:
+                        recovery.append("--production-trial-isolated-test")
+                else:
+                    recovery.append("--isolated-test-override")
                 if args.test_recovery_pg_sleep:
                     recovery += [
                         "--trial-test-pg-sleep-before-recovery",
                         str(args.test_recovery_pg_sleep),
                     ]
-                recovery_env = os.environ.copy()
-                recovery_env["LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN"] = recovery_token
                 active_process = subprocess.Popen(
                     recovery, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, start_new_session=True, pass_fds=lock_fds,
-                    env=recovery_env,
+                    env=child_environment(recovery_token),
                 )
                 active_token = recovery_token
+                deliver_pending_signal()
                 recovery_timed_out = False
                 try:
                     recovered_output, recovered_errors = active_process.communicate(
@@ -276,11 +443,11 @@ def run_trial(args) -> int:
                     )
                 state = json.loads(recovered_output)["state"]
                 if state not in {"recovered", "already_settled"}:
-                    if state != "no_reservation" or worker_exit == 0:
-                        raise RuntimeError(f"finite trial liability remains: {state}")
+                    raise RuntimeError(f"finite trial liability remains: {state}")
                 clear_quarantine_marker(marker)
                 print(json.dumps({
-                    "event": "isolated_finite_trial_supervised",
+                    "event": "finite_trial_supervised" if args.production
+                             else "isolated_finite_trial_supervised",
                     "policy_id": args.policy_id, "worker_exit": worker_exit,
                     "timed_out": timed_out, "recovery_state": state,
                     "interrupted_signal": interrupted_signal,
@@ -296,7 +463,9 @@ def run_trial(args) -> int:
                 # refuse it; inherited lock FDs cover a crashed parent while
                 # either child remains alive.
                 try:
-                    write_quarantine_marker(marker, args.policy_id, str(error)[:200])
+                    write_quarantine_marker(
+                        marker, args.policy_id, str(error)[:200], marker_tokens
+                    )
                 except Exception:
                     pass
                 if active_process is not None:
@@ -322,6 +491,9 @@ def main() -> int:
     parser.add_argument("--policy-id", required=True)
     parser.add_argument("--worker-lock-file", required=True)
     parser.add_argument("--database-heavy-lock-file", required=True)
+    parser.add_argument("--production", action="store_true")
+    parser.add_argument("--reconcile-quarantine", action="store_true")
+    parser.add_argument("--production-trial-isolated-test", action="store_true")
     parser.add_argument("--deadline-seconds", type=float, default=45)
     parser.add_argument("--grace-seconds", type=float, default=5)
     parser.add_argument("--drain-seconds", type=float, default=10)
@@ -331,6 +503,8 @@ def main() -> int:
     parser.add_argument("--test-force-uncertain-drain", action="store_true")
     parser.add_argument("--test-recovery-pg-sleep", type=float, default=0)
     args = parser.parse_args()
+    if args.production_trial_isolated_test and not args.production:
+        parser.error("production trial isolated test mode requires --production")
     if not (1 <= args.deadline_seconds <= 60 and 1 <= args.grace_seconds <= 10
             and 1 <= args.drain_seconds <= 30 and 1 <= args.recovery_seconds <= 30
             and 0 <= args.test_pg_sleep_after_admission <= 120
@@ -340,7 +514,7 @@ def main() -> int:
     if not Path(args.worker_path).is_file():
         parser.error("finite trial worker path is missing")
     try:
-        return run_trial(args)
+        return reconcile_quarantine(args) if args.reconcile_quarantine else run_trial(args)
     except Exception as error:
         print(f"finite trial supervisor stopped: {error}", file=sys.stderr)
         return 1

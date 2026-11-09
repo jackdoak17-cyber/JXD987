@@ -8,6 +8,8 @@ paid provider API. Production activation is separately gated by pipeline_state.
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import re
@@ -151,6 +153,66 @@ def isolated_test_database(conn) -> bool:
         cur.execute("select current_database(), inet_server_addr() is null")
         database_name, socket_only = cur.fetchone()
     return bool(socket_only and str(database_name).startswith("oddssearch_m3"))
+
+
+def validate_production_trial_connection(conn, args) -> None:
+    if args.isolated_test_override:
+        raise RuntimeError("production finite trial rejects the general test override")
+    if args.production_trial_isolated_test:
+        if not isolated_test_database(conn):
+            raise RuntimeError("production trial test path requires socket-only oddssearch_m3")
+    else:
+        expected_hash = os.environ.get("LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash) or not DATABASE_URL:
+            raise RuntimeError("production finite trial requires a pinned database URL hash")
+        if hashlib.sha256(DATABASE_URL.encode()).hexdigest() != expected_hash:
+            raise RuntimeError("production finite trial database URL does not match its pin")
+        with conn.cursor() as cur:
+            cur.execute("select current_database(), inet_server_addr() is not null, current_user")
+            database_name, network_connection, database_role = cur.fetchone()
+        if database_name != "postgres" or not network_connection or database_role != "postgres":
+            raise RuntimeError("production finite trial database identity is invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}", RELEASE_SHA):
+        raise RuntimeError("production finite trial requires a complete release SHA")
+    if os.environ.get("LEADERBOARD_FINITE_TRIAL_RELEASE_SHA") != RELEASE_SHA:
+        raise RuntimeError("production finite trial worker release differs from its reviewed pin")
+    if not re.fullmatch(
+        r"[0-9a-f]{16}", os.environ.get("LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN", "")
+    ):
+        raise RuntimeError("production finite trial requires a supervisor connection token")
+    if not args.production_trial_isolated_test and (
+        args.trial_test_pg_sleep_after_admission
+        or args.trial_test_pg_sleep_after_capture
+        or args.trial_test_pg_sleep_before_recovery
+    ):
+        raise RuntimeError("production finite trial rejects test sleep hooks")
+    supervisor_pid = os.environ.get("LEADERBOARD_FINITE_TRIAL_SUPERVISOR_PID", "")
+    if not supervisor_pid.isdecimal() or int(supervisor_pid) != os.getppid():
+        raise RuntimeError("production finite trial requires its live supervisor parent")
+    lock_specs = (
+        ("LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_FD", "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_PATH"),
+        ("LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_FD", "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_PATH"),
+    )
+    identities = []
+    for fd_key, path_key in lock_specs:
+        fd_text = os.environ.get(fd_key, "")
+        path = os.environ.get(path_key, "")
+        if not fd_text.isdecimal() or not path or not os.path.isabs(path):
+            raise RuntimeError("production finite trial inherited lock identity is incomplete")
+        fd = int(fd_text)
+        try:
+            held = os.fstat(fd)
+            named = os.stat(path, follow_symlinks=False)
+            if not stat.S_ISREG(held.st_mode) or not stat.S_ISREG(named.st_mode):
+                raise RuntimeError("production finite trial lock is not a regular file")
+            if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
+                raise RuntimeError("production finite trial lock descriptor changed")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (OSError, ValueError) as error:
+            raise RuntimeError("production finite trial does not hold both host locks") from error
+        identities.append((held.st_dev, held.st_ino))
+    if identities[0] == identities[1]:
+        raise RuntimeError("production finite trial host locks are not distinct")
 
 
 def validate_activation_override(conn, isolated_test_override: bool) -> bool:
@@ -888,14 +950,34 @@ def status(conn) -> dict[str, Any]:
         return cur.fetchone()["payload"]
 
 
-def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
-    """Exercise the committed one-use SQL fence in a disposable M3 database.
+TRIAL_STATEMENTS = {
+    "isolated": {
+        "begin": "select admission_proto.begin_bound_worker_trial_for_test(%s,%s,%s) as decision",
+        "guard": "select admission_proto.check_bound_worker_trial_for_test(%s,%s,%s,%s) as evidence",
+        "finish": "select admission_proto.finish_bound_worker_trial_with_counts_for_test(%s,%s,%s,%s,false,%s,%s,%s) as outcome",
+        "fail": "select admission_proto.finish_bound_worker_trial_with_counts_for_test(%s,%s,%s,%s,true,%s,%s,%s)",
+        "reservation": "select reservation_id, owner, worker_run_id, settled_at from admission_proto.reservations where policy_id=%s",
+        "recover": "select admission_proto.recover_bound_worker_trial_for_test(%s,%s,%s,%s) as outcome",
+    },
+    "production": {
+        "transition": "select leaderboard_trial_v1.create_finite_trial_transition(%s,%s,%s,%s) as transition",
+        "begin": "select leaderboard_trial_v1.begin_bound_worker_trial(%s,%s,%s) as decision",
+        "guard": "select leaderboard_trial_v1.check_bound_worker_trial(%s,%s,%s,%s) as evidence",
+        "finish": "select leaderboard_trial_v1.finish_bound_worker_trial_with_counts(%s,%s,%s,%s,false,%s,%s,%s) as outcome",
+        "fail": "select leaderboard_trial_v1.finish_bound_worker_trial_with_counts(%s,%s,%s,%s,true,%s,%s,%s)",
+        "reservation": "select reservation_id, owner, worker_run_id, settled_at from leaderboard_trial_v1.reservations where policy_id=%s",
+        "recover": "select leaderboard_trial_v1.recover_bound_worker_trial(%s,%s,%s,%s) as outcome",
+    },
+}
 
-    The SQL interface is still a test prototype. Keep this command unavailable
-    for production until a reviewed migration and host cancellation path exist.
-    """
-    if not validate_activation_override(conn, args.isolated_test_override):
+
+def run_finite_trial(conn, args, worker_id: str, *, production: bool) -> dict[str, Any]:
+    """Run the same bounded capture/settlement flow against a fixed SQL contract."""
+    if production:
+        validate_production_trial_connection(conn, args)
+    elif not validate_activation_override(conn, args.isolated_test_override):
         raise RuntimeError("trial-once requires the disposable database override")
+    statements = TRIAL_STATEMENTS["production" if production else "isolated"]
     if not args.trial_policy_id:
         raise RuntimeError("trial-once requires --trial-policy-id")
     if not (1 <= args.fixture_limit <= 10 and 1 <= args.capture_limit <= 10):
@@ -911,17 +993,29 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
     budget.apply_database_timeouts(conn)
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if production:
+                note = os.environ.get("LEADERBOARD_FINITE_TRIAL_OPERATOR_NOTE", "")
+                if not 1 <= len(note) <= 2000:
+                    raise RuntimeError("production finite trial operator note is missing or invalid")
+                cur.execute(
+                    statements["transition"],
+                    (args.trial_policy_id, RELEASE_SHA, 5368709120, note),
+                )
+                cur.fetchone()
             cur.execute(
-                "select admission_proto.begin_bound_worker_trial_for_test(%s,%s,%s) as decision",
+                statements["begin"],
                 (args.trial_policy_id, worker_id, RELEASE_SHA),
             )
             decision = cur.fetchone()["decision"]
+            if production and decision.get("admitted") is not True:
+                raise RuntimeError(f"finite trial admission refused: {decision.get('reason')}")
     if decision.get("admitted") is not True:
         raise RuntimeError(f"finite trial admission refused: {decision.get('reason')}")
     fence = int(decision["fence"])
     run_id = int(decision["run_id"])
     print(json.dumps({
-        "event": "isolated_finite_trial_admitted", "policy_id": args.trial_policy_id,
+        "event": "finite_trial_admitted" if production else "isolated_finite_trial_admitted",
+        "policy_id": args.trial_policy_id,
         "owner": worker_id, "fence": fence, "run_id": run_id,
     }, sort_keys=True), flush=True)
 
@@ -929,7 +1023,7 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
         with connection:
             with connection.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "select admission_proto.check_bound_worker_trial_for_test(%s,%s,%s,%s) as evidence",
+                    statements["guard"],
                     (args.trial_policy_id, worker_id, fence, run_id),
                 )
                 evidence = cur.fetchone()["evidence"]
@@ -974,7 +1068,7 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "select admission_proto.finish_bound_worker_trial_with_counts_for_test(%s,%s,%s,%s,false,%s,%s,%s) as outcome",
+                    statements["finish"],
                     (
                         args.trial_policy_id, worker_id, fence, run_id,
                         capture["claimed"], capture["acknowledged"], capture["failed"],
@@ -1002,7 +1096,7 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
             with conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        "select admission_proto.finish_bound_worker_trial_with_counts_for_test(%s,%s,%s,%s,true,%s,%s,%s)",
+                        statements["fail"],
                         (
                             args.trial_policy_id, worker_id, fence, run_id,
                             claimed, succeeded, failed,
@@ -1012,10 +1106,13 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
         raise
 
 
-def recover_isolated_finite_trial(conn, args) -> dict[str, Any]:
-    """Settle a stopped disposable trial while the caller holds the host lock."""
-    if not validate_activation_override(conn, args.isolated_test_override):
+def recover_finite_trial(conn, args, *, production: bool) -> dict[str, Any]:
+    """Settle a stopped trial while the supervisor holds both host locks."""
+    if production:
+        validate_production_trial_connection(conn, args)
+    elif not validate_activation_override(conn, args.isolated_test_override):
         raise RuntimeError("trial-recover requires the disposable database override")
+    statements = TRIAL_STATEMENTS["production" if production else "isolated"]
     if not args.trial_policy_id:
         raise RuntimeError("trial-recover requires --trial-policy-id")
     if not 0 <= args.trial_test_pg_sleep_before_recovery <= 120:
@@ -1030,8 +1127,7 @@ def recover_isolated_finite_trial(conn, args) -> dict[str, Any]:
     apply_preflight_timeouts(conn)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
-            "select reservation_id, owner, worker_run_id, settled_at "
-            "from admission_proto.reservations where policy_id=%s",
+            statements["reservation"],
             (args.trial_policy_id,),
         )
         reservations = cur.fetchall()
@@ -1047,7 +1143,7 @@ def recover_isolated_finite_trial(conn, args) -> dict[str, Any]:
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
-                "select admission_proto.recover_bound_worker_trial_for_test(%s,%s,%s,%s) as outcome",
+                statements["recover"],
                 (
                     args.trial_policy_id, reservation["owner"],
                     reservation["reservation_id"], reservation["worker_run_id"],
@@ -1059,10 +1155,22 @@ def recover_isolated_finite_trial(conn, args) -> dict[str, Any]:
     return {"state": "recovered", "policy_id": args.trial_policy_id, "outcome": outcome}
 
 
+def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
+    return run_finite_trial(conn, args, worker_id, production=False)
+
+
+def recover_isolated_finite_trial(conn, args) -> dict[str, Any]:
+    return recover_finite_trial(conn, args, production=False)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("run-once", "backfill", "backfill-all", "status", "trial-once", "trial-recover"))
+    parser.add_argument("command", choices=(
+        "run-once", "backfill", "backfill-all", "status",
+        "trial-once", "trial-recover", "finite-once", "finite-recover",
+    ))
     parser.add_argument("--isolated-test-override", action="store_true")
+    parser.add_argument("--production-trial-isolated-test", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
     parser.add_argument("--max-seconds", type=float, default=MAX_SECONDS_PER_RUN)
     parser.add_argument("--capture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
@@ -1076,6 +1184,8 @@ def main() -> int:
     parser.add_argument("--trial-test-pg-sleep-after-capture", type=float, default=0)
     parser.add_argument("--trial-test-pg-sleep-before-recovery", type=float, default=0)
     args = parser.parse_args()
+    if args.production_trial_isolated_test and args.command not in {"finite-once", "finite-recover"}:
+        parser.error("production trial isolated test flag requires finite-once/recover")
     if (args.league_id is None) != (args.season_id is None):
         parser.error("league-id and season-id must be supplied together")
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
@@ -1094,6 +1204,18 @@ def main() -> int:
         if args.command == "trial-recover":
             print(json.dumps(
                 recover_isolated_finite_trial(conn, args),
+                default=str, sort_keys=True,
+            ))
+            return 0
+        if args.command == "finite-once":
+            print(json.dumps(
+                run_finite_trial(conn, args, worker_id, production=True),
+                default=str, sort_keys=True,
+            ))
+            return 0
+        if args.command == "finite-recover":
+            print(json.dumps(
+                recover_finite_trial(conn, args, production=True),
                 default=str, sort_keys=True,
             ))
             return 0

@@ -414,6 +414,11 @@ run_with_database_heavy_lock() {
       log_info "[SKIPPED] database-heavy maintenance slot unavailable"
       exit 75
     fi
+    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine" \
+       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine" ]]; then
+      log_info "[SKIPPED] finite-trial quarantine blocks database-heavy maintenance"
+      exit 75
+    fi
     "$@"
   )
 }
@@ -446,6 +451,11 @@ run_with_database_heavy_lock_timed() {
     exec 8>"${lock_file}"
     if ! flock --wait "${wait_seconds}" 8; then
       log_info "[SKIPPED] database-heavy maintenance slot unavailable"
+      exit 75
+    fi
+    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine" \
+       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine" ]]; then
+      log_info "[SKIPPED] finite-trial quarantine blocks database-heavy maintenance"
       exit 75
     fi
     acquired_ms="$(epoch_milliseconds)"
