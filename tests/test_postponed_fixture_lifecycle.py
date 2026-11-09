@@ -36,6 +36,27 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = 19745046
 
 
+def connect_owned_postgres(url: str, data: Path):
+    """Prove the target is this suite's temporary cluster before any DDL."""
+    with pytest.MonkeyPatch.context() as clean_env:
+        for name in tuple(os.environ):
+            if name.startswith("PG") or name in {
+                "DATABASE_URL", "SUPABASE_DB_URL", "SUPABASE_DB_URL_SESSION",
+            }:
+                clean_env.delenv(name)
+        conn = psycopg2.connect(url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("select current_setting('data_directory'), inet_server_addr()")
+                data_dir, server_addr = cur.fetchone()
+            assert Path(data_dir).resolve() == data.resolve()
+            assert server_addr is None
+        except BaseException:
+            conn.close()
+            raise
+        return conn
+
+
 @pytest.mark.parametrize("status", ["POST", "POSTP", "POSTPONED"])
 def test_rolling_core_export_delivers_past_postponements_within_history_window(status):
     from datetime import timedelta
@@ -88,21 +109,14 @@ def postgres(tmp_path_factory):
     url = f"host={sockets} dbname=postgres user={getpass.getuser()} connect_timeout=5"
     try:
         with pytest.MonkeyPatch.context() as pg_env:
-            # libpq can honor inherited PGHOSTADDR/PGSERVICE even when a test
-            # supplies a socket URL. Verify the cluster before any schema reset.
+            # Keep every libpq connection in this module on the local socket.
             for name in tuple(os.environ):
-                if name.startswith("PG"):
+                if name.startswith("PG") or name in {
+                    "DATABASE_URL", "SUPABASE_DB_URL", "SUPABASE_DB_URL_SESSION",
+                }:
                     pg_env.delenv(name)
-            probe = psycopg2.connect(url)
-            try:
-                with probe.cursor() as cur:
-                    cur.execute("select current_setting('data_directory'), inet_server_addr()")
-                    data_dir, server_addr = cur.fetchone()
-                assert Path(data_dir).resolve() == data.resolve()
-                assert server_addr is None
-            finally:
-                probe.close()
-            yield url
+            connect_owned_postgres(url, data).close()
+            yield url, data
     finally:
         subprocess.run([pg_ctl, "-D", str(data), "-m", "immediate", "-w", "stop"],
                        check=True, capture_output=True)
@@ -121,9 +135,22 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", connect)
 
 
+def test_disposable_connection_ignores_poisoned_libpq_environment(postgres, monkeypatch):
+    url, data = postgres
+    monkeypatch.setenv("PGHOSTADDR", "127.0.0.1")
+    monkeypatch.setenv("PGPORT", "1")
+    monkeypatch.setenv("PGSERVICE", "missing_disposable_test_service")
+    monkeypatch.setenv("PGOPTIONS", "-c search_path=poisoned")
+    monkeypatch.setenv("SUPABASE_DB_URL", "postgres://127.0.0.1:1/poisoned")
+    connect_owned_postgres(url, data).close()
+    assert os.environ["PGHOSTADDR"] == "127.0.0.1"
+    assert os.environ["PGSERVICE"] == "missing_disposable_test_service"
+
+
 @pytest.fixture
 def replay(postgres, tmp_path):
-    conn = psycopg2.connect(postgres)
+    url, data = postgres
+    conn = connect_owned_postgres(url, data)
     with conn.cursor() as cur:
         cur.execute("drop schema public cascade; create schema public")
         cur.execute("""
@@ -195,7 +222,7 @@ def replay(postgres, tmp_path):
     client = Mock()
     client.fetch_collection.side_effect = AssertionError("Unconfigured provider mock")
     try:
-        yield Replay(conn, postgres, engine, client)
+        yield Replay(conn, url, engine, client)
     finally:
         conn.close()
         engine.dispose()
