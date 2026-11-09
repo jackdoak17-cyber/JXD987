@@ -117,6 +117,69 @@ def test_finite_trial_wrapper_accepts_pinned_archive_without_git(tmp_path):
     assert "trial database URL is required" in result.stderr
 
 
+def test_rolling_wrapper_passes_only_a_complete_reviewed_cohort_scope(tmp_path):
+    archive = tmp_path / "runtime-archive"
+    manifest = ROOT / "scripts/vps/runtime_manifest.sha1"
+    for line in manifest.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        relative = line.split(maxsplit=1)[1]
+        destination = archive / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+    archive_manifest = archive / "scripts/vps/runtime_manifest.sha1"
+    shutil.copy2(manifest, archive_manifest)
+    env_file = tmp_path / "rolling.env"
+    env_file.write_text(
+        "LEADERBOARD_ROLLING_POLICY_ID=local-policy\n"
+        "LEADERBOARD_ROLLING_EXPECTED_DSN_SHA256=" + "0" * 64 + "\n"
+        "LEADERBOARD_ROLLING_RELEASE_SHA=" + "1" * 40 + "\n"
+        "LEADERBOARD_ROLLING_RUNTIME_MANIFEST_SHA256="
+        + hashlib.sha256(archive_manifest.read_bytes()).hexdigest() + "\n"
+        "LEADERBOARD_ROLLING_FIXTURE_LIMIT=40\n"
+        "LEADERBOARD_ROLLING_CAPTURE_LIMIT=30\n"
+        "LEADERBOARD_ROLLING_COHORT_LIMIT=1\n"
+        "LEADERBOARD_ROLLING_JOB_LIMIT=10\n"
+        "LEADERBOARD_ROLLING_LEAGUE_ID=271\n"
+        "LEADERBOARD_ROLLING_SEASON_ID=27897\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text('#!/bin/sh\ncat "$FAKE_CRONTAB"\n')
+    (fake_bin / "ps").write_text('#!/bin/sh\ncat "$FAKE_PS"\n')
+    (fake_bin / "python3").write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_WORKER_ARGS"\n')
+    for name in ("crontab", "ps", "python3"):
+        (fake_bin / name).chmod(0o755)
+    schedule = tmp_path / "crontab"
+    schedule.write_text(
+        f"*/5 * * * * cd {archive} && {archive}/scripts/vps/run_stats_reconciliation.sh\n"
+        f"* * * * * cd {archive} && {archive}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+    )
+    processes = tmp_path / "ps"
+    processes.write_text("123 1 Mon Nov 9 08:00:00 2026 sleep 10\n")
+    worker_args = tmp_path / "worker-args"
+    environment = {
+        **os.environ,
+        "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+        "LEADERBOARD_SHADOW_ENV_FILE": str(env_file),
+        "FAKE_CRONTAB": str(schedule), "FAKE_PS": str(processes),
+        "FAKE_WORKER_ARGS": str(worker_args),
+    }
+    wrapper = ["bash", str(archive / "scripts/vps/run_leaderboard_rolling_worker.sh")]
+    accepted = subprocess.run(wrapper, env=environment, capture_output=True, text=True, timeout=15)
+    assert accepted.returncode == 0, accepted.stderr
+    args = worker_args.read_text().splitlines()
+    assert args[args.index("--league-id") + 1] == "271"
+    assert args[args.index("--season-id") + 1] == "27897"
+
+    worker_args.unlink()
+    env_file.write_text(env_file.read_text().replace("LEADERBOARD_ROLLING_SEASON_ID=27897\n", ""))
+    refused = subprocess.run(wrapper, env=environment, capture_output=True, text=True, timeout=15)
+    assert refused.returncode != 0
+    assert "cohort scope requires positive league and season IDs" in refused.stderr
+    assert not worker_args.exists()
+
+
 def test_finite_trial_host_gate_rejects_old_stats_release(tmp_path):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -564,6 +627,27 @@ def test_generation_supplied_guard_stops_before_job(monkeypatch):
     assert events == ["supplied_guard", "generation", "supplied_guard"]
 
 
+def test_rolling_generation_only_selects_the_capture_cohort(monkeypatch):
+    selected = []
+    monkeypatch.setattr(
+        worker_module, "pending_cohorts",
+        lambda _conn, limit, league_id, season_id: (
+            selected.append((limit, league_id, season_id)) or [(271, 27897)]
+        ),
+    )
+    monkeypatch.setattr(worker_module, "ensure_generation", lambda *_a, **_kw: 73)
+    monkeypatch.setattr(worker_module, "process_generation_job", lambda *_a: True)
+    monkeypatch.setattr(worker_module, "finish_generation", lambda *_a: True)
+    result = worker_module.process_generations(
+        FakeConnection(FakeCursor()), "worker", 1, 1,
+        RunBudget.create(10, MAX_SECONDS_PER_RUN), False,
+        guard_check=lambda *_a: {"ok": True},
+        max_materialized_jobs=1, league_id=271, season_id=27897,
+    )
+    assert selected == [(1, 271, 27897)]
+    assert result == {"cohorts": 1, "jobs": 1, "published": 1}
+
+
 def test_generation_progress_survives_a_prepublication_stop(monkeypatch):
     events = []
     progress = {"cohorts": 0, "jobs": 0, "published": 0}
@@ -808,6 +892,17 @@ def test_pending_cohorts_defer_both_recorded_and_current_dirty_cohorts():
         "(current_fixture.league_id, current_fixture.season_id) = "
         "(cursor.league_id, cursor.season_id)"
     ) in query
+
+
+def test_pending_cohorts_can_select_one_exact_target_without_changing_dirty_guard():
+    cursor = CohortCursor()
+    assert pending_cohorts(FakeConnection(cursor), 1, 271, 27897) == [(271, 27897)]
+    query, params = cursor.executed[0]
+    assert params == (271, 27897, 1)
+    assert "(cursor.league_id,cursor.season_id)=(%s,%s)" in query
+    assert "fixture_capture_queue queue" in query
+    with pytest.raises(ValueError, match="league and season together"):
+        pending_cohorts(FakeConnection(cursor), 1, 271, None)
 
 
 def test_worker_and_capture_hooks_are_pinned_in_the_vps_runtime_manifest():

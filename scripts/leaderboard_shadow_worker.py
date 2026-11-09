@@ -633,15 +633,25 @@ def process_capture_queue(
     return result
 
 
-def pending_cohorts(conn, limit: int) -> list[tuple[int, int]]:
+def pending_cohorts(
+    conn, limit: int, league_id: int | None = None, season_id: int | None = None,
+) -> list[tuple[int, int]]:
+    if (league_id is None) != (season_id is None):
+        raise ValueError("cohort scope requires league and season together")
+    scope_clause = (
+        "and (cursor.league_id,cursor.season_id)=(%s,%s)"
+        if league_id is not None else ""
+    )
+    params = (league_id, season_id, limit) if league_id is not None else (limit,)
     with conn.cursor() as cur:
         cur.execute(
-            """
+            f"""
             select cursor.league_id, cursor.season_id
             from leaderboard_shadow_v1.cohort_change_cursors cursor
             left join leaderboard_shadow_v1.cohort_publications publication
               using (league_id, season_id)
             where cursor.committed_version > coalesce(publication.published_cursor, 0)
+              {scope_clause}
               -- A queued fixture may invalidate an older journal event after a
               -- snapshot-contract upgrade or a cohort transfer.  Defer both
               -- its recorded and current cohorts until capture acknowledges
@@ -662,7 +672,7 @@ def pending_cohorts(conn, limit: int) -> list[tuple[int, int]]:
             order by cursor.updated_at, cursor.league_id, cursor.season_id
             limit %s
             """,
-            (limit,),
+            params,
         )
         return [(int(row[0]), int(row[1])) for row in cur.fetchall()]
 
@@ -841,19 +851,26 @@ def process_generations(
     guard_check: Callable[[Any, bool], dict[str, Any]] | None = None,
     progress: dict[str, int] | None = None,
     max_materialized_jobs: int | None = None,
+    league_id: int | None = None, season_id: int | None = None,
 ) -> dict[str, int]:
+    if (league_id is None) != (season_id is None):
+        raise ValueError("generation scope requires league and season together")
     result = progress if progress is not None else {"cohorts": 0, "jobs": 0, "published": 0}
     guard_check = guard_check or enforce_resource_guard
-    for league_id, season_id in pending_cohorts(conn, cohort_limit):
+    cohorts = (
+        pending_cohorts(conn, cohort_limit, league_id, season_id)
+        if league_id is not None else pending_cohorts(conn, cohort_limit)
+    )
+    for cohort_league_id, cohort_season_id in cohorts:
         if not budget.available():
             break
         budget.apply_database_timeouts(conn)
         guard_check(conn, require_external)
         generation_id = (
-            ensure_generation(conn, league_id, season_id)
+            ensure_generation(conn, cohort_league_id, cohort_season_id)
             if max_materialized_jobs is None else
             ensure_generation(
-                conn, league_id, season_id,
+                conn, cohort_league_id, cohort_season_id,
                 max_materialized_jobs=min(
                     max_materialized_jobs,
                     budget.fixture_limit - budget.processed,
@@ -1263,6 +1280,10 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
             and 0 <= args.job_limit <= args.fixture_limit
             and (args.capture_limit or args.job_limit)):
         raise RuntimeError("rolling worker capture, cohort or job bound is invalid")
+    if ((args.league_id is None) != (args.season_id is None)
+            or (args.league_id is not None
+                and (args.league_id <= 0 or args.season_id <= 0))):
+        raise RuntimeError("rolling cohort scope requires positive league and season together")
     if args.production_trial_isolated_test and not isolated_test_database(conn):
         raise RuntimeError("rolling test path requires socket-only oddssearch_m3")
     budget = RunBudget.create(args.fixture_limit, args.max_seconds)
@@ -1335,6 +1356,7 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
                 conn, worker_id, args.cohort_limit, remaining_jobs,
                 budget, False, guard_check=check_rolling_guard,
                 progress=generations, max_materialized_jobs=remaining_jobs,
+                league_id=args.league_id, season_id=args.season_id,
             )
         check_rolling_guard(conn, False)
         apply_recovery_timeouts(conn)
@@ -1355,6 +1377,10 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
             "policy_id": args.trial_policy_id, "owner": worker_id,
             "fence": fence, "run_id": run_id, "capture": capture,
             "generations": generations, "eligibility_count": eligibility_count,
+            "cohort_scope": (
+                {"league_id": args.league_id, "season_id": args.season_id}
+                if args.league_id is not None else None
+            ),
             "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
             "temp_file_limit_enforced": temp_file_limit_enforced,
             "outcome": outcome,

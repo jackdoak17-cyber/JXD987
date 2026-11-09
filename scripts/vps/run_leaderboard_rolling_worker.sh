@@ -49,6 +49,15 @@ if [[ ! "$LEADERBOARD_ROLLING_POLICY_ID" =~ ^[a-z0-9-]{8,80}$ \
   echo "leaderboard rolling policy, release or numeric pin is invalid" >&2
   exit 1
 fi
+scope_args=()
+if [[ -n "${LEADERBOARD_ROLLING_LEAGUE_ID:-}" || -n "${LEADERBOARD_ROLLING_SEASON_ID:-}" ]]; then
+  if [[ ! "${LEADERBOARD_ROLLING_LEAGUE_ID:-}" =~ ^[1-9][0-9]{0,8}$ \
+     || ! "${LEADERBOARD_ROLLING_SEASON_ID:-}" =~ ^[1-9][0-9]{0,8}$ ]]; then
+    echo "leaderboard rolling cohort scope requires positive league and season IDs" >&2
+    exit 1
+  fi
+  scope_args=(--league-id "$LEADERBOARD_ROLLING_LEAGUE_ID" --season-id "$LEADERBOARD_ROLLING_SEASON_ID")
+fi
 actual_manifest_sha256="$(shasum -a 256 "$ROOT/scripts/vps/runtime_manifest.sha1" | awk '{print $1}')"
 if [[ "$actual_manifest_sha256" != "$LEADERBOARD_ROLLING_RUNTIME_MANIFEST_SHA256" ]]; then
   echo "leaderboard rolling manifest differs from reviewed release" >&2
@@ -76,5 +85,6 @@ exec python3 "$ROOT/scripts/leaderboard_finite_trial_supervisor.py" \
   --capture-limit "$LEADERBOARD_ROLLING_CAPTURE_LIMIT" \
   --cohort-limit "$LEADERBOARD_ROLLING_COHORT_LIMIT" \
   --job-limit "$LEADERBOARD_ROLLING_JOB_LIMIT" \
+  "${scope_args[@]}" \
   --max-seconds 30 --deadline-seconds 45 --grace-seconds 5 \
   --drain-seconds 10 --recovery-seconds 15

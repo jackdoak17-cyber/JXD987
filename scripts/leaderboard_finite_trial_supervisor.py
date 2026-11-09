@@ -461,6 +461,11 @@ def run_trial(args) -> int:
                 "--job-limit", str(args.job_limit if rolling else 0),
                 "--max-seconds", str(args.max_seconds if rolling else 30),
             ]
+            if rolling and getattr(args, "league_id", None) is not None:
+                worker += [
+                    "--league-id", str(args.league_id),
+                    "--season-id", str(args.season_id),
+                ]
             if args.production:
                 if args.production_trial_isolated_test:
                     worker.append("--production-trial-isolated-test")
@@ -620,6 +625,8 @@ def main() -> int:
     parser.add_argument("--capture-limit", type=int, default=10)
     parser.add_argument("--cohort-limit", type=int, default=0)
     parser.add_argument("--job-limit", type=int, default=0)
+    parser.add_argument("--league-id", type=int)
+    parser.add_argument("--season-id", type=int)
     parser.add_argument("--max-seconds", type=float, default=30)
     parser.add_argument("--reconcile-quarantine", action="store_true")
     parser.add_argument("--production-trial-isolated-test", action="store_true")
@@ -645,6 +652,12 @@ def main() -> int:
         parser.error("rolling worker mode or limits are invalid")
     if args.follow_rolling_successors and not args.rolling:
         parser.error("successor selection requires rolling mode")
+    if (args.league_id is None) != (args.season_id is None):
+        parser.error("rolling cohort scope requires league and season together")
+    if args.league_id is not None and (
+        not args.rolling or args.league_id <= 0 or args.season_id <= 0
+    ):
+        parser.error("rolling cohort scope requires positive IDs and rolling mode")
     if not (1 <= args.deadline_seconds <= 60 and 1 <= args.grace_seconds <= 10
             and 1 <= args.drain_seconds <= 30 and 1 <= args.recovery_seconds <= 30
             and 0 <= args.test_pg_sleep_after_admission <= 120
