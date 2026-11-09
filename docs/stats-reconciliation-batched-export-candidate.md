@@ -167,7 +167,9 @@ Mixed partial failure and a one-first-attempt fallback have focused tests.
 The combined suite passed **160**, with one existing skip and12 deprecation
 warnings. Its regenerated49-entry manifest SHA-256 is
 `b5ff7da6e23d0eb546f1087574689fa09fb6edc731bc459c8001e2006f60a4bc`
-and release ID `b5ff7da6e23d`. It still needs a genuine live source trial
+and release ID `3df6bb130cb9` (manifest SHA-1 prefix). The immutable corrected
+archive was staged and verified at 19:51 UTC, but is not scheduled. It still
+needs a genuine live source trial
 under the installed lease, target parity check, full-job timing comparison,
 and normal old-source run verification before any renewed cutover can be
 called successful. No added capacity, Spend Cap change or paid service was

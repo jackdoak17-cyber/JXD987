@@ -98,7 +98,9 @@ the source report. The mixed-success/failure and one-first-attempt cases now
 have focused tests; the combined suite passed 160 with one existing skip after
 regenerating the 49-entry runtime manifest. Its manifest SHA-256 is
 `b5ff7da6e23d0eb546f1087574689fa09fb6edc731bc459c8001e2006f60a4bc`
-and release ID will be `b5ff7da6e23d` if the runtime bytes remain unchanged.
+and release ID is `3df6bb130cb9` (the manifest SHA-1 prefix). The immutable
+archive `/opt/odds-sync/JXD987-stats-batch-mixed-24d0a94-release` was staged
+and its 49-entry manifest and odds-delivery startup verified at 19:51 UTC.
 This candidate is **not active** and has not had a live performance trial.
 Another immutable archive and guarded source-only cutover require a fresh
 preflight, exact test/manifest readback and old-source result. No old sample
