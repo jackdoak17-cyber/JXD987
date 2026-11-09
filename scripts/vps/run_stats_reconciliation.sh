@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"
+require_default_trial_lock_paths_or_exit
 verify_runtime_manifest_or_exit "$0"
 require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
@@ -15,6 +16,7 @@ if [[ -f "${REPO_ROOT}/.env" ]]; then
   source "${REPO_ROOT}/.env"
   set +a
 fi
+require_default_trial_lock_paths_or_exit
 
 export PYTHONPATH="${REPO_ROOT}"
 export REPO_ROOT
