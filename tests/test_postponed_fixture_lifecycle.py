@@ -6,7 +6,9 @@ suite. No supplied database URL or project credentials are used.
 from __future__ import annotations
 
 import copy
+import contextlib
 import getpass
+import io
 import json
 import shutil
 import socket
@@ -15,6 +17,7 @@ import subprocess
 import sys
 import threading
 import tempfile
+import time
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -334,6 +337,138 @@ def test_batched_export_keeps_per_fixture_snapshot_lineage_in_disposable_postgre
             "select distinct provider_snapshot_id from fixture_player_statistics where fixture_id=%s",
             (data["id"],),
         ) == [(snapshots[data["id"]],)]
+
+    # A positive but wrong fixture snapshot must fail only that fixture. The
+    # successful sibling remains committed and the failed one can be retried
+    # through the existing single-fixture path.
+    replay.sql("""truncate fixture_players,fixture_statistics,
+        fixture_player_statistics,fixture_detail_delivery_status,projection_replays,players""")
+    mapping.write_text(json.dumps({
+        str(FIXTURE): snapshots[FIXTURE],
+        str(FIXTURE + 1): snapshots[FIXTURE],
+    }))
+    with pytest.raises(SystemExit) as failed:
+        exporter.main()
+    assert failed.value.code == 1
+    partial = json.loads(report.read_text())
+    assert partial["atomic_published_fixture_ids"] == [FIXTURE]
+    assert [item["fixture_id"] for item in partial["atomic_failed_fixtures"]] == [FIXTURE + 1]
+    assert replay.sql("select distinct fixture_id from fixture_player_statistics") == [(FIXTURE,)]
+
+    monkeypatch.setattr(sys, "argv", [
+        "export_to_supabase.py", "--strict", "--leagues", "8",
+        "--fixture-ids", str(FIXTURE + 1), "--keep-all-seasons",
+        "--protect-empty-detail", "--require-detail", "--atomic-fixture-detail",
+        "--skip-odds-snapshots", "--skip-odds-outcomes", "--skip-prune",
+        "--provider-snapshot-id", str(snapshots[FIXTURE + 1]),
+        "--report-json", str(tmp_path / "retry-report.json"),
+    ])
+    exporter.main()
+    for data in fixtures:
+        with replay.engine.connect() as source:
+            raw = source.connection.driver_connection
+            assert not delivery.compare_snapshots(
+                delivery.source_snapshot(raw, data["id"]),
+                delivery.target_snapshot(replay.conn, data["id"]),
+            )
+
+
+def test_twenty_fixture_old_vs_batch_export_parity_and_write_cost(replay, tmp_path, monkeypatch):
+    """Compare both real atomic paths on one disposable source and target."""
+    from scripts import export_to_supabase as exporter
+
+    fixture_ids = list(range(FIXTURE + 100, FIXTURE + 120))
+    snapshots = {}
+    for fixture_id in fixture_ids:
+        data = payload(fixture_id=fixture_id)
+        replay.discover(data)
+        assessment = delivery.assess_provider_payload(data)
+        snapshots[fixture_id] = delivery.persist_provider_snapshot(
+            replay.url, fixture_id, 8, 10, data, assessment,
+            delivery.provider_payload_hash(data), delivery.normalized_provider_hash(data),
+        )
+        delivery.store_provider_detail(replay.engine, replay.client, fixture_id, data, assessment)
+
+    monkeypatch.setattr(exporter, "DB_PATH", str(replay.engine.url.database))
+    monkeypatch.setattr(exporter, "SUPABASE_DB_URL", replay.url)
+    monkeypatch.setattr(exporter, "require_env", lambda *_: None)
+    monkeypatch.setattr(exporter, "choose_keep_seasons", lambda *_args, **_kwargs: {10})
+    monkeypatch.setattr(exporter, "fetch_seasons", lambda *_: [])
+    monkeypatch.setattr(exporter, "fetch_rounds", lambda *_: [])
+    monkeypatch.setattr(exporter, "fetch_sidelined_players", lambda *_: [])
+    monkeypatch.setattr(exporter, "fetch_player_team_history", lambda *_: [])
+    monkeypatch.setattr(exporter, "filter_rows_for_remote_schema", lambda _table, rows: rows)
+    calls = {"nonempty_parent_calls": 0, "fixture_players_source": 0}
+
+    def count_parent(_table, rows, *_args):
+        if rows:
+            calls["nonempty_parent_calls"] += 1
+        return len(rows), 0
+
+    original_fetch_players = exporter.fetch_fixture_players
+
+    def count_source_players(*args, **kwargs):
+        calls["fixture_players_source"] += 1
+        return original_fetch_players(*args, **kwargs)
+
+    monkeypatch.setattr(exporter, "upsert_table", count_parent)
+    monkeypatch.setattr(exporter, "fetch_fixture_players", count_source_players)
+
+    def run(mode):
+        calls.update(nonempty_parent_calls=0, fixture_players_source=0)
+        start_lsn = replay.sql("select pg_current_wal_lsn()")[0][0]
+        started = time.perf_counter()
+        if mode == "old":
+            for fixture_id in fixture_ids:
+                monkeypatch.setattr(sys, "argv", [
+                    "export_to_supabase.py", "--strict", "--leagues", "8",
+                    "--fixture-ids", str(fixture_id), "--keep-all-seasons",
+                    "--protect-empty-detail", "--require-detail", "--atomic-fixture-detail",
+                    "--skip-odds-snapshots", "--skip-odds-outcomes", "--skip-prune",
+                    "--provider-snapshot-id", str(snapshots[fixture_id]),
+                    "--report-json", str(tmp_path / f"old-{fixture_id}.json"),
+                ])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    exporter.main()
+        else:
+            mapping = tmp_path / "snapshot-ids.json"
+            mapping.write_text(json.dumps({str(key): value for key, value in snapshots.items()}))
+            report = tmp_path / "batch-report.json"
+            monkeypatch.setattr(sys, "argv", [
+                "export_to_supabase.py", "--strict", "--leagues", "8",
+                "--fixture-ids", ",".join(map(str, fixture_ids)), "--keep-all-seasons",
+                "--protect-empty-detail", "--require-detail", "--atomic-fixture-detail",
+                "--skip-odds-snapshots", "--skip-odds-outcomes", "--skip-prune",
+                "--provider-snapshot-ids-json", str(mapping), "--report-json", str(report),
+            ])
+            with contextlib.redirect_stdout(io.StringIO()):
+                exporter.main()
+            outcome = json.loads(report.read_text())
+            assert outcome["atomic_published_fixture_ids"] == fixture_ids
+            assert outcome["atomic_failed_fixtures"] == []
+        elapsed = time.perf_counter() - started
+        wal_bytes = replay.sql("select pg_wal_lsn_diff(pg_current_wal_lsn(),%s)", (start_lsn,))[0][0]
+        rows = replay.sql("""select fixture_id,player_id,type_id,value,provider_snapshot_id
+            from fixture_player_statistics order by fixture_id,player_id,type_id""")
+        lineage = replay.sql("""select fixture_id,accepted_snapshot_id
+            from fixture_detail_delivery_status where fixture_id between %s and %s
+            order by fixture_id""", (fixture_ids[0], fixture_ids[-1]))
+        metrics = {"mode": mode, "seconds": round(elapsed, 3),
+                   "wal_bytes": int(wal_bytes), **calls, "detail_rows": len(rows)}
+        print("EXPORT_COMPARE " + json.dumps(metrics, sort_keys=True))
+        return rows, lineage, metrics
+
+    old_rows, old_lineage, old = run("old")
+    replay.sql("""truncate fixture_players,fixture_statistics,
+        fixture_player_statistics,fixture_detail_delivery_status,projection_replays,players""")
+    new_rows, new_lineage, batched = run("batch")
+    assert new_rows == old_rows
+    assert new_lineage == old_lineage
+    assert {row[0] for row in new_rows} == set(fixture_ids)
+    assert old["fixture_players_source"] == len(fixture_ids)
+    assert batched["fixture_players_source"] == 1
+    assert old["nonempty_parent_calls"] == 2 * len(fixture_ids)
+    assert batched["nonempty_parent_calls"] == 2
 
 
 def test_discovery_alone_quarantines_postponement_until_complete_recovery(replay):
