@@ -233,6 +233,28 @@ def test_capture_resource_guard_is_checked_in_bounded_groups(monkeypatch):
     assert len(guard_calls) == 3
 
 
+def test_failed_capture_marks_interval_before_claim_cleanup(monkeypatch):
+    claims = iter([DirtyClaim(1001, 1, "worker:1", 1), None])
+    calls = []
+    monkeypatch.setattr(worker_module, "claim_dirty", lambda *_args, **_kwargs: next(claims))
+    monkeypatch.setattr(
+        worker_module, "process_dirty_claim",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("failed write")),
+    )
+    monkeypatch.setattr(worker_module, "apply_recovery_timeouts", lambda *_args: calls.append("rollback"))
+    monkeypatch.setattr(worker_module, "mark_failed_statement_interval", lambda *_args: calls.append("mark"))
+    monkeypatch.setattr(worker_module, "fail_dirty_claim", lambda *_args: calls.append("cleanup"))
+    monkeypatch.setattr(worker_module, "enforce_resource_guard", lambda *_args: {"ok": True})
+
+    result = process_capture_queue(
+        FakeConnection(FakeCursor()), "worker", 2,
+        RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN), True,
+    )
+
+    assert result["failed"] == 1
+    assert calls == ["rollback", "mark", "cleanup"]
+
+
 def test_worker_finish_is_included_in_final_resource_evidence(monkeypatch):
     calls = []
     monkeypatch.setattr(
@@ -290,6 +312,7 @@ def test_worker_run_opens_and_closes_the_durable_resource_window():
 
     statements = [query for query, _ in cursor.executed]
     assert any("begin_worker_resource_window" in query for query in statements)
+    assert "set_config('oddssearch.worker_failed_statement','false',false)" in statements[0]
     assert any("set_config('oddssearch.worker_run_id'" in query for query in statements)
     assert any("checkpoint_worker_resource_window" in query for query in statements)
     assert any("set_config('oddssearch.worker_run_id',''" in query for query in statements)
@@ -358,6 +381,25 @@ def test_successful_staging_does_not_create_a_duplicate_source_event():
 
     queries = [query for query, _params in cursor.executed]
     assert not any("capture_fixture_source_changes" in query for query in queries)
+
+
+def test_failed_generation_marks_interval_before_failure_record(monkeypatch):
+    class FailedStageCursor(GenerationJobCursor):
+        def execute(self, query, params=None):
+            if "stage_fixture_result" in query:
+                raise RuntimeError("failed write")
+            super().execute(query, params)
+
+    calls = []
+    monkeypatch.setattr(worker_module, "apply_recovery_timeouts", lambda *_args: calls.append("rollback"))
+    monkeypatch.setattr(worker_module, "mark_failed_statement_interval", lambda *_args: calls.append("mark"))
+    cursor = FailedStageCursor(staged=True, snapshot_hash="stale-hash")
+
+    with pytest.raises(RuntimeError, match="failed write"):
+        process_generation_job(GenerationJobConnection(cursor), 1000023, "worker")
+
+    assert calls == ["rollback", "mark"]
+    assert any("fail_generation_job" in query for query, _ in cursor.executed)
 
 
 def test_failed_active_generation_remains_fatal():
