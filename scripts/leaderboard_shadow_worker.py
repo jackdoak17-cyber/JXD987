@@ -16,7 +16,7 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -477,8 +477,10 @@ def process_capture_queue(
     require_external: bool,
     league_id: int | None = None,
     season_id: int | None = None,
+    guard_check: Callable[[Any, bool], dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     result = {"claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0}
+    guard_check = guard_check or enforce_resource_guard
     for _ in range(min(limit, budget.fixture_limit - budget.processed)):
         if not budget.available():
             break
@@ -486,7 +488,7 @@ def process_capture_queue(
             result["claimed"] % RESOURCE_GUARD_FIXTURE_INTERVAL == 0
         ):
             budget.apply_database_timeouts(conn)
-            enforce_resource_guard(conn, require_external)
+            guard_check(conn, require_external)
         claim = claim_dirty(
             conn,
             worker_id,
@@ -513,7 +515,7 @@ def process_capture_queue(
         and budget.available()
     ):
         budget.apply_database_timeouts(conn)
-        enforce_resource_guard(conn, require_external)
+        guard_check(conn, require_external)
     return result
 
 
@@ -837,9 +839,153 @@ def status(conn) -> dict[str, Any]:
         return cur.fetchone()["payload"]
 
 
+def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
+    """Exercise the committed one-use SQL fence in a disposable M3 database.
+
+    The SQL interface is still a test prototype. Keep this command unavailable
+    for production until a reviewed migration and host cancellation path exist.
+    """
+    if not validate_activation_override(conn, args.isolated_test_override):
+        raise RuntimeError("trial-once requires the disposable database override")
+    if not args.trial_policy_id:
+        raise RuntimeError("trial-once requires --trial-policy-id")
+    if not (1 <= args.fixture_limit <= 10 and 1 <= args.capture_limit <= 10):
+        raise RuntimeError("trial-once is limited to ten fixture captures")
+    if args.cohort_limit != 0 or args.job_limit != 0:
+        raise RuntimeError("trial-once cannot generate or publish leaderboards")
+    budget = RunBudget.create(args.fixture_limit, args.max_seconds)
+    apply_preflight_timeouts(conn)
+    temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
+    budget.apply_database_timeouts(conn)
+    with conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "select admission_proto.begin_bound_worker_trial_for_test(%s,%s,%s) as decision",
+                (args.trial_policy_id, worker_id, RELEASE_SHA),
+            )
+            decision = cur.fetchone()["decision"]
+    if decision.get("admitted") is not True:
+        raise RuntimeError(f"finite trial admission refused: {decision.get('reason')}")
+    fence = int(decision["fence"])
+    run_id = int(decision["run_id"])
+    print(json.dumps({
+        "event": "isolated_finite_trial_admitted", "policy_id": args.trial_policy_id,
+        "owner": worker_id, "fence": fence, "run_id": run_id,
+    }, sort_keys=True), flush=True)
+
+    def check_trial_guard(connection, _require_external: bool) -> dict[str, Any]:
+        with connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "select admission_proto.check_bound_worker_trial_for_test(%s,%s,%s,%s) as evidence",
+                    (args.trial_policy_id, worker_id, fence, run_id),
+                )
+                evidence = cur.fetchone()["evidence"]
+        if evidence.get("ok") is not True:
+            raise RuntimeError(f"finite trial guard stopped work: {evidence.get('reason')}")
+        return evidence
+
+    closed = False
+    capture: dict[str, int] | None = None
+    try:
+        check_trial_guard(conn, False)
+        budget.apply_database_timeouts(conn)
+        eligibility_count = refresh_eligibility_if_due(conn)
+        check_trial_guard(conn, False)
+        budget.apply_database_timeouts(conn)
+        capture = process_capture_queue(
+            conn, worker_id, args.capture_limit, budget, False,
+            league_id=args.league_id, season_id=args.season_id,
+            guard_check=check_trial_guard,
+        )
+        # A full ten-claim budget skips process_capture_queue's final periodic
+        # check. Always checkpoint before closing or claiming success.
+        check_trial_guard(conn, False)
+        if capture["failed"]:
+            raise RuntimeError("finite trial capture failed")
+        apply_recovery_timeouts(conn)
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "select admission_proto.finish_bound_worker_trial_with_counts_for_test(%s,%s,%s,%s,false,%s,%s,%s) as outcome",
+                    (
+                        args.trial_policy_id, worker_id, fence, run_id,
+                        capture["claimed"], capture["acknowledged"], capture["failed"],
+                    ),
+                )
+                outcome = cur.fetchone()["outcome"]
+        closed = True
+        if outcome.get("resolution_state") != "settled" or outcome.get("settlement", {}).get("settled") is not True:
+            raise RuntimeError("finite trial closed with unresolved liability")
+        return {
+            "policy_id": args.trial_policy_id, "owner": worker_id,
+            "fence": fence, "run_id": run_id,
+            "capture": capture, "eligibility_count": eligibility_count,
+            "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
+            "temp_file_limit_enforced": temp_file_limit_enforced,
+            "outcome": outcome,
+        }
+    except Exception:
+        if not closed:
+            apply_recovery_timeouts(conn)
+            mark_failed_statement_interval(conn)
+            claimed = capture["claimed"] if capture is not None else budget.processed
+            succeeded = capture["acknowledged"] if capture is not None else 0
+            failed = max(1, capture["failed"]) if capture is not None else 1
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "select admission_proto.finish_bound_worker_trial_with_counts_for_test(%s,%s,%s,%s,true,%s,%s,%s)",
+                        (
+                            args.trial_policy_id, worker_id, fence, run_id,
+                            claimed, succeeded, failed,
+                        ),
+                    )
+                    cur.fetchone()
+        raise
+
+
+def recover_isolated_finite_trial(conn, args) -> dict[str, Any]:
+    """Settle a stopped disposable trial while the caller holds the host lock."""
+    if not validate_activation_override(conn, args.isolated_test_override):
+        raise RuntimeError("trial-recover requires the disposable database override")
+    if not args.trial_policy_id:
+        raise RuntimeError("trial-recover requires --trial-policy-id")
+    apply_preflight_timeouts(conn)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "select reservation_id, owner, worker_run_id, settled_at "
+            "from admission_proto.reservations where policy_id=%s",
+            (args.trial_policy_id,),
+        )
+        reservations = cur.fetchall()
+    if len(reservations) > 1:
+        raise RuntimeError("finite trial has multiple reservations")
+    if not reservations:
+        return {"state": "no_reservation", "policy_id": args.trial_policy_id}
+    reservation = reservations[0]
+    if reservation["settled_at"] is not None:
+        return {"state": "already_settled", "policy_id": args.trial_policy_id}
+    if reservation["worker_run_id"] is None:
+        raise RuntimeError("finite trial has an unbound reservation")
+    with conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "select admission_proto.recover_bound_worker_trial_for_test(%s,%s,%s,%s) as outcome",
+                (
+                    args.trial_policy_id, reservation["owner"],
+                    reservation["reservation_id"], reservation["worker_run_id"],
+                ),
+            )
+            outcome = cur.fetchone()["outcome"]
+    if outcome.get("resolution_state") != "settled" or outcome.get("settlement", {}).get("settled") is not True:
+        raise RuntimeError(f"finite trial recovery remains unresolved: {outcome.get('reason') or outcome.get('resolution_state')}")
+    return {"state": "recovered", "policy_id": args.trial_policy_id, "outcome": outcome}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("run-once", "backfill", "backfill-all", "status"))
+    parser.add_argument("command", choices=("run-once", "backfill", "backfill-all", "status", "trial-once", "trial-recover"))
     parser.add_argument("--isolated-test-override", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
     parser.add_argument("--max-seconds", type=float, default=MAX_SECONDS_PER_RUN)
@@ -849,6 +995,7 @@ def main() -> int:
     parser.add_argument("--league-id", type=int)
     parser.add_argument("--season-id", type=int)
     parser.add_argument("--batch-size", type=int, default=250)
+    parser.add_argument("--trial-policy-id")
     args = parser.parse_args()
     if (args.league_id is None) != (args.season_id is None):
         parser.error("league-id and season-id must be supplied together")
@@ -858,6 +1005,18 @@ def main() -> int:
     try:
         if args.command == "status":
             print(json.dumps(status(conn), default=str, sort_keys=True))
+            return 0
+        if args.command == "trial-once":
+            print(json.dumps(
+                run_isolated_finite_trial(conn, args, worker_id),
+                default=str, sort_keys=True,
+            ))
+            return 0
+        if args.command == "trial-recover":
+            print(json.dumps(
+                recover_isolated_finite_trial(conn, args),
+                default=str, sort_keys=True,
+            ))
             return 0
         budget = RunBudget.create(args.fixture_limit, args.max_seconds)
         allow_disabled = validate_activation_override(conn, args.isolated_test_override)

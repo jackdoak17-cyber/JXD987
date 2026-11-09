@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -34,6 +35,15 @@ from scripts.leaderboard_shadow_worker import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_finite_trial_commands_reject_a_non_disposable_database(monkeypatch):
+    monkeypatch.setattr(worker_module, "isolated_test_database", lambda _conn: False)
+    args = SimpleNamespace(isolated_test_override=True)
+    with pytest.raises(RuntimeError, match="socket-only oddssearch_m3"):
+        worker_module.run_isolated_finite_trial(object(), args, "worker")
+    with pytest.raises(RuntimeError, match="socket-only oddssearch_m3"):
+        worker_module.recover_isolated_finite_trial(object(), args)
 
 
 class FakeCursor:
