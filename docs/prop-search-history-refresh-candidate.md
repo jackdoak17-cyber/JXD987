@@ -6,10 +6,12 @@ Date: 2026-11-09. This branch starts from JXD `main` at `aa9304e` and is
 
 `scripts/refresh_prop_search_history.py` is read-only by default. `--apply`
 requires an exact installed `refresh_fixture(bigint)` function MD5, a positive
-WAL ceiling, and hard per-run limits: at most 20 fixtures, 60 seconds, 8 MiB
+WAL ceiling, and hard work-loop limits: at most 20 fixtures, 60 seconds, 8 MiB
 accounted WAL, 10,000 statistic rows and 500 appearance rows per fixture.
 Defaults are stricter: 5 fixtures, 30 seconds, 5,000 statistics and 150
-appearances. The worker takes a session advisory lock, processes dirty
+appearances. Connection establishment has a separate five-second timeout;
+catalog and count preflights have five-second statement limits. The worker
+takes a session advisory lock, processes dirty
 fixtures before incomplete backfill fixtures, and commits one fixture at a
 time. It rolls back a fixture if its measured WAL plus commit reserve would
 cross the run ceiling. The WAL LSN measures all concurrent database writes
