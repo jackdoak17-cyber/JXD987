@@ -119,6 +119,61 @@ def test_retry_mode_uses_individual_exports(
     assert all("--provider-snapshot-ids-json" not in command for command in commands)
 
 
+def test_mixed_first_attempts_batch_while_retry_stays_individual(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report_path = tmp_path / "mixed-report.json"
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs):
+        commands.append(command)
+        if "--provider-snapshot-ids-json" in command:
+            assert command[command.index("--fixture-ids") + 1] == "1,2"
+            report_path.write_text(json.dumps({
+                "explicit_fixture_ids": [1, 2],
+                "atomic_published_fixture_ids": [1],
+                "atomic_failed_fixtures": [{"fixture_id": 2, "error": "isolated failure"}],
+            }), encoding="utf-8")
+            return subprocess.CompletedProcess(command, 1, "", "")
+        assert command[command.index("--fixture-ids") + 1] == "3"
+        assert "--provider-snapshot-id" in command
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(queue.subprocess, "run", fake_run)
+    result = queue.export_batch(
+        [1, 3, 2], [8], str(report_path), {1: 101, 2: 202, 3: 303},
+        attempt_by_id={1: 1, 3: 2, 2: 1},
+    )
+
+    assert len(commands) == 2
+    assert result.batched_fixture_ids == (1, 2)
+    assert [outcome.fixture_ids for outcome in result.outcomes] == [(1,), (3,), (2,)]
+    assert result.exported_ids == (1, 3)
+    assert result.failed_ids == (2,)
+    assert result.outcomes[2].stage == "atomic_fixture_detail_publish"
+
+
+def test_mixed_with_only_one_first_attempt_keeps_individual_exports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(queue.subprocess, "run", fake_run)
+    result = queue.export_batch(
+        [1, 2, 3], [8], str(tmp_path / "report.json"), {1: 101, 2: 202, 3: 303},
+        attempt_by_id={1: 1, 2: 2, 3: 3},
+    )
+
+    assert [command[command.index("--fixture-ids") + 1] for command in commands] == ["1", "2", "3"]
+    assert all("--provider-snapshot-ids-json" not in command for command in commands)
+    assert result.batched_fixture_ids == ()
+    assert result.exported_ids == (1, 2, 3)
+
+
 def test_exporter_reports_partial_atomic_results_and_filters_ancillary_rows(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

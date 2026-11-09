@@ -911,7 +911,7 @@ def test_real_queue_command_completes_recovery_and_records_eligibility(replay, m
 
     monkeypatch.setattr(queue.SyncService, "ensure_schema", count_ensure_schema)
 
-    def export_batch(ids, leagues, report_path, snapshot_ids=None, *, allow_batch=True):
+    def export_batch(ids, leagues, report_path, snapshot_ids=None, *, allow_batch=True, attempt_by_id=None):
         assert ids == [FIXTURE]
         replay.export(data, snapshot_ids[FIXTURE])
         return queue.ExportBatchResult((queue.ExportCommandResult.success(ids),))

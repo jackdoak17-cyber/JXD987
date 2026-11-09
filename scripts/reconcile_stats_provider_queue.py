@@ -129,6 +129,7 @@ class ExportCommandResult:
 @dataclass(frozen=True)
 class ExportBatchResult:
     outcomes: tuple[ExportCommandResult, ...]
+    batched_fixture_ids: tuple[int, ...] = ()
 
     @property
     def returncode(self) -> int:
@@ -385,9 +386,39 @@ def export_batch(
     snapshot_ids: dict[int, int] | None = None,
     *,
     allow_batch: bool = True,
+    attempt_by_id: dict[int, int] | None = None,
 ) -> ExportBatchResult:
     """Publish a bounded batch, preserving individual atomic outcomes."""
     snapshot_ids = snapshot_ids or {}
+    if allow_batch and attempt_by_id is not None:
+        first_attempt_ids = [
+            int(value) for value in fixture_ids
+            if type(attempt_by_id.get(int(value))) is int
+            and attempt_by_id[int(value)] == 1
+            and snapshot_ids.get(int(value))
+        ]
+        if 1 < len(first_attempt_ids) < len(fixture_ids):
+            retry_ids = [int(value) for value in fixture_ids if value not in first_attempt_ids]
+            first_result = export_batch(
+                first_attempt_ids, leagues, report_path, snapshot_ids,
+                allow_batch=True,
+            )
+            retry_result = export_batch(
+                retry_ids, leagues, report_path, snapshot_ids,
+                allow_batch=False,
+            )
+            by_id = {
+                outcome.fixture_ids[0]: outcome
+                for outcome in first_result.outcomes + retry_result.outcomes
+            }
+            if len(by_id) != len(fixture_ids):
+                raise RuntimeError("mixed export outcomes did not cover every fixture")
+            return ExportBatchResult(
+                tuple(by_id[int(value)] for value in fixture_ids),
+                first_result.batched_fixture_ids,
+            )
+        if len(first_attempt_ids) != len(fixture_ids):
+            allow_batch = False
     if (allow_batch and 1 < len(fixture_ids) <= 20
         and all(snapshot_ids.get(int(value)) for value in fixture_ids)):
         with tempfile.TemporaryDirectory(prefix="odds-fixture-export-") as protected_dir:
@@ -443,7 +474,7 @@ def export_batch(
                             returncode=completed.returncode or 1,
                         )
                         for fixture_id in fixture_ids
-                    ))
+                    ), tuple(fixture_ids))
             except (OSError, ValueError, TypeError, KeyError):
                 pass
             # The exporter may have committed a subset before an unreported
@@ -457,7 +488,7 @@ def export_batch(
                     returncode=completed.returncode or 1,
                 )
                 for fixture_id in fixture_ids
-            ))
+            ), tuple(fixture_ids))
 
     outcomes: list[ExportCommandResult] = []
     for fixture_id in fixture_ids:
@@ -649,6 +680,8 @@ def main() -> int:
         "provider_calls": 0,
         "provider_fixture_attempts": 0,
         "provider_http_calls": 0,
+        "export_batch_fixture_count": 0,
+        "export_individual_fixture_count": 0,
         "fetch_concurrency": fetch_concurrency,
         "bulk_size": bulk_size,
         "max_cohorts": max_cohorts,
@@ -981,13 +1014,19 @@ def main() -> int:
                         for item in accepted
                         if item.get("snapshot_id") is not None
                     },
-                    allow_batch=all(
-                        int(item.get("attempt") or 1) == 1
+                    attempt_by_id={
+                        int(item["fixture_id"]): int(item.get("attempt") or 1)
                         for item in accepted if int(item["fixture_id"]) in fixture_ids
-                    ),
+                    },
                 ),
             )
             report["stage_seconds"]["export"] = round(time.perf_counter() - stage_started, 3)
+            if isinstance(export_result.exporter_result, ExportBatchResult):
+                batch_result = export_result.exporter_result
+                report["export_batch_fixture_count"] += len(batch_result.batched_fixture_ids)
+                report["export_individual_fixture_count"] += (
+                    len(batch_result.outcomes) - len(batch_result.batched_fixture_ids)
+                )
             for item in export_result.partition.unsafe:
                 decision = export_result.partition.decisions[int(item["fixture_id"])]
                 next_at = backoff_time(int(item.get("attempt") or 1), datetime.now(timezone.utc))

@@ -47,10 +47,10 @@ UTC and held PID 1464919. It initially skipped because only 138 seconds of
 normal-writer lease remained against its 270-second minimum; this is the
 expected protection before the next settlement handoff, not a source failure.
 
-The first genuine new-release batch, source-performance sample, delivery
-parity and customer freshness must be observed before calling the cutover
-successful. If the source fails, allow any in-flight bounded child to exit or
-terminate it under the existing lease, then stop the new supervisor. Restore
+The first genuine new-release batch is recorded below. The cutover was rolled
+back because it preserved correctness but did not reduce export time. For any
+future rollback, allow any in-flight bounded child to exit or terminate it
+under the existing lease, then stop the new supervisor. Restore
 **only the statistics cron line** from the saved prior entry after verifying
 the current line still points to this candidate; preserve any later unrelated
 cron edits. Verify no new child or supervisor remains, restart the prior
@@ -61,3 +61,45 @@ The new release starts its own performance observation sequence. No old
 samples are relabeled. Pinning requires the installed sample, freshness and
 p95 limits; this source-only cutover does not create a renewable leaderboard
 worker allowance or authorize customer reader activation.
+
+## First genuine run and conditional rollback
+
+At 19:37 UTC, candidate release `368b97679c37` completed one genuine
+lease-bounded source batch: 20 selected, 13 accepted, seven provider-pending,
+zero failed. All 13 accepted target delivery rows had the accepted snapshot
+linked, equal source/target snapshots, and true player-stat and lineup parity.
+The source-store, export, projection-refresh and activation stages took
+21.226, 55.564, 8.354 and 8.811 seconds respectively. The final exporter
+report named one explicit fixture and had no batch-outcome field, proving
+that the **individual** exporter path ran. The candidate's all-or-nothing
+batch gate was disabled by at least one retry in the same accepted set; the
+isolated replay had not covered this mixed-attempt production shape. Correct
+delivery is established for this batch, but a live speed improvement is not.
+
+After the batch finished and no candidate child remained, the candidate
+supervisor was stopped. The current statistics cron entry was checked to
+point to this candidate, then only that entry was restored from the root-only
+prior backup; unrelated cron entries were retained. The inactive candidate
+entry was saved at `/root/odds-stats-cron-candidate-88125da-20261109`. The
+prior `3028e0f` supervisor restarted at 19:40:30 UTC; its first checks were
+expected lease and settlement deferrals, and PID 1469933 was still running at
+19:44:50. No old source pin, resource debt/cap, leaderboard worker, customer
+reader, disk/compute tier, Spend Cap or paid service was changed. A later
+genuine old-source result remains to be checked.
+
+## Mixed-attempt correction in development
+
+The next candidate groups eligible first attempts into one bounded exporter
+call while sending retries from the same source run through the existing
+individual commands. If only one first attempt is eligible, all exports stay
+individual. It preserves per-fixture outcome order, fails closed on an
+ambiguous batch report, and records batch versus individual fixture counts in
+the source report. The mixed-success/failure and one-first-attempt cases now
+have focused tests; the combined suite passed 160 with one existing skip after
+regenerating the 49-entry runtime manifest. Its manifest SHA-256 is
+`b5ff7da6e23d0eb546f1087574689fa09fb6edc731bc459c8001e2006f60a4bc`
+and release ID will be `b5ff7da6e23d` if the runtime bytes remain unchanged.
+This candidate is **not active** and has not had a live performance trial.
+Another immutable archive and guarded source-only cutover require a fresh
+preflight, exact test/manifest readback and old-source result. No old sample
+may be counted toward the new release's source pin.

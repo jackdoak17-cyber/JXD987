@@ -4,10 +4,12 @@ Date: 2026-11-09. Source branch `codex/batched-fixture-detail-export` starts
 from JXD `main` `aa9304e` and now merges the exact active VPS statistics
 archive `3028e0f` at merge commit `d78bc48`. The candidate manifest was
 regenerated for the two changed source files; its SHA-256 is
-`617534da51cb8f0b63d109067eba176cb853afb6e53d84ebea78295f722b053c`.
-All 49 entries verify. This branch is **not deployed or scheduled**. A new
-manifest identity would reset the source-performance observation sequence, so
-this merge is not permission to cut over while the current pin gate refuses.
+`617534da51cb8f0b63d109067eba176cb853afb6e53d84ebea78295f722b053c`
+for the first live candidate. All 49 entries verified. That candidate was
+briefly scheduled for a source-only trial and then rolled back; the corrected
+mixed-attempt revision below is **not deployed or scheduled**. A new manifest
+identity resets the source-performance observation sequence and does not
+bypass the existing source-pin gate.
 
 ## Measured reason for this candidate
 
@@ -126,7 +128,7 @@ production load. The source slice is real; the target and HTTP layer remain
 isolated substitutes. These results do not establish the live whole-job
 improvement or a production-safe cutover.
 
-The combined suite, Python compilation, 49-entry manifest verification and
+The initial combined suite, Python compilation, 49-entry manifest verification and
 `git diff --check` passed. The host composition shell test passed in an
 existing Linux Docker image with networking disabled and the worktree mounted
 read-only; the Mac host lacks `flock` and cannot run it natively.
@@ -141,5 +143,32 @@ current production source pin remains on `375f1f1aaf25`; new source
 18:54:03 UTC and normalized total p95 156,658.3 ms against a 148,617.4 ms
 ceiling as read at 19:04 UTC. Neither this branch nor a new manifest may be
 installed to bypass that guard. Keep the leaderboard worker paused, capture
-enabled, old resource debt/caps intact and the customer reader unchanged. No
-added cost or production change occurred in this candidate.
+enabled, old resource debt/caps intact and the customer reader unchanged.
+
+## Live trial correction
+
+The exact `88125da` runtime was installed in an immutable VPS archive and
+briefly scheduled as the source-only statistics worker. Its first genuine
+19:37 UTC batch accepted13 of20 selected with no failure; all13 target
+delivery rows passed snapshot, parity and accepted-link checks. Export still
+took55.564 seconds. The final exporter report listed one explicit fixture and
+no batch outcome, proving individual calls ran. Inspection of the worker's
+batch gate found that one later-attempt fixture disabled batching for the
+**entire** accepted set. The local old/batch benchmarks were valid for their
+isolated first-attempt workload but did not predict this mixed production
+run. The old statistics cron/supervisor were conditionally restored at19:40;
+details and limits are in the [live runbook](stats-reconciliation-batch-live-cutover-2026-11-09.md).
+
+The corrected candidate separates first-attempt and retry IDs within one
+accepted set. Eligible first attempts use one atomic-per-fixture batch;
+retries retain the individual exporter path, with original outcome order
+restored before verification. The source report counts each export path.
+Mixed partial failure and a one-first-attempt fallback have focused tests.
+The combined suite passed **160**, with one existing skip and12 deprecation
+warnings. Its regenerated49-entry manifest SHA-256 is
+`b5ff7da6e23d0eb546f1087574689fa09fb6edc731bc459c8001e2006f60a4bc`
+and release ID `b5ff7da6e23d`. It still needs a genuine live source trial
+under the installed lease, target parity check, full-job timing comparison,
+and normal old-source run verification before any renewed cutover can be
+called successful. No added capacity, Spend Cap change or paid service was
+used.
