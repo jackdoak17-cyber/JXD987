@@ -853,6 +853,8 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
         raise RuntimeError("trial-once is limited to ten fixture captures")
     if args.cohort_limit != 0 or args.job_limit != 0:
         raise RuntimeError("trial-once cannot generate or publish leaderboards")
+    if not 0 <= args.trial_test_pg_sleep_after_admission <= 120:
+        raise RuntimeError("isolated trial sleep must be within 120 seconds")
     budget = RunBudget.create(args.fixture_limit, args.max_seconds)
     apply_preflight_timeouts(conn)
     temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
@@ -888,6 +890,13 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
     closed = False
     capture: dict[str, int] | None = None
     try:
+        if args.trial_test_pg_sleep_after_admission:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "select pg_sleep(%s)",
+                        (args.trial_test_pg_sleep_after_admission,),
+                    )
         check_trial_guard(conn, False)
         budget.apply_database_timeouts(conn)
         eligibility_count = refresh_eligibility_if_due(conn)
@@ -996,6 +1005,7 @@ def main() -> int:
     parser.add_argument("--season-id", type=int)
     parser.add_argument("--batch-size", type=int, default=250)
     parser.add_argument("--trial-policy-id")
+    parser.add_argument("--trial-test-pg-sleep-after-admission", type=float, default=0)
     args = parser.parse_args()
     if (args.league_id is None) != (args.season_id is None):
         parser.error("league-id and season-id must be supplied together")

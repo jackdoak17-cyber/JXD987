@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.leaderboard_finite_trial_supervisor import acquire_lock
 import scripts.leaderboard_shadow_worker as worker_module
 from scripts.leaderboard_shadow_capture import capture_fixture_ids
 from scripts.leaderboard_shadow_worker import (
@@ -44,6 +45,19 @@ def test_finite_trial_commands_reject_a_non_disposable_database(monkeypatch):
         worker_module.run_isolated_finite_trial(object(), args, "worker")
     with pytest.raises(RuntimeError, match="socket-only oddssearch_m3"):
         worker_module.recover_isolated_finite_trial(object(), args)
+
+
+def test_finite_trial_supervisor_lock_excludes_and_releases(tmp_path):
+    path = str(tmp_path / "worker.lock")
+    first = acquire_lock(path)
+    assert first is not None
+    try:
+        assert acquire_lock(path) is None
+    finally:
+        first.close()
+    again = acquire_lock(path)
+    assert again is not None
+    again.close()
 
 
 class FakeCursor:
