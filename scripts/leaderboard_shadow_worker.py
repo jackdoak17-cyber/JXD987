@@ -238,9 +238,26 @@ def apply_recovery_timeouts(conn) -> None:
             cur.execute("select set_config('statement_timeout', '5000ms', false)")
 
 
+def mark_failed_statement_interval(conn) -> None:
+    """Charge an interval with failed SQL by database WAL at its next checkpoint.
+
+    A failed transaction is rolled back before this call. The marker belongs to
+    this connection, survives subsequent commits, and is cleared by a
+    successful checkpoint. Interrupted windows are marked during DB recovery.
+    """
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select set_config('oddssearch.worker_failed_statement','true',false)"
+            )
+
+
 def start_worker_run(conn, worker_id: str) -> int:
     with conn:
         with conn.cursor() as cur:
+            cur.execute(
+                "select set_config('oddssearch.worker_failed_statement','false',false)"
+            )
             cur.execute(
                 """
                 insert into leaderboard_shadow_v1.worker_runs(worker_id, release_sha)
@@ -487,6 +504,7 @@ def process_capture_queue(
                 result["redirtied"] += 1
         except Exception as error:
             apply_recovery_timeouts(conn)
+            mark_failed_statement_interval(conn)
             fail_dirty_claim(conn, claim, error)
             result["failed"] += 1
     if (
@@ -610,6 +628,7 @@ def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
                 return bool(next(iter(cur.fetchone().values())))
     except Exception as error:
         apply_recovery_timeouts(conn)
+        mark_failed_statement_interval(conn)
         conn.set_session(isolation_level="READ COMMITTED")
         with conn:
             with conn.cursor() as cur:
@@ -919,6 +938,7 @@ def main() -> int:
             }, sort_keys=True))
         except Exception as error:
             apply_recovery_timeouts(conn)
+            mark_failed_statement_interval(conn)
             # budget.processed advances only after a capture or generation job
             # committed successfully. Preserve that authoritative progress in
             # run evidence even when a later guard or publication check fails.
