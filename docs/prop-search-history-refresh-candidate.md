@@ -30,8 +30,23 @@ revision cannot silently change what the worker executes.
 read-only default, schema-hash mismatch, dirty-first ordering, fixture cap,
 WAL rollback, single-session lock and statistic-row ceiling. This test uses
 a minimal function with the same database interface; the website repository
-separately tests the full SQL calculation. A paired end-to-end test against
-the exact final SQL and production-shaped worker connection remains required.
+separately tests the full SQL calculation.
+
+The paired integration command also passed:
+
+```bash
+bash scripts/test_prop_search_history_integration.sh "/absolute/path/to/statswebsite-web-prototype"
+```
+
+It created a socket-only disposable database, loaded the exact website SQL
+with the test runner's explicit commit flag, changed one statistic, verified
+the worker's default dry-run observed one dirty fixture, then ran one bounded
+refresh with the installed function's exact MD5. The private dirty marker
+cleared, the metric changed, and the guarded count reader matched the
+installed calculation. The first integration attempt had an incorrectly
+spelled function signature in the test's MD5 lookup; this yielded an empty
+hash and was fixed before the passing run. This is an exact paired SQL/worker
+test on synthetic data, not production-scale backfill or normal ingestion.
 
 ## Release gates
 
