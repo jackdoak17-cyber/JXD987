@@ -275,6 +275,67 @@ def test_normal_fixture_to_played_complete(replay):
     assert replay.shots(player=22) == [(0,)]  # Only an explicit provider zero.
 
 
+def test_batched_export_keeps_per_fixture_snapshot_lineage_in_disposable_postgres(
+    replay, tmp_path, monkeypatch,
+):
+    from scripts import export_to_supabase as exporter
+
+    fixtures = [payload(fixture_id=FIXTURE), payload(fixture_id=FIXTURE + 1)]
+    snapshots = {}
+    for data in fixtures:
+        replay.discover(data)
+        assessment = delivery.assess_provider_payload(data)
+        snapshots[data["id"]] = delivery.persist_provider_snapshot(
+            replay.url, data["id"], 8, 10, data, assessment,
+            delivery.provider_payload_hash(data), delivery.normalized_provider_hash(data),
+        )
+        delivery.store_provider_detail(replay.engine, replay.client, data["id"], data, assessment)
+
+    mapping = tmp_path / "snapshots.json"
+    mapping.write_text(json.dumps({str(key): value for key, value in snapshots.items()}))
+    report = tmp_path / "batch-report.json"
+    monkeypatch.setattr(sys, "argv", [
+        "export_to_supabase.py", "--strict", "--leagues", "8",
+        "--fixture-ids", f"{FIXTURE},{FIXTURE + 1}", "--keep-all-seasons",
+        "--protect-empty-detail", "--require-detail", "--atomic-fixture-detail",
+        "--skip-odds-snapshots", "--skip-odds-outcomes", "--skip-prune",
+        "--provider-snapshot-ids-json", str(mapping), "--report-json", str(report),
+    ])
+    monkeypatch.setattr(exporter, "DB_PATH", str(replay.engine.url.database))
+    monkeypatch.setattr(exporter, "SUPABASE_DB_URL", replay.url)
+    monkeypatch.setattr(exporter, "require_env", lambda *_: None)
+    monkeypatch.setattr(exporter, "choose_keep_seasons", lambda *_args, **_kwargs: {10})
+    monkeypatch.setattr(exporter, "fetch_seasons", lambda *_: [])
+    monkeypatch.setattr(exporter, "fetch_rounds", lambda *_: [])
+    monkeypatch.setattr(exporter, "fetch_sidelined_players", lambda *_: [])
+    monkeypatch.setattr(exporter, "fetch_player_team_history", lambda *_: [])
+    monkeypatch.setattr(exporter, "filter_rows_for_remote_schema", lambda _table, rows: rows)
+    parent_calls = []
+
+    def publish_parents(table, rows, *_args):
+        parent_calls.append((table, len(rows)))
+        return len(rows), 0
+
+    monkeypatch.setattr(exporter, "upsert_table", publish_parents)
+    exporter.main()
+
+    result = json.loads(report.read_text())
+    assert result["atomic_published_fixture_ids"] == [FIXTURE, FIXTURE + 1]
+    assert result["atomic_failed_fixtures"] == []
+    assert parent_calls.count(("fixtures", 2)) == 1
+    for data in fixtures:
+        with replay.engine.connect() as source:
+            raw = source.connection.driver_connection
+            assert not delivery.compare_snapshots(
+                delivery.source_snapshot(raw, data["id"]),
+                delivery.target_snapshot(replay.conn, data["id"]),
+            )
+        assert replay.sql(
+            "select distinct provider_snapshot_id from fixture_player_statistics where fixture_id=%s",
+            (data["id"],),
+        ) == [(snapshots[data["id"]],)]
+
+
 def test_discovery_alone_quarantines_postponement_until_complete_recovery(replay):
     replay.discover(payload())
     assert replay.publish(payload())
@@ -547,7 +608,7 @@ def test_real_queue_command_completes_recovery_and_records_eligibility(replay, m
 
     monkeypatch.setattr(queue.SyncService, "ensure_schema", count_ensure_schema)
 
-    def export_batch(ids, leagues, report_path, snapshot_ids=None):
+    def export_batch(ids, leagues, report_path, snapshot_ids=None, *, allow_batch=True, attempt_by_id=None):
         assert ids == [FIXTURE]
         replay.export(data, snapshot_ids[FIXTURE])
         return queue.ExportBatchResult((queue.ExportCommandResult.success(ids),))
