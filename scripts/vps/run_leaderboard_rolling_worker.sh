@@ -67,7 +67,7 @@ export LEADERBOARD_SHADOW_RELEASE_SHA="$LEADERBOARD_ROLLING_RELEASE_SHA"
 export LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256="$LEADERBOARD_ROLLING_EXPECTED_DSN_SHA256"
 export LEADERBOARD_FINITE_TRIAL_RELEASE_SHA="$LEADERBOARD_ROLLING_RELEASE_SHA"
 exec python3 "$ROOT/scripts/leaderboard_finite_trial_supervisor.py" \
-  --production --rolling "$@" \
+  --production --rolling --follow-rolling-successors "$@" \
   --worker-path "$ROOT/scripts/leaderboard_shadow_worker.py" \
   --policy-id "$LEADERBOARD_ROLLING_POLICY_ID" \
   --worker-lock-file "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}" \

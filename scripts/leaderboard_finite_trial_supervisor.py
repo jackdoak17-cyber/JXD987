@@ -135,6 +135,61 @@ def read_quarantine_marker(path: Path, policy_id: str, *, rolling: bool = False)
     return tokens
 
 
+def rolling_policy_chain(url: str, root_policy_id: str,
+                         expected_worker_sha: str) -> list[str]:
+    """Read the reviewed root's immutable successor chain under host locks."""
+    if not re.fullmatch(r"[a-z0-9-]{8,80}", root_policy_id):
+        raise RuntimeError("rolling root policy identity is invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_worker_sha):
+        raise RuntimeError("rolling worker release identity is invalid")
+    with bounded_connection(url) as conn:
+        with conn.cursor() as cur:
+            cur.execute("set transaction read only")
+            cur.execute(
+                """
+                with recursive chain(policy_id,depth,path) as (
+                  select policy_id,0,array[policy_id]::text[]
+                  from leaderboard_rolling_v1.policies where policy_id=%s
+                  union all
+                  select succession.successor_policy_id,chain.depth+1,
+                         chain.path||succession.successor_policy_id
+                  from chain
+                  join leaderboard_rolling_v1.successions succession
+                    on succession.predecessor_policy_id=chain.policy_id
+                  where chain.depth<32
+                    and not succession.successor_policy_id=any(chain.path)
+                )
+                select chain.policy_id,chain.depth,policy.worker_release_sha,
+                       policy.source_release_id,
+                       exists(select 1 from leaderboard_rolling_v1.successions next
+                              where next.predecessor_policy_id=chain.policy_id)
+                from chain join leaderboard_rolling_v1.policies policy
+                  on policy.policy_id=chain.policy_id
+                order by chain.depth
+                """,
+                (root_policy_id,),
+            )
+            rows = cur.fetchall()
+    if (not rows or len(rows)>33 or rows[-1][4]
+            or any(row[2] != expected_worker_sha for row in rows)
+            or len({row[3] for row in rows}) != 1
+            or any(row[1] != index for index, row in enumerate(rows))):
+        raise RuntimeError("rolling successor chain or release is invalid")
+    return [row[0] for row in rows]
+
+
+def rolling_marker_policy_id(path: Path) -> str:
+    """Read a stopped run's exact policy before selecting a newer tip."""
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("rolling quarantine marker is missing or invalid")
+    marker = json.loads(path.read_text(encoding="utf-8"))
+    policy_id = marker.get("policy_id")
+    if not isinstance(policy_id, str) or not re.fullmatch(r"[a-z0-9-]{8,80}", policy_id):
+        raise RuntimeError("rolling quarantine policy identity is invalid")
+    read_quarantine_marker(path, policy_id, rolling=True)
+    return policy_id
+
+
 def drain_token_backends(url: str, token: str, seconds: float) -> None:
     deadline = time.monotonic() + seconds
     application_name = f"oddssearch-finite-trial/{token}"
@@ -231,6 +286,23 @@ def reconcile_quarantine(args) -> int:
             marker = Path(args.worker_lock_file + ".quarantine")
             heavy_marker = Path(args.worker_lock_file + ".quarantine.heavy")
             rolling = getattr(args, "rolling", False)
+            if rolling and args.follow_rolling_successors:
+                marker_policy_id = rolling_marker_policy_id(marker)
+                chain = rolling_policy_chain(
+                    url,args.policy_id,
+                    os.environ.get("LEADERBOARD_FINITE_TRIAL_RELEASE_SHA", ""),
+                )
+                if marker_policy_id not in chain:
+                    raise RuntimeError("rolling quarantine policy is outside reviewed lineage")
+                if os.path.lexists(heavy_marker):
+                    if (rolling_marker_policy_id(heavy_marker) != marker_policy_id
+                            or read_quarantine_marker(
+                                heavy_marker, marker_policy_id, rolling=True
+                            ) != read_quarantine_marker(
+                                marker, marker_policy_id, rolling=True
+                            )):
+                        raise RuntimeError("rolling quarantine markers disagree on identity or tokens")
+                args.policy_id = marker_policy_id
             tokens = read_quarantine_marker(marker, args.policy_id, rolling=rolling)
             for token in tokens:
                 drain_token_backends(url, token, args.drain_seconds)
@@ -324,6 +396,11 @@ def run_trial(args) -> int:
             heavy_marker = Path(args.worker_lock_file + ".quarantine.heavy")
             if os.path.lexists(marker) or os.path.lexists(heavy_marker):
                 raise RuntimeError("finite trial quarantine marker requires operator reconciliation")
+            if rolling and args.follow_rolling_successors:
+                args.policy_id = rolling_policy_chain(
+                    url,args.policy_id,
+                    os.environ.get("LEADERBOARD_FINITE_TRIAL_RELEASE_SHA", ""),
+                )[-1]
             main_token = uuid.uuid4().hex[:16]
             recovery_token = uuid.uuid4().hex[:16]
             marker_tokens = [main_token, recovery_token]
@@ -538,6 +615,7 @@ def main() -> int:
     parser.add_argument("--database-heavy-lock-file", required=True)
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--rolling", action="store_true")
+    parser.add_argument("--follow-rolling-successors", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=10)
     parser.add_argument("--capture-limit", type=int, default=10)
     parser.add_argument("--cohort-limit", type=int, default=0)
@@ -565,6 +643,8 @@ def main() -> int:
         or not 0 < args.max_seconds <= 30
     ):
         parser.error("rolling worker mode or limits are invalid")
+    if args.follow_rolling_successors and not args.rolling:
+        parser.error("successor selection requires rolling mode")
     if not (1 <= args.deadline_seconds <= 60 and 1 <= args.grace_seconds <= 10
             and 1 <= args.drain_seconds <= 30 and 1 <= args.recovery_seconds <= 30
             and 0 <= args.test_pg_sleep_after_admission <= 120

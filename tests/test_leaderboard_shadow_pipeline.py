@@ -190,6 +190,11 @@ def test_rolling_quarantine_cannot_be_cleared_by_finite_reconciliation(tmp_path)
     assert supervisor_module.read_quarantine_marker(
         marker, "rolling-policy", rolling=True
     ) == ["a" * 16]
+    assert supervisor_module.rolling_marker_policy_id(marker) == "rolling-policy"
+    marker.write_text(json.dumps({"policy_id": "foreign-policy", "mode": "finite",
+                                  "tokens": ["a" * 16]}))
+    with pytest.raises(RuntimeError, match="identity is invalid"):
+        supervisor_module.rolling_marker_policy_id(marker)
 
 
 def test_finite_trial_child_keeps_flock_after_parent_exit(tmp_path):
