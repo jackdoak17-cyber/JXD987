@@ -1240,6 +1240,32 @@ def atomic_fixture_detail_publish(
         raise
 
 
+def load_batch_snapshot_ids(path: str, fixture_ids_csv: str | None) -> Dict[int, int]:
+    """Validate the exact fixture-to-snapshot map before any export writes."""
+    if not fixture_ids_csv:
+        raise ValueError("batch snapshot IDs require explicit fixture IDs")
+    fixture_ids = [int(value.strip()) for value in fixture_ids_csv.split(",") if value.strip()]
+    if not 1 <= len(fixture_ids) <= 20 or any(value <= 0 for value in fixture_ids):
+        raise ValueError("batch export requires 1..20 positive fixture IDs")
+    if len(set(fixture_ids)) != len(fixture_ids):
+        raise ValueError("batch fixture IDs must be unique")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate fixture ID in snapshot map")
+            result[key] = value
+        return result
+
+    raw = json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=unique_object)
+    if not isinstance(raw, dict) or set(raw) != {str(value) for value in fixture_ids}:
+        raise ValueError("batch snapshot IDs must match the explicit fixture IDs exactly")
+    if any(not isinstance(value, int) or isinstance(value, bool) or value <= 0 for value in raw.values()):
+        raise ValueError("batch snapshot IDs must be positive integers")
+    return {int(key): value for key, value in raw.items()}
+
+
 def upsert_table(table: str, rows: List[Dict], on_conflict: str, dry_run: bool) -> Tuple[int, int]:
     if not rows:
         return 0, 0
@@ -1383,6 +1409,11 @@ def main():
         help="Accepted provider snapshot ID to link to atomically published fixture detail.",
     )
     parser.add_argument(
+        "--provider-snapshot-ids-json",
+        default=None,
+        help="Protected fixture-to-snapshot JSON map for one bounded atomic batch.",
+    )
+    parser.add_argument(
         "--upcoming-days",
         type=int,
         default=int(os.environ.get("EXPORT_DAYS_FORWARD", "45") or "45"),
@@ -1424,6 +1455,21 @@ def main():
         help="Optional path to write detailed export report (including timeout splits/missed fixture deletes).",
     )
     args = parser.parse_args()
+
+    batch_snapshot_ids: Dict[int, int] | None = None
+    if args.provider_snapshot_ids_json is not None:
+        if (args.provider_snapshot_id is not None or args.dry_run
+            or not args.atomic_fixture_detail or not args.fixture_ids
+            or not args.protect_empty_detail or not args.require_detail
+            or not args.keep_all_seasons or not args.skip_odds_snapshots
+            or not args.skip_odds_outcomes or not args.skip_prune):
+            raise SystemExit("batch snapshot map requires the guarded explicit-fixture detail flags")
+        try:
+            batch_snapshot_ids = load_batch_snapshot_ids(
+                args.provider_snapshot_ids_json, args.fixture_ids
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            raise SystemExit(f"invalid batch snapshot map: {exc}") from exc
 
     if not args.dry_run and not args.fixture_core_only and not args.atomic_fixture_detail:
         raise SystemExit("Fixture detail export requires --atomic-fixture-detail; REST replacement is not quarantine-safe")
@@ -1645,6 +1691,7 @@ def main():
 
     atomic_published: Dict[str, int] = {}
     atomic_deferred: list[int] = []
+    atomic_failures: list[Dict[str, object]] = []
     if args.atomic_fixture_detail and not args.dry_run:
         if psycopg2 is None or not SUPABASE_DB_URL:
             raise SystemExit("--atomic-fixture-detail requires SUPABASE_DB_URL and psycopg2")
@@ -1662,7 +1709,10 @@ def main():
                     outcome = atomic_fixture_detail_publish(
                         target_conn,
                         fixture_id=int(fixture_id),
-                        snapshot_id=args.provider_snapshot_id,
+                        snapshot_id=(
+                            batch_snapshot_ids[int(fixture_id)]
+                            if batch_snapshot_ids is not None else args.provider_snapshot_id
+                        ),
                         defer_quarantined=not explicit_fixture_ids,
                         player_dimensions=[
                             row
@@ -1688,12 +1738,34 @@ def main():
                         "fixture_id": int(fixture_id),
                         "error": str(exc)[-4000:],
                     }
+                    if batch_snapshot_ids is not None:
+                        atomic_failures.append(failure)
+                        continue
                     _write_json_report(args.report_json, failure)
                     raise SystemExit(
                         f"Atomic fixture-detail publish failed for fixture {fixture_id}: {exc}"
                     ) from exc
         finally:
             target_conn.close()
+
+    if batch_snapshot_ids is not None and atomic_failures:
+        published_ids = {int(value) for value in atomic_published}
+        published_players = {
+            int(row["player_id"])
+            for row in fixture_players + fixture_player_stats
+            if int(row["fixture_id"]) in published_ids and row.get("player_id") is not None
+        }
+        published_teams = {
+            int(fixture[key])
+            for fixture in fixtures if int(fixture["id"]) in published_ids
+            for key in ("home_team_id", "away_team_id") if fixture.get(key) is not None
+        }
+        post_atomic_exports = [
+            ("sidelined_players", [row for row in sidelined_players
+                                   if row.get("team_id") in published_teams], "id"),
+            ("player_team_history", [row for row in player_team_history
+                                     if row.get("player_id") in published_players], "id"),
+        ] if published_ids else []
 
     if post_atomic_exports:
         export_rows(post_atomic_exports)
@@ -1738,8 +1810,13 @@ def main():
         "fixtures_pruned_other_seasons": pruned,
         "delete_stats": delete_stats,
     }
+    if batch_snapshot_ids is not None:
+        summary["atomic_published_fixture_ids"] = sorted(int(value) for value in atomic_published)
+        summary["atomic_failed_fixtures"] = atomic_failures
     _write_json_report(args.report_json, summary)
     print(json.dumps(summary))
+    if atomic_failures:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

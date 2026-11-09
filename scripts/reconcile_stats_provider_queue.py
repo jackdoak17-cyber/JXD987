@@ -19,6 +19,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -382,10 +383,83 @@ def export_batch(
     leagues: list[int],
     report_path: str,
     snapshot_ids: dict[int, int] | None = None,
+    *,
+    allow_batch: bool = True,
 ) -> ExportBatchResult:
-    """Publish each safe fixture through an atomic target transaction."""
-    outcomes: list[ExportCommandResult] = []
+    """Publish a bounded batch, preserving individual atomic outcomes."""
     snapshot_ids = snapshot_ids or {}
+    if (allow_batch and 1 < len(fixture_ids) <= 20
+        and all(snapshot_ids.get(int(value)) for value in fixture_ids)):
+        with tempfile.TemporaryDirectory(prefix="odds-fixture-export-") as protected_dir:
+            snapshot_path = Path(protected_dir) / "snapshot_ids.json"
+            snapshot_path.write_text(
+                json.dumps({str(value): int(snapshot_ids[int(value)]) for value in fixture_ids}),
+                encoding="utf-8",
+            )
+            Path(report_path).unlink(missing_ok=True)
+            command = [
+                sys.executable,
+                str(Path(__file__).with_name("export_to_supabase.py")),
+                "--strict", "--leagues", ",".join(str(value) for value in leagues),
+                "--fixture-ids", ",".join(str(value) for value in fixture_ids),
+                "--keep-all-seasons", "--protect-empty-detail", "--require-detail",
+                "--atomic-fixture-detail", "--skip-odds-snapshots",
+                "--skip-odds-outcomes", "--skip-prune",
+                "--provider-snapshot-ids-json", str(snapshot_path),
+                "--report-json", report_path,
+            ]
+            completed = subprocess.run(command, text=True, capture_output=True, check=False)
+            try:
+                report = json.loads(Path(report_path).read_text(encoding="utf-8"))
+                if not isinstance(report, dict):
+                    raise ValueError("batch report must be an object")
+                published = report["atomic_published_fixture_ids"]
+                failures = report["atomic_failed_fixtures"]
+                if (not isinstance(published, list) or not isinstance(failures, list)
+                    or any(type(value) is not int for value in published)
+                    or any(not isinstance(item, dict) or type(item.get("fixture_id")) is not int
+                           for item in failures)):
+                    raise ValueError("batch report fixture outcomes are invalid")
+                published_ids = set(published)
+                failed_by_id = {item["fixture_id"]: item for item in failures}
+                requested_ids = {int(value) for value in fixture_ids}
+                valid = (
+                    len(published_ids) == len(published)
+                    and len(failed_by_id) == len(failures)
+                    and not (published_ids & set(failed_by_id))
+                    and published_ids | set(failed_by_id) == requested_ids
+                    and (completed.returncode == 0) == (not failures)
+                    and all(type(value) is int for value in report.get("explicit_fixture_ids", []))
+                    and report.get("explicit_fixture_ids") == fixture_ids
+                )
+                if valid:
+                    return ExportBatchResult(tuple(
+                        ExportCommandResult.success([fixture_id])
+                        if fixture_id in published_ids else ExportCommandResult.failure(
+                            fixture_ids=[fixture_id],
+                            failure_class="exporter",
+                            stage="atomic_fixture_detail_publish",
+                            message=str(failed_by_id[fixture_id].get("error") or "atomic detail publish failed")[-4000:],
+                            returncode=completed.returncode or 1,
+                        )
+                        for fixture_id in fixture_ids
+                    ))
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+            # The exporter may have committed a subset before an unreported
+            # failure. Do not guess which fixtures are safe or immediately
+            # replay the ambiguous batch: leave every fixture retryable.
+            message = (completed.stderr or completed.stdout or "batch export had no complete outcome report")[-4000:]
+            return ExportBatchResult(tuple(
+                ExportCommandResult.failure(
+                    fixture_ids=[fixture_id], failure_class="exporter",
+                    stage="batch_outcome_unverified", message=message,
+                    returncode=completed.returncode or 1,
+                )
+                for fixture_id in fixture_ids
+            ))
+
+    outcomes: list[ExportCommandResult] = []
     for fixture_id in fixture_ids:
         command = [
             sys.executable,
@@ -907,6 +981,10 @@ def main() -> int:
                         for item in accepted
                         if item.get("snapshot_id") is not None
                     },
+                    allow_batch=all(
+                        int(item.get("attempt") or 1) == 1
+                        for item in accepted if int(item["fixture_id"]) in fixture_ids
+                    ),
                 ),
             )
             report["stage_seconds"]["export"] = round(time.perf_counter() - stage_started, 3)
