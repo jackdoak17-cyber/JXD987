@@ -15,6 +15,10 @@ DB_HEAVY_LOCK_WAIT_SECONDS="${LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS:-0}"
 
 exec 9>"$LOCK_FILE"
 flock -n 9 || exit 0
+if [[ -e "${LOCK_FILE}.quarantine" ]]; then
+  echo "leaderboard worker blocked by unresolved finite-trial quarantine" >&2
+  exit 1
+fi
 
 if [[ ! -r "$ENV_FILE" ]]; then
   echo "leaderboard shadow environment file is unavailable" >&2

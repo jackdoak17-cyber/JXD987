@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import stat
 import sys
@@ -132,10 +133,16 @@ def apply_preflight_timeouts(conn) -> None:
 def connect():
     if not DATABASE_URL:
         raise RuntimeError("SUPABASE_DB_URL_SESSION or SUPABASE_DB_URL is required")
+    trial_token = os.environ.get("LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN")
+    if trial_token and not re.fullmatch(r"[0-9a-f]{16}", trial_token):
+        raise RuntimeError("finite trial connection token is invalid")
     return psycopg2.connect(
         DATABASE_URL,
         connect_timeout=20,
-        application_name=f"oddssearch-leaderboard-shadow/{RELEASE_SHA[:12]}",
+        application_name=(
+            f"oddssearch-finite-trial/{trial_token}" if trial_token
+            else f"oddssearch-leaderboard-shadow/{RELEASE_SHA[:12]}"
+        ),
     )
 
 
@@ -1011,6 +1018,15 @@ def recover_isolated_finite_trial(conn, args) -> dict[str, Any]:
         raise RuntimeError("trial-recover requires the disposable database override")
     if not args.trial_policy_id:
         raise RuntimeError("trial-recover requires --trial-policy-id")
+    if not 0 <= args.trial_test_pg_sleep_before_recovery <= 120:
+        raise RuntimeError("isolated recovery sleep must be within 120 seconds")
+    if args.trial_test_pg_sleep_before_recovery:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "select pg_sleep(%s)",
+                    (args.trial_test_pg_sleep_before_recovery,),
+                )
     apply_preflight_timeouts(conn)
     with conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute(
@@ -1058,6 +1074,7 @@ def main() -> int:
     parser.add_argument("--trial-policy-id")
     parser.add_argument("--trial-test-pg-sleep-after-admission", type=float, default=0)
     parser.add_argument("--trial-test-pg-sleep-after-capture", type=float, default=0)
+    parser.add_argument("--trial-test-pg-sleep-before-recovery", type=float, default=0)
     args = parser.parse_args()
     if (args.league_id is None) != (args.season_id is None):
         parser.error("league-id and season-id must be supplied together")

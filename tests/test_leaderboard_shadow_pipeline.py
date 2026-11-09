@@ -2,6 +2,7 @@ import os
 import json
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,6 +59,34 @@ def test_finite_trial_supervisor_lock_excludes_and_releases(tmp_path):
     again = acquire_lock(path)
     assert again is not None
     again.close()
+
+
+def test_finite_trial_child_keeps_flock_after_parent_exit(tmp_path):
+    path = str(tmp_path / "inherited.lock")
+    parent_code = (
+        "import fcntl,os,subprocess,sys; "
+        "lock=open(sys.argv[1],'a'); "
+        "fcntl.flock(lock,fcntl.LOCK_EX); "
+        "subprocess.Popen([sys.executable,'-c','import time; time.sleep(3)'], "
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+        "stderr=subprocess.DEVNULL,pass_fds=(lock.fileno(),)); "
+        "os._exit(0)"
+    )
+    parent = subprocess.run(
+        [sys.executable, "-c", parent_code, path],
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    assert parent.returncode == 0
+    assert acquire_lock(path) is None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        released = acquire_lock(path)
+        if released is not None:
+            released.close()
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("orphaned child did not release inherited flock")
 
 
 def test_trial_capture_progress_survives_a_later_guard_failure(monkeypatch):
