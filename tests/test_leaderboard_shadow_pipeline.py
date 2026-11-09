@@ -558,6 +558,23 @@ def test_generation_progress_survives_a_prepublication_stop(monkeypatch):
     assert events == ["guard", "guard", "guard"]
 
 
+def test_full_trial_refuses_oversized_generation_before_materialization():
+    class GenerationCursor(FakeCursor):
+        answers = iter([(73,), ("materializing", None, 10)])
+
+        def fetchone(self):
+            return next(self.answers)
+
+    cursor = GenerationCursor()
+    with pytest.raises(RuntimeError, match="generation exceeds finite trial job bound"):
+        worker_module.ensure_generation(
+            FakeConnection(cursor), 8, 2026, max_materialized_jobs=9,
+        )
+    assert len(cursor.executed) == 2
+    assert cursor.executed[1][1] == (10, 73)
+    assert "materialize_generation" not in cursor.executed[1][0]
+
+
 def test_full_workload_trial_has_no_production_entrypoint():
     with pytest.raises(RuntimeError, match="no production entrypoint"):
         worker_module.run_finite_trial(
