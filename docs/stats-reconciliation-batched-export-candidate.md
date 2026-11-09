@@ -89,15 +89,53 @@ were simpler than production. This proves the candidate removes repeated
 process, source and parent-request work in that isolation. It does not establish
 the production gain, full parent-write WAL, or a production-shaped lease bound.
 
+## Representative source replay
+
+The read-only source slice was extracted from the active VPS SQLite file with
+`scripts/benchmarks/extract_fixture_detail_source_subset.py`. It contains 20
+recently accepted fixture IDs across league82 and league387: `19735139,
+19735136,19735135,19735133,19735157,19735156,19735129,19735127,19735153,
+19735137,19735131,19735130,19735152,19735126,19735118,19735160,19735155,
+19735154,19735138,19768813`. The 2.7MB local slice had six seasons, 18
+teams, 410 players, 408 player-team-history rows, 806 lineups, 1,800 team
+statistics and **17,944** player statistics. Its SHA-256 was
+`68435c3b829eb9c949e366b48ec9457926b3b9209239a178686581f78c3fb202`.
+The data file is local and uncommitted; the extractor streams to stdout so a
+repeat can avoid writing a copy on the VPS. The benchmark test accepts this
+slice through `ODDS_REPRESENTATIVE_SOURCE_PATH`.
+
+The first representative actual-process replay kept parent HTTP as a local
+no-write endpoint. Old/batch delivered identical 17,944 target detail rows
+and snapshot lineage; used 20/1 exporter processes and 60/3 parent requests
+carrying 971/432 rows; took 3.120/0.338 seconds; and wrote
+4,043,336/4,042,616 target WAL bytes. The disposable PostgreSQL cluster
+initially used SQL_ASCII and rejected real accented player names. Changing
+its `initdb` encoding to UTF-8 resolved that test-environment error; no
+product data was altered.
+
+With `ODDS_PARENT_WRITE_REPLAY=1`, the local HTTP endpoint wrote every parent
+payload into a generic JSONB upsert table, committing each request. Exact
+detail, snapshot lineage and all **432 distinct parent payloads** matched
+between paths. In old-first order, old/batch took 3.158/0.351 seconds and
+wrote 4,462,976/4,261,168 WAL bytes. In batch-first order, batch/old took
+0.356/3.113 seconds and wrote 4,261,128/4,463,016 WAL bytes. Both runs had
+60/3 parent HTTP requests and 971/432 submitted parent rows. The generic
+table captures duplicate-write direction but does not reproduce the real
+PostgREST schemas, indexes, authorization, network latency or concurrent
+production load. The source slice is real; the target and HTTP layer remain
+isolated substitutes. These results do not establish the live whole-job
+improvement or a production-safe cutover.
+
 The combined suite, Python compilation, 49-entry manifest verification and
 `git diff --check` passed. The host composition shell test passed in an
 existing Linux Docker image with networking disabled and the worktree mounted
 read-only; the Mac host lacks `flock` and cannot run it natively.
 
-Before a production release, compare old/batch exports on a representative
-normal source with isolated target and production-equivalent parent writes;
-measure whole-stage wall time, target WAL, lease duration and retry outcomes.
-Review the merged manifest and exact host release identity. The
+Before a production release, verify a normal source run's full provider,
+source-store, export, verification and projection stages under the live lease;
+check real PostgREST parent behavior, target WAL and partial-failure recovery
+with bounded observation. Review the merged manifest and exact host release
+identity. The
 current production source pin remains on `375f1f1aaf25`; new source
 `d025f6607f67` had 18/20 comparable samples, latest20-unit success at
 18:54:03 UTC and normalized total p95 156,658.3 ms against a 148,617.4 ms

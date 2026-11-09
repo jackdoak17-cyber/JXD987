@@ -25,6 +25,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import psycopg2
+from psycopg2.extras import Json
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -84,7 +85,7 @@ def postgres(tmp_path_factory):
     data = root / "db"
     socket_dir = tempfile.TemporaryDirectory(prefix="jxd-pg-", dir="/tmp")
     sockets = Path(socket_dir.name)
-    subprocess.run([initdb, "-D", str(data), "-A", "trust", "--no-locale"],
+    subprocess.run([initdb, "-D", str(data), "-A", "trust", "--no-locale", "--encoding=UTF8"],
                    check=True, capture_output=True)
     subprocess.run([pg_ctl, "-D", str(data), "-l", str(root / "postgres.log"),
                     "-o", f"-F -h '' -k {sockets}", "-w", "start"],
@@ -475,23 +476,56 @@ def test_twenty_fixture_old_vs_batch_export_parity_and_write_cost(replay, tmp_pa
 
 def test_twenty_fixture_subprocess_export_with_local_parent_http(replay, tmp_path):
     """Exercise the actual exporter process and parent HTTP call pattern offline."""
-    fixture_ids = list(range(FIXTURE + 200, FIXTURE + 220))
     snapshots = {}
-    with replay.engine.begin() as source:
-        source.exec_driver_sql(
-            "insert into seasons(id,league_id,name,is_current) values(10,8,'test',1)"
-        )
-    for fixture_id in fixture_ids:
-        data = payload(fixture_id=fixture_id)
-        replay.discover(data)
-        assessment = delivery.assess_provider_payload(data)
-        snapshots[fixture_id] = delivery.persist_provider_snapshot(
-            replay.url, fixture_id, 8, 10, data, assessment,
-            delivery.provider_payload_hash(data), delivery.normalized_provider_hash(data),
-        )
-        delivery.store_provider_detail(replay.engine, replay.client, fixture_id, data, assessment)
+    representative = os.environ.get("ODDS_REPRESENTATIVE_SOURCE_PATH")
+    if representative:
+        source_path = Path(representative)
+        assert source_path.is_file()
+        with sqlite3.connect(f"file:{source_path}?mode=ro", uri=True) as source:
+            source_rows = source.execute("""select id,league_id,season_id,
+                home_team_id,away_team_id,starting_at,status,status_code,
+                home_score,away_score from fixtures order by id""").fetchall()
+        assert len(source_rows) == 20
+        fixture_ids = [row[0] for row in source_rows]
+        league_ids = sorted({row[1] for row in source_rows})
+        with replay.conn.cursor() as cur:
+            for row in source_rows:
+                cur.execute("insert into teams(id) values(%s) on conflict do nothing", (row[3],))
+                cur.execute("insert into teams(id) values(%s) on conflict do nothing", (row[4],))
+                cur.execute("""insert into fixtures(id,league_id,season_id,
+                    home_team_id,away_team_id,starting_at,status,status_code,
+                    home_score,away_score) values(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""", row)
+                cur.execute("""insert into fixture_detail_snapshots(fixture_id,
+                    league_id,season_id) values(%s,%s,%s) returning id""", row[:3])
+                snapshots[row[0]] = cur.fetchone()[0]
+        replay.conn.commit()
+    else:
+        source_path = Path(replay.engine.url.database)
+        fixture_ids = list(range(FIXTURE + 200, FIXTURE + 220))
+        league_ids = [8]
+        with replay.engine.begin() as source:
+            source.exec_driver_sql(
+                "insert into seasons(id,league_id,name,is_current) values(10,8,'test',1)"
+            )
+        for fixture_id in fixture_ids:
+            data = payload(fixture_id=fixture_id)
+            replay.discover(data)
+            assessment = delivery.assess_provider_payload(data)
+            snapshots[fixture_id] = delivery.persist_provider_snapshot(
+                replay.url, fixture_id, 8, 10, data, assessment,
+                delivery.provider_payload_hash(data), delivery.normalized_provider_hash(data),
+            )
+            delivery.store_provider_detail(replay.engine, replay.client, fixture_id, data, assessment)
 
     http_calls = []
+    parent_write_replay = os.environ.get("ODDS_PARENT_WRITE_REPLAY") == "1"
+    parent_db = None
+    parent_lock = threading.Lock()
+    if parent_write_replay:
+        replay.sql("""create table parent_payloads(table_name text not null,
+            row_id bigint not null,payload jsonb not null,
+            primary key(table_name,row_id))""")
+        parent_db = psycopg2.connect(replay.url)
 
     class LocalParentAPI(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -499,7 +533,18 @@ def test_twenty_fixture_subprocess_export_with_local_parent_http(replay, tmp_pat
             if not self.path.startswith("/rest/v1/"):
                 self.send_error(404)
                 return
-            http_calls.append((self.path.split("?", 1)[0], len(json.loads(body))))
+            table = self.path.split("?", 1)[0].rsplit("/", 1)[-1]
+            rows = json.loads(body)
+            http_calls.append((table, len(rows)))
+            if parent_db is not None:
+                with parent_lock:
+                    with parent_db.cursor() as cur:
+                        for row in rows:
+                            cur.execute("""insert into parent_payloads(table_name,row_id,payload)
+                                values(%s,%s,%s) on conflict(table_name,row_id)
+                                do update set payload=excluded.payload""",
+                                (table, row["id"], Json(row)))
+                    parent_db.commit()
             self.send_response(204)
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -513,7 +558,7 @@ def test_twenty_fixture_subprocess_export_with_local_parent_http(replay, tmp_pat
     env = {
         "PATH": os.environ["PATH"],
         "PYTHONPATH": str(ROOT),
-        "JXD_DB_PATH": str(replay.engine.url.database),
+        "JXD_DB_PATH": str(source_path),
         "SUPABASE_URL": f"http://127.0.0.1:{server.server_port}",
         "SUPABASE_SERVICE_ROLE_KEY": "disposable-test-only",
         "SUPABASE_DB_URL": replay.url,
@@ -521,7 +566,7 @@ def test_twenty_fixture_subprocess_export_with_local_parent_http(replay, tmp_pat
     }
     common = [
         sys.executable, str(ROOT / "scripts/export_to_supabase.py"),
-        "--strict", "--leagues", "8", "--keep-all-seasons",
+        "--strict", "--leagues", ",".join(map(str, league_ids)), "--keep-all-seasons",
         "--protect-empty-detail", "--require-detail", "--atomic-fixture-detail",
         "--skip-odds-snapshots", "--skip-odds-outcomes", "--skip-prune",
     ]
@@ -559,24 +604,37 @@ def test_twenty_fixture_subprocess_export_with_local_parent_http(replay, tmp_pat
         lineage = replay.sql("""select fixture_id,accepted_snapshot_id
             from fixture_detail_delivery_status where fixture_id between %s and %s
             order by fixture_id""", (fixture_ids[0], fixture_ids[-1]))
+        parent_rows = (replay.sql("""select table_name,row_id,payload
+            from parent_payloads order by table_name,row_id""")
+            if parent_write_replay else [])
         metrics = {"mode": mode, "processes": len(commands), "seconds": round(elapsed, 3),
                    "wal_bytes": int(wal_bytes), "parent_http_requests": len(http_calls),
                    "parent_http_rows": sum(count for _, count in http_calls),
-                   "detail_rows": len(rows)}
+                   "detail_rows": len(rows), "distinct_parent_rows": len(parent_rows)}
         print("EXPORT_SUBPROCESS_COMPARE " + json.dumps(metrics, sort_keys=True))
-        return rows, lineage, metrics
+        return rows, lineage, parent_rows, metrics
 
     try:
-        old_rows, old_lineage, old = run("old")
-        replay.sql("""truncate fixture_players,fixture_statistics,
-            fixture_player_statistics,fixture_detail_delivery_status,projection_replays,players""")
-        batch_rows, batch_lineage, batched = run("batch")
+        modes = ("batch", "old") if os.environ.get("ODDS_BATCH_FIRST") == "1" else ("old", "batch")
+        results = {}
+        for index, mode in enumerate(modes):
+            if index:
+                replay.sql("""truncate fixture_players,fixture_statistics,
+                    fixture_player_statistics,fixture_detail_delivery_status,projection_replays,players""")
+                if parent_write_replay:
+                    replay.sql("truncate parent_payloads")
+            results[mode] = run(mode)
     finally:
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)
+        if parent_db is not None:
+            parent_db.close()
+    old_rows, old_lineage, old_parent, old = results["old"]
+    batch_rows, batch_lineage, batch_parent, batched = results["batch"]
     assert batch_rows == old_rows
     assert batch_lineage == old_lineage
+    assert batch_parent == old_parent
     assert {row[0] for row in batch_rows} == set(fixture_ids)
     assert old["parent_http_requests"] > batched["parent_http_requests"]
 
