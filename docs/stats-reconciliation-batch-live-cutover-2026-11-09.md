@@ -225,3 +225,23 @@ Three separate corrected-release batches have now succeeded (6/6, 17/13,
 3/3), including mixed batch/retry paths, without target parity failure.
 Retain the source-only trial under the unchanged schedule and safeguards;
 do not rearm leaderboard processing or switch its source pin yet.
+
+## Fourth normal source window and target parity
+
+The same corrected supervisor next completed a normal 20-unit batch at
+20:40:52: 20 selected, 19 accepted, one provider-pending, zero failed.
+Source-store/export/projection/activation took 32.750/47.036/9.201/24.296
+seconds. The corresponding job row reports 125,731 ms execution and 124,548
+ms processing. A direct read-only target query at21:01 found exactly 19
+`fixture_detail_delivery_status` rows for release `3df6bb130cb9` with
+`last_successful_at` from20:40:30 to20:40:52. All19 had non-null equal
+source/target snapshots, true player-stat and lineup parity, and an accepted
+snapshot link. All were labelled `provider_sparse`; this is the recorded
+provider status, not a delivery failure. The 20-unit run adds a second genuine
+comparable source sample. A later successful seven-unit batch at20:52:52
+establishes continuing source health but does not increase that comparable
+count; the performance view at20:52:55 reported **2/20** and preliminary
+normalized total p95 127,480.494 ms. This sample is too small to certify
+the source pin or justify leaderboard admission. Keep the source-only archive
+and ordinary schedule stable; preserve the old pinned release, resource debt,
+paused leaderboard worker, customer reader setting and paid capacity.
