@@ -192,3 +192,11 @@ batching them requires separate safety proof. The current JXD `main` at
 `aa9304e` is behind the active production archive `3028e0f`, so merging this
 branch directly would carry earlier unmerged worker changes. No added
 capacity, Spend Cap change or paid service was used.
+
+A third ordinary source window at20:37 succeeded3/3 with two batched and
+one individual retry, export10.369 seconds. All three serving rows passed
+the same snapshot, parity and accepted-link checks. The latest source status
+is success at20:37:31, but comparable sample count remains one because this
+run had only three work units. This supports recurrence and correctness for
+the current release; the20-sample performance gate and full customer/worker
+acceptance remain open.

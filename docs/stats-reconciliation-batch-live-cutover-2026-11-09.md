@@ -208,3 +208,20 @@ broaden batch eligibility without separate retry-safety evidence. JXD `main`
 was `aa9304e` at this check, behind the exact active `3028e0f` archive, so a
 direct PR from the trial branch would include earlier unmerged host/leaderboard
 work. Reconcile that integration boundary before a production-branch merge.
+
+## Third normal source window
+
+At20:37:01–20:37:31, the same corrected supervisor completed another normal
+lease-bounded batch: three selected, three accepted, zero pending or failed.
+Two fixtures used the batch path and one retry remained individual; export
+took10.369 seconds, source-store4.764, projection4.931 and activation4.491.
+Direct serving-status read found one `provider_sparse` and two `verified`
+rows, all three with non-null equal source/target snapshots, true player and
+lineup parity, and accepted snapshot links. The source performance view
+reported latest release `3df6bb130cb9`, status success, three work units at
+20:37:31, while comparable sample count remained **one**. A later small
+success can prove health but cannot satisfy the20-comparable-run pin gate.
+Three separate corrected-release batches have now succeeded (6/6, 17/13,
+3/3), including mixed batch/retry paths, without target parity failure.
+Retain the source-only trial under the unchanged schedule and safeguards;
+do not rearm leaderboard processing or switch its source pin yet.
