@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import shutil
 import signal
 import subprocess
@@ -47,6 +48,9 @@ def test_finite_trial_wrapper_rejects_unreviewed_release_before_connection(tmp_p
         "LEADERBOARD_FINITE_TRIAL_POLICY_ID=local-policy\n"
         "LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256=" + "0" * 64 + "\n"
         "LEADERBOARD_FINITE_TRIAL_RELEASE_SHA=" + "1" * 40 + "\n"
+        "LEADERBOARD_FINITE_TRIAL_RUNTIME_MANIFEST_SHA256="
+        + hashlib.sha256((ROOT / "scripts/vps/runtime_manifest.sha1").read_bytes()).hexdigest()
+        + "\n"
         "LEADERBOARD_FINITE_TRIAL_OPERATOR_NOTE='local wrapper rejection'\n"
     )
     environment = os.environ.copy()
@@ -59,6 +63,40 @@ def test_finite_trial_wrapper_rejects_unreviewed_release_before_connection(tmp_p
     )
     assert process.returncode != 0
     assert "checkout differs from the reviewed release" in process.stderr
+
+
+def test_finite_trial_wrapper_accepts_pinned_archive_without_git(tmp_path):
+    archive = tmp_path / "runtime-archive"
+    manifest = ROOT / "scripts/vps/runtime_manifest.sha1"
+    for line in manifest.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        relative = line.split(maxsplit=1)[1]
+        destination = archive / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+    archive_manifest = archive / "scripts/vps/runtime_manifest.sha1"
+    shutil.copy2(manifest, archive_manifest)
+    environment_file = tmp_path / "archive-trial.env"
+    environment_file.write_text(
+        "LEADERBOARD_FINITE_TRIAL_POLICY_ID=local-policy\n"
+        "LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256=" + "0" * 64 + "\n"
+        "LEADERBOARD_FINITE_TRIAL_RELEASE_SHA=" + "1" * 40 + "\n"
+        "LEADERBOARD_FINITE_TRIAL_RUNTIME_MANIFEST_SHA256="
+        + hashlib.sha256(archive_manifest.read_bytes()).hexdigest() + "\n"
+        "LEADERBOARD_FINITE_TRIAL_OPERATOR_NOTE='archive identity proof'\n"
+    )
+    environment = os.environ.copy()
+    environment["LEADERBOARD_SHADOW_ENV_FILE"] = str(environment_file)
+    environment.pop("SUPABASE_DB_URL", None)
+    environment.pop("SUPABASE_DB_URL_SESSION", None)
+    result = subprocess.run(
+        ["bash", str(archive / "scripts/vps/run_leaderboard_finite_trial.sh")],
+        env=environment, capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert result.returncode != 0
+    assert "runtime manifest verified" in result.stdout
+    assert "trial database URL is required" in result.stderr
 
 
 def test_finite_trial_commands_reject_a_non_disposable_database(monkeypatch):

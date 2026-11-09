@@ -118,7 +118,8 @@ does not turn on the ordinary worker or customer reader. The reviewed policy
 ID, full release SHA and SHA-256 of the existing database URL must be pinned
 in `LEADERBOARD_FINITE_TRIAL_POLICY_ID`,
 `LEADERBOARD_FINITE_TRIAL_RELEASE_SHA` and
-`LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256`, together with a reviewed
+`LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256`, plus the reviewed SHA-256 of
+the complete runtime manifest in `LEADERBOARD_FINITE_TRIAL_RUNTIME_MANIFEST_SHA256`, together with a reviewed
 `LEADERBOARD_FINITE_TRIAL_OPERATOR_NOTE`. The URL itself is never logged.
 
 The production-named `finite-once`/`finite-recover` commands require the
