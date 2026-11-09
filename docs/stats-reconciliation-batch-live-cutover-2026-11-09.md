@@ -118,8 +118,9 @@ was changed to the previously verified `24d0a94` archive, preserving every
 other cron entry. Exact cron readback passed. The corrected supervisor started
 at19:56:12 as PID1476216, release `3df6bb130cb9`. Its first lease check
 deferred because only168 seconds remained against the270-second minimum.
-The first genuine corrected-release batch, batch/individual counts, source
-stage timings, target parity and normal recurrence are **pending**.
+The first genuine corrected-release batch and launch-context correction are
+recorded below. Repeated-run and comparable full-workload evidence remain
+open.
 
 If this trial fails its source or data checks, first let its child drain or
 terminate it under the existing lease. Stop only PID1476216 after verifying
@@ -127,3 +128,44 @@ its command, restore only the statistics cron entry from the root-only backup
 if the current entry still points to this archive, and restart the verified
 old archive. Keep the original source pin/resource debt, paused leaderboard
 worker and customer reader unchanged. No paid settings changed in this trial.
+
+## Corrected first run and an action-time launch error
+
+The first manually started corrected supervisor was invoked by absolute script
+path from root's working directory. The wrapper derives `REPO_ROOT` for its
+runtime files, but its default `data/jxd.sqlite` source path is relative to
+the process working directory. At20:07:01 the source worker exited before
+candidate selection with `Source database not found: data/jxd.sqlite`.
+There was no exporter, accepted fixture, source-ledger mutation or source
+report from this attempt. This was a deployment-command error, not evidence
+that the staged database symlink was missing. The normal cron command already
+includes `cd` to the archive, but the first supervisor would have kept
+holding the singleton lock and retrying from the wrong directory. With no
+source child in flight, it was stopped and the same exact archive was
+restarted **from inside** its directory at20:07:47 as PID1479855. The cron
+entry, archive and manifest were not changed. Future manual starts must first
+`cd` to the archive, matching cron.
+
+The next lease-bounded corrected run at20:07:48–20:08:42 succeeded: six
+selected, six accepted, zero pending or failed. The two-cohort limiter
+reduced the nominal100 candidate pool to six. Source report counted **five
+batched fixtures and one individual retry**; the final exporter report was
+the expected one-fixture retry because the shared report path is last-writer.
+Source-store/export/verification/projection/activation took
+14.591/16.679/0.525/7.067/8.842 seconds. A direct read of the serving
+delivery-status table found all six accepted rows under `3df6bb130cb9` at
+20:08:34–20:08:41, with equal non-null source/target snapshots, true player
+and lineup parity and accepted snapshot links. Source performance latest
+status became success at20:08:42, with only one release sample and latest six
+work units. This shows the mixed path now executes and delivers correctly for
+one small run. It is not a controlled comparison with the prior20/20 run,
+which had export80.556 seconds, or sufficient source-pin evidence.
+
+At20:09:19 the corrected supervisor and exact cron entry remained active.
+Read-only serving state still showed capture on, worker/backfill off and
+resource paused at `wal_bytes_limit`, with durable WAL3,821,618,701 bytes
+and temp444,508,273 bytes. The old source's21 comparable20-unit samples had
+total p95 154,667ms against the pinned148,617.4ms ceiling; the corrected
+release has not met its20-sample guard. Observe the next ordinary larger
+batch and recurring source/Fixtures health before deciding whether to retain
+the trial. No paid capacity, disk provisioning or Spend Cap change occurred.

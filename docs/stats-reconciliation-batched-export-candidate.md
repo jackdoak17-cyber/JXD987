@@ -170,8 +170,13 @@ warnings. Its regenerated49-entry manifest SHA-256 is
 and release ID `3df6bb130cb9` (manifest SHA-1 prefix). The immutable corrected
 archive was staged and verified at 19:51 UTC, then activated for a guarded
 source-only trial at 19:56 after the old source's ordinary20/20 success. Its
-first lease check correctly deferred; the first genuine batch is pending. It
-still needs a genuine live source trial
+first lease check correctly deferred. The first manual start from outside the
+archive hit a relative-source-path error before fixture work; it was restarted
+from the archive directory without changing runtime bytes or cron. The first
+genuine corrected batch succeeded6/6, with five batched and one individual
+retry, export16.679s and all six target snapshot/parity/link checks passing.
+This is a small mixed-path proof, not a comparable full-workload benchmark.
+It still needs repeated live source trials
 under the installed lease, target parity check, full-job timing comparison,
 and normal old-source run verification before any renewed cutover can be
 called successful. No added capacity, Spend Cap change or paid service was
