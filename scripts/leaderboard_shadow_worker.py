@@ -371,6 +371,7 @@ def claim_dirty(
     lease_seconds: int = 60,
     league_id: int | None = None,
     season_id: int | None = None,
+    audit_run_id: int | None = None,
 ) -> DirtyClaim | None:
     token = f"{worker_id}:{uuid.uuid4().hex}"
     with conn:
@@ -417,10 +418,20 @@ def claim_dirty(
                 ),
             )
             row = cur.fetchone()
+            if row is not None and audit_run_id is not None:
+                cur.execute(
+                    "update leaderboard_shadow_v1.worker_runs "
+                    "set claimed_count=claimed_count+1 where run_id=%s and finished_at is null",
+                    (audit_run_id,),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("finite trial audit run is not open")
     return DirtyClaim(**row) if row else None
 
 
-def process_dirty_claim(conn, claim: DirtyClaim) -> bool:
+def process_dirty_claim(
+    conn, claim: DirtyClaim, audit_run_id: int | None = None,
+) -> bool:
     """Capture and acknowledge only the exact dirty version that was claimed."""
 
     with conn:
@@ -444,6 +455,15 @@ def process_dirty_claim(conn, claim: DirtyClaim) -> bool:
                 ),
             )
             if cur.rowcount == 1:
+                if audit_run_id is not None:
+                    cur.execute(
+                        "update leaderboard_shadow_v1.worker_runs "
+                        "set succeeded_count=succeeded_count+1 "
+                        "where run_id=%s and finished_at is null",
+                        (audit_run_id,),
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError("finite trial audit run is not open")
                 return True
             cur.execute(
                 """
@@ -456,7 +476,9 @@ def process_dirty_claim(conn, claim: DirtyClaim) -> bool:
             return False
 
 
-def fail_dirty_claim(conn, claim: DirtyClaim, error: Exception) -> None:
+def fail_dirty_claim(
+    conn, claim: DirtyClaim, error: Exception, audit_run_id: int | None = None,
+) -> None:
     with conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -467,6 +489,15 @@ def fail_dirty_claim(conn, claim: DirtyClaim, error: Exception) -> None:
                 """,
                 (str(error)[:2000], claim.fixture_id, claim.claim_token, claim.claim_fence),
             )
+            if audit_run_id is not None:
+                cur.execute(
+                    "update leaderboard_shadow_v1.worker_runs "
+                    "set failed_count=failed_count+1 "
+                    "where run_id=%s and finished_at is null",
+                    (audit_run_id,),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("finite trial audit run is not open")
 
 
 def process_capture_queue(
@@ -478,8 +509,12 @@ def process_capture_queue(
     league_id: int | None = None,
     season_id: int | None = None,
     guard_check: Callable[[Any, bool], dict[str, Any]] | None = None,
+    progress: dict[str, int] | None = None,
+    audit_run_id: int | None = None,
 ) -> dict[str, int]:
-    result = {"claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0}
+    result = progress if progress is not None else {
+        "claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0,
+    }
     guard_check = guard_check or enforce_resource_guard
     for _ in range(min(limit, budget.fixture_limit - budget.processed)):
         if not budget.available():
@@ -494,20 +529,27 @@ def process_capture_queue(
             worker_id,
             league_id=league_id,
             season_id=season_id,
+            **({"audit_run_id": audit_run_id} if audit_run_id is not None else {}),
         )
         if claim is None:
             break
         result["claimed"] += 1
         budget.consume()
         try:
-            if process_dirty_claim(conn, claim):
+            if process_dirty_claim(
+                conn, claim,
+                **({"audit_run_id": audit_run_id} if audit_run_id is not None else {}),
+            ):
                 result["acknowledged"] += 1
             else:
                 result["redirtied"] += 1
         except Exception as error:
             apply_recovery_timeouts(conn)
             mark_failed_statement_interval(conn)
-            fail_dirty_claim(conn, claim, error)
+            fail_dirty_claim(
+                conn, claim, error,
+                **({"audit_run_id": audit_run_id} if audit_run_id is not None else {}),
+            )
             result["failed"] += 1
     if (
         result["claimed"] > 0
@@ -853,7 +895,8 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
         raise RuntimeError("trial-once is limited to ten fixture captures")
     if args.cohort_limit != 0 or args.job_limit != 0:
         raise RuntimeError("trial-once cannot generate or publish leaderboards")
-    if not 0 <= args.trial_test_pg_sleep_after_admission <= 120:
+    if not (0 <= args.trial_test_pg_sleep_after_admission <= 120
+            and 0 <= args.trial_test_pg_sleep_after_capture <= 120):
         raise RuntimeError("isolated trial sleep must be within 120 seconds")
     budget = RunBudget.create(args.fixture_limit, args.max_seconds)
     apply_preflight_timeouts(conn)
@@ -888,7 +931,7 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
         return evidence
 
     closed = False
-    capture: dict[str, int] | None = None
+    capture = {"claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0}
     try:
         if args.trial_test_pg_sleep_after_admission:
             with conn:
@@ -906,7 +949,15 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
             conn, worker_id, args.capture_limit, budget, False,
             league_id=args.league_id, season_id=args.season_id,
             guard_check=check_trial_guard,
+            progress=capture, audit_run_id=run_id,
         )
+        if args.trial_test_pg_sleep_after_capture:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "select pg_sleep(%s)",
+                        (args.trial_test_pg_sleep_after_capture,),
+                    )
         # A full ten-claim budget skips process_capture_queue's final periodic
         # check. Always checkpoint before closing or claiming success.
         check_trial_guard(conn, False)
@@ -924,8 +975,8 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
                 )
                 outcome = cur.fetchone()["outcome"]
         closed = True
-        if outcome.get("resolution_state") != "settled" or outcome.get("settlement", {}).get("settled") is not True:
-            raise RuntimeError("finite trial closed with unresolved liability")
+        if outcome.get("trial_succeeded") is not True:
+            raise RuntimeError("finite trial settled but failed its final safety check")
         return {
             "policy_id": args.trial_policy_id, "owner": worker_id,
             "fence": fence, "run_id": run_id,
@@ -938,9 +989,9 @@ def run_isolated_finite_trial(conn, args, worker_id: str) -> dict[str, Any]:
         if not closed:
             apply_recovery_timeouts(conn)
             mark_failed_statement_interval(conn)
-            claimed = capture["claimed"] if capture is not None else budget.processed
-            succeeded = capture["acknowledged"] if capture is not None else 0
-            failed = max(1, capture["failed"]) if capture is not None else 1
+            claimed = capture["claimed"]
+            succeeded = capture["acknowledged"]
+            failed = max(1, capture["failed"])
             with conn:
                 with conn.cursor() as cur:
                     cur.execute(
@@ -1006,6 +1057,7 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=250)
     parser.add_argument("--trial-policy-id")
     parser.add_argument("--trial-test-pg-sleep-after-admission", type=float, default=0)
+    parser.add_argument("--trial-test-pg-sleep-after-capture", type=float, default=0)
     args = parser.parse_args()
     if (args.league_id is None) != (args.season_id is None):
         parser.error("league-id and season-id must be supplied together")

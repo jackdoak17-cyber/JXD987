@@ -60,6 +60,24 @@ def test_finite_trial_supervisor_lock_excludes_and_releases(tmp_path):
     again.close()
 
 
+def test_trial_capture_progress_survives_a_later_guard_failure(monkeypatch):
+    claims = iter([DirtyClaim(2001, 1, "worker:1", 1), None])
+    monkeypatch.setattr(worker_module, "claim_dirty", lambda *_args, **_kwargs: next(claims))
+    monkeypatch.setattr(worker_module, "process_dirty_claim", lambda *_args, **_kwargs: True)
+    progress = {"claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0}
+
+    def stopped_guard(*_args):
+        raise RuntimeError("guard stopped after one committed capture")
+
+    with pytest.raises(RuntimeError, match="guard stopped"):
+        process_capture_queue(
+            FakeConnection(FakeCursor()), "worker", 10,
+            RunBudget.create(10, MAX_SECONDS_PER_RUN), False,
+            guard_check=stopped_guard, progress=progress, audit_run_id=11,
+        )
+    assert progress == {"claimed": 1, "acknowledged": 1, "redirtied": 0, "failed": 0}
+
+
 class FakeCursor:
     def __init__(self, delete_count=1):
         self.executed = []

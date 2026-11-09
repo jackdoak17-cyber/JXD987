@@ -121,6 +121,11 @@ def run_trial(args) -> int:
                     "--trial-test-pg-sleep-after-admission",
                     str(args.test_pg_sleep_after_admission),
                 ]
+            if args.test_pg_sleep_after_capture:
+                worker += [
+                    "--trial-test-pg-sleep-after-capture",
+                    str(args.test_pg_sleep_after_capture),
+                ]
             process = subprocess.Popen(
                 worker, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, start_new_session=True,
@@ -180,10 +185,12 @@ def main() -> int:
     parser.add_argument("--drain-seconds", type=float, default=10)
     parser.add_argument("--recovery-seconds", type=float, default=15)
     parser.add_argument("--test-pg-sleep-after-admission", type=float, default=0)
+    parser.add_argument("--test-pg-sleep-after-capture", type=float, default=0)
     args = parser.parse_args()
     if not (1 <= args.deadline_seconds <= 60 and 1 <= args.grace_seconds <= 10
             and 1 <= args.drain_seconds <= 30 and 1 <= args.recovery_seconds <= 30
-            and 0 <= args.test_pg_sleep_after_admission <= 120):
+            and 0 <= args.test_pg_sleep_after_admission <= 120
+            and 0 <= args.test_pg_sleep_after_capture <= 120):
         parser.error("finite trial time bounds are invalid")
     if not Path(args.worker_path).is_file():
         parser.error("finite trial worker path is missing")
