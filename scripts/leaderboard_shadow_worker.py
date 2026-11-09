@@ -580,7 +580,10 @@ def process_capture_queue(
     guard_check: Callable[[Any, bool], dict[str, Any]] | None = None,
     progress: dict[str, int] | None = None,
     audit_run_id: int | None = None,
+    guard_interval: int = RESOURCE_GUARD_FIXTURE_INTERVAL,
 ) -> dict[str, int]:
+    if not 1 <= guard_interval <= RESOURCE_GUARD_FIXTURE_INTERVAL:
+        raise ValueError("capture guard interval is outside its bounded range")
     result = progress if progress is not None else {
         "claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0,
     }
@@ -589,7 +592,7 @@ def process_capture_queue(
         if not budget.available():
             break
         if result["claimed"] > 0 and (
-            result["claimed"] % RESOURCE_GUARD_FIXTURE_INTERVAL == 0
+            result["claimed"] % guard_interval == 0
         ):
             budget.apply_database_timeouts(conn)
             guard_check(conn, require_external)
@@ -622,7 +625,7 @@ def process_capture_queue(
             result["failed"] += 1
     if (
         result["claimed"] > 0
-        and result["claimed"] % RESOURCE_GUARD_FIXTURE_INTERVAL != 0
+        and result["claimed"] % guard_interval != 0
         and budget.available()
     ):
         budget.apply_database_timeouts(conn)
@@ -851,7 +854,10 @@ def process_generations(
             if max_materialized_jobs is None else
             ensure_generation(
                 conn, league_id, season_id,
-                max_materialized_jobs=max_materialized_jobs,
+                max_materialized_jobs=min(
+                    max_materialized_jobs,
+                    budget.fixture_limit - budget.processed,
+                ),
             )
         )
         if generation_id is None:
@@ -1238,12 +1244,181 @@ def recover_isolated_finite_trial(conn, args) -> dict[str, Any]:
     return recover_finite_trial(conn, args, production=False)
 
 
+ROLLING_STATEMENTS = {
+    "begin": "select leaderboard_rolling_v1.begin_bound_worker(%s,%s,%s) as decision",
+    "guard": "select leaderboard_rolling_v1.check_bound_worker(%s,%s,%s,%s) as evidence",
+    "finish": "select leaderboard_rolling_v1.finish_bound_worker(%s,%s,%s,%s,%s,%s,%s,%s) as outcome",
+    "recover": "select leaderboard_rolling_v1.recover_bound_worker(%s,%s,%s,%s) as outcome",
+}
+
+
+def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
+    """One supervised capture and publication run under a renewable reservation."""
+    validate_production_trial_connection(conn, args)
+    if not args.trial_policy_id:
+        raise RuntimeError("rolling worker requires --trial-policy-id")
+    if not (1 <= args.fixture_limit <= MAX_FIXTURES_PER_RUN
+            and 0 <= args.capture_limit <= args.fixture_limit
+            and 0 <= args.cohort_limit <= 8
+            and 0 <= args.job_limit <= args.fixture_limit
+            and (args.capture_limit or args.job_limit)):
+        raise RuntimeError("rolling worker capture, cohort or job bound is invalid")
+    if args.production_trial_isolated_test and not isolated_test_database(conn):
+        raise RuntimeError("rolling test path requires socket-only oddssearch_m3")
+    budget = RunBudget.create(args.fixture_limit, args.max_seconds)
+    apply_preflight_timeouts(conn)
+    temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
+    budget.apply_database_timeouts(conn)
+    with conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                ROLLING_STATEMENTS["begin"],
+                (args.trial_policy_id, worker_id, RELEASE_SHA),
+            )
+            decision = cur.fetchone()["decision"]
+    if decision.get("admitted") is not True:
+        raise RuntimeError(f"rolling admission refused: {decision.get('reason')}")
+    fence, run_id = int(decision["fence"]), int(decision["run_id"])
+    print(json.dumps({
+        "event": "rolling_worker_admitted", "policy_id": args.trial_policy_id,
+        "owner": worker_id, "fence": fence, "run_id": run_id,
+    }, sort_keys=True), flush=True)
+
+    def check_rolling_guard(connection, _require_external: bool) -> dict[str, Any]:
+        with connection:
+            with connection.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    ROLLING_STATEMENTS["guard"],
+                    (args.trial_policy_id, worker_id, fence, run_id),
+                )
+                evidence = cur.fetchone()["evidence"]
+        if evidence.get("ok") is not True:
+            raise RuntimeError(f"rolling guard stopped work: {evidence.get('reason')}")
+        return evidence
+
+    capture = {"claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0}
+    generations = {"cohorts": 0, "jobs": 0, "published": 0}
+    closed = False
+    try:
+        if args.production_trial_isolated_test and args.trial_test_pg_sleep_after_admission:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "select pg_sleep(%s)",
+                        (args.trial_test_pg_sleep_after_admission,),
+                    )
+        check_rolling_guard(conn, False)
+        budget.apply_database_timeouts(conn)
+        eligibility_count = refresh_eligibility_if_due(conn)
+        check_rolling_guard(conn, False)
+        budget.apply_database_timeouts(conn)
+        if args.capture_limit:
+            process_capture_queue(
+                conn, worker_id, args.capture_limit, budget, False,
+                league_id=args.league_id, season_id=args.season_id,
+                guard_check=check_rolling_guard, progress=capture,
+                audit_run_id=run_id, guard_interval=1,
+            )
+        if capture["failed"]:
+            raise RuntimeError("rolling capture failed")
+        remaining_jobs = min(
+            args.job_limit, budget.fixture_limit - budget.processed
+        )
+        if args.cohort_limit and remaining_jobs and budget.available():
+            check_rolling_guard(conn, False)
+            budget.apply_database_timeouts(conn)
+            process_generations(
+                conn, worker_id, args.cohort_limit, remaining_jobs,
+                budget, False, guard_check=check_rolling_guard,
+                progress=generations, max_materialized_jobs=remaining_jobs,
+            )
+        check_rolling_guard(conn, False)
+        apply_recovery_timeouts(conn)
+        with conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    ROLLING_STATEMENTS["finish"],
+                    (args.trial_policy_id, worker_id, fence, run_id, False,
+                     capture["claimed"] + generations["jobs"],
+                     capture["acknowledged"] + generations["jobs"],
+                     capture["failed"]),
+                )
+                outcome = cur.fetchone()["outcome"]
+        closed = True
+        if outcome.get("run_succeeded") is not True:
+            raise RuntimeError("rolling worker closed but failed final safety check")
+        return {
+            "policy_id": args.trial_policy_id, "owner": worker_id,
+            "fence": fence, "run_id": run_id, "capture": capture,
+            "generations": generations, "eligibility_count": eligibility_count,
+            "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
+            "temp_file_limit_enforced": temp_file_limit_enforced,
+            "outcome": outcome,
+        }
+    except Exception:
+        if not closed:
+            apply_recovery_timeouts(conn)
+            mark_failed_statement_interval(conn)
+            with conn:
+                with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(
+                        ROLLING_STATEMENTS["finish"],
+                        (args.trial_policy_id, worker_id, fence, run_id, True,
+                         capture["claimed"] + generations["jobs"],
+                         capture["acknowledged"] + generations["jobs"],
+                         max(1, capture["failed"])),
+                    )
+                    cur.fetchone()
+        raise
+
+
+def recover_rolling_worker(conn, args) -> dict[str, Any]:
+    """Settle the single stopped run after its exact owner backend has drained."""
+    validate_production_trial_connection(conn, args)
+    if not args.trial_policy_id:
+        raise RuntimeError("rolling recovery requires --trial-policy-id")
+    apply_preflight_timeouts(conn)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            "select reservation_id,owner,worker_run_id,closed_unsettled_at "
+            "from leaderboard_rolling_v1.reservations "
+            "where policy_id=%s and settled_at is null",
+            (args.trial_policy_id,),
+        )
+        reservations = cur.fetchall()
+    if not reservations:
+        return {"state": "already_settled", "policy_id": args.trial_policy_id}
+    if len(reservations) != 1:
+        raise RuntimeError("rolling recovery found multiple unsettled reservations")
+    reservation = reservations[0]
+    if reservation["worker_run_id"] is None:
+        raise RuntimeError("rolling recovery found an unbound reservation")
+    if reservation["closed_unsettled_at"] is not None:
+        raise RuntimeError("rolling recovery remains closed and unsettled")
+    with conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                ROLLING_STATEMENTS["recover"],
+                (args.trial_policy_id, reservation["owner"],
+                 reservation["reservation_id"], reservation["worker_run_id"]),
+            )
+            outcome = cur.fetchone()["outcome"]
+    if (outcome.get("resolution_state") != "settled"
+            or outcome.get("settlement", {}).get("settled") is not True):
+        raise RuntimeError(
+            "rolling recovery remains unresolved: "
+            + str(outcome.get("reason") or outcome.get("resolution_state"))
+        )
+    return {"state": "recovered", "policy_id": args.trial_policy_id,
+            "outcome": outcome}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=(
         "run-once", "backfill", "backfill-all", "status",
         "trial-once", "trial-full-once", "trial-recover",
-        "finite-once", "finite-recover",
+        "finite-once", "finite-recover", "rolling-once", "rolling-recover",
     ))
     parser.add_argument("--isolated-test-override", action="store_true")
     parser.add_argument("--production-trial-isolated-test", action="store_true")
@@ -1260,8 +1435,10 @@ def main() -> int:
     parser.add_argument("--trial-test-pg-sleep-after-capture", type=float, default=0)
     parser.add_argument("--trial-test-pg-sleep-before-recovery", type=float, default=0)
     args = parser.parse_args()
-    if args.production_trial_isolated_test and args.command not in {"finite-once", "finite-recover"}:
-        parser.error("production trial isolated test flag requires finite-once/recover")
+    if args.production_trial_isolated_test and args.command not in {
+        "finite-once", "finite-recover", "rolling-once", "rolling-recover"
+    }:
+        parser.error("production isolated test flag requires a bound worker command")
     if (args.league_id is None) != (args.season_id is None):
         parser.error("league-id and season-id must be supplied together")
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
@@ -1301,6 +1478,18 @@ def main() -> int:
         if args.command == "finite-recover":
             print(json.dumps(
                 recover_finite_trial(conn, args, production=True),
+                default=str, sort_keys=True,
+            ))
+            return 0
+        if args.command == "rolling-once":
+            print(json.dumps(
+                run_rolling_worker(conn, args, worker_id),
+                default=str, sort_keys=True,
+            ))
+            return 0
+        if args.command == "rolling-recover":
+            print(json.dumps(
+                recover_rolling_worker(conn, args),
                 default=str, sort_keys=True,
             ))
             return 0

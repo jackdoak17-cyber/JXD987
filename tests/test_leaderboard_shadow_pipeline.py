@@ -180,6 +180,18 @@ def test_finite_trial_supervisor_lock_excludes_and_releases(tmp_path):
     again.close()
 
 
+def test_rolling_quarantine_cannot_be_cleared_by_finite_reconciliation(tmp_path):
+    marker = tmp_path / "worker.lock.quarantine"
+    supervisor_module.write_quarantine_marker(
+        marker, "rolling-policy", "inflight", ["a" * 16], rolling=True
+    )
+    with pytest.raises(RuntimeError, match="identity is invalid"):
+        supervisor_module.read_quarantine_marker(marker, "rolling-policy")
+    assert supervisor_module.read_quarantine_marker(
+        marker, "rolling-policy", rolling=True
+    ) == ["a" * 16]
+
+
 def test_finite_trial_child_keeps_flock_after_parent_exit(tmp_path):
     path = str(tmp_path / "inherited.lock")
     parent_code = (
@@ -467,6 +479,22 @@ def test_capture_resource_guard_is_checked_in_bounded_groups(monkeypatch):
         "failed": 0,
     }
     assert len(guard_calls) == 3
+
+
+def test_rolling_capture_guard_checks_after_each_claim(monkeypatch):
+    claims = iter([DirtyClaim(1, 1, "worker:1", 1),
+                   DirtyClaim(2, 1, "worker:2", 1), None])
+    guard_calls = []
+    monkeypatch.setattr(worker_module, "claim_dirty", lambda *_a, **_kw: next(claims))
+    monkeypatch.setattr(worker_module, "process_dirty_claim", lambda *_a, **_kw: True)
+    budget = RunBudget.create(10, MAX_SECONDS_PER_RUN)
+    progress = process_capture_queue(
+        FakeConnection(FakeCursor()), "worker", 10, budget, False,
+        guard_check=lambda *_a: guard_calls.append(True) or {"ok": True},
+        audit_run_id=42, guard_interval=1,
+    )
+    assert progress["acknowledged"] == 2
+    assert len(guard_calls) == 2
 
 
 def test_generation_keeps_legacy_guard_at_each_work_boundary(monkeypatch):

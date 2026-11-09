@@ -84,13 +84,14 @@ def stop_process_group(process: subprocess.Popen, grace_seconds: float) -> tuple
 
 
 def write_quarantine_marker(path: Path, policy_id: str, state: str,
-                            tokens: list[str]) -> None:
+                            tokens: list[str], *, rolling: bool = False) -> None:
     if not tokens or len(tokens) != len(set(tokens)) or any(
         not re.fullmatch(r"[0-9a-f]{16}", token) for token in tokens
     ):
         raise RuntimeError("finite trial quarantine tokens are invalid")
     payload = json.dumps({
         "policy_id": policy_id, "state": state, "tokens": tokens,
+        "mode": "rolling" if rolling else "finite",
         "recorded_at": time.time(),
     }, sort_keys=True).encode("utf-8")
     temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
@@ -118,12 +119,15 @@ def clear_quarantine_marker(path: Path) -> None:
         os.close(directory)
 
 
-def read_quarantine_marker(path: Path, policy_id: str) -> list[str]:
+def read_quarantine_marker(path: Path, policy_id: str, *, rolling: bool = False) -> list[str]:
     if path.is_symlink() or not path.is_file():
         raise RuntimeError("finite trial quarantine marker is missing or invalid")
     marker = json.loads(path.read_text(encoding="utf-8"))
     tokens = marker.get("tokens")
-    if (marker.get("policy_id") != policy_id or not isinstance(tokens, list)
+    expected_mode = "rolling" if rolling else "finite"
+    if (marker.get("policy_id") != policy_id
+            or marker.get("mode", "finite") != expected_mode
+            or not isinstance(tokens, list)
             or not tokens or len(tokens) != len(set(tokens))
             or any(not isinstance(token, str) or
                    not re.fullmatch(r"[0-9a-f]{16}", token) for token in tokens)):
@@ -158,7 +162,8 @@ def drain_token_backends(url: str, token: str, seconds: float) -> None:
         conn.close()
 
 
-def drain_exact_backend(url: str, policy_id: str, seconds: float, *, production: bool) -> None:
+def drain_exact_backend(url: str, policy_id: str, seconds: float, *,
+                        production: bool, rolling: bool = False) -> None:
     deadline = time.monotonic() + seconds
     conn = bounded_connection(url)
     try:
@@ -170,6 +175,14 @@ def drain_exact_backend(url: str, policy_id: str, seconds: float, *, production:
                 # held. Terminate only the still-open reservation's exact
                 # backend PID/start identity, never another database process.
                 query = (
+                    """
+                    select pg_terminate_backend(activity.pid)
+                    from leaderboard_rolling_v1.reservations reservation
+                    join pg_catalog.pg_stat_activity activity
+                      on activity.pid=reservation.owner_backend_pid
+                     and activity.backend_start=reservation.owner_backend_started_at
+                    where reservation.policy_id=%s and reservation.settled_at is null
+                    """ if rolling else
                     """
                     select pg_terminate_backend(activity.pid)
                     from leaderboard_trial_v1.reservations reservation
@@ -217,17 +230,20 @@ def reconcile_quarantine(args) -> int:
         try:
             marker = Path(args.worker_lock_file + ".quarantine")
             heavy_marker = Path(args.worker_lock_file + ".quarantine.heavy")
-            tokens = read_quarantine_marker(marker, args.policy_id)
+            rolling = getattr(args, "rolling", False)
+            tokens = read_quarantine_marker(marker, args.policy_id, rolling=rolling)
             for token in tokens:
                 drain_token_backends(url, token, args.drain_seconds)
             drain_exact_backend(url, args.policy_id, args.drain_seconds,
-                                production=args.production)
+                                production=args.production, rolling=rolling)
             recovery_token = uuid.uuid4().hex[:16]
             tokens.append(recovery_token)
             write_quarantine_marker(marker, args.policy_id,
-                                    "operator_recovery_inflight", tokens)
+                                    "operator_recovery_inflight", tokens,
+                                    rolling=rolling)
             write_quarantine_marker(heavy_marker, args.policy_id,
-                                    "operator_recovery_inflight", tokens)
+                                    "operator_recovery_inflight", tokens,
+                                    rolling=rolling)
             lock_fds = (worker_lock.fileno(), heavy_lock.fileno())
             environment = os.environ.copy()
             environment.update({
@@ -240,7 +256,8 @@ def reconcile_quarantine(args) -> int:
             })
             recovery = [
                 sys.executable, args.worker_path,
-                "finite-recover" if args.production else "trial-recover",
+                "rolling-recover" if rolling else
+                ("finite-recover" if args.production else "trial-recover"),
                 "--trial-policy-id", args.policy_id,
             ]
             if args.production_trial_isolated_test:
@@ -260,7 +277,7 @@ def reconcile_quarantine(args) -> int:
             for token in tokens:
                 drain_token_backends(url, token, args.drain_seconds)
             drain_exact_backend(url, args.policy_id, args.drain_seconds,
-                                production=args.production)
+                                production=args.production, rolling=rolling)
             clear_quarantine_marker(heavy_marker)
             if process.returncode != 0:
                 raise RuntimeError("finite trial operator recovery failed: " + errors[-1000:])
@@ -280,6 +297,9 @@ def reconcile_quarantine(args) -> int:
 
 def run_trial(args) -> int:
     url = database_url()
+    rolling = getattr(args, "rolling", False)
+    if rolling and not args.production:
+        raise RuntimeError("rolling supervisor requires production identity checks")
     if args.production:
         if args.production_trial_isolated_test:
             assert_disposable_database(url)
@@ -307,9 +327,12 @@ def run_trial(args) -> int:
             main_token = uuid.uuid4().hex[:16]
             recovery_token = uuid.uuid4().hex[:16]
             marker_tokens = [main_token, recovery_token]
-            write_quarantine_marker(marker, args.policy_id, "inflight", marker_tokens)
+            write_quarantine_marker(
+                marker, args.policy_id, "inflight", marker_tokens, rolling=rolling
+            )
             write_quarantine_marker(heavy_marker, args.policy_id,
-                                    "backend_drain_unproved", marker_tokens)
+                                    "backend_drain_unproved", marker_tokens,
+                                    rolling=rolling)
             active_process: subprocess.Popen | None = None
             active_token: str | None = None
             interrupted_signal: int | None = None
@@ -352,11 +375,14 @@ def run_trial(args) -> int:
                 return environment
             worker = [
                 sys.executable, args.worker_path,
-                "finite-once" if args.production else "trial-once",
+                "rolling-once" if rolling else
+                ("finite-once" if args.production else "trial-once"),
                 "--trial-policy-id", args.policy_id,
-                "--fixture-limit", "10", "--capture-limit", "10",
-                "--cohort-limit", "0", "--job-limit", "0",
-                "--max-seconds", "30",
+                "--fixture-limit", str(args.fixture_limit if rolling else 10),
+                "--capture-limit", str(args.capture_limit if rolling else 10),
+                "--cohort-limit", str(args.cohort_limit if rolling else 0),
+                "--job-limit", str(args.job_limit if rolling else 0),
+                "--max-seconds", str(args.max_seconds if rolling else 30),
             ]
             if args.production:
                 if args.production_trial_isolated_test:
@@ -404,12 +430,14 @@ def run_trial(args) -> int:
                 # committed a reservation. Keep both flocks until it is gone.
                 drain_token_backends(url, main_token, args.drain_seconds)
                 drain_exact_backend(
-                    url, args.policy_id, args.drain_seconds, production=args.production
+                    url, args.policy_id, args.drain_seconds,
+                    production=args.production, rolling=rolling,
                 )
 
                 recovery = [
                     sys.executable, args.worker_path,
-                    "finite-recover" if args.production else "trial-recover",
+                    "rolling-recover" if rolling else
+                    ("finite-recover" if args.production else "trial-recover"),
                     "--trial-policy-id", args.policy_id,
                 ]
                 if args.production:
@@ -444,7 +472,8 @@ def run_trial(args) -> int:
                 active_token = None
                 drain_token_backends(url, recovery_token, args.drain_seconds)
                 drain_exact_backend(
-                    url, args.policy_id, args.drain_seconds, production=args.production
+                    url, args.policy_id, args.drain_seconds,
+                    production=args.production, rolling=rolling,
                 )
                 # Backend absence is now proved. Keep the trial-only marker
                 # until settlement is known, but let the unrelated source
@@ -460,8 +489,9 @@ def run_trial(args) -> int:
                     raise RuntimeError(f"finite trial liability remains: {state}")
                 clear_quarantine_marker(marker)
                 print(json.dumps({
-                    "event": "finite_trial_supervised" if args.production
-                             else "isolated_finite_trial_supervised",
+                    "event": "rolling_worker_supervised" if rolling else
+                             ("finite_trial_supervised" if args.production
+                              else "isolated_finite_trial_supervised"),
                     "policy_id": args.policy_id, "worker_exit": worker_exit,
                     "timed_out": timed_out, "recovery_state": state,
                     "interrupted_signal": interrupted_signal,
@@ -478,7 +508,8 @@ def run_trial(args) -> int:
                 # either child remains alive.
                 try:
                     write_quarantine_marker(
-                        marker, args.policy_id, str(error)[:200], marker_tokens
+                        marker, args.policy_id, str(error)[:200], marker_tokens,
+                        rolling=rolling,
                     )
                 except Exception:
                     pass
@@ -506,6 +537,12 @@ def main() -> int:
     parser.add_argument("--worker-lock-file", required=True)
     parser.add_argument("--database-heavy-lock-file", required=True)
     parser.add_argument("--production", action="store_true")
+    parser.add_argument("--rolling", action="store_true")
+    parser.add_argument("--fixture-limit", type=int, default=10)
+    parser.add_argument("--capture-limit", type=int, default=10)
+    parser.add_argument("--cohort-limit", type=int, default=0)
+    parser.add_argument("--job-limit", type=int, default=0)
+    parser.add_argument("--max-seconds", type=float, default=30)
     parser.add_argument("--reconcile-quarantine", action="store_true")
     parser.add_argument("--production-trial-isolated-test", action="store_true")
     parser.add_argument("--deadline-seconds", type=float, default=45)
@@ -519,6 +556,15 @@ def main() -> int:
     args = parser.parse_args()
     if args.production_trial_isolated_test and not args.production:
         parser.error("production trial isolated test mode requires --production")
+    if args.rolling and (
+        not args.production or not 1 <= args.fixture_limit <= 250
+        or not 0 <= args.capture_limit <= args.fixture_limit
+        or not 0 <= args.cohort_limit <= 8
+        or not 0 <= args.job_limit <= args.fixture_limit
+        or not (args.capture_limit or args.job_limit)
+        or not 0 < args.max_seconds <= 30
+    ):
+        parser.error("rolling worker mode or limits are invalid")
     if not (1 <= args.deadline_seconds <= 60 and 1 <= args.grace_seconds <= 10
             and 1 <= args.drain_seconds <= 30 and 1 <= args.recovery_seconds <= 30
             and 0 <= args.test_pg_sleep_after_admission <= 120
