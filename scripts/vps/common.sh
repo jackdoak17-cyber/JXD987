@@ -414,8 +414,8 @@ run_with_database_heavy_lock() {
       log_info "[SKIPPED] database-heavy maintenance slot unavailable"
       exit 75
     fi
-    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine" \
-       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine" ]]; then
+    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" \
+       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" ]]; then
       log_info "[SKIPPED] finite-trial quarantine blocks database-heavy maintenance"
       exit 75
     fi
@@ -453,8 +453,8 @@ run_with_database_heavy_lock_timed() {
       log_info "[SKIPPED] database-heavy maintenance slot unavailable"
       exit 75
     fi
-    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine" \
-       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine" ]]; then
+    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" \
+       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" ]]; then
       log_info "[SKIPPED] finite-trial quarantine blocks database-heavy maintenance"
       exit 75
     fi

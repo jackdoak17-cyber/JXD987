@@ -90,13 +90,69 @@ def test_finite_trial_wrapper_accepts_pinned_archive_without_git(tmp_path):
     environment["LEADERBOARD_SHADOW_ENV_FILE"] = str(environment_file)
     environment.pop("SUPABASE_DB_URL", None)
     environment.pop("SUPABASE_DB_URL_SESSION", None)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text('#!/bin/sh\ncat "$FAKE_CRONTAB"\n')
+    (fake_bin / "ps").write_text('#!/bin/sh\ncat "$FAKE_PS"\n')
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "ps").chmod(0o755)
+    fake_crontab = tmp_path / "crontab"
+    fake_crontab.write_text(
+        f"*/5 * * * * cd {archive} && {archive}/scripts/vps/run_stats_reconciliation.sh\n"
+        f"* * * * * cd {archive} && {archive}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+    )
+    fake_ps = tmp_path / "ps"
+    fake_ps.write_text("")
+    environment.update({
+        "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+        "FAKE_CRONTAB": str(fake_crontab), "FAKE_PS": str(fake_ps),
+    })
     result = subprocess.run(
         ["bash", str(archive / "scripts/vps/run_leaderboard_finite_trial.sh")],
         env=environment, capture_output=True, text=True, timeout=15, check=False,
     )
     assert result.returncode != 0
     assert "runtime manifest verified" in result.stdout
+    assert "host cutover verified" in result.stdout
     assert "trial database URL is required" in result.stderr
+
+
+def test_finite_trial_host_gate_rejects_old_stats_release(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text('#!/bin/sh\ncat "$FAKE_CRONTAB"\n')
+    (fake_bin / "ps").write_text('#!/bin/sh\ncat "$FAKE_PS"\n')
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "ps").chmod(0o755)
+    schedule = tmp_path / "crontab"
+    processes = tmp_path / "ps"
+    processes.write_text("")
+    environment = {
+        **os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+        "FAKE_CRONTAB": str(schedule), "FAKE_PS": str(processes),
+    }
+    checker = ["bash", str(ROOT / "scripts/vps/verify_finite_trial_host_cutover.sh")]
+    schedule.write_text(
+        "*/5 * * * * cd /opt/odds-sync/old && /opt/odds-sync/old/scripts/vps/run_stats_reconciliation.sh\n"
+        f"* * * * * cd {ROOT} && {ROOT}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+    )
+    rejected = subprocess.run(checker, env=environment, capture_output=True, text=True, timeout=10)
+    assert rejected.returncode != 0
+    assert "requires one exact run_stats_reconciliation.sh cron entry" in rejected.stderr
+    schedule.write_text(
+        f"*/5 * * * * cd {ROOT} && {ROOT}/scripts/vps/run_stats_reconciliation.sh\n"
+        f"* * * * * cd {ROOT} && {ROOT}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+    )
+    processes.write_text(
+        "bash /opt/odds-sync/old/scripts/vps/run_stats_reconciliation.sh\n"
+    )
+    rejected_process = subprocess.run(checker, env=environment, capture_output=True, text=True, timeout=10)
+    assert rejected_process.returncode != 0
+    assert "found an old scheduled process" in rejected_process.stderr
+    processes.write_text("")
+    accepted = subprocess.run(checker, env=environment, capture_output=True, text=True, timeout=10)
+    assert accepted.returncode == 0, accepted.stderr
+    assert "host cutover verified" in accepted.stdout
 
 
 def test_finite_trial_commands_reject_a_non_disposable_database(monkeypatch):
@@ -192,6 +248,7 @@ def test_supervisor_delivers_signal_arriving_before_child_assignment(
     assert time.monotonic() - started < 3
     assert children[signal_during_spawn - 1].poll() is not None
     assert (tmp_path / "worker.lock.quarantine").exists()
+    assert not (tmp_path / "worker.lock.quarantine.heavy").exists()
 
 
 def test_trial_capture_progress_survives_a_later_guard_failure(monkeypatch):
@@ -707,8 +764,10 @@ def test_database_heavy_gates_refuse_durable_trial_quarantine(tmp_path):
         fake_flock.write_text("#!/bin/sh\nexit 0\n")
         fake_flock.chmod(0o755)
     leaderboard_lock = tmp_path / "leaderboard.lock"
-    marker = Path(str(leaderboard_lock) + ".quarantine")
-    marker.write_text('{"policy_id":"local-test"}')
+    trial_marker = Path(str(leaderboard_lock) + ".quarantine")
+    heavy_marker = Path(str(leaderboard_lock) + ".quarantine.heavy")
+    trial_marker.write_text('{"policy_id":"local-test"}')
+    heavy_marker.write_text('{"policy_id":"local-test"}')
     launched = tmp_path / "launched"
     timing = tmp_path / "timing"
     env = {
@@ -732,13 +791,14 @@ def test_database_heavy_gates_refuse_durable_trial_quarantine(tmp_path):
         assert "finite-trial quarantine blocks" in result.stdout
         assert not launched.exists()
         assert not timing.exists()
-    marker.unlink()
+    heavy_marker.unlink()
     result = subprocess.run(
         ["bash", "-lc", 'source "$COMMON_SH"; run_with_database_heavy_lock 0 bash -c \'touch "$LAUNCHED"\''],
         env=env, capture_output=True, text=True, timeout=5, check=False,
     )
     assert result.returncode == 0, result.stderr
     assert launched.exists()
+    assert trial_marker.exists()
 
 
 def test_run_budget_rejects_unbounded_fixture_and_time_limits():

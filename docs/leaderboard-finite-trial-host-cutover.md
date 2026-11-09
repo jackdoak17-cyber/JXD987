@@ -1,0 +1,26 @@
+# Finite leaderboard trial host cutover candidate
+
+**Observed:** 9 November 2026, 05:12–05:15 UTC. **Status:** Draft; no host or database cutover has occurred. This procedure uses existing VPS, Supabase and scheduled job capacity. Any change that adds a charge requires Jack's separate approval.
+
+## Live host evidence
+
+- Root cron starts statistics reconciliation every five minutes from `/opt/odds-sync/JXD987-leaderboard-81-563d92-release` and the disabled normal leaderboard worker from `/opt/odds-sync/JXD987-leaderboard-b60a2dc-release` on its existing minute pattern.
+- The statistics supervisor from the older archive was still alive after 13 hours. Editing cron alone would leave that process using its older `common.sh`, which does not honor finite-trial quarantine.
+- Both old archives contain the same `run_stats_reconciliation.sh` and `reconcile_stats_provider_queue.py` bytes as the candidate. Their `common.sh` bytes differ. The new archive must run both cron entries before any trial.
+- The old archives source `.env` through a symlink to `/opt/odds-sync/JXD987-runtime-f250c85-release/.env`. The separate leaderboard environment is `/etc/oddssearch/leaderboard-shadow.env` (root-owned, mode 600). Neither checked file sets custom leaderboard or database-heavy lock paths.
+- VPS root volume had 5.1 GB free; the existing leaderboard archives were roughly 2.7–3.7 MB each. No finite-trial quarantine file or leaderboard worker process was present at the read. Production Supabase had no `leaderboard_trial_v1` schema and the normal leaderboard worker remained paused/disabled with capture on.
+
+## Release sequence
+
+1. Complete independent exact-pair review of the website migrations and JXD runtime, including the two-marker handoff, active source-job cutover and action-time numeric/cost checks. Preserve the old archives and original cron text as the rollback record.
+2. Install the reviewed JXD manifest files into a **new immutable release directory**; verify the complete manifest and its reviewed SHA-256. Add the same protected `.env` symlink used by the existing statistics archive. Do not copy credentials into the Git archive. Install the dormant and transition SQL only after their exact source/ACL review; installation creates no trial policy.
+3. Change the **two existing cron lines**, keeping their schedules and log destinations, to use the new directory for `run_stats_reconciliation.sh` and `run_leaderboard_shadow_worker.sh`. Do not add a new periodic job. Let any current statistics batch finish, terminate the old long-lived supervisor during its handoff/sleep interval, and verify it has exited. The next normal cron tick starts the new supervisor. Confirm normal source timing and delivery have not regressed.
+4. Run `scripts/vps/verify_finite_trial_host_cutover.sh` from the new directory. It requires both cron entries to point to the exact same manifest-verified release, refuses an old scheduled process, and rejects differing lock-path overrides. A failed check blocks the trial.
+5. Immediately before a single manual trial, verify fresh platform disk and importer evidence, original 5 GiB/512 MiB caps and WAL-only pause, zero unfinished worker runs, current queue and source health, no overlapping heavy maintenance or index pilot, available VPS/database headroom, and that the existing Spend Cap/capacity remain unchanged. Pin the reviewed database URL digest, full release SHA, runtime manifest SHA-256, policy ID and operator note in the protected trial environment. The wrapper itself repeats identity and host-cutover checks. Run the manual wrapper once; its worker creates the finite transition and admission atomically. Record its output, charge, backend drain, queue movement and old guard state.
+6. If the trial leaves `.quarantine.heavy`, keep both cron entries on the new release: they defer heavy work until exact backend drain is proved. Run the explicit `reconcile` mode under both locks. A retained `.quarantine` with no `.quarantine.heavy` blocks another trial but allows ordinary statistics ingestion to resume. Do not clear either marker by hand or restore an old statistics release while the heavy marker exists. If a reservation remains closed/unsettled, use the separately reviewed retained-evidence resolution; no automatic second grant is implied.
+
+## Reversal boundary
+
+Before a live trial or any quarantine, the two cron paths can be restored to their saved old lines after the new supervisor exits; both old archives remain intact. After a trial, preserve the new archive and both cron paths until exact backend absence and liability resolution are proved. Unused database functions/schema have guarded rollbacks that acquire the same state lock and refuse once evidence exists. The old exhausted campaign, capture-on setting, customer reader flag and 135 GB provisioned disk are not reset by this cutover.
+
+This is a capture-cost measurement only. It does not publish leaderboards, enable the customer reader or prove sustained operation and 1,000-user capacity.

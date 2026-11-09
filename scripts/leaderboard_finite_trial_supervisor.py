@@ -216,6 +216,7 @@ def reconcile_quarantine(args) -> int:
             return 75
         try:
             marker = Path(args.worker_lock_file + ".quarantine")
+            heavy_marker = Path(args.worker_lock_file + ".quarantine.heavy")
             tokens = read_quarantine_marker(marker, args.policy_id)
             for token in tokens:
                 drain_token_backends(url, token, args.drain_seconds)
@@ -224,6 +225,8 @@ def reconcile_quarantine(args) -> int:
             recovery_token = uuid.uuid4().hex[:16]
             tokens.append(recovery_token)
             write_quarantine_marker(marker, args.policy_id,
+                                    "operator_recovery_inflight", tokens)
+            write_quarantine_marker(heavy_marker, args.policy_id,
                                     "operator_recovery_inflight", tokens)
             lock_fds = (worker_lock.fileno(), heavy_lock.fileno())
             environment = os.environ.copy()
@@ -258,6 +261,7 @@ def reconcile_quarantine(args) -> int:
                 drain_token_backends(url, token, args.drain_seconds)
             drain_exact_backend(url, args.policy_id, args.drain_seconds,
                                 production=args.production)
+            clear_quarantine_marker(heavy_marker)
             if process.returncode != 0:
                 raise RuntimeError("finite trial operator recovery failed: " + errors[-1000:])
             state = json.loads(output)["state"]
@@ -297,12 +301,15 @@ def run_trial(args) -> int:
             return 75
         try:
             marker = Path(args.worker_lock_file + ".quarantine")
-            if os.path.lexists(marker):
+            heavy_marker = Path(args.worker_lock_file + ".quarantine.heavy")
+            if os.path.lexists(marker) or os.path.lexists(heavy_marker):
                 raise RuntimeError("finite trial quarantine marker requires operator reconciliation")
             main_token = uuid.uuid4().hex[:16]
             recovery_token = uuid.uuid4().hex[:16]
             marker_tokens = [main_token, recovery_token]
             write_quarantine_marker(marker, args.policy_id, "inflight", marker_tokens)
+            write_quarantine_marker(heavy_marker, args.policy_id,
+                                    "backend_drain_unproved", marker_tokens)
             active_process: subprocess.Popen | None = None
             active_token: str | None = None
             interrupted_signal: int | None = None
@@ -436,6 +443,13 @@ def run_trial(args) -> int:
                 active_process = None
                 active_token = None
                 drain_token_backends(url, recovery_token, args.drain_seconds)
+                drain_exact_backend(
+                    url, args.policy_id, args.drain_seconds, production=args.production
+                )
+                # Backend absence is now proved. Keep the trial-only marker
+                # until settlement is known, but let the unrelated source
+                # reconciler resume after the host locks are released.
+                clear_quarantine_marker(heavy_marker)
                 if recovery_timed_out or recovery_exit != 0:
                     raise RuntimeError(
                         "finite trial recovery failed or timed out: "

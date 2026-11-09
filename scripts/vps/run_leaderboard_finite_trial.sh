@@ -52,6 +52,8 @@ if [[ -e "$ROOT/.git" \
   exit 1
 fi
 
+"$ROOT/scripts/vps/verify_finite_trial_host_cutover.sh"
+
 export LEADERBOARD_SHADOW_RELEASE_SHA="$LEADERBOARD_FINITE_TRIAL_RELEASE_SHA"
 exec python3 "$ROOT/scripts/leaderboard_finite_trial_supervisor.py" \
   --production \
