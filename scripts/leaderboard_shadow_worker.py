@@ -798,13 +798,15 @@ def finish_generation(conn, generation_id: int) -> bool:
 def process_generations(
     conn, worker_id: str, cohort_limit: int, job_limit: int,
     budget: RunBudget, require_external: bool,
+    guard_check: Callable[[Any, bool], dict[str, Any]] | None = None,
 ) -> dict[str, int]:
     result = {"cohorts": 0, "jobs": 0, "published": 0}
+    guard_check = guard_check or enforce_resource_guard
     for league_id, season_id in pending_cohorts(conn, cohort_limit):
         if not budget.available():
             break
         budget.apply_database_timeouts(conn)
-        enforce_resource_guard(conn, require_external)
+        guard_check(conn, require_external)
         generation_id = ensure_generation(conn, league_id, season_id)
         if generation_id is None:
             continue
@@ -813,7 +815,7 @@ def process_generations(
             if not budget.available():
                 break
             budget.apply_database_timeouts(conn)
-            enforce_resource_guard(conn, require_external)
+            guard_check(conn, require_external)
             if not process_generation_job(conn, generation_id, worker_id):
                 break
             result["jobs"] += 1
@@ -821,7 +823,7 @@ def process_generations(
         if not budget.available():
             break
         budget.apply_database_timeouts(conn)
-        enforce_resource_guard(conn, require_external)
+        guard_check(conn, require_external)
         if finish_generation(conn, generation_id):
             result["published"] += 1
     return result

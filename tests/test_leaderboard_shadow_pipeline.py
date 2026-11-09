@@ -102,7 +102,7 @@ def test_finite_trial_wrapper_accepts_pinned_archive_without_git(tmp_path):
         f"* * * * * cd {archive} && {archive}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
     )
     fake_ps = tmp_path / "ps"
-    fake_ps.write_text("")
+    fake_ps.write_text("123 1 Mon Nov 9 08:00:00 2026 sleep 10\n")
     environment.update({
         "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
         "FAKE_CRONTAB": str(fake_crontab), "FAKE_PS": str(fake_ps),
@@ -126,10 +126,13 @@ def test_finite_trial_host_gate_rejects_old_stats_release(tmp_path):
     (fake_bin / "ps").chmod(0o755)
     schedule = tmp_path / "crontab"
     processes = tmp_path / "ps"
-    processes.write_text("")
+    processes.write_text("123 1 Mon Nov 9 08:00:00 2026 sleep 10\n")
+    worker_env = tmp_path / "leaderboard-shadow.env"
+    worker_env.write_text("LEADERBOARD_FINITE_TRIAL_POLICY_ID=local-policy\n")
     environment = {
         **os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
         "FAKE_CRONTAB": str(schedule), "FAKE_PS": str(processes),
+        "LEADERBOARD_SHADOW_ENV_FILE": str(worker_env),
     }
     checker = ["bash", str(ROOT / "scripts/vps/verify_finite_trial_host_cutover.sh")]
     schedule.write_text(
@@ -144,12 +147,12 @@ def test_finite_trial_host_gate_rejects_old_stats_release(tmp_path):
         f"* * * * * cd {ROOT} && {ROOT}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
     )
     processes.write_text(
-        "bash /opt/odds-sync/old/scripts/vps/run_stats_reconciliation.sh\n"
+        "123 1 Mon Nov 9 08:00:00 2026 bash /opt/odds-sync/old/scripts/vps/run_stats_reconciliation.sh\n"
     )
     rejected_process = subprocess.run(checker, env=environment, capture_output=True, text=True, timeout=10)
     assert rejected_process.returncode != 0
-    assert "found an old scheduled process" in rejected_process.stderr
-    processes.write_text("")
+    assert "found old wrapper" in rejected_process.stderr
+    processes.write_text("123 1 Mon Nov 9 08:00:00 2026 sleep 10\n")
     accepted = subprocess.run(checker, env=environment, capture_output=True, text=True, timeout=10)
     assert accepted.returncode == 0, accepted.stderr
     assert "host cutover verified" in accepted.stdout
@@ -464,6 +467,68 @@ def test_capture_resource_guard_is_checked_in_bounded_groups(monkeypatch):
         "failed": 0,
     }
     assert len(guard_calls) == 3
+
+
+def test_generation_keeps_legacy_guard_at_each_work_boundary(monkeypatch):
+    events = []
+    monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
+    monkeypatch.setattr(
+        worker_module, "ensure_generation",
+        lambda *_args: events.append("generation") or 73,
+    )
+    monkeypatch.setattr(
+        worker_module, "process_generation_job",
+        lambda *_args: events.append("job") or True,
+    )
+    monkeypatch.setattr(
+        worker_module, "finish_generation",
+        lambda *_args: events.append("publish") or True,
+    )
+    monkeypatch.setattr(
+        worker_module, "enforce_resource_guard",
+        lambda *_args: events.append("legacy_guard") or {"ok": True},
+    )
+    result = worker_module.process_generations(
+        FakeConnection(FakeCursor()), "worker", 1, 1,
+        RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN), True,
+    )
+    assert result == {"cohorts": 1, "jobs": 1, "published": 1}
+    assert events == [
+        "legacy_guard", "generation", "legacy_guard", "job",
+        "legacy_guard", "publish",
+    ]
+
+
+def test_generation_supplied_guard_stops_before_job(monkeypatch):
+    events = []
+    monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
+    monkeypatch.setattr(
+        worker_module, "ensure_generation",
+        lambda *_args: events.append("generation") or 73,
+    )
+    monkeypatch.setattr(
+        worker_module, "process_generation_job",
+        lambda *_args: events.append("job") or True,
+    )
+    monkeypatch.setattr(
+        worker_module, "enforce_resource_guard",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("legacy guard called")),
+    )
+
+    def guarded(_conn, require_external):
+        assert require_external is True
+        events.append("supplied_guard")
+        if events.count("supplied_guard") == 2:
+            raise RuntimeError("admission stopped")
+        return {"ok": True}
+
+    with pytest.raises(RuntimeError, match="admission stopped"):
+        worker_module.process_generations(
+            FakeConnection(FakeCursor()), "worker", 1, 1,
+            RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN), True,
+            guard_check=guarded,
+        )
+    assert events == ["supplied_guard", "generation", "supplied_guard"]
 
 
 def test_failed_capture_marks_interval_before_claim_cleanup(monkeypatch):
