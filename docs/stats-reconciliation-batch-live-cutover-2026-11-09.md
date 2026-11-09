@@ -101,7 +101,29 @@ regenerating the 49-entry runtime manifest. Its manifest SHA-256 is
 and release ID is `3df6bb130cb9` (the manifest SHA-1 prefix). The immutable
 archive `/opt/odds-sync/JXD987-stats-batch-mixed-24d0a94-release` was staged
 and its 49-entry manifest and odds-delivery startup verified at 19:51 UTC.
-This candidate is **not active** and has not had a live performance trial.
-Another immutable archive and guarded source-only cutover require a fresh
-preflight, exact test/manifest readback and old-source result. No old sample
-may be counted toward the new release's source pin.
+The corrected candidate was then activated as a source-only trial, as
+recorded below. No old sample may be counted toward its source pin.
+
+## Corrected source-only trial at 19:56 UTC
+
+The restored `3028e0f` worker's next ordinary batch started at19:52 and
+finished successfully at19:55: 20 selected, 20 accepted, zero pending or
+failed. Source-store/export/projection/activation took
+30.463/80.556/11.996/17.532 seconds. This is one composition-matched old
+run, not a paired controlled benchmark. With no old child left, the old
+supervisor was stopped after checking its exact PID and command. The current
+crontab was saved root-only as
+`/root/odds-stats-cron-before-24d0a94-20261109`; only the statistics entry
+was changed to the previously verified `24d0a94` archive, preserving every
+other cron entry. Exact cron readback passed. The corrected supervisor started
+at19:56:12 as PID1476216, release `3df6bb130cb9`. Its first lease check
+deferred because only168 seconds remained against the270-second minimum.
+The first genuine corrected-release batch, batch/individual counts, source
+stage timings, target parity and normal recurrence are **pending**.
+
+If this trial fails its source or data checks, first let its child drain or
+terminate it under the existing lease. Stop only PID1476216 after verifying
+its command, restore only the statistics cron entry from the root-only backup
+if the current entry still points to this archive, and restart the verified
+old archive. Keep the original source pin/resource debt, paused leaderboard
+worker and customer reader unchanged. No paid settings changed in this trial.

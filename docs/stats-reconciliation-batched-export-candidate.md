@@ -7,7 +7,7 @@ regenerated for the two changed source files; its SHA-256 is
 `617534da51cb8f0b63d109067eba176cb853afb6e53d84ebea78295f722b053c`
 for the first live candidate. All 49 entries verified. That candidate was
 briefly scheduled for a source-only trial and then rolled back; the corrected
-mixed-attempt revision below is **not deployed or scheduled**. A new manifest
+mixed-attempt revision below is now in a guarded **source-only trial**. A new manifest
 identity resets the source-performance observation sequence and does not
 bypass the existing source-pin gate.
 
@@ -168,8 +168,10 @@ The combined suite passed **160**, with one existing skip and12 deprecation
 warnings. Its regenerated49-entry manifest SHA-256 is
 `b5ff7da6e23d0eb546f1087574689fa09fb6edc731bc459c8001e2006f60a4bc`
 and release ID `3df6bb130cb9` (manifest SHA-1 prefix). The immutable corrected
-archive was staged and verified at 19:51 UTC, but is not scheduled. It still
-needs a genuine live source trial
+archive was staged and verified at 19:51 UTC, then activated for a guarded
+source-only trial at 19:56 after the old source's ordinary20/20 success. Its
+first lease check correctly deferred; the first genuine batch is pending. It
+still needs a genuine live source trial
 under the installed lease, target parity check, full-job timing comparison,
 and normal old-source run verification before any renewed cutover can be
 called successful. No added capacity, Spend Cap change or paid service was
