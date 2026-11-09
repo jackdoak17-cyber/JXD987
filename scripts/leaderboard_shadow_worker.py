@@ -799,8 +799,9 @@ def process_generations(
     conn, worker_id: str, cohort_limit: int, job_limit: int,
     budget: RunBudget, require_external: bool,
     guard_check: Callable[[Any, bool], dict[str, Any]] | None = None,
+    progress: dict[str, int] | None = None,
 ) -> dict[str, int]:
-    result = {"cohorts": 0, "jobs": 0, "published": 0}
+    result = progress if progress is not None else {"cohorts": 0, "jobs": 0, "published": 0}
     guard_check = guard_check or enforce_resource_guard
     for league_id, season_id in pending_cohorts(conn, cohort_limit):
         if not budget.available():
@@ -973,8 +974,13 @@ TRIAL_STATEMENTS = {
 }
 
 
-def run_finite_trial(conn, args, worker_id: str, *, production: bool) -> dict[str, Any]:
+def run_finite_trial(
+    conn, args, worker_id: str, *, production: bool,
+    include_generations: bool = False,
+) -> dict[str, Any]:
     """Run the same bounded capture/settlement flow against a fixed SQL contract."""
+    if production and include_generations:
+        raise RuntimeError("full-workload trial has no production entrypoint")
     if production:
         validate_production_trial_connection(conn, args)
     elif not validate_activation_override(conn, args.isolated_test_override):
@@ -984,7 +990,11 @@ def run_finite_trial(conn, args, worker_id: str, *, production: bool) -> dict[st
         raise RuntimeError("trial-once requires --trial-policy-id")
     if not (1 <= args.fixture_limit <= 10 and 1 <= args.capture_limit <= 10):
         raise RuntimeError("trial-once is limited to ten fixture captures")
-    if args.cohort_limit != 0 or args.job_limit != 0:
+    if include_generations:
+        if (args.cohort_limit != 1 or not 1 <= args.job_limit <= 10
+                or args.capture_limit > args.fixture_limit):
+            raise RuntimeError("isolated full-workload trial requires one cohort and at most ten jobs")
+    elif args.cohort_limit != 0 or args.job_limit != 0:
         raise RuntimeError("trial-once cannot generate or publish leaderboards")
     if not (0 <= args.trial_test_pg_sleep_after_admission <= 120
             and 0 <= args.trial_test_pg_sleep_after_capture <= 120):
@@ -1035,6 +1045,7 @@ def run_finite_trial(conn, args, worker_id: str, *, production: bool) -> dict[st
 
     closed = False
     capture = {"claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0}
+    generations = {"cohorts": 0, "jobs": 0, "published": 0}
     try:
         if args.trial_test_pg_sleep_after_admission:
             with conn:
@@ -1054,6 +1065,15 @@ def run_finite_trial(conn, args, worker_id: str, *, production: bool) -> dict[st
             guard_check=check_trial_guard,
             progress=capture, audit_run_id=run_id,
         )
+        if include_generations:
+            if capture["failed"]:
+                raise RuntimeError("finite trial capture failed")
+            check_trial_guard(conn, False)
+            budget.apply_database_timeouts(conn)
+            process_generations(
+                conn, worker_id, args.cohort_limit, args.job_limit, budget, False,
+                guard_check=check_trial_guard, progress=generations,
+            )
         if args.trial_test_pg_sleep_after_capture:
             with conn:
                 with conn.cursor() as cur:
@@ -1073,7 +1093,9 @@ def run_finite_trial(conn, args, worker_id: str, *, production: bool) -> dict[st
                     statements["finish"],
                     (
                         args.trial_policy_id, worker_id, fence, run_id,
-                        capture["claimed"], capture["acknowledged"], capture["failed"],
+                        capture["claimed"] + generations["jobs"],
+                        capture["acknowledged"] + generations["jobs"],
+                        capture["failed"],
                     ),
                 )
                 outcome = cur.fetchone()["outcome"]
@@ -1084,6 +1106,7 @@ def run_finite_trial(conn, args, worker_id: str, *, production: bool) -> dict[st
             "policy_id": args.trial_policy_id, "owner": worker_id,
             "fence": fence, "run_id": run_id,
             "capture": capture, "eligibility_count": eligibility_count,
+            **({"generations": generations} if include_generations else {}),
             "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
             "temp_file_limit_enforced": temp_file_limit_enforced,
             "outcome": outcome,
@@ -1092,8 +1115,8 @@ def run_finite_trial(conn, args, worker_id: str, *, production: bool) -> dict[st
         if not closed:
             apply_recovery_timeouts(conn)
             mark_failed_statement_interval(conn)
-            claimed = capture["claimed"]
-            succeeded = capture["acknowledged"]
+            claimed = capture["claimed"] + generations["jobs"]
+            succeeded = capture["acknowledged"] + generations["jobs"]
             failed = max(1, capture["failed"])
             with conn:
                 with conn.cursor() as cur:
@@ -1169,7 +1192,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=(
         "run-once", "backfill", "backfill-all", "status",
-        "trial-once", "trial-recover", "finite-once", "finite-recover",
+        "trial-once", "trial-full-once", "trial-recover",
+        "finite-once", "finite-recover",
     ))
     parser.add_argument("--isolated-test-override", action="store_true")
     parser.add_argument("--production-trial-isolated-test", action="store_true")
@@ -1200,6 +1224,15 @@ def main() -> int:
         if args.command == "trial-once":
             print(json.dumps(
                 run_isolated_finite_trial(conn, args, worker_id),
+                default=str, sort_keys=True,
+            ))
+            return 0
+        if args.command == "trial-full-once":
+            print(json.dumps(
+                run_finite_trial(
+                    conn, args, worker_id, production=False,
+                    include_generations=True,
+                ),
                 default=str, sort_keys=True,
             ))
             return 0

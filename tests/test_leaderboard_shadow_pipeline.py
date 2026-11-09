@@ -531,6 +531,41 @@ def test_generation_supplied_guard_stops_before_job(monkeypatch):
     assert events == ["supplied_guard", "generation", "supplied_guard"]
 
 
+def test_generation_progress_survives_a_prepublication_stop(monkeypatch):
+    events = []
+    progress = {"cohorts": 0, "jobs": 0, "published": 0}
+    monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
+    monkeypatch.setattr(worker_module, "ensure_generation", lambda *_args: 73)
+    monkeypatch.setattr(worker_module, "process_generation_job", lambda *_args: True)
+    monkeypatch.setattr(
+        worker_module, "finish_generation",
+        lambda *_args: events.append("published") or True,
+    )
+
+    def guarded(_conn, _require_external):
+        events.append("guard")
+        if len(events) == 3:
+            raise RuntimeError("prepublication stop")
+        return {"ok": True}
+
+    with pytest.raises(RuntimeError, match="prepublication stop"):
+        worker_module.process_generations(
+            FakeConnection(FakeCursor()), "worker", 1, 1,
+            RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN), False,
+            guard_check=guarded, progress=progress,
+        )
+    assert progress == {"cohorts": 1, "jobs": 1, "published": 0}
+    assert events == ["guard", "guard", "guard"]
+
+
+def test_full_workload_trial_has_no_production_entrypoint():
+    with pytest.raises(RuntimeError, match="no production entrypoint"):
+        worker_module.run_finite_trial(
+            object(), SimpleNamespace(), "worker", production=True,
+            include_generations=True,
+        )
+
+
 def test_failed_capture_marks_interval_before_claim_cleanup(monkeypatch):
     claims = iter([DirtyClaim(1001, 1, "worker:1", 1), None])
     calls = []
