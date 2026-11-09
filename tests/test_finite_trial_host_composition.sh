@@ -11,9 +11,9 @@ export ODDS_SYNC_LOCK_FILE="$tmp/writer.lock"
 export ODDS_SYNC_LIVE_SCHEDULE_ENABLED=false
 export ODDS_SYNC_P3_MAX_DURATION_SECONDS=2
 export ODDS_SYNC_JOB_PRIORITY=normal
-owner="00000000-0000-4000-8000-000000000001"
 reservation="$(fixture_core_reservation_file)"
-printf '%s %s\n' "$owner" "$(( $(date -u +%s) + 300 ))" >"$reservation"
+owner="$(fixture_core_reservation_claim)"
+[[ "$owner" =~ ^[0-9a-f-]{36}$ && -f "$reservation" ]]
 
 set +e
 run_with_global_lock_and_timeout "touch '$tmp/normal-ran'" >/dev/null
@@ -24,7 +24,11 @@ set -e
   exit 1
 }
 
-rm "$reservation"
+ODDS_SYNC_JOB_PRIORITY=settlement run_with_global_lock_and_timeout "touch '$tmp/settlement-ran'" >/dev/null
+[[ -e "$tmp/settlement-ran" && -f "$reservation" ]]
+FIXTURE_CORE_RESERVATION_OWNER="$owner" ODDS_SYNC_JOB_PRIORITY=fixture_core \
+  run_with_global_lock_and_timeout "touch '$tmp/fixture-core-ran'" >/dev/null
+[[ -e "$tmp/fixture-core-ran" && ! -e "$reservation" ]]
 run_with_global_lock_and_timeout "touch '$tmp/normal-ran'" >/dev/null
 [[ -e "$tmp/normal-ran" ]]
 
