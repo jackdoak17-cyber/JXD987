@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/scripts/vps/common.sh"
+require_default_trial_lock_paths_or_exit
 verify_runtime_manifest_or_exit "$0"
 require_runtime_manifest_entries_or_exit "$0" \
   "scripts/leaderboard_shadow_capture.py" \
@@ -15,6 +16,10 @@ DB_HEAVY_LOCK_WAIT_SECONDS="${LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS:-0}"
 
 exec 9>"$LOCK_FILE"
 flock -n 9 || exit 0
+if [[ -e "${LOCK_FILE}.quarantine" ]]; then
+  echo "leaderboard worker blocked by unresolved finite-trial quarantine" >&2
+  exit 1
+fi
 
 if [[ ! -r "$ENV_FILE" ]]; then
   echo "leaderboard shadow environment file is unavailable" >&2
@@ -25,6 +30,7 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
+require_default_trial_lock_paths_or_exit
 
 export LEADERBOARD_SHADOW_RELEASE_SHA="${LEADERBOARD_SHADOW_RELEASE_SHA:-$(git -C "$ROOT" rev-parse HEAD)}"
 set +e

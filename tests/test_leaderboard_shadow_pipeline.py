@@ -1,12 +1,18 @@
 import os
 import json
+import hashlib
 import shutil
+import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from scripts.leaderboard_finite_trial_supervisor import acquire_lock
+import scripts.leaderboard_finite_trial_supervisor as supervisor_module
 import scripts.leaderboard_shadow_worker as worker_module
 from scripts.leaderboard_shadow_capture import capture_fixture_ids
 from scripts.leaderboard_shadow_worker import (
@@ -34,6 +40,316 @@ from scripts.leaderboard_shadow_worker import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_finite_trial_wrapper_rejects_unreviewed_release_before_connection(tmp_path):
+    environment_file = tmp_path / "finite-trial.env"
+    environment_file.write_text(
+        "LEADERBOARD_FINITE_TRIAL_POLICY_ID=local-policy\n"
+        "LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256=" + "0" * 64 + "\n"
+        "LEADERBOARD_FINITE_TRIAL_RELEASE_SHA=" + "1" * 40 + "\n"
+        "LEADERBOARD_FINITE_TRIAL_RUNTIME_MANIFEST_SHA256="
+        + hashlib.sha256((ROOT / "scripts/vps/runtime_manifest.sha1").read_bytes()).hexdigest()
+        + "\n"
+        "LEADERBOARD_FINITE_TRIAL_OPERATOR_NOTE='local wrapper rejection'\n"
+    )
+    environment = os.environ.copy()
+    environment["LEADERBOARD_SHADOW_ENV_FILE"] = str(environment_file)
+    environment.pop("SUPABASE_DB_URL", None)
+    environment.pop("SUPABASE_DB_URL_SESSION", None)
+    process = subprocess.run(
+        ["bash", str(ROOT / "scripts/vps/run_leaderboard_finite_trial.sh")],
+        env=environment, capture_output=True, text=True, timeout=10, check=False,
+    )
+    assert process.returncode != 0
+    assert "checkout differs from the reviewed release" in process.stderr
+
+
+def test_finite_trial_wrapper_accepts_pinned_archive_without_git(tmp_path):
+    archive = tmp_path / "runtime-archive"
+    manifest = ROOT / "scripts/vps/runtime_manifest.sha1"
+    for line in manifest.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        relative = line.split(maxsplit=1)[1]
+        destination = archive / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+    archive_manifest = archive / "scripts/vps/runtime_manifest.sha1"
+    shutil.copy2(manifest, archive_manifest)
+    environment_file = tmp_path / "archive-trial.env"
+    environment_file.write_text(
+        "LEADERBOARD_FINITE_TRIAL_POLICY_ID=local-policy\n"
+        "LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256=" + "0" * 64 + "\n"
+        "LEADERBOARD_FINITE_TRIAL_RELEASE_SHA=" + "1" * 40 + "\n"
+        "LEADERBOARD_FINITE_TRIAL_RUNTIME_MANIFEST_SHA256="
+        + hashlib.sha256(archive_manifest.read_bytes()).hexdigest() + "\n"
+        "LEADERBOARD_FINITE_TRIAL_OPERATOR_NOTE='archive identity proof'\n"
+    )
+    environment = os.environ.copy()
+    environment["LEADERBOARD_SHADOW_ENV_FILE"] = str(environment_file)
+    environment.pop("SUPABASE_DB_URL", None)
+    environment.pop("SUPABASE_DB_URL_SESSION", None)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text('#!/bin/sh\ncat "$FAKE_CRONTAB"\n')
+    (fake_bin / "ps").write_text('#!/bin/sh\ncat "$FAKE_PS"\n')
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "ps").chmod(0o755)
+    fake_crontab = tmp_path / "crontab"
+    fake_crontab.write_text(
+        f"*/5 * * * * cd {archive} && {archive}/scripts/vps/run_stats_reconciliation.sh\n"
+        f"* * * * * cd {archive} && {archive}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+    )
+    fake_ps = tmp_path / "ps"
+    fake_ps.write_text("123 1 Mon Nov 9 08:00:00 2026 sleep 10\n")
+    environment.update({
+        "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+        "FAKE_CRONTAB": str(fake_crontab), "FAKE_PS": str(fake_ps),
+    })
+    result = subprocess.run(
+        ["bash", str(archive / "scripts/vps/run_leaderboard_finite_trial.sh")],
+        env=environment, capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert result.returncode != 0
+    assert "runtime manifest verified" in result.stdout
+    assert "host cutover verified" in result.stdout
+    assert "trial database URL is required" in result.stderr
+
+
+def test_rolling_wrapper_passes_only_a_complete_reviewed_cohort_scope(tmp_path):
+    archive = tmp_path / "runtime-archive"
+    manifest = ROOT / "scripts/vps/runtime_manifest.sha1"
+    for line in manifest.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        relative = line.split(maxsplit=1)[1]
+        destination = archive / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+    archive_manifest = archive / "scripts/vps/runtime_manifest.sha1"
+    shutil.copy2(manifest, archive_manifest)
+    env_file = tmp_path / "rolling.env"
+    env_file.write_text(
+        "LEADERBOARD_ROLLING_POLICY_ID=local-policy\n"
+        "LEADERBOARD_ROLLING_EXPECTED_DSN_SHA256=" + "0" * 64 + "\n"
+        "LEADERBOARD_ROLLING_RELEASE_SHA=" + "1" * 40 + "\n"
+        "LEADERBOARD_ROLLING_RUNTIME_MANIFEST_SHA256="
+        + hashlib.sha256(archive_manifest.read_bytes()).hexdigest() + "\n"
+        "LEADERBOARD_ROLLING_FIXTURE_LIMIT=40\n"
+        "LEADERBOARD_ROLLING_CAPTURE_LIMIT=30\n"
+        "LEADERBOARD_ROLLING_COHORT_LIMIT=1\n"
+        "LEADERBOARD_ROLLING_JOB_LIMIT=10\n"
+        "LEADERBOARD_ROLLING_LEAGUE_ID=271\n"
+        "LEADERBOARD_ROLLING_SEASON_ID=27897\n"
+    )
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text('#!/bin/sh\ncat "$FAKE_CRONTAB"\n')
+    (fake_bin / "ps").write_text('#!/bin/sh\ncat "$FAKE_PS"\n')
+    (fake_bin / "python3").write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_WORKER_ARGS"\n')
+    for name in ("crontab", "ps", "python3"):
+        (fake_bin / name).chmod(0o755)
+    schedule = tmp_path / "crontab"
+    schedule.write_text(
+        f"*/5 * * * * cd {archive} && {archive}/scripts/vps/run_stats_reconciliation.sh\n"
+        f"* * * * * cd {archive} && {archive}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+    )
+    processes = tmp_path / "ps"
+    processes.write_text("123 1 Mon Nov 9 08:00:00 2026 sleep 10\n")
+    worker_args = tmp_path / "worker-args"
+    environment = {
+        **os.environ,
+        "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+        "LEADERBOARD_SHADOW_ENV_FILE": str(env_file),
+        "FAKE_CRONTAB": str(schedule), "FAKE_PS": str(processes),
+        "FAKE_WORKER_ARGS": str(worker_args),
+    }
+    wrapper = ["bash", str(archive / "scripts/vps/run_leaderboard_rolling_worker.sh")]
+    accepted = subprocess.run(wrapper, env=environment, capture_output=True, text=True, timeout=15)
+    assert accepted.returncode == 0, accepted.stderr
+    args = worker_args.read_text().splitlines()
+    assert args[args.index("--league-id") + 1] == "271"
+    assert args[args.index("--season-id") + 1] == "27897"
+
+    worker_args.unlink()
+    env_file.write_text(env_file.read_text().replace("LEADERBOARD_ROLLING_SEASON_ID=27897\n", ""))
+    refused = subprocess.run(wrapper, env=environment, capture_output=True, text=True, timeout=15)
+    assert refused.returncode != 0
+    assert "cohort scope requires positive league and season IDs" in refused.stderr
+    assert not worker_args.exists()
+
+
+def test_finite_trial_host_gate_rejects_old_stats_release(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "crontab").write_text('#!/bin/sh\ncat "$FAKE_CRONTAB"\n')
+    (fake_bin / "ps").write_text('#!/bin/sh\ncat "$FAKE_PS"\n')
+    (fake_bin / "crontab").chmod(0o755)
+    (fake_bin / "ps").chmod(0o755)
+    schedule = tmp_path / "crontab"
+    processes = tmp_path / "ps"
+    processes.write_text("123 1 Mon Nov 9 08:00:00 2026 sleep 10\n")
+    worker_env = tmp_path / "leaderboard-shadow.env"
+    worker_env.write_text("LEADERBOARD_FINITE_TRIAL_POLICY_ID=local-policy\n")
+    environment = {
+        **os.environ, "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+        "FAKE_CRONTAB": str(schedule), "FAKE_PS": str(processes),
+        "LEADERBOARD_SHADOW_ENV_FILE": str(worker_env),
+    }
+    checker = ["bash", str(ROOT / "scripts/vps/verify_finite_trial_host_cutover.sh")]
+    schedule.write_text(
+        "*/5 * * * * cd /opt/odds-sync/old && /opt/odds-sync/old/scripts/vps/run_stats_reconciliation.sh\n"
+        f"* * * * * cd {ROOT} && {ROOT}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+    )
+    rejected = subprocess.run(checker, env=environment, capture_output=True, text=True, timeout=10)
+    assert rejected.returncode != 0
+    assert "requires one exact run_stats_reconciliation.sh cron entry" in rejected.stderr
+    schedule.write_text(
+        f"*/5 * * * * cd {ROOT} && {ROOT}/scripts/vps/run_stats_reconciliation.sh\n"
+        f"* * * * * cd {ROOT} && {ROOT}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+    )
+    processes.write_text(
+        "123 1 Mon Nov 9 08:00:00 2026 bash /opt/odds-sync/old/scripts/vps/run_stats_reconciliation.sh\n"
+    )
+    rejected_process = subprocess.run(checker, env=environment, capture_output=True, text=True, timeout=10)
+    assert rejected_process.returncode != 0
+    assert "found old wrapper" in rejected_process.stderr
+    processes.write_text("123 1 Mon Nov 9 08:00:00 2026 sleep 10\n")
+    accepted = subprocess.run(checker, env=environment, capture_output=True, text=True, timeout=10)
+    assert accepted.returncode == 0, accepted.stderr
+    assert "host cutover verified" in accepted.stdout
+
+
+def test_finite_trial_commands_reject_a_non_disposable_database(monkeypatch):
+    monkeypatch.setattr(worker_module, "isolated_test_database", lambda _conn: False)
+    args = SimpleNamespace(isolated_test_override=True)
+    with pytest.raises(RuntimeError, match="socket-only oddssearch_m3"):
+        worker_module.run_isolated_finite_trial(object(), args, "worker")
+    with pytest.raises(RuntimeError, match="socket-only oddssearch_m3"):
+        worker_module.recover_isolated_finite_trial(object(), args)
+
+
+def test_finite_trial_supervisor_lock_excludes_and_releases(tmp_path):
+    path = str(tmp_path / "worker.lock")
+    first = acquire_lock(path)
+    assert first is not None
+    try:
+        assert acquire_lock(path) is None
+    finally:
+        first.close()
+    again = acquire_lock(path)
+    assert again is not None
+    again.close()
+
+
+def test_rolling_quarantine_cannot_be_cleared_by_finite_reconciliation(tmp_path):
+    marker = tmp_path / "worker.lock.quarantine"
+    supervisor_module.write_quarantine_marker(
+        marker, "rolling-policy", "inflight", ["a" * 16], rolling=True
+    )
+    with pytest.raises(RuntimeError, match="identity is invalid"):
+        supervisor_module.read_quarantine_marker(marker, "rolling-policy")
+    assert supervisor_module.read_quarantine_marker(
+        marker, "rolling-policy", rolling=True
+    ) == ["a" * 16]
+    assert supervisor_module.rolling_marker_policy_id(marker) == "rolling-policy"
+    marker.write_text(json.dumps({"policy_id": "foreign-policy", "mode": "finite",
+                                  "tokens": ["a" * 16]}))
+    with pytest.raises(RuntimeError, match="identity is invalid"):
+        supervisor_module.rolling_marker_policy_id(marker)
+
+
+def test_finite_trial_child_keeps_flock_after_parent_exit(tmp_path):
+    path = str(tmp_path / "inherited.lock")
+    parent_code = (
+        "import fcntl,os,subprocess,sys; "
+        "lock=open(sys.argv[1],'a'); "
+        "fcntl.flock(lock,fcntl.LOCK_EX); "
+        "subprocess.Popen([sys.executable,'-c','import time; time.sleep(3)'], "
+        "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+        "stderr=subprocess.DEVNULL,pass_fds=(lock.fileno(),)); "
+        "os._exit(0)"
+    )
+    parent = subprocess.run(
+        [sys.executable, "-c", parent_code, path],
+        capture_output=True, text=True, timeout=5, check=False,
+    )
+    assert parent.returncode == 0
+    assert acquire_lock(path) is None
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        released = acquire_lock(path)
+        if released is not None:
+            released.close()
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("orphaned child did not release inherited flock")
+
+
+@pytest.mark.parametrize("signal_during_spawn", [1, 2])
+def test_supervisor_delivers_signal_arriving_before_child_assignment(
+    tmp_path, monkeypatch, signal_during_spawn,
+):
+    worker = tmp_path / "fake_worker.py"
+    worker.write_text(
+        "import json,sys,time\n"
+        f"if (sys.argv[1] == 'trial-once') == {signal_during_spawn == 1}:\n"
+        "    time.sleep(10)\n"
+        "else:\n"
+        "    print(json.dumps({'state':'no_reservation'}), flush=True)\n"
+    )
+    monkeypatch.setattr(supervisor_module, "database_url", lambda: "disposable")
+    monkeypatch.setattr(supervisor_module, "assert_disposable_database", lambda _url: None)
+    monkeypatch.setattr(supervisor_module, "drain_token_backends", lambda *_args: None)
+    monkeypatch.setattr(supervisor_module, "drain_exact_backend", lambda *_args, **_kw: None)
+    real_popen = subprocess.Popen
+    children = []
+
+    def inject_signal(*args, **kwargs):
+        child = real_popen(*args, **kwargs)
+        children.append(child)
+        if len(children) == signal_during_spawn:
+            signal.raise_signal(signal.SIGTERM)
+        return child
+
+    monkeypatch.setattr(supervisor_module.subprocess, "Popen", inject_signal)
+    args = SimpleNamespace(
+        production=False, production_trial_isolated_test=False,
+        worker_lock_file=str(tmp_path / "worker.lock"),
+        database_heavy_lock_file=str(tmp_path / "heavy.lock"),
+        worker_path=str(worker), policy_id="local-signal",
+        test_pg_sleep_after_admission=0, test_pg_sleep_after_capture=0,
+        test_recovery_pg_sleep=0, test_force_uncertain_drain=False,
+        deadline_seconds=3, grace_seconds=1, drain_seconds=1,
+        recovery_seconds=3,
+    )
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="finite trial liability remains|finite trial recovery failed"):
+        supervisor_module.run_trial(args)
+    assert time.monotonic() - started < 3
+    assert children[signal_during_spawn - 1].poll() is not None
+    assert (tmp_path / "worker.lock.quarantine").exists()
+    assert not (tmp_path / "worker.lock.quarantine.heavy").exists()
+
+
+def test_trial_capture_progress_survives_a_later_guard_failure(monkeypatch):
+    claims = iter([DirtyClaim(2001, 1, "worker:1", 1), None])
+    monkeypatch.setattr(worker_module, "claim_dirty", lambda *_args, **_kwargs: next(claims))
+    monkeypatch.setattr(worker_module, "process_dirty_claim", lambda *_args, **_kwargs: True)
+    progress = {"claimed": 0, "acknowledged": 0, "redirtied": 0, "failed": 0}
+
+    def stopped_guard(*_args):
+        raise RuntimeError("guard stopped after one committed capture")
+
+    with pytest.raises(RuntimeError, match="guard stopped"):
+        process_capture_queue(
+            FakeConnection(FakeCursor()), "worker", 10,
+            RunBudget.create(10, MAX_SECONDS_PER_RUN), False,
+            guard_check=stopped_guard, progress=progress, audit_run_id=11,
+        )
+    assert progress == {"claimed": 1, "acknowledged": 1, "redirtied": 0, "failed": 0}
 
 
 class FakeCursor:
@@ -233,6 +549,157 @@ def test_capture_resource_guard_is_checked_in_bounded_groups(monkeypatch):
     assert len(guard_calls) == 3
 
 
+def test_rolling_capture_guard_checks_after_each_claim(monkeypatch):
+    claims = iter([DirtyClaim(1, 1, "worker:1", 1),
+                   DirtyClaim(2, 1, "worker:2", 1), None])
+    guard_calls = []
+    monkeypatch.setattr(worker_module, "claim_dirty", lambda *_a, **_kw: next(claims))
+    monkeypatch.setattr(worker_module, "process_dirty_claim", lambda *_a, **_kw: True)
+    budget = RunBudget.create(10, MAX_SECONDS_PER_RUN)
+    progress = process_capture_queue(
+        FakeConnection(FakeCursor()), "worker", 10, budget, False,
+        guard_check=lambda *_a: guard_calls.append(True) or {"ok": True},
+        audit_run_id=42, guard_interval=1,
+    )
+    assert progress["acknowledged"] == 2
+    assert len(guard_calls) == 2
+
+
+def test_generation_keeps_legacy_guard_at_each_work_boundary(monkeypatch):
+    events = []
+    monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
+    monkeypatch.setattr(
+        worker_module, "ensure_generation",
+        lambda *_args: events.append("generation") or 73,
+    )
+    monkeypatch.setattr(
+        worker_module, "process_generation_job",
+        lambda *_args: events.append("job") or True,
+    )
+    monkeypatch.setattr(
+        worker_module, "finish_generation",
+        lambda *_args: events.append("publish") or True,
+    )
+    monkeypatch.setattr(
+        worker_module, "enforce_resource_guard",
+        lambda *_args: events.append("legacy_guard") or {"ok": True},
+    )
+    result = worker_module.process_generations(
+        FakeConnection(FakeCursor()), "worker", 1, 1,
+        RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN), True,
+    )
+    assert result == {"cohorts": 1, "jobs": 1, "published": 1}
+    assert events == [
+        "legacy_guard", "generation", "legacy_guard", "job",
+        "legacy_guard", "publish",
+    ]
+
+
+def test_generation_supplied_guard_stops_before_job(monkeypatch):
+    events = []
+    monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
+    monkeypatch.setattr(
+        worker_module, "ensure_generation",
+        lambda *_args: events.append("generation") or 73,
+    )
+    monkeypatch.setattr(
+        worker_module, "process_generation_job",
+        lambda *_args: events.append("job") or True,
+    )
+    monkeypatch.setattr(
+        worker_module, "enforce_resource_guard",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("legacy guard called")),
+    )
+
+    def guarded(_conn, require_external):
+        assert require_external is True
+        events.append("supplied_guard")
+        if events.count("supplied_guard") == 2:
+            raise RuntimeError("admission stopped")
+        return {"ok": True}
+
+    with pytest.raises(RuntimeError, match="admission stopped"):
+        worker_module.process_generations(
+            FakeConnection(FakeCursor()), "worker", 1, 1,
+            RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN), True,
+            guard_check=guarded,
+        )
+    assert events == ["supplied_guard", "generation", "supplied_guard"]
+
+
+def test_rolling_generation_only_selects_the_capture_cohort(monkeypatch):
+    selected = []
+    monkeypatch.setattr(
+        worker_module, "pending_cohorts",
+        lambda _conn, limit, league_id, season_id: (
+            selected.append((limit, league_id, season_id)) or [(271, 27897)]
+        ),
+    )
+    monkeypatch.setattr(worker_module, "ensure_generation", lambda *_a, **_kw: 73)
+    monkeypatch.setattr(worker_module, "process_generation_job", lambda *_a: True)
+    monkeypatch.setattr(worker_module, "finish_generation", lambda *_a: True)
+    result = worker_module.process_generations(
+        FakeConnection(FakeCursor()), "worker", 1, 1,
+        RunBudget.create(10, MAX_SECONDS_PER_RUN), False,
+        guard_check=lambda *_a: {"ok": True},
+        max_materialized_jobs=1, league_id=271, season_id=27897,
+    )
+    assert selected == [(1, 271, 27897)]
+    assert result == {"cohorts": 1, "jobs": 1, "published": 1}
+
+
+def test_generation_progress_survives_a_prepublication_stop(monkeypatch):
+    events = []
+    progress = {"cohorts": 0, "jobs": 0, "published": 0}
+    monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
+    monkeypatch.setattr(worker_module, "ensure_generation", lambda *_args: 73)
+    monkeypatch.setattr(worker_module, "process_generation_job", lambda *_args: True)
+    monkeypatch.setattr(
+        worker_module, "finish_generation",
+        lambda *_args: events.append("published") or True,
+    )
+
+    def guarded(_conn, _require_external):
+        events.append("guard")
+        if len(events) == 3:
+            raise RuntimeError("prepublication stop")
+        return {"ok": True}
+
+    with pytest.raises(RuntimeError, match="prepublication stop"):
+        worker_module.process_generations(
+            FakeConnection(FakeCursor()), "worker", 1, 1,
+            RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN), False,
+            guard_check=guarded, progress=progress,
+        )
+    assert progress == {"cohorts": 1, "jobs": 1, "published": 0}
+    assert events == ["guard", "guard", "guard"]
+
+
+def test_full_trial_refuses_oversized_generation_before_materialization():
+    class GenerationCursor(FakeCursor):
+        answers = iter([(73,), ("materializing", None, 10)])
+
+        def fetchone(self):
+            return next(self.answers)
+
+    cursor = GenerationCursor()
+    with pytest.raises(RuntimeError, match="generation exceeds finite trial job bound"):
+        worker_module.ensure_generation(
+            FakeConnection(cursor), 8, 2026, max_materialized_jobs=9,
+        )
+    assert len(cursor.executed) == 2
+    assert cursor.executed[1][1] == (10, 73)
+    assert "materialize_generation" not in cursor.executed[1][0]
+
+
+def test_full_workload_trial_has_no_production_entrypoint():
+    with pytest.raises(RuntimeError, match="no production entrypoint"):
+        worker_module.run_finite_trial(
+            object(), SimpleNamespace(), "worker", production=True,
+            include_generations=True,
+        )
+
+
 def test_failed_capture_marks_interval_before_claim_cleanup(monkeypatch):
     claims = iter([DirtyClaim(1001, 1, "worker:1", 1), None])
     calls = []
@@ -427,6 +894,17 @@ def test_pending_cohorts_defer_both_recorded_and_current_dirty_cohorts():
     ) in query
 
 
+def test_pending_cohorts_can_select_one_exact_target_without_changing_dirty_guard():
+    cursor = CohortCursor()
+    assert pending_cohorts(FakeConnection(cursor), 1, 271, 27897) == [(271, 27897)]
+    query, params = cursor.executed[0]
+    assert params == (271, 27897, 1)
+    assert "(cursor.league_id,cursor.season_id)=(%s,%s)" in query
+    assert "fixture_capture_queue queue" in query
+    with pytest.raises(ValueError, match="league and season together"):
+        pending_cohorts(FakeConnection(cursor), 1, 271, None)
+
+
 def test_worker_and_capture_hooks_are_pinned_in_the_vps_runtime_manifest():
     runtime_files = {
         line.strip()
@@ -519,6 +997,53 @@ def test_database_heavy_lock_defers_overlap_then_releases(tmp_path):
         if holder.poll() is None:
             holder.terminate()
             holder.wait(timeout=2)
+
+
+def test_database_heavy_gates_refuse_durable_trial_quarantine(tmp_path):
+    # macOS lacks flock(1); a no-op command still exercises the post-lock
+    # quarantine decision. The Linux lock test above verifies real exclusion.
+    fake_bin = tmp_path / "bin"
+    if shutil.which("flock") is None:
+        fake_bin.mkdir()
+        fake_flock = fake_bin / "flock"
+        fake_flock.write_text("#!/bin/sh\nexit 0\n")
+        fake_flock.chmod(0o755)
+    leaderboard_lock = tmp_path / "leaderboard.lock"
+    trial_marker = Path(str(leaderboard_lock) + ".quarantine")
+    heavy_marker = Path(str(leaderboard_lock) + ".quarantine.heavy")
+    trial_marker.write_text('{"policy_id":"local-test"}')
+    heavy_marker.write_text('{"policy_id":"local-test"}')
+    launched = tmp_path / "launched"
+    timing = tmp_path / "timing"
+    env = {
+        **os.environ,
+        "ODDSSEARCH_DB_HEAVY_LOCK_FILE": str(tmp_path / "heavy.lock"),
+        "LEADERBOARD_SHADOW_LOCK_FILE": str(leaderboard_lock),
+        "COMMON_SH": str(ROOT / "scripts/vps/common.sh"),
+        "LAUNCHED": str(launched),
+        "TIMING": str(timing),
+        "PATH": str(fake_bin) + os.pathsep + os.environ.get("PATH", ""),
+    }
+    for gate in (
+        'run_with_database_heavy_lock 0 bash -c \'touch "$LAUNCHED"\'',
+        'run_with_database_heavy_lock_timed 0 "$TIMING" bash -c \'touch "$LAUNCHED"\'',
+    ):
+        result = subprocess.run(
+            ["bash", "-lc", f'source "$COMMON_SH"; {gate}'],
+            env=env, capture_output=True, text=True, timeout=5, check=False,
+        )
+        assert result.returncode == 75, result.stderr
+        assert "finite-trial quarantine blocks" in result.stdout
+        assert not launched.exists()
+        assert not timing.exists()
+    heavy_marker.unlink()
+    result = subprocess.run(
+        ["bash", "-lc", 'source "$COMMON_SH"; run_with_database_heavy_lock 0 bash -c \'touch "$LAUNCHED"\''],
+        env=env, capture_output=True, text=True, timeout=5, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert launched.exists()
+    assert trial_marker.exists()
 
 
 def test_run_budget_rejects_unbounded_fixture_and_time_limits():

@@ -13,6 +13,17 @@ log_error() {
   printf '%s [ERROR] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*" >&2
 }
 
+# The finite trial and both scheduled database-heavy entrants must share these
+# lock identities. Fail closed if a sourced or inherited environment changes
+# either path; otherwise a quarantine marker could protect the wrong file.
+require_default_trial_lock_paths_or_exit() {
+  if [[ "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}" != "/var/lock/oddssearch-leaderboard-shadow.lock" \
+     || "${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-/var/lock/oddssearch-db-heavy.lock}" != "/var/lock/oddssearch-db-heavy.lock" ]]; then
+    log_error "finite-trial lock paths must use the shared production defaults"
+    exit 1
+  fi
+}
+
 hash_file() {
   local path="$1"
   if command -v shasum >/dev/null 2>&1; then
@@ -321,6 +332,19 @@ run_recorded_pipeline_job() {
   else
     run_with_global_lock_and_timeout "${chain_command}" || status=$?
   fi
+  # A caller may explicitly disable retries. The settlement handoff still
+  # means admitted work was stopped deliberately, not that the run failed.
+  if [[ "${status}" -eq 76 && "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
+    status=2
+  fi
+  # Deferral before admission also ends this invocation's claim. Drop it
+  # before the database heartbeat, just as admitted work does on exit.
+  if [[ "${ODDS_SYNC_JOB_PRIORITY:-normal}" == "fixture_core" && -n "${FIXTURE_CORE_RESERVATION_OWNER:-}" ]]; then
+    fixture_core_reservation_release "${FIXTURE_CORE_RESERVATION_OWNER}" || {
+      log_error "fixture-core reservation release failed before heartbeat"
+      status=1
+    }
+  fi
   finished_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
   finished_epoch="$(date -u +%s)"
 
@@ -346,6 +370,8 @@ run_with_global_lock_and_retry() {
   local chain_command="$1"
   local retry_attempts="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-0}"
   local retry_delay_seconds="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-15}"
+  local retry_deadline_seconds="${ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS:-0}"
+  local retry_started_epoch
   local attempt=0 status=2
 
   if [[ ! "${retry_attempts}" =~ ^[0-9]+$ ]]; then
@@ -356,15 +382,35 @@ run_with_global_lock_and_retry() {
     log_error "ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS must be a non-negative number"
     return 1
   fi
+  if [[ ! "${retry_deadline_seconds}" =~ ^[0-9]+$ ]]; then
+    log_error "ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS must be a non-negative integer"
+    return 1
+  fi
+  retry_started_epoch="${ODDS_SYNC_LOCK_RETRY_STARTED_EPOCH:-$(date -u +%s)}"
 
   while (( attempt <= retry_attempts )); do
-    run_with_global_lock_and_timeout "${chain_command}" && return 0
+    if (( retry_deadline_seconds > 0 && $(date -u +%s) - retry_started_epoch >= retry_deadline_seconds )); then
+      log_info "[SKIPPED] writer-lock retry deadline reached"
+      return 2
+    fi
+    ODDS_SYNC_LOCK_RETRY_STARTED_EPOCH="${retry_started_epoch}" \
+      run_with_global_lock_and_timeout "${chain_command}" && return 0
     status=$?
+    if [[ "${status}" -eq 76 && "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
+      # The job already acquired the canonical lock and began provider work.
+      # A later settlement handoff is a skip, but should not repeat that work
+      # inside this same invocation when the caller opts out of such retries.
+      return 2
+    fi
     if [[ "${status}" -ne 2 ]]; then
       return "${status}"
     fi
     attempt=$((attempt + 1))
     if (( attempt > retry_attempts )); then
+      return 2
+    fi
+    if (( retry_deadline_seconds > 0 && $(date -u +%s) - retry_started_epoch >= retry_deadline_seconds )); then
+      log_info "[SKIPPED] writer-lock retry deadline reached"
       return 2
     fi
     log_info "[RETRY] lock handoff; retry ${attempt}/${retry_attempts} in ${retry_delay_seconds}s"
@@ -414,6 +460,11 @@ run_with_database_heavy_lock() {
       log_info "[SKIPPED] database-heavy maintenance slot unavailable"
       exit 75
     fi
+    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" \
+       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" ]]; then
+      log_info "[SKIPPED] finite-trial quarantine blocks database-heavy maintenance"
+      exit 75
+    fi
     "$@"
   )
 }
@@ -448,6 +499,11 @@ run_with_database_heavy_lock_timed() {
       log_info "[SKIPPED] database-heavy maintenance slot unavailable"
       exit 75
     fi
+    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" \
+       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" ]]; then
+      log_info "[SKIPPED] finite-trial quarantine blocks database-heavy maintenance"
+      exit 75
+    fi
     acquired_ms="$(epoch_milliseconds)"
     printf '%s\n' "${acquired_ms}" >"${timing_file}"
     set +e
@@ -458,6 +514,81 @@ run_with_database_heavy_lock_timed() {
     printf '%s\n' "${finished_ms}" >>"${timing_file}"
     exit "${status}"
   )
+}
+
+# The fixture-core source must be admitted before it ages out, but the
+# quarter-hour settlement still has priority. A short-lived reservation keeps
+# newly arriving normal writers from overtaking an already waiting fixture
+# core. Both files are derived from the canonical writer lock path, so an
+# unrelated lock domain (for example Models) is unaffected.
+fixture_core_reservation_file() {
+  printf '%s.fixture-core-reservation' "${ODDS_SYNC_LOCK_FILE:-/var/lock/odds-sync.lock}"
+}
+
+fixture_core_reservation_active() {
+  local reservation_file="$1" owner expires now
+  [[ -f "${reservation_file}" ]] || return 1
+  read -r owner expires <"${reservation_file}" || return 1
+  if [[ ! "${owner}" =~ ^[0-9a-f-]{36}$ || ! "${expires}" =~ ^[0-9]+$ ]]; then
+    log_error "ignoring malformed fixture-core reservation at ${reservation_file}"
+    return 1
+  fi
+  now="$(date -u +%s)"
+  (( expires > now ))
+}
+
+fixture_core_reservation_owned_for() {
+  local reservation_file="$1" expected_owner="$2" minimum_seconds="$3"
+  local owner expires now
+  [[ -f "${reservation_file}" ]] || return 1
+  read -r owner expires <"${reservation_file}" || return 1
+  [[ "${owner}" == "${expected_owner}" && "${expires}" =~ ^[0-9]+$ ]] || return 1
+  now="$(date -u +%s)"
+  (( expires > now + minimum_seconds ))
+}
+
+fixture_core_reservation_claim() {
+  local reservation_file guard_file ttl
+  reservation_file="$(fixture_core_reservation_file)"
+  guard_file="${reservation_file}.guard"
+  ttl="${FIXTURE_CORE_RESERVATION_TTL_SECONDS:-3600}"
+  if [[ ! "${ttl}" =~ ^[1-9][0-9]*$ ]] || (( ttl > 3600 )); then
+    log_error "fixture-core reservation TTL must be between 1 and 3600 seconds"
+    return 1
+  fi
+  mkdir -p "$(dirname "${reservation_file}")" || return 1
+  (
+    local owner expires tmp
+    umask 077
+    flock -w 2 -x 7 || exit 2
+    if fixture_core_reservation_active "${reservation_file}"; then
+      exit 2
+    fi
+    owner="$(python3 -c 'import uuid; print(uuid.uuid4())')" || exit 1
+    expires=$(( $(date -u +%s) + ttl ))
+    tmp="$(mktemp "${reservation_file}.tmp.XXXXXXXX")" || exit 1
+    if ! printf '%s %s\n' "${owner}" "${expires}" >"${tmp}" ||
+       ! mv -f "${tmp}" "${reservation_file}"; then
+      rm -f "${tmp}"
+      exit 1
+    fi
+    printf '%s\n' "${owner}"
+  ) 7>"${guard_file}"
+}
+
+fixture_core_reservation_release() {
+  local expected_owner="$1" reservation_file guard_file owner expires
+  reservation_file="$(fixture_core_reservation_file)"
+  guard_file="${reservation_file}.guard"
+  [[ -f "${reservation_file}" ]] || return 0
+  (
+    flock -w 2 -x 7 || exit 1
+    [[ -f "${reservation_file}" ]] || exit 0
+    read -r owner expires <"${reservation_file}" || exit 1
+    if [[ "${owner}" == "${expected_owner}" ]]; then
+      rm -f "${reservation_file}"
+    fi
+  ) 7>"${guard_file}"
 }
 
 run_with_global_lock_and_timeout() {
@@ -472,6 +603,14 @@ run_with_global_lock_and_timeout() {
   local live_grace_seconds="${ODDS_SYNC_LIVE_GRACE_SECONDS:-120}"
   local min_normal_lease_seconds="${ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS:-0}"
   local live_schedule_enabled="${ODDS_SYNC_LIVE_SCHEDULE_ENABLED:-true}"
+  local reservation_file reservation_owner="${FIXTURE_CORE_RESERVATION_OWNER:-}"
+  local retry_started_epoch="${ODDS_SYNC_LOCK_RETRY_STARTED_EPOCH:-0}"
+  local retry_deadline_seconds="${ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS:-0}"
+
+  if [[ ! "${retry_started_epoch}" =~ ^[0-9]+$ || ! "${retry_deadline_seconds}" =~ ^[0-9]+$ ]]; then
+    log_error "writer-lock retry deadline requires numeric start and duration"
+    return 1
+  fi
 
   mkdir -p "$(dirname "${lock_file}")"
 
@@ -489,6 +628,27 @@ run_with_global_lock_and_timeout() {
       exit 2
     fi
 
+    # Use the same short guard as fixture-core reservation creation. A normal
+    # writer admitted before a reservation claim may finish; one arriving
+    # afterward yields before it can take the canonical writer lock.
+    if [[ "${job_priority}" == "normal" ]]; then
+      reservation_file="$(fixture_core_reservation_file)"
+      exec 7>"${reservation_file}.guard"
+      if ! flock -w 2 -x 7; then
+        log_info "[SKIPPED] fixture-core admission guard unavailable"
+        exit 2
+      fi
+      if fixture_core_reservation_active "${reservation_file}"; then
+        log_info "[SKIPPED] fixture-core reservation active"
+        exit 2
+      fi
+    fi
+
+    if [[ "${job_priority}" == "fixture_core" && -z "${reservation_owner}" ]]; then
+      log_error "fixture-core admission requires a reservation owner"
+      exit 1
+    fi
+
     wait_started="$(date -u +%s)"
     while ! flock --nonblock 9; do
       if [[ "${job_priority}" != "settlement" ]]; then
@@ -502,6 +662,10 @@ run_with_global_lock_and_timeout() {
       fi
       sleep "${lock_poll_seconds}" 9>&-
     done
+    if [[ "${job_priority}" == "normal" ]]; then
+      flock -u 7
+      exec 7>&-
+    fi
 
     local effective_runtime="${max_runtime}"
     if [[ "${live_schedule_enabled}" == "true" && "${job_priority}" != "settlement" ]]; then
@@ -529,12 +693,88 @@ run_with_global_lock_and_timeout() {
       fi
     fi
 
+    if [[ "${job_priority}" == "fixture_core" ]]; then
+      # Recheck the exact owner immediately before provider work. Its expiry
+      # must outlast this lease, including timeout's five-second kill grace.
+      reservation_file="$(fixture_core_reservation_file)"
+      exec 7>"${reservation_file}.guard"
+      if ! flock -w 2 -x 7; then
+        log_info "[SKIPPED] fixture-core owner guard unavailable"
+        exit 2
+      fi
+      if [[ "${live_schedule_enabled}" == "true" ]]; then
+        # Owner validation must use the lease left after acquiring this guard,
+        # not the longer lease calculated before the wait.
+        now_epoch="$(date -u +%s)"
+        live_phase=$((now_epoch % live_tick_seconds))
+        available_runtime=$((live_tick_seconds - live_phase - live_grace_seconds))
+        if (( available_runtime <= 0 ||
+              (min_normal_lease_seconds > 0 && available_runtime < min_normal_lease_seconds) )); then
+          log_info "[SKIPPED] fixture-core lease too short after owner guard"
+          exit 2
+        fi
+        if (( available_runtime < effective_runtime )); then
+          effective_runtime="${available_runtime}"
+        fi
+      fi
+      if ! fixture_core_reservation_owned_for "${reservation_file}" "${reservation_owner}" "$((effective_runtime + 10))"; then
+        log_info "[SKIPPED] fixture-core reservation owner expired or changed before admission"
+        exit 2
+      fi
+      flock -u 7
+      exec 7>&-
+    fi
+
+    # Guard acquisition and lock handoff can advance the clock after the
+    # initial check. Recheck immediately before the work command starts.
+    now_epoch="$(date -u +%s)"
+    if (( retry_deadline_seconds > 0 && retry_started_epoch > 0 && now_epoch - retry_started_epoch >= retry_deadline_seconds )); then
+      log_info "[SKIPPED] writer-lock retry deadline reached before admission"
+      exit 2
+    fi
+    live_phase=$((now_epoch % live_tick_seconds))
+    if [[ "${live_schedule_enabled}" == "true" && "${job_priority}" != "settlement" ]] && {
+      (( live_phase >= live_tick_seconds - live_reserve_seconds )) ||
+      (( live_phase < live_grace_seconds ));
+    }; then
+      log_info "[SKIPPED] live settlement reservation active before admission (phase=${live_phase}s)"
+      exit 2
+    fi
+    if [[ "${live_schedule_enabled}" == "true" && "${job_priority}" != "settlement" ]]; then
+      # The owner-guard wait may consume part of the lease calculated above.
+      # Recompute from the actual admission instant before starting the chain.
+      available_runtime=$((live_tick_seconds - live_phase - live_grace_seconds))
+      if (( available_runtime <= 0 )); then
+        log_info "[SKIPPED] no writer lease before settlement grace window after admission wait"
+        exit 2
+      fi
+      if (( min_normal_lease_seconds > 0 && available_runtime < min_normal_lease_seconds )); then
+        log_info "[SKIPPED] writer lease too short after admission wait (available=${available_runtime}s minimum=${min_normal_lease_seconds}s)"
+        exit 2
+      fi
+      if (( available_runtime < effective_runtime )); then
+        effective_runtime="${available_runtime}"
+        log_info "writer lease shortened to ${effective_runtime}s after admission wait"
+      fi
+    fi
+
     # The full chain must execute as one subshell so timeout covers every step.
     timeout --signal=TERM --kill-after=5s "${effective_runtime}" bash -lc "${chain_command}"
     local status=$?
+    if [[ "${job_priority}" == "fixture_core" ]]; then
+      # Release priority at the end of admitted work, before the wrapper's
+      # database heartbeat. A stalled heartbeat must not block normal writers.
+      fixture_core_reservation_release "${reservation_owner}" || {
+        log_error "fixture-core reservation release failed after admitted work"
+        exit 1
+      }
+    fi
     if [[ ${status} -eq 124 || ${status} -eq 137 ]]; then
       if [[ "${job_priority}" != "settlement" && "${effective_runtime}" -lt "${max_runtime}" ]]; then
         log_info "[SKIPPED] normal-writer lease ended for settlement handoff after ${effective_runtime}s"
+        if [[ "${ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF:-false}" == "true" ]]; then
+          exit 76
+        fi
         exit 2
       fi
       log_error "process killed after ${max_runtime}s overrun"
