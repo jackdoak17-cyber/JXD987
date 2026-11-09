@@ -14,6 +14,8 @@ The production source-only archive based on `24d0a94` is currently using a corre
 - `python3 -m py_compile scripts/export_to_supabase.py scripts/reconcile_stats_provider_queue.py`: passed.
 - `shasum -c scripts/vps/runtime_manifest.sha1`: all listed runtime files passed.
 - `git diff --check`: passed. The two production source files match `24d0a94` byte for byte.
+- The disposable PostgreSQL lifecycle fixture now strips inherited libpq `PG*` settings and verifies the connected server's data directory and Unix-socket address **before** its schema reset. This closes a test-isolation risk that a Python socket monkeypatch alone cannot cover. The focused suite still passes 54/54 after this guard.
+- Read-only workflow search found the scheduled `fixture_delivery_failover.yml`, `sync_history.yml` and `sync_recent.yml` call the exporter without `--provider-snapshot-ids-json`; none of the workflows has a `push` trigger. The new batch path requires that explicit map plus guarded fixture-detail flags, so a merge does not opt those existing scheduled calls into batch mode. Their pre-existing single-fixture/core paths still require ordinary post-merge observation.
 
 Regenerating the manifest changed the expected hashes for the two source files and also corrected an **already stale** `scripts/leaderboard_shadow_worker.py` entry on `main`: the file at `aa9304e` hashes to `b670e9b45ed9bcccf4bb3c40e0f62ba85022cf7e`, whereas its committed manifest listed `e5c676f8d40932ea43444f87e12add076c7018b2`. The worker file itself is unchanged by this branch. This is a manifest integrity correction, not a worker release.
 

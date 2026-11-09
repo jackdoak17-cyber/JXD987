@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import getpass
 import json
+import os
 import shutil
 import socket
 import sqlite3
@@ -84,9 +85,24 @@ def postgres(tmp_path_factory):
     subprocess.run([pg_ctl, "-D", str(data), "-l", str(root / "postgres.log"),
                     "-o", f"-F -h '' -k {sockets}", "-w", "start"],
                    check=True, capture_output=True)
-    url = f"host={sockets} dbname=postgres user={getpass.getuser()}"
+    url = f"host={sockets} dbname=postgres user={getpass.getuser()} connect_timeout=5"
     try:
-        yield url
+        with pytest.MonkeyPatch.context() as pg_env:
+            # libpq can honor inherited PGHOSTADDR/PGSERVICE even when a test
+            # supplies a socket URL. Verify the cluster before any schema reset.
+            for name in tuple(os.environ):
+                if name.startswith("PG"):
+                    pg_env.delenv(name)
+            probe = psycopg2.connect(url)
+            try:
+                with probe.cursor() as cur:
+                    cur.execute("select current_setting('data_directory'), inet_server_addr()")
+                    data_dir, server_addr = cur.fetchone()
+                assert Path(data_dir).resolve() == data.resolve()
+                assert server_addr is None
+            finally:
+                probe.close()
+            yield url
     finally:
         subprocess.run([pg_ctl, "-D", str(data), "-m", "immediate", "-w", "stop"],
                        check=True, capture_output=True)
