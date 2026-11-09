@@ -169,3 +169,42 @@ total p95 154,667ms against the pinned148,617.4ms ceiling; the corrected
 release has not met its20-sample guard. Observe the next ordinary larger
 batch and recurring source/Fixtures health before deciding whether to retain
 the trial. No paid capacity, disk provisioning or Spend Cap change occurred.
+
+## Second ordinary source batch and Fixtures recurrence
+
+The normal hourly Fixtures publisher finished at20:11:53, published release
+`622f1d64-f810-4f44-b99c-c66de5080457` with 1,239 schedule, 1,341
+standings, 109,032 metrics and 3,333 odds rows, and pinned it to22:11:06.
+Its source freshness identified the genuine fixture-core job verified at
+18:18:09, well within the existing540-minute gate. This proves publication
+continued while the source-only statistics trial was active; it is not a
+browser/customer certification.
+
+The corrected supervisor's next natural batch began at20:22 and succeeded at
+20:23:49: 17 selected, 13 accepted, four provider-pending, zero failed.
+The existing two-cohort limiter selected17 from the nominal100 pool. Five
+accepted fixtures used one batch and eight later-attempt fixtures kept their
+individual commands. Candidate selection/provider fetch/source-store/export/
+verification/projection/activation took
+2.221/1.266/19.988/48.423/1.301/7.451/20.164 seconds. A direct serving
+status query found all13 accepted rows under `3df6bb130cb9` at20:23:31–
+20:23:48 with equal non-null source/target snapshots, true player and lineup
+parity and accepted snapshot links. The source-performance view at20:31 had
+one comparable17-unit sample, total p95 108,441ms and processing p95
+107,137ms. The old release's21 comparable20-unit runs had total p95
+154,667ms against the old pinned148,617.4ms ceiling. Different selected and
+accepted fixture sets mean this is a promising but **uncontrolled** speed
+comparison; 20 new-release comparable samples and freshness gates remain
+unmet.
+
+At20:31 the corrected supervisor and exact cron entry remained active. The
+leaderboard pipeline still had old source pin `375f1f1aaf25`, capture on,
+worker/backfill off, and resource paused for `wal_bytes_limit`; durable
+WAL3,821,618,701 and temp444,508,273 bytes were unchanged by these reads.
+Keep the source-only trial for normal recurrence and examine its 20-sample
+distribution before pinning. Eight of13 accepted fixtures still used the
+individual retry path, limiting this release's possible export gain; do not
+broaden batch eligibility without separate retry-safety evidence. JXD `main`
+was `aa9304e` at this check, behind the exact active `3028e0f` archive, so a
+direct PR from the trial branch would include earlier unmerged host/leaderboard
+work. Reconcile that integration boundary before a production-branch merge.

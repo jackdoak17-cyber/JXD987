@@ -176,8 +176,19 @@ from the archive directory without changing runtime bytes or cron. The first
 genuine corrected batch succeeded6/6, with five batched and one individual
 retry, export16.679s and all six target snapshot/parity/link checks passing.
 This is a small mixed-path proof, not a comparable full-workload benchmark.
-It still needs repeated live source trials
-under the installed lease, target parity check, full-job timing comparison,
-and normal old-source run verification before any renewed cutover can be
-called successful. No added capacity, Spend Cap change or paid service was
-used.
+The next ordinary corrected run at20:22 selected17 and accepted13, with
+four provider-pending and no failure. Five accepted fixtures were batched and
+eight later attempts kept the individual path; export took48.423 seconds,
+source-store19.988 seconds, projection7.451 seconds and activation20.164
+seconds. All13 accepted target status rows passed non-null snapshot equality,
+lineup/player parity and accepted-link checks. The source-performance view
+reported one comparable17-unit sample with total p95 108,441ms, compared
+with the old release's21 comparable20-unit samples and total p95 154,667ms.
+This is an encouraging but composition-dependent observation, not a verified
+production speed improvement. The corrected source remains active for normal
+recurrence, while its old pin and all leaderboard processing/cost safeguards
+remain unchanged. Eight individual retries may limit the long-term gain;
+batching them requires separate safety proof. The current JXD `main` at
+`aa9304e` is behind the active production archive `3028e0f`, so merging this
+branch directly would carry earlier unmerged worker changes. No added
+capacity, Spend Cap change or paid service was used.
