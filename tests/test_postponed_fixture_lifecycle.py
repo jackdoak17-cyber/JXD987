@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import getpass
 import json
+import os
 import shutil
 import socket
 import sqlite3
@@ -33,6 +34,27 @@ from scripts.refresh_fixture_delivery import is_hidden
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = 19745046
+
+
+def connect_owned_postgres(url: str, data: Path):
+    """Prove the target is this suite's temporary cluster before any DDL."""
+    with pytest.MonkeyPatch.context() as clean_env:
+        for name in tuple(os.environ):
+            if name.startswith("PG") or name in {
+                "DATABASE_URL", "SUPABASE_DB_URL", "SUPABASE_DB_URL_SESSION",
+            }:
+                clean_env.delenv(name)
+        conn = psycopg2.connect(url)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("select current_setting('data_directory'), inet_server_addr()")
+                data_dir, server_addr = cur.fetchone()
+            assert Path(data_dir).resolve() == data.resolve()
+            assert server_addr is None
+        except BaseException:
+            conn.close()
+            raise
+        return conn
 
 
 @pytest.mark.parametrize("status", ["POST", "POSTP", "POSTPONED"])
@@ -84,9 +106,17 @@ def postgres(tmp_path_factory):
     subprocess.run([pg_ctl, "-D", str(data), "-l", str(root / "postgres.log"),
                     "-o", f"-F -h '' -k {sockets}", "-w", "start"],
                    check=True, capture_output=True)
-    url = f"host={sockets} dbname=postgres user={getpass.getuser()}"
+    url = f"host={sockets} dbname=postgres user={getpass.getuser()} connect_timeout=5"
     try:
-        yield url
+        with pytest.MonkeyPatch.context() as pg_env:
+            # Keep every libpq connection in this module on the local socket.
+            for name in tuple(os.environ):
+                if name.startswith("PG") or name in {
+                    "DATABASE_URL", "SUPABASE_DB_URL", "SUPABASE_DB_URL_SESSION",
+                }:
+                    pg_env.delenv(name)
+            connect_owned_postgres(url, data).close()
+            yield url, data
     finally:
         subprocess.run([pg_ctl, "-D", str(data), "-m", "immediate", "-w", "stop"],
                        check=True, capture_output=True)
@@ -105,9 +135,22 @@ def no_network(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", connect)
 
 
+def test_disposable_connection_ignores_poisoned_libpq_environment(postgres, monkeypatch):
+    url, data = postgres
+    monkeypatch.setenv("PGHOSTADDR", "127.0.0.1")
+    monkeypatch.setenv("PGPORT", "1")
+    monkeypatch.setenv("PGSERVICE", "missing_disposable_test_service")
+    monkeypatch.setenv("PGOPTIONS", "-c search_path=poisoned")
+    monkeypatch.setenv("SUPABASE_DB_URL", "postgres://127.0.0.1:1/poisoned")
+    connect_owned_postgres(url, data).close()
+    assert os.environ["PGHOSTADDR"] == "127.0.0.1"
+    assert os.environ["PGSERVICE"] == "missing_disposable_test_service"
+
+
 @pytest.fixture
 def replay(postgres, tmp_path):
-    conn = psycopg2.connect(postgres)
+    url, data = postgres
+    conn = connect_owned_postgres(url, data)
     with conn.cursor() as cur:
         cur.execute("drop schema public cascade; create schema public")
         cur.execute("""
@@ -179,7 +222,7 @@ def replay(postgres, tmp_path):
     client = Mock()
     client.fetch_collection.side_effect = AssertionError("Unconfigured provider mock")
     try:
-        yield Replay(conn, postgres, engine, client)
+        yield Replay(conn, url, engine, client)
     finally:
         conn.close()
         engine.dispose()
@@ -273,6 +316,67 @@ def test_normal_fixture_to_played_complete(replay):
     assert replay.publish(payload())
     assert replay.shots() == [(2,)]
     assert replay.shots(player=22) == [(0,)]  # Only an explicit provider zero.
+
+
+def test_batched_export_keeps_per_fixture_snapshot_lineage_in_disposable_postgres(
+    replay, tmp_path, monkeypatch,
+):
+    from scripts import export_to_supabase as exporter
+
+    fixtures = [payload(fixture_id=FIXTURE), payload(fixture_id=FIXTURE + 1)]
+    snapshots = {}
+    for data in fixtures:
+        replay.discover(data)
+        assessment = delivery.assess_provider_payload(data)
+        snapshots[data["id"]] = delivery.persist_provider_snapshot(
+            replay.url, data["id"], 8, 10, data, assessment,
+            delivery.provider_payload_hash(data), delivery.normalized_provider_hash(data),
+        )
+        delivery.store_provider_detail(replay.engine, replay.client, data["id"], data, assessment)
+
+    mapping = tmp_path / "snapshots.json"
+    mapping.write_text(json.dumps({str(key): value for key, value in snapshots.items()}))
+    report = tmp_path / "batch-report.json"
+    monkeypatch.setattr(sys, "argv", [
+        "export_to_supabase.py", "--strict", "--leagues", "8",
+        "--fixture-ids", f"{FIXTURE},{FIXTURE + 1}", "--keep-all-seasons",
+        "--protect-empty-detail", "--require-detail", "--atomic-fixture-detail",
+        "--skip-odds-snapshots", "--skip-odds-outcomes", "--skip-prune",
+        "--provider-snapshot-ids-json", str(mapping), "--report-json", str(report),
+    ])
+    monkeypatch.setattr(exporter, "DB_PATH", str(replay.engine.url.database))
+    monkeypatch.setattr(exporter, "SUPABASE_DB_URL", replay.url)
+    monkeypatch.setattr(exporter, "require_env", lambda *_: None)
+    monkeypatch.setattr(exporter, "choose_keep_seasons", lambda *_args, **_kwargs: {10})
+    monkeypatch.setattr(exporter, "fetch_seasons", lambda *_: [])
+    monkeypatch.setattr(exporter, "fetch_rounds", lambda *_: [])
+    monkeypatch.setattr(exporter, "fetch_sidelined_players", lambda *_: [])
+    monkeypatch.setattr(exporter, "fetch_player_team_history", lambda *_: [])
+    monkeypatch.setattr(exporter, "filter_rows_for_remote_schema", lambda _table, rows: rows)
+    parent_calls = []
+
+    def publish_parents(table, rows, *_args):
+        parent_calls.append((table, len(rows)))
+        return len(rows), 0
+
+    monkeypatch.setattr(exporter, "upsert_table", publish_parents)
+    exporter.main()
+
+    result = json.loads(report.read_text())
+    assert result["atomic_published_fixture_ids"] == [FIXTURE, FIXTURE + 1]
+    assert result["atomic_failed_fixtures"] == []
+    assert parent_calls.count(("fixtures", 2)) == 1
+    for data in fixtures:
+        with replay.engine.connect() as source:
+            raw = source.connection.driver_connection
+            assert not delivery.compare_snapshots(
+                delivery.source_snapshot(raw, data["id"]),
+                delivery.target_snapshot(replay.conn, data["id"]),
+            )
+        assert replay.sql(
+            "select distinct provider_snapshot_id from fixture_player_statistics where fixture_id=%s",
+            (data["id"],),
+        ) == [(snapshots[data["id"]],)]
 
 
 def test_discovery_alone_quarantines_postponement_until_complete_recovery(replay):
@@ -547,7 +651,7 @@ def test_real_queue_command_completes_recovery_and_records_eligibility(replay, m
 
     monkeypatch.setattr(queue.SyncService, "ensure_schema", count_ensure_schema)
 
-    def export_batch(ids, leagues, report_path, snapshot_ids=None):
+    def export_batch(ids, leagues, report_path, snapshot_ids=None, *, allow_batch=True, attempt_by_id=None):
         assert ids == [FIXTURE]
         replay.export(data, snapshot_ids[FIXTURE])
         return queue.ExportBatchResult((queue.ExportCommandResult.success(ids),))
