@@ -10,6 +10,7 @@ import contextlib
 import getpass
 import io
 import json
+import os
 import shutil
 import socket
 import sqlite3
@@ -18,6 +19,7 @@ import sys
 import threading
 import tempfile
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -469,6 +471,114 @@ def test_twenty_fixture_old_vs_batch_export_parity_and_write_cost(replay, tmp_pa
     assert batched["fixture_players_source"] == 1
     assert old["nonempty_parent_calls"] == 2 * len(fixture_ids)
     assert batched["nonempty_parent_calls"] == 2
+
+
+def test_twenty_fixture_subprocess_export_with_local_parent_http(replay, tmp_path):
+    """Exercise the actual exporter process and parent HTTP call pattern offline."""
+    fixture_ids = list(range(FIXTURE + 200, FIXTURE + 220))
+    snapshots = {}
+    with replay.engine.begin() as source:
+        source.exec_driver_sql(
+            "insert into seasons(id,league_id,name,is_current) values(10,8,'test',1)"
+        )
+    for fixture_id in fixture_ids:
+        data = payload(fixture_id=fixture_id)
+        replay.discover(data)
+        assessment = delivery.assess_provider_payload(data)
+        snapshots[fixture_id] = delivery.persist_provider_snapshot(
+            replay.url, fixture_id, 8, 10, data, assessment,
+            delivery.provider_payload_hash(data), delivery.normalized_provider_hash(data),
+        )
+        delivery.store_provider_detail(replay.engine, replay.client, fixture_id, data, assessment)
+
+    http_calls = []
+
+    class LocalParentAPI(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            if not self.path.startswith("/rest/v1/"):
+                self.send_error(404)
+                return
+            http_calls.append((self.path.split("?", 1)[0], len(json.loads(body))))
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), LocalParentAPI)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    env = {
+        "PATH": os.environ["PATH"],
+        "PYTHONPATH": str(ROOT),
+        "JXD_DB_PATH": str(replay.engine.url.database),
+        "SUPABASE_URL": f"http://127.0.0.1:{server.server_port}",
+        "SUPABASE_SERVICE_ROLE_KEY": "disposable-test-only",
+        "SUPABASE_DB_URL": replay.url,
+        "SUPABASE_EXPORT_SLEEP": "0",
+    }
+    common = [
+        sys.executable, str(ROOT / "scripts/export_to_supabase.py"),
+        "--strict", "--leagues", "8", "--keep-all-seasons",
+        "--protect-empty-detail", "--require-detail", "--atomic-fixture-detail",
+        "--skip-odds-snapshots", "--skip-odds-outcomes", "--skip-prune",
+    ]
+
+    def run(mode):
+        http_calls.clear()
+        start_lsn = replay.sql("select pg_current_wal_lsn()")[0][0]
+        started = time.perf_counter()
+        if mode == "old":
+            commands = [
+                common + ["--fixture-ids", str(fixture_id),
+                          "--provider-snapshot-id", str(snapshots[fixture_id]),
+                          "--report-json", str(tmp_path / f"old-process-{fixture_id}.json")]
+                for fixture_id in fixture_ids
+            ]
+        else:
+            mapping = tmp_path / "subprocess-snapshot-ids.json"
+            mapping.write_text(json.dumps({str(key): value for key, value in snapshots.items()}))
+            report_path = tmp_path / "batch-process.json"
+            commands = [common + ["--fixture-ids", ",".join(map(str, fixture_ids)),
+                                  "--provider-snapshot-ids-json", str(mapping),
+                                  "--report-json", str(report_path)]]
+        for command in commands:
+            result = subprocess.run(command, env=env, cwd=ROOT, text=True,
+                                    capture_output=True, timeout=30, check=False)
+            assert result.returncode == 0, result.stderr[-2000:]
+        if mode == "batch":
+            batch_report = json.loads(report_path.read_text())
+            assert batch_report["atomic_published_fixture_ids"] == fixture_ids
+            assert batch_report["atomic_failed_fixtures"] == []
+        elapsed = time.perf_counter() - started
+        wal_bytes = replay.sql("select pg_wal_lsn_diff(pg_current_wal_lsn(),%s)", (start_lsn,))[0][0]
+        rows = replay.sql("""select fixture_id,player_id,type_id,value,provider_snapshot_id
+            from fixture_player_statistics order by fixture_id,player_id,type_id""")
+        lineage = replay.sql("""select fixture_id,accepted_snapshot_id
+            from fixture_detail_delivery_status where fixture_id between %s and %s
+            order by fixture_id""", (fixture_ids[0], fixture_ids[-1]))
+        metrics = {"mode": mode, "processes": len(commands), "seconds": round(elapsed, 3),
+                   "wal_bytes": int(wal_bytes), "parent_http_requests": len(http_calls),
+                   "parent_http_rows": sum(count for _, count in http_calls),
+                   "detail_rows": len(rows)}
+        print("EXPORT_SUBPROCESS_COMPARE " + json.dumps(metrics, sort_keys=True))
+        return rows, lineage, metrics
+
+    try:
+        old_rows, old_lineage, old = run("old")
+        replay.sql("""truncate fixture_players,fixture_statistics,
+            fixture_player_statistics,fixture_detail_delivery_status,projection_replays,players""")
+        batch_rows, batch_lineage, batched = run("batch")
+    finally:
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
+    assert batch_rows == old_rows
+    assert batch_lineage == old_lineage
+    assert {row[0] for row in batch_rows} == set(fixture_ids)
+    assert old["parent_http_requests"] > batched["parent_http_requests"]
 
 
 def test_discovery_alone_quarantines_postponement_until_complete_recovery(replay):

@@ -57,7 +57,7 @@ single-fixture path is unchanged.
 tests/test_stats_reconciliation_batched_export.py
 tests/test_fixture_detail_export_policy.py tests/test_export_to_supabase.py
 tests/test_postponed_fixture_lifecycle.py tests/test_reconcile_stats_provider_queue.py
-tests/test_leaderboard_shadow_pipeline.py` passed **157**, with one existing
+tests/test_leaderboard_shadow_pipeline.py` passed **158**, with one existing
 skip and 12 deprecation warnings. New tests cover
 strict map validation, one-process invocation, partial success, ambiguous
 report refusal, retry-mode individual commands and a Unix-socket-only
@@ -76,15 +76,28 @@ HTTP traffic, against a synthetic source with 22 lineups per fixture. These
 numbers demonstrate parity and lower duplicated source/parent work in this
 isolation, **not** production speed, live WAL or network savings.
 
+An actual-process replay then used the same 20-fixture source, a fresh target
+detail state for each path, a Unix-socket-only disposable PostgreSQL server,
+and a local HTTP server that accepted parent upserts without writing them.
+The old/batch paths produced identical 1,340 target player-stat rows and
+snapshot lineage. Old used 20 exporter processes, 40 local parent HTTP
+requests carrying 60 rows, 2.872 seconds and 442,448 target WAL bytes;
+batch used one process, two local parent HTTP requests carrying three rows,
+0.251 seconds and 441,792 target WAL bytes. The old path ran first, and both
+used synthetic 22-player fixtures; HTTP response behavior and target schema
+were simpler than production. This proves the candidate removes repeated
+process, source and parent-request work in that isolation. It does not establish
+the production gain, full parent-write WAL, or a production-shaped lease bound.
+
 The combined suite, Python compilation, 49-entry manifest verification and
 `git diff --check` passed. The host composition shell test passed in an
 existing Linux Docker image with networking disabled and the worktree mounted
 read-only; the Mac host lacks `flock` and cannot run it natively.
 
-Before a production release, compare actual subprocess old/batch exports on a
-representative normal source with isolated target and real parent HTTP
-behavior; measure whole-stage wall time, target WAL, lease duration and retry
-outcomes. Review the merged manifest and exact host release identity. The
+Before a production release, compare old/batch exports on a representative
+normal source with isolated target and production-equivalent parent writes;
+measure whole-stage wall time, target WAL, lease duration and retry outcomes.
+Review the merged manifest and exact host release identity. The
 current production source pin remains on `375f1f1aaf25`; new source
 `d025f6607f67` had 18/20 comparable samples, latest20-unit success at
 18:54:03 UTC and normalized total p95 156,658.3 ms against a 148,617.4 ms
