@@ -1286,6 +1286,17 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
         raise RuntimeError("rolling cohort scope requires positive league and season together")
     if args.production_trial_isolated_test and not isolated_test_database(conn):
         raise RuntimeError("rolling test path requires socket-only oddssearch_m3")
+    if args.production_trial_isolated_test and args.trial_test_pg_sleep_after_capture:
+        if not 0 < args.trial_test_pg_sleep_after_capture <= 120:
+            raise RuntimeError("rolling post-capture test pause is outside its bound")
+        with conn.cursor() as cur:
+            cur.execute("""
+                select current_database()='oddssearch_m3_rolling_worker'
+                   and inet_server_addr() is null
+                   and current_setting('data_directory') like '/tmp/oddssearch-m3-pg.%'
+            """)
+            if cur.fetchone()[0] is not True:
+                raise RuntimeError("rolling post-capture pause requires exact disposable clone")
     budget = RunBudget.create(args.fixture_limit, args.max_seconds)
     apply_preflight_timeouts(conn)
     # The normal worker is paused, so it cannot upload the host's fresh disk
@@ -1344,9 +1355,9 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
                 guard_check=check_rolling_guard, progress=capture,
                 audit_run_id=run_id, guard_interval=1,
             )
-        if (args.production_trial_isolated_test
-                and args.trial_test_pg_sleep_after_capture
-                and capture["acknowledged"]):
+        if args.production_trial_isolated_test and args.trial_test_pg_sleep_after_capture:
+            if not capture["acknowledged"]:
+                raise RuntimeError("rolling post-capture pause had no acknowledged capture")
             with conn:
                 with conn.cursor() as cur:
                     cur.execute(
