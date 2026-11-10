@@ -825,6 +825,22 @@ def test_superseded_generation_defers_to_a_replacement_without_worker_failure():
     assert "cohort_pending_publications generation" in cursor.executed[0][0]
 
 
+def test_already_published_generation_is_not_counted_again():
+    cursor = GenerationFinishCursor(("published", 0, 0))
+
+    assert finish_generation(FakeConnection(cursor), 1000016) is False
+    assert len(cursor.executed) == 1
+    assert "publish_generation" not in cursor.executed[0][0]
+
+
+def test_corrupt_published_generation_is_not_treated_as_an_ordinary_skip():
+    cursor = GenerationFinishCursor(("published", 0, 1))
+
+    with pytest.raises(RuntimeError, match="published generation 1000016 has incomplete jobs"):
+        finish_generation(FakeConnection(cursor), 1000016)
+    assert len(cursor.executed) == 1
+
+
 def test_source_drift_is_recaptured_before_replacement_generation():
     cursor = GenerationJobCursor(staged=False)
     connection = GenerationJobConnection(cursor)

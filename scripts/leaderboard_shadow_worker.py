@@ -832,6 +832,14 @@ def finish_generation(conn, generation_id: int) -> bool:
     # generation from the cohort's newer committed cursor.
     if generation_status == "superseded":
         return False
+    if generation_status == "published":
+        if failed or outstanding:
+            raise RuntimeError(
+                f"published generation {generation_id} has incomplete jobs"
+            )
+        # publish_generation() also returns true for an already-published
+        # generation. Do not count that as a publication by this worker run.
+        return False
     if failed:
         raise RuntimeError(f"generation {generation_id} has {failed} failed jobs")
     if outstanding:
