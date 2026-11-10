@@ -810,7 +810,10 @@ def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
         conn.set_session(isolation_level="READ COMMITTED")
 
 
-def finish_generation(conn, generation_id: int) -> bool:
+def finish_generation(
+    conn, generation_id: int,
+    publication_binding: tuple[int, int] | None = None,
+) -> bool:
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -846,6 +849,14 @@ def finish_generation(conn, generation_id: int) -> bool:
         return False
     with conn:
         with conn.cursor() as cur:
+            if publication_binding is not None:
+                cur.execute(
+                    "select leaderboard_rolling_v1.publish_generation_for_run(%s,%s,%s)",
+                    (generation_id, *publication_binding),
+                )
+                # SQL 92 can observe a publication committed after our status
+                # read. Its idempotent published=true is not this run's work.
+                return cur.fetchone()[0].get("transitioned") is True
             cur.execute(
                 "select leaderboard_shadow_v1.publish_generation(%s)",
                 (generation_id,),
@@ -860,6 +871,7 @@ def process_generations(
     progress: dict[str, int] | None = None,
     max_materialized_jobs: int | None = None,
     league_id: int | None = None, season_id: int | None = None,
+    publication_binding: tuple[int, int] | None = None,
 ) -> dict[str, int]:
     if (league_id is None) != (season_id is None):
         raise ValueError("generation scope requires league and season together")
@@ -901,7 +913,7 @@ def process_generations(
             break
         budget.apply_database_timeouts(conn)
         guard_check(conn, require_external)
-        if finish_generation(conn, generation_id):
+        if finish_generation(conn, generation_id, publication_binding):
             result["published"] += 1
     return result
 
@@ -1277,6 +1289,20 @@ ROLLING_STATEMENTS = {
 }
 
 
+def require_bound_publication_schema(conn) -> None:
+    """Explicit opt-in requires SQL 92; never fall back to legacy publication."""
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                select to_regprocedure(
+                  'leaderboard_rolling_v1.publish_generation_for_run(bigint,bigint,bigint)'
+                ) is not null
+                and to_regclass('leaderboard_rolling_v1.publication_run_links') is not null
+            """)
+            if cur.fetchone()[0] is not True:
+                raise RuntimeError("bound publication requires SQL 92 wrapper schema")
+
+
 def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
     """One supervised capture and publication run under a renewable reservation."""
     validate_production_trial_connection(conn, args)
@@ -1307,6 +1333,8 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
                 raise RuntimeError("rolling post-capture pause requires exact disposable clone")
     budget = RunBudget.create(args.fixture_limit, args.max_seconds)
     apply_preflight_timeouts(conn)
+    if getattr(args, "require_bound_publication", False):
+        require_bound_publication_schema(conn)
     # The normal worker is paused, so it cannot upload the host's fresh disk
     # sample. Refresh it before admission; the installed function validates
     # both the sample age and current source identity without rearming debt.
@@ -1385,6 +1413,10 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
                 budget, False, guard_check=check_rolling_guard,
                 progress=generations, max_materialized_jobs=remaining_jobs,
                 league_id=args.league_id, season_id=args.season_id,
+                publication_binding=(
+                    (fence, run_id) if getattr(args, "require_bound_publication", False)
+                    else None
+                ),
             )
         check_rolling_guard(conn, False)
         apply_recovery_timeouts(conn)
@@ -1480,6 +1512,7 @@ def main() -> int:
     ))
     parser.add_argument("--isolated-test-override", action="store_true")
     parser.add_argument("--production-trial-isolated-test", action="store_true")
+    parser.add_argument("--require-bound-publication", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
     parser.add_argument("--max-seconds", type=float, default=MAX_SECONDS_PER_RUN)
     parser.add_argument("--capture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
@@ -1493,6 +1526,8 @@ def main() -> int:
     parser.add_argument("--trial-test-pg-sleep-after-capture", type=float, default=0)
     parser.add_argument("--trial-test-pg-sleep-before-recovery", type=float, default=0)
     args = parser.parse_args()
+    if args.require_bound_publication and args.command != "rolling-once":
+        parser.error("bound publication requires rolling-once")
     if args.production_trial_isolated_test and args.command not in {
         "finite-once", "finite-recover", "rolling-once", "rolling-recover"
     }:

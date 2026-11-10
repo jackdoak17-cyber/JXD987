@@ -484,6 +484,8 @@ def run_trial(args) -> int:
                     "--league-id", str(args.league_id),
                     "--season-id", str(args.season_id),
                 ]
+            if rolling and getattr(args, "require_bound_publication", False):
+                worker.append("--require-bound-publication")
             if args.production:
                 if args.production_trial_isolated_test:
                     worker.append("--production-trial-isolated-test")
@@ -644,6 +646,7 @@ def main() -> int:
     parser.add_argument("--database-heavy-lock-file", required=True)
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--rolling", action="store_true")
+    parser.add_argument("--require-bound-publication", action="store_true")
     parser.add_argument("--follow-rolling-successors", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=10)
     parser.add_argument("--capture-limit", type=int, default=10)
@@ -663,6 +666,8 @@ def main() -> int:
     parser.add_argument("--test-force-uncertain-drain", action="store_true")
     parser.add_argument("--test-recovery-pg-sleep", type=float, default=0)
     args = parser.parse_args()
+    if args.require_bound_publication and not args.rolling:
+        parser.error("bound publication requires rolling mode")
     if args.production_trial_isolated_test and not args.production:
         parser.error("production trial isolated test mode requires --production")
     if args.rolling and (
