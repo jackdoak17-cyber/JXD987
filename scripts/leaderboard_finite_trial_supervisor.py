@@ -26,6 +26,41 @@ def database_url() -> str:
     return url
 
 
+CHILD_ENVIRONMENT_ALLOWLIST = frozenset({
+    "PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+    "LEADERBOARD_SHADOW_RELEASE_SHA",
+    "LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE",
+    "LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256",
+    "LEADERBOARD_FINITE_TRIAL_RELEASE_SHA",
+    "LEADERBOARD_FINITE_TRIAL_OPERATOR_NOTE",
+})
+
+
+def child_environment(token: str, lock_fds: tuple[int, int],
+                      worker_lock_path: str, heavy_lock_path: str) -> dict[str, str]:
+    """Pass only worker inputs, never the supervisor's ambient credentials.
+
+    Normalize the selected worker DSN to one key so an unused fallback URL
+    cannot expose a second credential. libpq defaults, Python injection knobs,
+    operator/admin URLs and provider keys are deliberately not inherited.
+    The operator note is required worker audit input, not an operator credential.
+    """
+    environment = {
+        key: os.environ[key] for key in CHILD_ENVIRONMENT_ALLOWLIST
+        if key in os.environ
+    }
+    environment.update({
+        "SUPABASE_DB_URL_SESSION": database_url(),
+        "LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN": token,
+        "LEADERBOARD_FINITE_TRIAL_SUPERVISOR_PID": str(os.getpid()),
+        "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_FD": str(lock_fds[0]),
+        "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_PATH": worker_lock_path,
+        "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_FD": str(lock_fds[1]),
+        "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_PATH": heavy_lock_path,
+    })
+    return environment
+
+
 def bounded_connection(url: str):
     return psycopg2.connect(
         url, connect_timeout=5,
@@ -317,15 +352,6 @@ def reconcile_quarantine(args) -> int:
                                     "operator_recovery_inflight", tokens,
                                     rolling=rolling)
             lock_fds = (worker_lock.fileno(), heavy_lock.fileno())
-            environment = os.environ.copy()
-            environment.update({
-                "LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN": recovery_token,
-                "LEADERBOARD_FINITE_TRIAL_SUPERVISOR_PID": str(os.getpid()),
-                "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_FD": str(lock_fds[0]),
-                "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_PATH": args.worker_lock_file,
-                "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_FD": str(lock_fds[1]),
-                "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_PATH": args.database_heavy_lock_file,
-            })
             recovery = [
                 sys.executable, args.worker_path,
                 "rolling-recover" if rolling else
@@ -339,7 +365,10 @@ def reconcile_quarantine(args) -> int:
             process = subprocess.Popen(
                 recovery, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, start_new_session=True, pass_fds=lock_fds,
-                env=environment,
+                env=child_environment(
+                    recovery_token, lock_fds, args.worker_lock_file,
+                    args.database_heavy_lock_file,
+                ),
             )
             try:
                 output, errors = process.communicate(timeout=args.recovery_seconds)
@@ -439,17 +468,6 @@ def run_trial(args) -> int:
             prior_term = signal.signal(signal.SIGTERM, on_signal)
             prior_int = signal.signal(signal.SIGINT, on_signal)
             lock_fds = (worker_lock.fileno(), heavy_lock.fileno())
-            def child_environment(token: str) -> dict[str, str]:
-                environment = os.environ.copy()
-                environment.update({
-                    "LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN": token,
-                    "LEADERBOARD_FINITE_TRIAL_SUPERVISOR_PID": str(os.getpid()),
-                    "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_FD": str(lock_fds[0]),
-                    "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_PATH": args.worker_lock_file,
-                    "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_FD": str(lock_fds[1]),
-                    "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_PATH": args.database_heavy_lock_file,
-                })
-                return environment
             worker = [
                 sys.executable, args.worker_path,
                 "rolling-once" if rolling else
@@ -485,7 +503,10 @@ def run_trial(args) -> int:
                 active_process = subprocess.Popen(
                     worker, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, start_new_session=True, pass_fds=lock_fds,
-                    env=child_environment(main_token),
+                    env=child_environment(
+                        main_token, lock_fds, args.worker_lock_file,
+                        args.database_heavy_lock_file,
+                    ),
                 )
                 active_token = main_token
                 deliver_pending_signal()
@@ -535,7 +556,10 @@ def run_trial(args) -> int:
                 active_process = subprocess.Popen(
                     recovery, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     text=True, start_new_session=True, pass_fds=lock_fds,
-                    env=child_environment(recovery_token),
+                    env=child_environment(
+                        recovery_token, lock_fds, args.worker_lock_file,
+                        args.database_heavy_lock_file,
+                    ),
                 )
                 active_token = recovery_token
                 deliver_pending_signal()
