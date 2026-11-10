@@ -71,8 +71,10 @@ def bounded_connection(url: str):
 def assert_disposable_database(url: str) -> None:
     with bounded_connection(url) as conn:
         with conn.cursor() as cur:
-            cur.execute("select current_database(), inet_server_addr() is null")
-            name, socket_only = cur.fetchone()
+            cur.execute("select current_database(), inet_server_addr() is null, session_user")
+            name, socket_only, login = cur.fetchone()
+    if login in {"m3_role_worker", "m3_role_supervisor"}:
+        raise RuntimeError("restricted logins require restricted supervisor mode")
     if not socket_only or not str(name).startswith("oddssearch_m3"):
         raise RuntimeError("finite trial supervisor requires a socket-only oddssearch_m3 database")
 
@@ -252,6 +254,60 @@ def drain_token_backends(url: str, token: str, seconds: float) -> None:
         conn.close()
 
 
+def restricted_drain_url(worker_url: str) -> str:
+    drain_url = os.environ.get("LEADERBOARD_DRAIN_DB_URL")
+    if not drain_url or drain_url == worker_url:
+        raise RuntimeError("restricted supervisor needs distinct worker and drain database URLs")
+    identities = []
+    for url, role in ((worker_url, "m3_role_worker"), (drain_url, "m3_role_supervisor")):
+        conn = bounded_connection(url)
+        try:
+            with conn, conn.cursor() as cur:
+                cur.execute("""
+                    select current_database(),inet_server_addr() is null,
+                           current_user,session_user
+                """)
+                name, socket_only, current_role, login = cur.fetchone()
+                if (name != "oddssearch_m3_rolling_worker" or not socket_only
+                        or not conn.info.host.startswith("/tmp/oddssearch-m3-socket.")
+                        or current_role != role or login != role):
+                    raise RuntimeError("restricted supervisor database identity is invalid")
+                identities.append((name, conn.info.host, conn.info.port))
+        finally:
+            conn.close()
+    if identities[0] != identities[1]:
+        raise RuntimeError("worker and drain URLs must target the same disposable database")
+    return drain_url
+
+
+def drain_restricted_worker(url: str, policy_id: str, token: str, seconds: float) -> dict:
+    """Only the checked database function can signal a stored backend binding."""
+    deadline = time.monotonic() + seconds
+    conn = bounded_connection(url)
+    try:
+        conn.autocommit = True
+        terminate = False
+        signal_requested = False
+        while True:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    select leaderboard_role_boundary_v1.drain_policy_worker(%s,%s,%s)
+                """, (policy_id, f"oddssearch-finite-trial/{token}", terminate))
+                evidence = cur.fetchone()[0]
+            if evidence.get("state") == "exited":
+                return evidence
+            if evidence.get("state") not in {"active", "signal_requested"}:
+                raise RuntimeError("restricted drain returned an invalid state")
+            if time.monotonic() >= deadline:
+                raise RuntimeError("restricted worker backend exit remains unproved")
+            # Probe first, signal at most once, and require fresh exit proof.
+            signal_requested |= terminate
+            terminate = not signal_requested
+            time.sleep(0.1)
+    finally:
+        conn.close()
+
+
 def drain_exact_backend(url: str, policy_id: str, seconds: float, *,
                         production: bool, rolling: bool = False) -> None:
     deadline = time.monotonic() + seconds
@@ -399,11 +455,20 @@ def reconcile_quarantine(args) -> int:
 def run_trial(args) -> int:
     url = database_url()
     rolling = getattr(args, "rolling", False)
+    restricted = getattr(args, "restricted_worker", False)
+    if restricted and (
+        not rolling or not args.production or not args.production_trial_isolated_test
+        or not getattr(args, "require_bound_publication", False)
+        or getattr(args, "league_id", None) is None or args.follow_rolling_successors
+    ):
+        raise RuntimeError("restricted supervisor requires scoped rolling and bound publication in disposable mode")
+    drain_url = restricted_drain_url(url) if restricted else None
     if rolling and not args.production:
         raise RuntimeError("rolling supervisor requires production identity checks")
     if args.production:
         if args.production_trial_isolated_test:
-            assert_disposable_database(url)
+            if not restricted:
+                assert_disposable_database(url)
         else:
             assert_production_database(url)
             if (args.test_pg_sleep_after_admission or args.test_pg_sleep_after_capture
@@ -432,7 +497,7 @@ def run_trial(args) -> int:
                 )[-1]
             main_token = uuid.uuid4().hex[:16]
             recovery_token = uuid.uuid4().hex[:16]
-            marker_tokens = [main_token, recovery_token]
+            marker_tokens = [main_token] if restricted else [main_token, recovery_token]
             write_quarantine_marker(
                 marker, args.policy_id, "inflight", marker_tokens, rolling=rolling
             )
@@ -486,6 +551,8 @@ def run_trial(args) -> int:
                 ]
             if rolling and getattr(args, "require_bound_publication", False):
                 worker.append("--require-bound-publication")
+            if restricted:
+                worker.append("--restricted-worker")
             if args.production:
                 if args.production_trial_isolated_test:
                     worker.append("--production-trial-isolated-test")
@@ -531,6 +598,34 @@ def run_trial(args) -> int:
                     print(errors, end="", file=sys.stderr)
                 if args.test_force_uncertain_drain:
                     raise RuntimeError("forced uncertain original-owner drain")
+                if restricted:
+                    drained = drain_restricted_worker(
+                        drain_url, args.policy_id, main_token, args.drain_seconds,
+                    )
+                    # A drained worker still has accounting liability. Keep the
+                    # trial marker and never launch a recovery child in this mode.
+                    clear_quarantine_marker(heavy_marker)
+                    reports = [json.loads(line) for line in output.splitlines() if line.strip()]
+                    report = reports[-1] if reports else {}
+                    prepared = (
+                        worker_exit == 0 and drained.get("prepared_pending") is True
+                        and report.get("state") == "prepared_pending"
+                        and report.get("fence") == drained["fence"]
+                        and report.get("run_id") == drained["run_id"]
+                    )
+                    state = "prepared_pending" if prepared else "drained_unsettled"
+                    write_quarantine_marker(marker, args.policy_id, state, marker_tokens, rolling=True)
+                    print(json.dumps({
+                        "event": "restricted_rolling_worker_supervised",
+                        "policy_id": args.policy_id, "worker_exit": worker_exit,
+                        "timed_out": timed_out, "state": state, "drain": drained,
+                        "interrupted_signal": interrupted_signal,
+                    }, sort_keys=True), flush=True)
+                    if interrupted_signal is not None:
+                        return 128 + interrupted_signal
+                    if timed_out:
+                        return 124
+                    return 0 if prepared else 1
                 # The token finds even a preflight/admission backend that never
                 # committed a reservation. Keep both flocks until it is gone.
                 drain_token_backends(url, main_token, args.drain_seconds)
@@ -625,7 +720,10 @@ def run_trial(args) -> int:
                     try:
                         stop_process_group(active_process, args.grace_seconds)
                         if active_token is not None:
-                            drain_token_backends(url, active_token, args.drain_seconds)
+                            if restricted:
+                                drain_restricted_worker(drain_url, args.policy_id, active_token, args.drain_seconds)
+                            else:
+                                drain_token_backends(url, active_token, args.drain_seconds)
                     except Exception:
                         pass
                 raise
@@ -647,6 +745,7 @@ def main() -> int:
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--rolling", action="store_true")
     parser.add_argument("--require-bound-publication", action="store_true")
+    parser.add_argument("--restricted-worker", action="store_true")
     parser.add_argument("--follow-rolling-successors", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=10)
     parser.add_argument("--capture-limit", type=int, default=10)
@@ -666,6 +765,13 @@ def main() -> int:
     parser.add_argument("--test-force-uncertain-drain", action="store_true")
     parser.add_argument("--test-recovery-pg-sleep", type=float, default=0)
     args = parser.parse_args()
+    if args.restricted_worker and (
+        not args.rolling or not args.production or not args.production_trial_isolated_test
+        or not args.require_bound_publication or args.league_id is None
+        or args.follow_rolling_successors or args.test_recovery_pg_sleep
+        or args.reconcile_quarantine
+    ):
+        parser.error("restricted supervisor requires scoped disposable rolling with bound publication and no recovery")
     if args.require_bound_publication and not args.rolling:
         parser.error("bound publication requires rolling mode")
     if args.production_trial_isolated_test and not args.production:

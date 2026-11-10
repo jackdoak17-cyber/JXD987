@@ -434,6 +434,24 @@ def refresh_eligibility_if_due(conn, max_age_seconds: int = 600) -> int:
             return int(cur.fetchone()[0])
 
 
+def audit_capture_count(conn, cur, run_id: int, field: str) -> None:
+    if field not in {"claimed_count", "succeeded_count", "failed_count"}:
+        raise ValueError("invalid capture audit field")
+    if getattr(getattr(conn, "info", None), "user", None) == "m3_role_worker":
+        cur.execute(
+            "select leaderboard_role_boundary_v1.audit_capture_count(%s,%s)",
+            (run_id, field),
+        )
+        cur.fetchone()
+    else:
+        cur.execute(
+            f"update leaderboard_shadow_v1.worker_runs set {field}={field}+1 "
+            "where run_id=%s and finished_at is null", (run_id,),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("finite trial audit run is not open")
+
+
 def claim_dirty(
     conn,
     worker_id: str,
@@ -488,13 +506,7 @@ def claim_dirty(
             )
             row = cur.fetchone()
             if row is not None and audit_run_id is not None:
-                cur.execute(
-                    "update leaderboard_shadow_v1.worker_runs "
-                    "set claimed_count=claimed_count+1 where run_id=%s and finished_at is null",
-                    (audit_run_id,),
-                )
-                if cur.rowcount != 1:
-                    raise RuntimeError("finite trial audit run is not open")
+                audit_capture_count(conn, cur, audit_run_id, "claimed_count")
     return DirtyClaim(**row) if row else None
 
 
@@ -525,14 +537,7 @@ def process_dirty_claim(
             )
             if cur.rowcount == 1:
                 if audit_run_id is not None:
-                    cur.execute(
-                        "update leaderboard_shadow_v1.worker_runs "
-                        "set succeeded_count=succeeded_count+1 "
-                        "where run_id=%s and finished_at is null",
-                        (audit_run_id,),
-                    )
-                    if cur.rowcount != 1:
-                        raise RuntimeError("finite trial audit run is not open")
+                    audit_capture_count(conn, cur, audit_run_id, "succeeded_count")
                 return True
             cur.execute(
                 """
@@ -559,14 +564,7 @@ def fail_dirty_claim(
                 (str(error)[:2000], claim.fixture_id, claim.claim_token, claim.claim_fence),
             )
             if audit_run_id is not None:
-                cur.execute(
-                    "update leaderboard_shadow_v1.worker_runs "
-                    "set failed_count=failed_count+1 "
-                    "where run_id=%s and finished_at is null",
-                    (audit_run_id,),
-                )
-                if cur.rowcount != 1:
-                    raise RuntimeError("finite trial audit run is not open")
+                audit_capture_count(conn, cur, audit_run_id, "failed_count")
 
 
 def process_capture_queue(
@@ -1338,7 +1336,10 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
     # The normal worker is paused, so it cannot upload the host's fresh disk
     # sample. Refresh it before admission; the installed function validates
     # both the sample age and current source identity without rearming debt.
-    load_external_resource_evidence(conn)
+    if not getattr(args, "restricted_worker", False):
+        load_external_resource_evidence(conn)
+    # The restricted login cannot write external resource evidence. Admission
+    # still validates the freshness of the operator's independently loaded sample.
     temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
     budget.apply_database_timeouts(conn)
     with conn:
@@ -1431,7 +1432,15 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
                 )
                 outcome = cur.fetchone()["outcome"]
         closed = True
-        if outcome.get("run_succeeded") is not True:
+        prepared_pending = (
+            getattr(args, "restricted_worker", False)
+            and outcome.get("resolution_state") == "pending_finalization"
+            and outcome.get("settlement", {}).get("settled") is False
+            and capture["claimed"] == capture["acknowledged"]
+            and capture["failed"] == 0
+            and outcome.get("checkpoint", {}).get("ok") is True
+        )
+        if outcome.get("run_succeeded") is not True and not prepared_pending:
             raise RuntimeError("rolling worker closed but failed final safety check")
         return {
             "policy_id": args.trial_policy_id, "owner": worker_id,
@@ -1444,6 +1453,7 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
             "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
             "temp_file_limit_enforced": temp_file_limit_enforced,
             "outcome": outcome,
+            **({"state": "prepared_pending"} if prepared_pending else {}),
         }
     except Exception:
         if not closed:
@@ -1513,6 +1523,7 @@ def main() -> int:
     parser.add_argument("--isolated-test-override", action="store_true")
     parser.add_argument("--production-trial-isolated-test", action="store_true")
     parser.add_argument("--require-bound-publication", action="store_true")
+    parser.add_argument("--restricted-worker", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
     parser.add_argument("--max-seconds", type=float, default=MAX_SECONDS_PER_RUN)
     parser.add_argument("--capture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
@@ -1538,6 +1549,20 @@ def main() -> int:
 
     conn = connect()
     try:
+        with conn, conn.cursor() as cur:
+            cur.execute("select session_user")
+            restricted_login = cur.fetchone()[0] == "m3_role_worker"
+            if restricted_login or args.restricted_worker:
+                if (not restricted_login or not args.restricted_worker
+                        or not args.require_bound_publication
+                        or args.command != "rolling-once"
+                        or not args.production_trial_isolated_test
+                        or args.league_id is None):
+                    raise RuntimeError("restricted worker requires scoped rolling-once, bound publication and disposable mode")
+                cur.execute("""
+                    select set_config('oddssearch.restricted_worker','on',false),
+                           set_config('oddssearch.restricted_scope',%s,false)
+                """, (f"{args.league_id}/{args.season_id}",))
         if args.command == "status":
             print(json.dumps(status(conn), default=str, sort_keys=True))
             return 0
