@@ -1344,6 +1344,15 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
                 guard_check=check_rolling_guard, progress=capture,
                 audit_run_id=run_id, guard_interval=1,
             )
+        if (args.production_trial_isolated_test
+                and args.trial_test_pg_sleep_after_capture
+                and capture["acknowledged"]):
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "select pg_sleep(%s)",
+                        (args.trial_test_pg_sleep_after_capture,),
+                    )
         if capture["failed"]:
             raise RuntimeError("rolling capture failed")
         remaining_jobs = min(
