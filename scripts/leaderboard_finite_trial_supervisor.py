@@ -121,7 +121,8 @@ def stop_process_group(process: subprocess.Popen, grace_seconds: float) -> tuple
 
 
 def write_quarantine_marker(path: Path, policy_id: str, state: str,
-                            tokens: list[str], *, rolling: bool = False) -> None:
+                            tokens: list[str], *, rolling: bool = False,
+                            restricted: bool = False) -> None:
     if not tokens or len(tokens) != len(set(tokens)) or any(
         not re.fullmatch(r"[0-9a-f]{16}", token) for token in tokens
     ):
@@ -130,6 +131,7 @@ def write_quarantine_marker(path: Path, policy_id: str, state: str,
         "policy_id": policy_id, "state": state, "tokens": tokens,
         "mode": "rolling" if rolling else "finite",
         "recorded_at": time.time(),
+        **({"restricted": True} if restricted else {}),
     }, sort_keys=True).encode("utf-8")
     temporary = path.with_name(path.name + ".tmp-" + uuid.uuid4().hex)
     try:
@@ -395,6 +397,14 @@ def reconcile_quarantine(args) -> int:
                         raise RuntimeError("rolling quarantine markers disagree on identity or tokens")
                 args.policy_id = marker_policy_id
             tokens = read_quarantine_marker(marker, args.policy_id, rolling=rolling)
+            if rolling:
+                for path in (marker, heavy_marker):
+                    if os.path.lexists(path):
+                        read_quarantine_marker(path, args.policy_id, rolling=True)
+                        identity = json.loads(path.read_text(encoding="utf-8"))
+                        if (identity.get("restricted") is True
+                                or identity.get("state") in ("prepared_pending", "drained_unsettled")):
+                            raise RuntimeError("restricted quarantine requires committed-state release")
             for token in tokens:
                 drain_token_backends(url, token, args.drain_seconds)
             drain_exact_backend(url, args.policy_id, args.drain_seconds,
@@ -499,11 +509,12 @@ def run_trial(args) -> int:
             recovery_token = uuid.uuid4().hex[:16]
             marker_tokens = [main_token] if restricted else [main_token, recovery_token]
             write_quarantine_marker(
-                marker, args.policy_id, "inflight", marker_tokens, rolling=rolling
+                marker, args.policy_id, "inflight", marker_tokens, rolling=rolling,
+                restricted=restricted,
             )
             write_quarantine_marker(heavy_marker, args.policy_id,
                                     "backend_drain_unproved", marker_tokens,
-                                    rolling=rolling)
+                                    rolling=rolling, restricted=restricted)
             active_process: subprocess.Popen | None = None
             active_token: str | None = None
             interrupted_signal: int | None = None
@@ -614,7 +625,8 @@ def run_trial(args) -> int:
                         and report.get("run_id") == drained["run_id"]
                     )
                     state = "prepared_pending" if prepared else "drained_unsettled"
-                    write_quarantine_marker(marker, args.policy_id, state, marker_tokens, rolling=True)
+                    write_quarantine_marker(marker, args.policy_id, state, marker_tokens,
+                                            rolling=True, restricted=True)
                     print(json.dumps({
                         "event": "restricted_rolling_worker_supervised",
                         "policy_id": args.policy_id, "worker_exit": worker_exit,
@@ -712,7 +724,7 @@ def run_trial(args) -> int:
                 try:
                     write_quarantine_marker(
                         marker, args.policy_id, str(error)[:200], marker_tokens,
-                        rolling=rolling,
+                        rolling=rolling, restricted=restricted,
                     )
                 except Exception:
                     pass
