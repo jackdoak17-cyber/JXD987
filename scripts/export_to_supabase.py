@@ -1450,11 +1450,30 @@ def main():
         help="Retain every provider season for the selected leagues.",
     )
     parser.add_argument(
+        "--scope-explicit-metadata",
+        action="store_true",
+        help="Export seasons and rounds only for the requested reconciliation fixtures.",
+    )
+    parser.add_argument(
         "--report-json",
         default=os.environ.get("SUPABASE_EXPORT_REPORT_JSON", ""),
         help="Optional path to write detailed export report (including timeout splits/missed fixture deletes).",
     )
     args = parser.parse_args()
+
+    explicit_fixture_ids = [
+        int(value.strip())
+        for value in (args.fixture_ids or "").split(",")
+        if value.strip()
+    ]
+    if args.scope_explicit_metadata and (
+        not explicit_fixture_ids or len(set(explicit_fixture_ids)) != len(explicit_fixture_ids)
+        or not args.strict or not args.atomic_fixture_detail or args.fixture_core_only
+        or not args.keep_all_seasons or not args.skip_prune
+        or not args.protect_empty_detail or not args.require_detail
+        or not args.skip_odds_snapshots or not args.skip_odds_outcomes
+    ):
+        raise SystemExit("scoped metadata requires the guarded explicit-fixture reconciliation flags")
 
     batch_snapshot_ids: Dict[int, int] | None = None
     if args.provider_snapshot_ids_json is not None:
@@ -1489,13 +1508,6 @@ def main():
     if not keep_ids:
         raise SystemExit("No seasons to export")
 
-    seasons = fetch_seasons(conn, list(keep_ids))
-    rounds = fetch_rounds(conn, list(keep_ids))
-    explicit_fixture_ids = [
-        int(value.strip())
-        for value in (args.fixture_ids or "").split(",")
-        if value.strip()
-    ]
     fixtures = (
         fetch_fixtures_by_ids(conn, explicit_fixture_ids)
         if explicit_fixture_ids
@@ -1506,6 +1518,17 @@ def main():
             days_back=args.days_back,
         )
     )
+    metadata_season_ids = keep_ids
+    if args.scope_explicit_metadata:
+        if {fixture["id"] for fixture in fixtures} != set(explicit_fixture_ids):
+            raise SystemExit("scoped metadata export could not load every requested fixture")
+        metadata_season_ids = {fixture["season_id"] for fixture in fixtures}
+        if not metadata_season_ids <= keep_ids:
+            raise SystemExit("scoped metadata export found a fixture outside the retained seasons")
+    seasons = fetch_seasons(conn, sorted(metadata_season_ids))
+    if args.scope_explicit_metadata and {season["id"] for season in seasons} != metadata_season_ids:
+        raise SystemExit("scoped metadata export could not load every requested fixture season")
+    rounds = fetch_rounds(conn, sorted(metadata_season_ids))
     team_ids = {f["home_team_id"] for f in fixtures} | {f["away_team_id"] for f in fixtures}
     teams = fetch_teams(conn, list(team_ids))
     known_team_ids = {t["id"] for t in teams}
@@ -1810,6 +1833,8 @@ def main():
         "fixtures_pruned_other_seasons": pruned,
         "delete_stats": delete_stats,
     }
+    if args.scope_explicit_metadata:
+        summary["metadata_season_ids"] = sorted(metadata_season_ids)
     if batch_snapshot_ids is not None:
         summary["atomic_published_fixture_ids"] = sorted(int(value) for value in atomic_published)
         summary["atomic_failed_fixtures"] = atomic_failures

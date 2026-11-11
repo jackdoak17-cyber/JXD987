@@ -436,6 +436,7 @@ def export_batch(
                 "--keep-all-seasons", "--protect-empty-detail", "--require-detail",
                 "--atomic-fixture-detail", "--skip-odds-snapshots",
                 "--skip-odds-outcomes", "--skip-prune",
+                "--scope-explicit-metadata",
                 "--provider-snapshot-ids-json", str(snapshot_path),
                 "--report-json", report_path,
             ]
@@ -507,6 +508,7 @@ def export_batch(
             "--skip-odds-snapshots",
             "--skip-odds-outcomes",
             "--skip-prune",
+            "--scope-explicit-metadata",
             "--report-json",
             report_path,
         ]

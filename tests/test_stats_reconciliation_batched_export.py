@@ -117,6 +117,7 @@ def test_retry_mode_uses_individual_exports(
     assert len(commands) == 2
     assert [command[command.index("--fixture-ids") + 1] for command in commands] == ["1", "2"]
     assert all("--provider-snapshot-ids-json" not in command for command in commands)
+    assert all("--scope-explicit-metadata" in command for command in commands)
 
 
 def test_mixed_first_attempts_batch_while_retry_stays_individual(
@@ -146,6 +147,7 @@ def test_mixed_first_attempts_batch_while_retry_stays_individual(
     )
 
     assert len(commands) == 2
+    assert all("--scope-explicit-metadata" in command for command in commands)
     assert result.batched_fixture_ids == (1, 2)
     assert [outcome.fixture_ids for outcome in result.outcomes] == [(1,), (3,), (2,)]
     assert result.exported_ids == (1, 3)
@@ -174,8 +176,9 @@ def test_mixed_with_only_one_first_attempt_keeps_individual_exports(
     assert result.exported_ids == (1, 2, 3)
 
 
+@pytest.mark.parametrize("scoped", [False, True])
 def test_exporter_reports_partial_atomic_results_and_filters_ancillary_rows(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, scoped: bool,
 ) -> None:
     mapping = tmp_path / "snapshots.json"
     mapping.write_text('{"1":101,"2":202}', encoding="utf-8")
@@ -186,18 +189,19 @@ def test_exporter_reports_partial_atomic_results_and_filters_ancillary_rows(
         "--atomic-fixture-detail", "--skip-odds-snapshots", "--skip-odds-outcomes",
         "--skip-prune", "--provider-snapshot-ids-json", str(mapping),
         "--report-json", str(report_path),
+        *(["--strict", "--scope-explicit-metadata"] if scoped else []),
     ])
     monkeypatch.setattr(exporter, "require_env", lambda *_: None)
     monkeypatch.setattr(exporter, "SUPABASE_DB_URL", "postgres://disposable")
     monkeypatch.setattr(exporter, "get_conn", lambda: object())
     monkeypatch.setattr(exporter, "ensure_tables_exist", lambda *_: None)
     monkeypatch.setattr(exporter, "ensure_fixture_columns", lambda *_: None)
-    monkeypatch.setattr(exporter, "choose_keep_seasons", lambda *_args, **_kwargs: {10})
-    monkeypatch.setattr(exporter, "fetch_seasons", lambda *_: [])
-    monkeypatch.setattr(exporter, "fetch_rounds", lambda *_: [])
+    monkeypatch.setattr(exporter, "choose_keep_seasons", lambda *_args, **_kwargs: {10, 11, 12})
+    monkeypatch.setattr(exporter, "fetch_seasons", lambda _conn, ids: [{"id": value} for value in ids])
+    monkeypatch.setattr(exporter, "fetch_rounds", lambda _conn, ids: [{"id": value * 10, "season_id": value} for value in ids])
     fixtures = [
-        {"id": 1, "home_team_id": 11, "away_team_id": 12},
-        {"id": 2, "home_team_id": 21, "away_team_id": 22},
+        {"id": 1, "home_team_id": 11, "away_team_id": 12, "season_id": 10},
+        {"id": 2, "home_team_id": 21, "away_team_id": 22, "season_id": 11},
     ]
     monkeypatch.setattr(exporter, "fetch_fixtures_by_ids", lambda *_: fixtures)
     monkeypatch.setattr(exporter, "fetch_teams", lambda _conn, ids: [{"id": value} for value in ids])
@@ -246,6 +250,45 @@ def test_exporter_reports_partial_atomic_results_and_filters_ancillary_rows(
     assert published == [(1, 101), (2, 202)]
     assert exported_rows["player_team_history"] == [{"id": 1, "player_id": 1011}]
     assert exported_rows["sidelined_players"] == [{"id": 1, "team_id": 11}]
+    expected_seasons = [10, 11] if scoped else [10, 11, 12]
+    assert [row["id"] for row in exported_rows["seasons"]] == expected_seasons
+    assert [row["season_id"] for row in exported_rows["rounds"]] == expected_seasons
     report = json.loads(report_path.read_text())
+    assert sorted(report["keep_season_ids"]) == [10, 11, 12]
+    assert report.get("metadata_season_ids") == ([10, 11] if scoped else None)
     assert report["atomic_published_fixture_ids"] == [1]
     assert [item["fixture_id"] for item in report["atomic_failed_fixtures"]] == [2]
+
+
+@pytest.mark.parametrize(("fixtures", "season_rows", "message"), [
+    ([], [], "load every requested fixture"),
+    ([{"id": 1, "season_id": 12}], [], "outside the retained seasons"),
+    ([{"id": 1, "season_id": 10}], [], "load every requested fixture season"),
+])
+def test_scoped_metadata_rejects_missing_dependencies_before_export(
+    monkeypatch: pytest.MonkeyPatch, fixtures: list[dict], season_rows: list[dict], message: str,
+) -> None:
+    monkeypatch.setattr(sys, "argv", [
+        "export_to_supabase.py", "--fixture-ids", "1", "--leagues", "8",
+        "--strict", "--keep-all-seasons", "--protect-empty-detail", "--require-detail",
+        "--atomic-fixture-detail", "--skip-odds-snapshots", "--skip-odds-outcomes",
+        "--skip-prune", "--scope-explicit-metadata",
+    ])
+    monkeypatch.setattr(exporter, "require_env", lambda *_: None)
+    monkeypatch.setattr(exporter, "get_conn", lambda: object())
+    monkeypatch.setattr(exporter, "ensure_tables_exist", lambda *_: None)
+    monkeypatch.setattr(exporter, "ensure_fixture_columns", lambda *_: None)
+    monkeypatch.setattr(exporter, "choose_keep_seasons", lambda *_args, **_kwargs: {10})
+    monkeypatch.setattr(exporter, "fetch_fixtures_by_ids", lambda *_: fixtures)
+    monkeypatch.setattr(exporter, "fetch_seasons", lambda *_: season_rows)
+    monkeypatch.setattr(exporter, "upsert_table", lambda *_: pytest.fail("target write before metadata validation"))
+
+    with pytest.raises(SystemExit, match=message):
+        exporter.main()
+
+
+def test_scoped_metadata_is_refused_for_a_rolling_export(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sys, "argv", ["export_to_supabase.py", "--scope-explicit-metadata"])
+    monkeypatch.setattr(exporter, "get_conn", lambda: pytest.fail("opened source for unguarded export"))
+    with pytest.raises(SystemExit, match="guarded explicit-fixture"):
+        exporter.main()
