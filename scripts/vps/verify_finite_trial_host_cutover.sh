@@ -4,11 +4,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/scripts/vps/common.sh"
 mode="${1:-active}"
-install_crontab=false
-if [[ $# -eq 5 && ( "$mode" == prepare || "$mode" == revert ) && "$2" == --install ]]; then
-  install_crontab=true
+cron_action=none
+if [[ $# -eq 5 && ( "$mode" == prepare || "$mode" == revert ) &&
+      ( "$2" == --install || "$2" == --recover ) ]]; then
+  cron_action="${2#--}"
 elif [[ $# -gt 1 || ( "$mode" != active && "$mode" != prepare && "$mode" != revert ) ]]; then
-  echo "usage: verify_finite_trial_host_cutover.sh [active|prepare|revert [--install frozen-sha256 target-sha256 target-file]]" >&2
+  echo "usage: verify_finite_trial_host_cutover.sh [active|prepare|revert [--install frozen-sha256 target-sha256 target-file|--recover frozen-sha256 target-sha256 frozen-file]]" >&2
   exit 2
 fi
 verify_runtime_manifest_or_exit "$0"
@@ -18,7 +19,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/vps/run_leaderboard_shadow_worker.sh" \
   "scripts/vps/run_leaderboard_finite_trial.sh" \
   "scripts/vps/common.sh"
-if [[ "$install_crontab" == true ]]; then
+if [[ "$cron_action" != none ]]; then
   require_runtime_manifest_entries_or_exit "$0" "scripts/vps/install_leaderboard_crontab.py"
   if [[ ! -f "$TRIAL_LOCK_PINS" || -L "$TRIAL_LOCK_PINS" || ! -O "$TRIAL_LOCK_PINS" ]]; then
     echo "finite trial cron transition requires the existing owned lock pin file" >&2
@@ -30,6 +31,7 @@ if [[ "$install_crontab" == true ]]; then
     exit 1
   fi
 fi
+if [[ "$mode" == active ]]; then require_no_cron_transition; fi
 
 # Each entrant must use this exact archived common.sh. The statistics
 # supervisor is long-lived, so a cron edit alone cannot retire its old copy.
@@ -45,7 +47,9 @@ fi
 for entrypoint in run_stats_reconciliation.sh run_leaderboard_shadow_worker.sh; do
   matches="$(printf '%s\n' "$active_schedule" | grep -F "/scripts/vps/$entrypoint" || true)"
   exact="cd $ROOT && $ROOT/scripts/vps/$entrypoint"
-  if [[ "$mode" != active ]]; then
+  if [[ "$cron_action" == recover ]]; then
+    continue
+  elif [[ "$mode" != active ]]; then
     if [[ -n "$matches" ]]; then
       echo "finite trial $mode requires both scheduled entrants frozen" >&2
       exit 1
@@ -168,7 +172,17 @@ else
     exit 1
   fi
   echo "finite trial $mode verified frozen schedules, drained processes and both lock pairs"
-  if [[ "$install_crontab" == true ]]; then
-    python3 -I "$ROOT/scripts/vps/install_leaderboard_crontab.py" "$mode" "$ROOT" "$3" "$4" "$5"
+  if [[ "$cron_action" != none ]]; then
+    helper="$ROOT/scripts/vps/install_leaderboard_crontab.py"
+    python3 -I "$helper" "$cron_action" "$mode" "$ROOT" "$3" "$4" "$5"
+    if [[ "$cron_action" == install ]]; then
+      check_process_releases
+      check_legacy_quarantine
+      if has_quarantine_marker "$TRIAL_WORKER_LOCK"; then
+        echo "finite trial $mode found protected quarantine after crontab installation" >&2
+        exit 1
+      fi
+      python3 -I "$helper" finish "$mode" "$ROOT" "$3" "$4" "$5"
+    fi
   fi
 fi

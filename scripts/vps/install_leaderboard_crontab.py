@@ -25,6 +25,7 @@ BARRIER = {
     7: "/var/lock/stats-reconciliation-supervisor.lock",
     9: "/var/lib/oddssearch/leaderboard-locks/pins.json",
 }
+HOLD = Path(BARRIER[9]).with_name("cron-transition.hold")
 
 
 def digest(value):
@@ -99,37 +100,108 @@ def check_barrier():
             os.close(other)
 
 
-def install(mode, root, expected_frozen, expected_target, path):
+def sync_hold_directory():
+    fd = os.open(HOLD.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_hold(evidence):
+    fd = os.open(HOLD, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(evidence)
+        stream.flush()
+        os.fsync(stream.fileno())
+    sync_hold_directory()
+
+
+def clear_hold(evidence):
+    if reviewed_bytes(HOLD) != evidence:
+        raise ValueError("cron transition hold identity differs")
+    HOLD.unlink()
+    sync_hold_directory()
+
+
+def read_crontab():
+    return subprocess.check_output(["crontab", "-l"], timeout=8)
+
+
+def write_crontab(schedule):
+    try:
+        status = subprocess.run(["crontab", "-"], input=schedule, timeout=8).returncode
+    except subprocess.TimeoutExpired:
+        status = 124
+    return status, read_crontab()
+
+
+def install(mode, root, expected_frozen, expected_target, path, evidence):
     destination = reviewed_bytes(path)
     if digest(destination) != expected_target:
         raise ValueError("reviewed destination crontab digest differs")
-    frozen = subprocess.check_output(["crontab", "-l"], timeout=8)
+    frozen = read_crontab()
     if digest(frozen) != expected_frozen:
         raise ValueError("current frozen crontab digest differs")
     validate_switch(frozen, destination, mode, os.fsencode(root))
-    if subprocess.check_output(["crontab", "-l"], timeout=8) != frozen:
-        raise ValueError("current crontab changed before installation")
     check_barrier()
+    write_hold(evidence)
+    if read_crontab() != frozen:
+        raise ValueError("current crontab changed before installation")
     # Bash retains the transition lock and all five barrier descriptors while
     # this child installs and reads back the exact reviewed bytes.
-    try:
-        status = subprocess.run(["crontab", "-"], input=destination, timeout=8).returncode
-    except subprocess.TimeoutExpired:
-        status = 124
-    actual = subprocess.check_output(["crontab", "-l"], timeout=8)
+    status, actual = write_crontab(destination)
     if status or actual != destination:
+        if actual == frozen:
+            clear_hold(evidence)
         state = "still frozen" if actual == frozen else "requires operator inspection"
         raise ValueError(f"crontab installation did not verify ({state})")
+
+
+def finish(mode, expected_target, evidence):
+    check_barrier()
+    if digest(read_crontab()) != expected_target:
+        raise ValueError("installed crontab changed during post-install verification")
+    clear_hold(evidence)
     print(f"finite trial {mode} installed and verified crontab sha256={expected_target}")
+
+
+def recover(mode, root, expected_frozen, expected_target, path, evidence):
+    check_barrier()
+    if reviewed_bytes(HOLD) != evidence:
+        raise ValueError("cron transition hold identity differs")
+    frozen = reviewed_bytes(path)
+    if digest(frozen) != expected_frozen:
+        raise ValueError("reviewed frozen crontab digest differs")
+    current = read_crontab()
+    if current != frozen:
+        if digest(current) != expected_target:
+            raise ValueError("unrecognized current crontab; protected transition hold retained")
+        validate_switch(frozen, current, mode, os.fsencode(root))
+        if read_crontab() != current:
+            raise ValueError("current crontab changed before recovery")
+        status, actual = write_crontab(frozen)
+        if status or actual != frozen:
+            raise ValueError("frozen crontab restoration did not verify; protected transition hold retained")
+    clear_hold(evidence)
+    print(f"finite trial {mode} recovered frozen crontab sha256={expected_frozen}")
 
 
 if __name__ == "__main__":
     try:
-        mode, root, before_sha, after_sha, path = sys.argv[1:]
+        action, mode, root, before_sha, after_sha, path = sys.argv[1:]
         if mode not in ("prepare", "revert") or not all(
             re.fullmatch(r"[a-f0-9]{64}", value) for value in (before_sha, after_sha)
         ):
             raise ValueError("invalid cron transition mode or digest")
-        install(mode, root, before_sha, after_sha, path)
+        evidence = f"{mode} {before_sha} {after_sha}\n".encode("ascii")
+        if action == "install":
+            install(mode, root, before_sha, after_sha, path, evidence)
+        elif action == "finish":
+            finish(mode, after_sha, evidence)
+        elif action == "recover":
+            recover(mode, root, before_sha, after_sha, path, evidence)
+        else:
+            raise ValueError("invalid cron transition action")
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         sys.exit(f"finite trial crontab stopped: {error}")

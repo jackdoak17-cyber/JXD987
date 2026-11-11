@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/scripts/vps/common.sh"
 verify_runtime_manifest_or_exit "$0"
 require_default_trial_lock_paths_or_exit
+require_no_cron_transition
 require_runtime_manifest_entries_or_exit "$0" \
   "scripts/leaderboard_shadow_capture.py" \
   "scripts/leaderboard_shadow_worker.py" \

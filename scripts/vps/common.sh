@@ -8,10 +8,11 @@ TRIAL_LOCK_DIRECTORY=/var/lib/oddssearch/leaderboard-locks
 TRIAL_WORKER_LOCK="${TRIAL_LOCK_DIRECTORY}/oddssearch-leaderboard-shadow.lock"
 TRIAL_HEAVY_LOCK="${TRIAL_LOCK_DIRECTORY}/oddssearch-db-heavy.lock"
 TRIAL_LOCK_PINS="${TRIAL_LOCK_DIRECTORY}/pins.json"
+TRIAL_CRON_HOLD="${TRIAL_LOCK_DIRECTORY}/cron-transition.hold"
 LEGACY_TRIAL_WORKER_LOCK=/var/lock/oddssearch-leaderboard-shadow.lock
 LEGACY_TRIAL_HEAVY_LOCK=/var/lock/oddssearch-db-heavy.lock
 STATS_SUPERVISOR_LOCK=/var/lock/stats-reconciliation-supervisor.lock
-readonly TRIAL_LOCK_DIRECTORY TRIAL_WORKER_LOCK TRIAL_HEAVY_LOCK TRIAL_LOCK_PINS
+readonly TRIAL_LOCK_DIRECTORY TRIAL_WORKER_LOCK TRIAL_HEAVY_LOCK TRIAL_LOCK_PINS TRIAL_CRON_HOLD
 readonly LEGACY_TRIAL_WORKER_LOCK LEGACY_TRIAL_HEAVY_LOCK STATS_SUPERVISOR_LOCK
 
 log_info() {
@@ -44,6 +45,13 @@ check_trial_lock_fd() {
 
 has_quarantine_marker() {
   [[ -e "$1.quarantine" || -L "$1.quarantine" || -e "$1.quarantine.heavy" || -L "$1.quarantine.heavy" ]]
+}
+
+require_no_cron_transition() {
+  if [[ -e "$TRIAL_CRON_HOLD" || -L "$TRIAL_CRON_HOLD" ]]; then
+    log_error "protected cron transition is unresolved" >&2
+    exit 75
+  fi
 }
 
 hash_file() {

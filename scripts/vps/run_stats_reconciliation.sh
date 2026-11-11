@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 verify_runtime_manifest_or_exit "$0"
 require_default_trial_lock_paths_or_exit
+require_no_cron_transition
 require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
   "scripts/reconcile_stats_provider_queue.py"
@@ -122,6 +123,7 @@ wait_for_live_window() {
 
 while true; do
   wait_for_live_window
+  require_no_cron_transition
   # The supervisor is intentionally long-lived. Refresh the release label for
   # every bounded batch so hot deployments cannot leave delivery reports and
   # ledger rows attributed to the release that started the parent shell.
