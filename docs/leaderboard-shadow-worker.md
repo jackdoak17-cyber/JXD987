@@ -108,3 +108,50 @@ remains customer-visible.
 
 Production activation, trigger enablement, backfill and the 48-hour soak are
 outside this candidate and require their own approved runbook.
+
+## Draft single-use finite trial path
+
+`run_leaderboard_finite_trial.sh` is a separate manual entrypoint. It verifies
+the complete runtime manifest, protected environment file and exact Git
+release before calling the whole-process supervisor. It has no cron entry and
+does not turn on the ordinary worker or customer reader. The reviewed policy
+ID, full release SHA and SHA-256 of the existing database URL must be pinned
+in `LEADERBOARD_FINITE_TRIAL_POLICY_ID`,
+`LEADERBOARD_FINITE_TRIAL_RELEASE_SHA` and
+`LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256`, plus the reviewed SHA-256 of
+the complete runtime manifest in `LEADERBOARD_FINITE_TRIAL_RUNTIME_MANIFEST_SHA256`, together with a reviewed
+`LEADERBOARD_FINITE_TRIAL_OPERATOR_NOTE`. The URL itself is never logged.
+
+The production-named `finite-once`/`finite-recover` commands require the
+network `postgres` database, its pinned URL, a complete release SHA, a unique
+supervisor connection token and both inherited worker/database-heavy lock
+descriptors. Direct invocation fails before admission. The worker creates the
+fixed transition and requests bound admission in one database transaction on
+its own backend; refused admission rolls that transition back. The supervisor retains
+those locks through the bounded process deadline, backend drain and recovery;
+an uncertain result leaves its durable quarantine marker for an explicit
+operator handoff. The marker retains every connection token across a supervisor
+crash. An operator can run `run_leaderboard_finite_trial.sh reconcile` after
+reviewing the marker: it holds both locks, drains only those connections and
+the exact reserved owner, then runs bounded recovery. A separate
+`.quarantine.heavy` marker blocks every shared database-heavy entrant until
+exact backend absence is proved. It is cleared after authoritative drain, so
+normal source reconciliation resumes even if a failed attempt has no
+reservation. The trial-only `.quarantine` marker clears only after a settled
+reservation. If the attempt created no reservation, that marker remains and
+another trial stays blocked pending a separately reviewed disposition of
+possible pre-admission WAL. It uses the private `leaderboard_trial_v1` SQL contract
+from website draft PR #103. The ordinary wrapper also refuses the marker.
+
+In the disposable PostgreSQL integration run, the same production-named code
+path rejected a direct call and a wrong release, quarantined the unreserved
+wrong-release attempt, captured a real fixture once in a separate clone,
+settled its charge, refused a repeat and retained the exhausted old campaign
+with capture on. Its `--production-trial-isolated-test` flag is restricted to a
+socket-only `oddssearch_m3*` database and is never passed by the VPS wrapper.
+This is draft code and local evidence. The fixed numeric policy, database
+migrations, release archive, host configuration, action-time health and billing
+check still require exact review before any production trial. The
+[host cutover candidate](leaderboard-finite-trial-host-cutover.md) records why
+both scheduled archive paths and the old long-lived statistics supervisor must
+be retired together before the manual trial can run.
