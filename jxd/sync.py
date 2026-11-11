@@ -1290,7 +1290,7 @@ class SyncService:
             _upsert(self.session, Player, player_payload)
 
             details = l.get("details") or []
-            self._store_lineup_details_stats(
+            stored_stats = self._store_lineup_details_stats(
                 fixture_id,
                 player_id,
                 team_id,
@@ -1374,7 +1374,9 @@ class SyncService:
                     name = type_info.get("name")
                     value = _extract_stat_value(d.get("data") or d.get("value"))
                     pk = (fixture_id, player_id, type_id, code)
-                    obj_stat = self.session.get(FixturePlayerStatistic, pk)
+                    obj_stat = stored_stats.get(pk)
+                    if obj_stat is None:
+                        obj_stat = self.session.get(FixturePlayerStatistic, pk)
                     payload_stat = {
                         "fixture_id": fixture_id,
                         "player_id": player_id,
@@ -1466,7 +1468,8 @@ class SyncService:
         details: Iterable[Dict],
         log_changes: bool = False,
         retain_raw: bool = True,
-    ) -> None:
+    ) -> dict[tuple[int, int, int, str], FixturePlayerStatistic]:
+        stored_stats: dict[tuple[int, int, int, str], FixturePlayerStatistic] = {}
         for d in details or []:
             type_info = d.get("type") or {}
             type_id = d.get("type_id") or type_info.get("id")
@@ -1504,7 +1507,12 @@ class SyncService:
                 for k, v in payload.items():
                     setattr(obj, k, v)
             else:
-                self.session.add(FixturePlayerStatistic(**payload))
+                obj = FixturePlayerStatistic(**payload)
+                self.session.add(obj)
+            if not log_changes:
+                # The second pass can reuse rows that this pass already loaded or added.
+                stored_stats[pk] = obj
+        return stored_stats
 
     def _replace_fixture_lineup_rows(self, fixture_id: int) -> None:
         """Replace lineup rows without deleting already-ingested player stats."""

@@ -367,6 +367,12 @@ def test_compact_fixture_detail_storage_keeps_export_fields_without_raw_payloads
         {"description": "1ST_HALF", "score": {"participant": "home", "goals": 1}},
         {"description": "1ST_HALF", "score": {"participant": "away", "goals": 0}},
     ]
+    payload["lineups"][0]["details"].extend([
+        {"type_id": 86, "data": {"value": 0}},
+        {"type_id": 86, "value": 2},
+        {"type_id": 9101, "stat": {"value": 7.25}},
+        {"type_id": 9102},
+    ])
     service = SyncService(client=object(), session=session)
     service._store_fixture_raw(payload, full_detail=True, retain_raw=False)
     session.commit()
@@ -379,6 +385,13 @@ def test_compact_fixture_detail_storage_keeps_export_fields_without_raw_payloads
         row.extra is None
         for row in session.query(FixturePlayerStatistic).filter_by(fixture_id=9001)
     )
+    values = {
+        row.type_id: row.value
+        for row in session.query(FixturePlayerStatistic).filter_by(fixture_id=9001, player_id=11)
+    }
+    assert values[86] == 2
+    assert values[9101] is None
+    assert values[9102] is None
     assert all(
         row.extra is None or row.extra.get("source") == "derived"
         for row in session.query(FixtureStatistic).filter_by(fixture_id=9001)
