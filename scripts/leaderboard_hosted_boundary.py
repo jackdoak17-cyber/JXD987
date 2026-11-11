@@ -6,13 +6,7 @@ import json
 import os
 from pathlib import Path
 import stat
-
-import psycopg2
-
-if __package__:
-    from .leaderboard_restricted_runtime import validate_restricted_connection, validate_restricted_dsn
-else:
-    from leaderboard_restricted_runtime import validate_restricted_connection, validate_restricted_dsn
+import sys
 
 
 TARGET_ENV = (
@@ -27,6 +21,10 @@ ROLE_PINS = {
 
 
 def hosted_target(dsn, role):
+    if __package__:
+        from .leaderboard_restricted_runtime import validate_restricted_dsn
+    else:
+        from leaderboard_restricted_runtime import validate_restricted_dsn
     return validate_restricted_dsn(
         dsn, expected_role=role, expected_dsn_sha256=os.environ.get(ROLE_PINS[role], ""),
         expected_host=os.environ.get(TARGET_ENV[0], ""), expected_port=os.environ.get(TARGET_ENV[1], ""),
@@ -35,6 +33,12 @@ def hosted_target(dsn, role):
 
 
 def connect_hosted(dsn, role, **kwargs):
+    import psycopg2
+
+    if __package__:
+        from .leaderboard_restricted_runtime import validate_restricted_connection
+    else:
+        from leaderboard_restricted_runtime import validate_restricted_connection
     target = hosted_target(dsn, role)
     if target.sslrootcert != "system":
         certificate = Path(target.sslrootcert)
@@ -93,17 +97,23 @@ def read_lock_pins():
     return data
 
 
-def acquire_hosted_lock(path, kind):
+def check_hosted_lock_fd(path, kind, fd):
     pin = read_lock_pins()[kind]
     location = Path(path)
     parent = trusted_parent(location)
-    if (path, str(parent)) != (pin["path"], pin["directory"]):
+    if (path, str(parent)) != (pin["path"], pin["directory"]) or location.parent != parent:
         raise RuntimeError("hosted restricted lock path differs from its pin")
-    fd = os.open(parent / location.name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+    opened = os.fstat(fd)
+    named = location.stat(follow_symlinks=False)
+    pinned = (pin["device"], pin["inode"])
+    if any(not trusted_file(info) or (info.st_dev, info.st_ino) != pinned for info in (opened, named)):
+        raise RuntimeError("hosted restricted lock identity differs from its pin")
+
+
+def acquire_hosted_lock(path, kind):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
-        info = os.fstat(fd)
-        if not trusted_file(info) or (info.st_dev, info.st_ino) != (pin["device"], pin["inode"]):
-            raise RuntimeError("hosted restricted lock identity differs from its pin")
+        check_hosted_lock_fd(path, kind, fd)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return os.fdopen(fd, "rb")
     except BlockingIOError:
@@ -112,3 +122,11 @@ def acquire_hosted_lock(path, kind):
     except BaseException:
         os.close(fd)
         raise
+
+
+if __name__ == "__main__":
+    try:
+        kind, path, descriptor = sys.argv[1:]
+        check_hosted_lock_fd(path, kind, int(descriptor))
+    except (OSError, ValueError, KeyError, RuntimeError) as error:
+        sys.exit(f"protected lock check stopped: {error}")

@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"
-require_default_trial_lock_paths_or_exit
 verify_runtime_manifest_or_exit "$0"
+require_default_trial_lock_paths_or_exit
 require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
   "scripts/reconcile_stats_provider_queue.py"
@@ -53,15 +53,22 @@ export ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS="${STATS_RECONCILE_MIN_LEASE_SECONDS:-
 export STATS_RECONCILE_REPORT="${STATS_RECONCILE_REPORT:-/tmp/stats_reconcile_provider_batch.json}"
 export STATS_RECONCILE_RUN_LOG="${STATS_RECONCILE_RUN_LOG:-/tmp/stats_reconcile_provider_batch.log}"
 export STATS_RECONCILE_TIMING_FILE="${STATS_RECONCILE_TIMING_FILE:-/tmp/stats_reconcile_provider_batch.timing.$$}"
-export STATS_RECONCILE_SUPERVISOR_LOCK="${STATS_RECONCILE_SUPERVISOR_LOCK:-/var/lock/stats-reconciliation-supervisor.lock}"
+if [[ "${STATS_RECONCILE_SUPERVISOR_LOCK:-$STATS_SUPERVISOR_LOCK}" != "$STATS_SUPERVISOR_LOCK" ]]; then
+  log_error "statistics reconciliation supervisor lock differs from the shared path"
+  exit 1
+fi
+export STATS_RECONCILE_SUPERVISOR_LOCK="$STATS_SUPERVISOR_LOCK"
 # Existing source reconciliation is the priority workload. If a bounded
 # leaderboard publication is already in flight, wait just beyond its 30-second
 # ceiling; while waiting we do not hold the canonical SQLite writer lock.
 export STATS_RECONCILE_DB_HEAVY_LOCK_WAIT_SECONDS="${STATS_RECONCILE_DB_HEAVY_LOCK_WAIT_SECONDS:-35}"
 export RUNTIME_RELEASE_ID="${RUNTIME_RELEASE_ID:-$(runtime_release_id)}"
 
-mkdir -p "$(dirname "${STATS_RECONCILE_SUPERVISOR_LOCK}")"
-exec 9>"${STATS_RECONCILE_SUPERVISOR_LOCK}"
+if [[ ! -f "$STATS_SUPERVISOR_LOCK" || -L "$STATS_SUPERVISOR_LOCK" || ! -O "$STATS_SUPERVISOR_LOCK" ]]; then
+  log_error "statistics reconciliation supervisor lock must be an existing owned file"
+  exit 1
+fi
+exec 9<"$STATS_SUPERVISOR_LOCK"
 if ! flock --nonblock 9; then
   log_info "[SKIPPED] stats reconciliation supervisor already running"
   exit 0

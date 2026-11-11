@@ -4,6 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RUNTIME_MANIFEST_PATH="${REPO_ROOT}/scripts/vps/runtime_manifest.sha1"
+TRIAL_LOCK_DIRECTORY=/var/lib/oddssearch/leaderboard-locks
+TRIAL_WORKER_LOCK="${TRIAL_LOCK_DIRECTORY}/oddssearch-leaderboard-shadow.lock"
+TRIAL_HEAVY_LOCK="${TRIAL_LOCK_DIRECTORY}/oddssearch-db-heavy.lock"
+TRIAL_LOCK_PINS="${TRIAL_LOCK_DIRECTORY}/pins.json"
+LEGACY_TRIAL_WORKER_LOCK=/var/lock/oddssearch-leaderboard-shadow.lock
+LEGACY_TRIAL_HEAVY_LOCK=/var/lock/oddssearch-db-heavy.lock
+STATS_SUPERVISOR_LOCK=/var/lock/stats-reconciliation-supervisor.lock
+readonly TRIAL_LOCK_DIRECTORY TRIAL_WORKER_LOCK TRIAL_HEAVY_LOCK TRIAL_LOCK_PINS
+readonly LEGACY_TRIAL_WORKER_LOCK LEGACY_TRIAL_HEAVY_LOCK STATS_SUPERVISOR_LOCK
 
 log_info() {
   printf '%s [INFO] %s\n' "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" "$*"
@@ -17,11 +26,24 @@ log_error() {
 # lock identities. Fail closed if a sourced or inherited environment changes
 # either path; otherwise a quarantine marker could protect the wrong file.
 require_default_trial_lock_paths_or_exit() {
-  if [[ "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}" != "/var/lock/oddssearch-leaderboard-shadow.lock" \
-     || "${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-/var/lock/oddssearch-db-heavy.lock}" != "/var/lock/oddssearch-db-heavy.lock" ]]; then
-    log_error "finite-trial lock paths must use the shared production defaults"
+  if [[ "${LEADERBOARD_SHADOW_LOCK_FILE:-$TRIAL_WORKER_LOCK}" != "$TRIAL_WORKER_LOCK" \
+     || "${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-$TRIAL_HEAVY_LOCK}" != "$TRIAL_HEAVY_LOCK" \
+     || "${LEADERBOARD_RESTRICTED_HOST_PIN_FILE:-$TRIAL_LOCK_PINS}" != "$TRIAL_LOCK_PINS" ]]; then
+    log_error "finite-trial lock paths must use the protected shared production defaults"
     exit 1
   fi
+  require_runtime_manifest_entries_or_exit "protected trial locks" "scripts/leaderboard_hosted_boundary.py"
+  check_trial_lock_fd worker "$TRIAL_WORKER_LOCK" 7 7<"$TRIAL_WORKER_LOCK" || exit 1
+  check_trial_lock_fd heavy "$TRIAL_HEAVY_LOCK" 7 7<"$TRIAL_HEAVY_LOCK" || exit 1
+}
+
+check_trial_lock_fd() {
+  LEADERBOARD_RESTRICTED_HOST_PIN_FILE="$TRIAL_LOCK_PINS" \
+    python3 -I "$REPO_ROOT/scripts/leaderboard_hosted_boundary.py" "$@"
+}
+
+has_quarantine_marker() {
+  [[ -e "$1.quarantine" || -L "$1.quarantine" || -e "$1.quarantine.heavy" || -L "$1.quarantine.heavy" ]]
 }
 
 hash_file() {
@@ -442,7 +464,7 @@ healthcheck_ping() {
 run_with_database_heavy_lock() {
   local wait_seconds="$1"
   shift
-  local lock_file="${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-/var/lock/oddssearch-db-heavy.lock}"
+  local lock_file="${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-$TRIAL_HEAVY_LOCK}"
 
   if [[ ! "${wait_seconds}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     log_error "database-heavy lock wait must be a non-negative number"
@@ -453,20 +475,30 @@ run_with_database_heavy_lock() {
     return 1
   fi
 
-  mkdir -p "$(dirname "${lock_file}")"
   (
-    exec 8>"${lock_file}"
+    open_database_heavy_lock_fd "$lock_file"
     if ! flock --wait "${wait_seconds}" 8; then
       log_info "[SKIPPED] database-heavy maintenance slot unavailable"
       exit 75
     fi
-    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" \
-       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" ]]; then
+    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-$TRIAL_WORKER_LOCK}.quarantine.heavy" \
+       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-$TRIAL_WORKER_LOCK}.quarantine.heavy" ]]; then
       log_info "[SKIPPED] finite-trial quarantine blocks database-heavy maintenance"
       exit 75
     fi
     "$@"
   )
+}
+
+open_database_heavy_lock_fd() {
+  local lock_file="$1"
+  if [[ "$lock_file" == "$TRIAL_HEAVY_LOCK" ]]; then
+    exec 8<"$lock_file" || exit 1
+    check_trial_lock_fd heavy "$lock_file" 8 || exit 1
+  else
+    mkdir -p "$(dirname "$lock_file")"
+    exec 8>"$lock_file"
+  fi
 }
 
 epoch_milliseconds() {
@@ -480,7 +512,7 @@ run_with_database_heavy_lock_timed() {
   local wait_seconds="$1"
   local timing_file="$2"
   shift 2
-  local lock_file="${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-/var/lock/oddssearch-db-heavy.lock}"
+  local lock_file="${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-$TRIAL_HEAVY_LOCK}"
 
   if [[ ! "${wait_seconds}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
     log_error "database-heavy lock wait must be a non-negative number"
@@ -491,16 +523,16 @@ run_with_database_heavy_lock_timed() {
     return 1
   fi
 
-  mkdir -p "$(dirname "${lock_file}")" "$(dirname "${timing_file}")"
+  mkdir -p "$(dirname "${timing_file}")"
   (
     local status acquired_ms finished_ms
-    exec 8>"${lock_file}"
+    open_database_heavy_lock_fd "$lock_file"
     if ! flock --wait "${wait_seconds}" 8; then
       log_info "[SKIPPED] database-heavy maintenance slot unavailable"
       exit 75
     fi
-    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" \
-       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}.quarantine.heavy" ]]; then
+    if [[ -e "${LEADERBOARD_SHADOW_LOCK_FILE:-$TRIAL_WORKER_LOCK}.quarantine.heavy" \
+       || -L "${LEADERBOARD_SHADOW_LOCK_FILE:-$TRIAL_WORKER_LOCK}.quarantine.heavy" ]]; then
       log_info "[SKIPPED] finite-trial quarantine blocks database-heavy maintenance"
       exit 75
     fi

@@ -61,7 +61,7 @@ exec python3 "$ROOT/scripts/leaderboard_finite_trial_supervisor.py" \
   "$@" \
   --worker-path "$ROOT/scripts/leaderboard_shadow_worker.py" \
   --policy-id "$LEADERBOARD_FINITE_TRIAL_POLICY_ID" \
-  --worker-lock-file "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}" \
-  --database-heavy-lock-file "${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-/var/lock/oddssearch-db-heavy.lock}" \
+  --worker-lock-file "$TRIAL_WORKER_LOCK" \
+  --database-heavy-lock-file "$TRIAL_HEAVY_LOCK" \
   --deadline-seconds 45 --grace-seconds 5 --drain-seconds 10 \
   --recovery-seconds 15

@@ -97,6 +97,7 @@ export LEADERBOARD_SHADOW_RELEASE_SHA="$LEADERBOARD_ROLLING_RELEASE_SHA"
 export LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256="$LEADERBOARD_ROLLING_EXPECTED_DSN_SHA256"
 export LEADERBOARD_FINITE_TRIAL_RELEASE_SHA="$LEADERBOARD_ROLLING_RELEASE_SHA"
 if [[ "$hosted_restricted" == 1 ]]; then
+  export LEADERBOARD_RESTRICTED_HOST_PIN_FILE="$TRIAL_LOCK_PINS"
   set -- --production-restricted --restricted-worker --require-bound-publication
 else
   set -- --follow-rolling-successors "$@"
@@ -105,8 +106,8 @@ exec python3 "$ROOT/scripts/leaderboard_finite_trial_supervisor.py" \
   --production --rolling "$@" \
   --worker-path "$ROOT/scripts/leaderboard_shadow_worker.py" \
   --policy-id "$LEADERBOARD_ROLLING_POLICY_ID" \
-  --worker-lock-file "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}" \
-  --database-heavy-lock-file "${ODDSSEARCH_DB_HEAVY_LOCK_FILE:-/var/lock/oddssearch-db-heavy.lock}" \
+  --worker-lock-file "$TRIAL_WORKER_LOCK" \
+  --database-heavy-lock-file "$TRIAL_HEAVY_LOCK" \
   --fixture-limit "$LEADERBOARD_ROLLING_FIXTURE_LIMIT" \
   --capture-limit "$LEADERBOARD_ROLLING_CAPTURE_LIMIT" \
   --cohort-limit "$LEADERBOARD_ROLLING_COHORT_LIMIT" \

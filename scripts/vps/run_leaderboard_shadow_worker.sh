@@ -3,20 +3,21 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/scripts/vps/common.sh"
-require_default_trial_lock_paths_or_exit
 verify_runtime_manifest_or_exit "$0"
+require_default_trial_lock_paths_or_exit
 require_runtime_manifest_entries_or_exit "$0" \
   "scripts/leaderboard_shadow_capture.py" \
   "scripts/leaderboard_shadow_worker.py" \
   "scripts/export_to_supabase.py" \
   "scripts/postmatch_fixture_detail_delivery.py"
-LOCK_FILE="${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}"
+LOCK_FILE="$TRIAL_WORKER_LOCK"
 ENV_FILE="${LEADERBOARD_SHADOW_ENV_FILE:-/etc/oddssearch/leaderboard-shadow.env}"
 DB_HEAVY_LOCK_WAIT_SECONDS="${LEADERBOARD_SHADOW_DB_HEAVY_LOCK_WAIT_SECONDS:-0}"
 
-exec 9>"$LOCK_FILE"
+exec 9<"$LOCK_FILE"
+check_trial_lock_fd worker "$LOCK_FILE" 9
 flock -n 9 || exit 0
-if [[ -e "${LOCK_FILE}.quarantine" ]]; then
+if has_quarantine_marker "$LOCK_FILE"; then
   echo "leaderboard worker blocked by unresolved finite-trial quarantine" >&2
   exit 1
 fi
