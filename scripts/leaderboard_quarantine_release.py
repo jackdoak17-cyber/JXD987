@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Release one committed restricted-worker quarantine in the disposable clone."""
+"""Release one committed restricted-worker quarantine."""
 
 from __future__ import annotations
 
@@ -16,7 +16,12 @@ import sys
 import psycopg2
 from psycopg2.extensions import parse_dsn
 
-from leaderboard_finite_trial_supervisor import acquire_lock, bounded_connection, clear_quarantine_marker
+if __package__:
+    from .leaderboard_finite_trial_supervisor import acquire_lock, bounded_connection, clear_quarantine_marker
+    from .leaderboard_hosted_boundary import acquire_hosted_lock, connect_hosted
+else:
+    from leaderboard_finite_trial_supervisor import acquire_lock, bounded_connection, clear_quarantine_marker
+    from leaderboard_hosted_boundary import acquire_hosted_lock, connect_hosted
 
 
 def marker_snapshot(path: Path):
@@ -36,6 +41,11 @@ def marker_snapshot(path: Path):
 
 def confirm_committed(args) -> None:
     dsn = os.environ.get("LEADERBOARD_OPERATOR_DB_URL", "")
+    if getattr(args, "production_restricted", False):
+        with closing(connect_hosted(dsn, "m3_role_operator")) as connection, connection, connection.cursor() as cursor:
+            cursor.execute("set transaction read only")
+            verify_receipt(cursor, args)
+        return
     pin = os.environ.get("LEADERBOARD_OPERATOR_EXPECTED_DSN_SHA256", "")
     if not dsn or hashlib.sha256(dsn.encode()).hexdigest() != pin:
         raise RuntimeError("operator database URL is missing or does not match its pin")
@@ -56,21 +66,28 @@ def confirm_committed(args) -> None:
         if (database != "oddssearch_m3_rolling_worker" or not local
                 or login != "m3_role_operator" or role != login):
             raise RuntimeError("disposable operator database identity is invalid")
-        cursor.execute("""
-            select leaderboard_role_boundary_v1.confirm_quarantine_release(%s,%s,%s,%s,%s)
-        """, (args.policy_id, args.reservation_id, args.evidence_id, args.token, args.marker_sha256))
-        if cursor.fetchone() != (True,):
-            raise RuntimeError("no matching committed quarantine settlement")
+        verify_receipt(cursor, args)
+
+
+def verify_receipt(cursor, args):
+    cursor.execute("""
+        select leaderboard_role_boundary_v1.confirm_quarantine_release(%s,%s,%s,%s,%s)
+    """, (args.policy_id, args.reservation_id, args.evidence_id, args.token, args.marker_sha256))
+    if cursor.fetchone() != (True,):
+        raise RuntimeError("no matching committed quarantine settlement")
 
 
 def release(args) -> int:
+    hosted = getattr(args, "production_restricted", False)
     marker = Path(args.worker_lock_file + ".quarantine")
     heavy_marker = Path(args.worker_lock_file + ".quarantine.heavy")
-    worker_lock = acquire_lock(args.worker_lock_file)
+    worker_lock = (acquire_hosted_lock(args.worker_lock_file, "worker") if hosted
+                   else acquire_lock(args.worker_lock_file))
     if worker_lock is None:
         return 75
     with worker_lock:
-        heavy_lock = acquire_lock(args.database_heavy_lock_file)
+        heavy_lock = (acquire_hosted_lock(args.database_heavy_lock_file, "heavy") if hosted
+                      else acquire_lock(args.database_heavy_lock_file))
         if heavy_lock is None:
             return 75
         with heavy_lock:
@@ -111,6 +128,7 @@ def release(args) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--production-restricted", action="store_true")
     parser.add_argument("--worker-lock-file", required=True)
     parser.add_argument("--database-heavy-lock-file", required=True)
     parser.add_argument("--policy-id", required=True)

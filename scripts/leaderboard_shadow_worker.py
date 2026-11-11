@@ -19,10 +19,15 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+if __package__:
+    from .leaderboard_hosted_boundary import connect_hosted, read_lock_pins, trusted_file, trusted_parent
+else:
+    from leaderboard_hosted_boundary import connect_hosted, read_lock_pins, trusted_file, trusted_parent
 
 
 DATABASE_URL = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
@@ -158,7 +163,10 @@ def isolated_test_database(conn) -> bool:
 def validate_production_trial_connection(conn, args) -> None:
     if args.isolated_test_override:
         raise RuntimeError("production finite trial rejects the general test override")
-    if args.production_trial_isolated_test:
+    hosted = getattr(args, "production_restricted", False)
+    if hosted:
+        pins = read_lock_pins()
+    elif args.production_trial_isolated_test:
         if not isolated_test_database(conn):
             raise RuntimeError("production trial test path requires socket-only oddssearch_m3")
     else:
@@ -194,7 +202,7 @@ def validate_production_trial_connection(conn, args) -> None:
         ("LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_FD", "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_PATH"),
     )
     identities = []
-    for fd_key, path_key in lock_specs:
+    for kind, (fd_key, path_key) in zip(("worker", "heavy"), lock_specs, strict=True):
         fd_text = os.environ.get(fd_key, "")
         path = os.environ.get(path_key, "")
         if not fd_text.isdecimal() or not path or not os.path.isabs(path):
@@ -207,6 +215,11 @@ def validate_production_trial_connection(conn, args) -> None:
                 raise RuntimeError("production finite trial lock is not a regular file")
             if (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino):
                 raise RuntimeError("production finite trial lock descriptor changed")
+            if hosted:
+                pin = pins[kind]
+                if (not trusted_file(held) or (path, str(trusted_parent(Path(path))), held.st_dev, held.st_ino)
+                        != (pin["path"], pin["directory"], pin["device"], pin["inode"])):
+                    raise RuntimeError("hosted restricted inherited lock does not match its pin")
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except (OSError, ValueError) as error:
             raise RuntimeError("production finite trial does not hold both host locks") from error
@@ -1524,6 +1537,7 @@ def main() -> int:
     parser.add_argument("--production-trial-isolated-test", action="store_true")
     parser.add_argument("--require-bound-publication", action="store_true")
     parser.add_argument("--restricted-worker", action="store_true")
+    parser.add_argument("--production-restricted", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
     parser.add_argument("--max-seconds", type=float, default=MAX_SECONDS_PER_RUN)
     parser.add_argument("--capture-limit", type=int, default=MAX_FIXTURES_PER_RUN)
@@ -1545,9 +1559,24 @@ def main() -> int:
         parser.error("production isolated test flag requires a bound worker command")
     if (args.league_id is None) != (args.season_id is None):
         parser.error("league-id and season-id must be supplied together")
+    if args.production_restricted and (
+        args.command != "rolling-once" or not args.restricted_worker or not args.require_bound_publication
+        or args.production_trial_isolated_test or args.isolated_test_override or args.league_id is None
+        or (args.fixture_limit, args.capture_limit, args.cohort_limit, args.job_limit, args.max_seconds)
+        != (21, 10, 1, 10, 30)
+        or any((args.trial_test_pg_sleep_after_admission, args.trial_test_pg_sleep_after_capture,
+                args.trial_test_pg_sleep_before_recovery))
+    ):
+        parser.error("hosted restricted worker requires the reviewed canary envelope")
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
 
-    conn = connect()
+    if args.production_restricted:
+        token = os.environ.get("LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN", "")
+        if not re.fullmatch(r"[0-9a-f]{16}", token):
+            raise RuntimeError("hosted restricted worker requires its supervisor token")
+        conn = connect_hosted(DATABASE_URL, "m3_role_worker", application_name=f"oddssearch-finite-trial/{token}")
+    else:
+        conn = connect()
     try:
         with conn, conn.cursor() as cur:
             cur.execute("select session_user")
@@ -1556,7 +1585,7 @@ def main() -> int:
                 if (not restricted_login or not args.restricted_worker
                         or not args.require_bound_publication
                         or args.command != "rolling-once"
-                        or not args.production_trial_isolated_test
+                        or not (args.production_trial_isolated_test or args.production_restricted)
                         or args.league_id is None):
                     raise RuntimeError("restricted worker requires scoped rolling-once, bound publication and disposable mode")
                 cur.execute("""

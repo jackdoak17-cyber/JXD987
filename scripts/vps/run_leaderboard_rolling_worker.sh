@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -gt 1 || ( $# -eq 1 && "$1" != reconcile ) ]]; then
-  echo "usage: run_leaderboard_rolling_worker.sh [reconcile]" >&2
+if [[ $# -gt 1 || ( $# -eq 1 && "$1" != reconcile && "$1" != restricted ) ]]; then
+  echo "usage: run_leaderboard_rolling_worker.sh [reconcile|restricted]" >&2
   exit 2
 fi
-if [[ $# -eq 1 ]]; then set -- --reconcile-quarantine; else set --; fi
+hosted_restricted=0
+case "${1:-}" in
+  reconcile) set -- --reconcile-quarantine ;;
+  restricted) hosted_restricted=1; set -- ;;
+  *) set -- ;;
+esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "${ROOT}/scripts/vps/common.sh"
@@ -15,6 +20,9 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/vps/verify_finite_trial_host_cutover.sh" \
   "scripts/leaderboard_finite_trial_supervisor.py" \
   "scripts/leaderboard_shadow_worker.py" \
+  "scripts/leaderboard_hosted_boundary.py" \
+  "scripts/leaderboard_restricted_runtime.py" \
+  "scripts/leaderboard_quarantine_release.py" \
   "scripts/leaderboard_shadow_capture.py" \
   "scripts/export_to_supabase.py" \
   "scripts/postmatch_fixture_detail_delivery.py"
@@ -23,6 +31,19 @@ ENV_FILE="${LEADERBOARD_SHADOW_ENV_FILE:-/etc/oddssearch/leaderboard-shadow.env}
 if [[ ! -r "$ENV_FILE" ]]; then
   echo "leaderboard rolling environment file is unavailable" >&2
   exit 1
+fi
+if [[ "$hosted_restricted" == 1 ]]; then
+  python3 -I - "$ENV_FILE" "$ROOT/scripts" <<'PYTHON'
+import os
+from pathlib import Path
+import sys
+sys.path.insert(0, sys.argv[2])
+from leaderboard_hosted_boundary import trusted_file, trusted_parent
+path = Path(sys.argv[1])
+parent = trusted_parent(path)
+if not trusted_file(os.stat(parent / path.name, follow_symlinks=False)):
+    raise SystemExit("hosted restricted environment file is not protected")
+PYTHON
 fi
 set -a
 # shellcheck disable=SC1090
@@ -75,8 +96,13 @@ fi
 export LEADERBOARD_SHADOW_RELEASE_SHA="$LEADERBOARD_ROLLING_RELEASE_SHA"
 export LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256="$LEADERBOARD_ROLLING_EXPECTED_DSN_SHA256"
 export LEADERBOARD_FINITE_TRIAL_RELEASE_SHA="$LEADERBOARD_ROLLING_RELEASE_SHA"
+if [[ "$hosted_restricted" == 1 ]]; then
+  set -- --production-restricted --restricted-worker --require-bound-publication
+else
+  set -- --follow-rolling-successors "$@"
+fi
 exec python3 "$ROOT/scripts/leaderboard_finite_trial_supervisor.py" \
-  --production --rolling --follow-rolling-successors "$@" \
+  --production --rolling "$@" \
   --worker-path "$ROOT/scripts/leaderboard_shadow_worker.py" \
   --policy-id "$LEADERBOARD_ROLLING_POLICY_ID" \
   --worker-lock-file "${LEADERBOARD_SHADOW_LOCK_FILE:-/var/lock/oddssearch-leaderboard-shadow.lock}" \

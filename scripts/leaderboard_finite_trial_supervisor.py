@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import fcntl
 import hashlib
 import json
@@ -17,6 +18,10 @@ import uuid
 from pathlib import Path
 
 import psycopg2
+if __package__:
+    from .leaderboard_hosted_boundary import TARGET_ENV, acquire_hosted_lock, connect_hosted
+else:
+    from leaderboard_hosted_boundary import TARGET_ENV, acquire_hosted_lock, connect_hosted
 
 
 def database_url() -> str:
@@ -37,7 +42,8 @@ CHILD_ENVIRONMENT_ALLOWLIST = frozenset({
 
 
 def child_environment(token: str, lock_fds: tuple[int, int],
-                      worker_lock_path: str, heavy_lock_path: str) -> dict[str, str]:
+                      worker_lock_path: str, heavy_lock_path: str, *,
+                      hosted_worker_url: str | None = None) -> dict[str, str]:
     """Pass only worker inputs, never the supervisor's ambient credentials.
 
     Normalize the selected worker DSN to one key so an unused fallback URL
@@ -50,7 +56,7 @@ def child_environment(token: str, lock_fds: tuple[int, int],
         if key in os.environ
     }
     environment.update({
-        "SUPABASE_DB_URL_SESSION": database_url(),
+        "SUPABASE_DB_URL_SESSION": hosted_worker_url or database_url(),
         "LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN": token,
         "LEADERBOARD_FINITE_TRIAL_SUPERVISOR_PID": str(os.getpid()),
         "LEADERBOARD_FINITE_TRIAL_WORKER_LOCK_FD": str(lock_fds[0]),
@@ -58,6 +64,8 @@ def child_environment(token: str, lock_fds: tuple[int, int],
         "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_FD": str(lock_fds[1]),
         "LEADERBOARD_FINITE_TRIAL_HEAVY_LOCK_PATH": heavy_lock_path,
     })
+    if hosted_worker_url:
+        environment.update({key: os.environ[key] for key in TARGET_ENV})
     return environment
 
 
@@ -256,10 +264,15 @@ def drain_token_backends(url: str, token: str, seconds: float) -> None:
         conn.close()
 
 
-def restricted_drain_url(worker_url: str) -> str:
+def restricted_drain_url(worker_url: str, hosted: bool = False) -> str:
     drain_url = os.environ.get("LEADERBOARD_DRAIN_DB_URL")
     if not drain_url or drain_url == worker_url:
         raise RuntimeError("restricted supervisor needs distinct worker and drain database URLs")
+    if hosted:
+        for url, role in ((worker_url, "m3_role_worker"), (drain_url, "m3_role_supervisor")):
+            with closing(connect_hosted(url, role)):
+                pass
+        return drain_url
     identities = []
     for url, role in ((worker_url, "m3_role_worker"), (drain_url, "m3_role_supervisor")):
         conn = bounded_connection(url)
@@ -282,10 +295,10 @@ def restricted_drain_url(worker_url: str) -> str:
     return drain_url
 
 
-def drain_restricted_worker(url: str, policy_id: str, token: str, seconds: float) -> dict:
+def drain_restricted_worker(url: str, policy_id: str, token: str, seconds: float, *, hosted: bool = False) -> dict:
     """Only the checked database function can signal a stored backend binding."""
     deadline = time.monotonic() + seconds
-    conn = bounded_connection(url)
+    conn = connect_hosted(url, "m3_role_supervisor") if hosted else bounded_connection(url)
     try:
         conn.autocommit = True
         terminate = False
@@ -463,23 +476,30 @@ def reconcile_quarantine(args) -> int:
 
 
 def run_trial(args) -> int:
-    url = database_url()
+    hosted = getattr(args, "production_restricted", False)
+    url = os.environ.get("LEADERBOARD_WORKER_DB_URL", "") if hosted else database_url()
     rolling = getattr(args, "rolling", False)
     restricted = getattr(args, "restricted_worker", False)
     if restricted and (
-        not rolling or not args.production or not args.production_trial_isolated_test
+        not rolling or not args.production or not (args.production_trial_isolated_test or hosted)
         or not getattr(args, "require_bound_publication", False)
         or getattr(args, "league_id", None) is None or args.follow_rolling_successors
     ):
         raise RuntimeError("restricted supervisor requires scoped rolling and bound publication in disposable mode")
-    drain_url = restricted_drain_url(url) if restricted else None
+    if hosted and (not restricted or args.production_trial_isolated_test or not url
+                   or (args.fixture_limit, args.capture_limit, args.cohort_limit, args.job_limit, args.max_seconds)
+                   != (21, 10, 1, 10, 30)
+                   or any((args.test_pg_sleep_after_admission, args.test_pg_sleep_after_capture,
+                           args.test_recovery_pg_sleep, args.test_force_uncertain_drain))):
+        raise RuntimeError("hosted restricted supervisor requires the reviewed canary envelope")
+    drain_url = restricted_drain_url(url, hosted=hosted) if restricted else None
     if rolling and not args.production:
         raise RuntimeError("rolling supervisor requires production identity checks")
     if args.production:
         if args.production_trial_isolated_test:
             if not restricted:
                 assert_disposable_database(url)
-        else:
+        elif not hosted:
             assert_production_database(url)
             if (args.test_pg_sleep_after_admission or args.test_pg_sleep_after_capture
                     or args.test_recovery_pg_sleep or args.test_force_uncertain_drain):
@@ -488,11 +508,13 @@ def run_trial(args) -> int:
         if args.production_trial_isolated_test:
             raise RuntimeError("production trial test mode requires --production")
         assert_disposable_database(url)
-    worker_lock = acquire_lock(args.worker_lock_file)
+    worker_lock = (acquire_hosted_lock(args.worker_lock_file, "worker") if hosted
+                   else acquire_lock(args.worker_lock_file))
     if worker_lock is None:
         return 75
     try:
-        heavy_lock = acquire_lock(args.database_heavy_lock_file)
+        heavy_lock = (acquire_hosted_lock(args.database_heavy_lock_file, "heavy") if hosted
+                      else acquire_lock(args.database_heavy_lock_file))
         if heavy_lock is None:
             return 75
         try:
@@ -564,6 +586,8 @@ def run_trial(args) -> int:
                 worker.append("--require-bound-publication")
             if restricted:
                 worker.append("--restricted-worker")
+            if hosted:
+                worker.append("--production-restricted")
             if args.production:
                 if args.production_trial_isolated_test:
                     worker.append("--production-trial-isolated-test")
@@ -586,6 +610,7 @@ def run_trial(args) -> int:
                     env=child_environment(
                         main_token, lock_fds, args.worker_lock_file,
                         args.database_heavy_lock_file,
+                        **({"hosted_worker_url": url} if hosted else {}),
                     ),
                 )
                 active_token = main_token
@@ -612,6 +637,7 @@ def run_trial(args) -> int:
                 if restricted:
                     drained = drain_restricted_worker(
                         drain_url, args.policy_id, main_token, args.drain_seconds,
+                        **({"hosted": True} if hosted else {}),
                     )
                     # A drained worker still has accounting liability. Keep the
                     # trial marker and never launch a recovery child in this mode.
@@ -733,7 +759,8 @@ def run_trial(args) -> int:
                         stop_process_group(active_process, args.grace_seconds)
                         if active_token is not None:
                             if restricted:
-                                drain_restricted_worker(drain_url, args.policy_id, active_token, args.drain_seconds)
+                                drain_restricted_worker(drain_url, args.policy_id, active_token, args.drain_seconds,
+                                                        **({"hosted": True} if hosted else {}))
                             else:
                                 drain_token_backends(url, active_token, args.drain_seconds)
                     except Exception:
@@ -758,6 +785,7 @@ def main() -> int:
     parser.add_argument("--rolling", action="store_true")
     parser.add_argument("--require-bound-publication", action="store_true")
     parser.add_argument("--restricted-worker", action="store_true")
+    parser.add_argument("--production-restricted", action="store_true")
     parser.add_argument("--follow-rolling-successors", action="store_true")
     parser.add_argument("--fixture-limit", type=int, default=10)
     parser.add_argument("--capture-limit", type=int, default=10)
@@ -778,12 +806,14 @@ def main() -> int:
     parser.add_argument("--test-recovery-pg-sleep", type=float, default=0)
     args = parser.parse_args()
     if args.restricted_worker and (
-        not args.rolling or not args.production or not args.production_trial_isolated_test
+        not args.rolling or not args.production or not (args.production_trial_isolated_test or args.production_restricted)
         or not args.require_bound_publication or args.league_id is None
         or args.follow_rolling_successors or args.test_recovery_pg_sleep
         or args.reconcile_quarantine
     ):
         parser.error("restricted supervisor requires scoped disposable rolling with bound publication and no recovery")
+    if args.production_restricted and (not args.restricted_worker or args.production_trial_isolated_test):
+        parser.error("hosted restricted supervisor requires exclusive restricted mode")
     if args.require_bound_publication and not args.rolling:
         parser.error("bound publication requires rolling mode")
     if args.production_trial_isolated_test and not args.production:

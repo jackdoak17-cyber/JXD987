@@ -23,6 +23,9 @@ scripts/postmatch_fixture_detail_delivery.py
 scripts/leaderboard_shadow_capture.py
 scripts/leaderboard_shadow_worker.py
 scripts/leaderboard_finite_trial_supervisor.py
+scripts/leaderboard_hosted_boundary.py
+scripts/leaderboard_restricted_runtime.py
+scripts/leaderboard_quarantine_release.py
 scripts/vps/run_leaderboard_shadow_worker.sh
 scripts/vps/run_leaderboard_finite_trial.sh
 scripts/vps/run_leaderboard_rolling_worker.sh
