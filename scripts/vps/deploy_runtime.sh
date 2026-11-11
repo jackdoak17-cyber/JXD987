@@ -48,6 +48,7 @@ required_runtime_entries=(
   "scripts/vps/run_leaderboard_shadow_worker.sh"
   "scripts/vps/run_leaderboard_finite_trial.sh"
   "scripts/vps/verify_finite_trial_host_cutover.sh"
+  "scripts/vps/install_leaderboard_crontab.py"
 )
 for required_entry in "${required_runtime_entries[@]}"; do
   if [[ ! -f "${REPO_ROOT}/${required_entry}" ]]; then

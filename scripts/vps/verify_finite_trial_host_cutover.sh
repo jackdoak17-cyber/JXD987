@@ -4,8 +4,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source "$ROOT/scripts/vps/common.sh"
 mode="${1:-active}"
-if [[ $# -gt 1 || ( "$mode" != active && "$mode" != prepare && "$mode" != revert ) ]]; then
-  echo "usage: verify_finite_trial_host_cutover.sh [active|prepare|revert]" >&2
+install_crontab=false
+if [[ $# -eq 5 && ( "$mode" == prepare || "$mode" == revert ) && "$2" == --install ]]; then
+  install_crontab=true
+elif [[ $# -gt 1 || ( "$mode" != active && "$mode" != prepare && "$mode" != revert ) ]]; then
+  echo "usage: verify_finite_trial_host_cutover.sh [active|prepare|revert [--install frozen-sha256 target-sha256 target-file]]" >&2
   exit 2
 fi
 verify_runtime_manifest_or_exit "$0"
@@ -15,6 +18,18 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/vps/run_leaderboard_shadow_worker.sh" \
   "scripts/vps/run_leaderboard_finite_trial.sh" \
   "scripts/vps/common.sh"
+if [[ "$install_crontab" == true ]]; then
+  require_runtime_manifest_entries_or_exit "$0" "scripts/vps/install_leaderboard_crontab.py"
+  if [[ ! -f "$TRIAL_LOCK_PINS" || -L "$TRIAL_LOCK_PINS" || ! -O "$TRIAL_LOCK_PINS" ]]; then
+    echo "finite trial cron transition requires the existing owned lock pin file" >&2
+    exit 1
+  fi
+  exec 9<"$TRIAL_LOCK_PINS"
+  if ! flock -n 9; then
+    echo "finite trial cron transition is already running" >&2
+    exit 1
+  fi
+fi
 
 # Each entrant must use this exact archived common.sh. The statistics
 # supervisor is long-lived, so a cron edit alone cannot retire its old copy.
@@ -153,4 +168,7 @@ else
     exit 1
   fi
   echo "finite trial $mode verified frozen schedules, drained processes and both lock pairs"
+  if [[ "$install_crontab" == true ]]; then
+    python3 -I "$ROOT/scripts/vps/install_leaderboard_crontab.py" "$mode" "$ROOT" "$3" "$4" "$5"
+  fi
 fi
