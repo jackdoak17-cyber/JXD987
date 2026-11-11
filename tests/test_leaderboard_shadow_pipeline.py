@@ -3,8 +3,10 @@ import json
 import hashlib
 import shutil
 import signal
+import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +44,37 @@ from scripts.leaderboard_shadow_worker import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+@pytest.fixture
+def protected_runtime_archive(tmp_path):
+    archive = tmp_path / "runtime-archive"
+    manifest = ROOT / "scripts/vps/runtime_manifest.sha1"
+    entries = [line.split(maxsplit=1)[1] for line in manifest.read_text().splitlines()
+               if line.strip() and not line.startswith("#")]
+    for relative in entries:
+        destination = archive / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+    with tempfile.TemporaryDirectory(prefix=".jxd-test-locks.", dir=Path.home()) as directory:
+        locks = Path(directory)
+        pins = {}
+        for kind, filename in (("worker", "oddssearch-leaderboard-shadow.lock"),
+                               ("heavy", "oddssearch-db-heavy.lock")):
+            lock = locks / filename
+            lock.touch(mode=0o600)
+            info = lock.stat()
+            pins[kind] = dict(path=str(lock), directory=str(locks.resolve()), device=info.st_dev, inode=info.st_ino)
+        (locks / "pins.json").write_text(json.dumps(pins))
+        common = archive / "scripts/vps/common.sh"
+        common.write_text(common.read_text().replace(
+            "TRIAL_LOCK_DIRECTORY=/var/lib/oddssearch/leaderboard-locks",
+            f"TRIAL_LOCK_DIRECTORY={shlex.quote(str(locks))}",
+        ))
+        archive_manifest = archive / "scripts/vps/runtime_manifest.sha1"
+        archive_manifest.write_text("".join(
+            f"{hashlib.sha1((archive / relative).read_bytes()).hexdigest()}  {relative}\n" for relative in entries))
+        yield archive, archive_manifest
+
+
 def test_finite_trial_wrapper_rejects_unreviewed_release_before_connection(tmp_path):
     environment_file = tmp_path / "finite-trial.env"
     environment_file.write_text(
@@ -65,18 +98,8 @@ def test_finite_trial_wrapper_rejects_unreviewed_release_before_connection(tmp_p
     assert "checkout differs from the reviewed release" in process.stderr
 
 
-def test_finite_trial_wrapper_accepts_pinned_archive_without_git(tmp_path):
-    archive = tmp_path / "runtime-archive"
-    manifest = ROOT / "scripts/vps/runtime_manifest.sha1"
-    for line in manifest.read_text().splitlines():
-        if not line.strip() or line.startswith("#"):
-            continue
-        relative = line.split(maxsplit=1)[1]
-        destination = archive / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ROOT / relative, destination)
-    archive_manifest = archive / "scripts/vps/runtime_manifest.sha1"
-    shutil.copy2(manifest, archive_manifest)
+def test_finite_trial_wrapper_accepts_pinned_archive_without_git(tmp_path, protected_runtime_archive):
+    archive, archive_manifest = protected_runtime_archive
     environment_file = tmp_path / "archive-trial.env"
     environment_file.write_text(
         "LEADERBOARD_FINITE_TRIAL_POLICY_ID=local-policy\n"
@@ -117,18 +140,8 @@ def test_finite_trial_wrapper_accepts_pinned_archive_without_git(tmp_path):
     assert "trial database URL is required" in result.stderr
 
 
-def test_rolling_wrapper_passes_only_a_complete_reviewed_cohort_scope(tmp_path):
-    archive = tmp_path / "runtime-archive"
-    manifest = ROOT / "scripts/vps/runtime_manifest.sha1"
-    for line in manifest.read_text().splitlines():
-        if not line.strip() or line.startswith("#"):
-            continue
-        relative = line.split(maxsplit=1)[1]
-        destination = archive / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(ROOT / relative, destination)
-    archive_manifest = archive / "scripts/vps/runtime_manifest.sha1"
-    shutil.copy2(manifest, archive_manifest)
+def test_rolling_wrapper_passes_only_a_complete_reviewed_cohort_scope(tmp_path, protected_runtime_archive):
+    archive, archive_manifest = protected_runtime_archive
     env_file = tmp_path / "rolling.env"
     env_file.write_text(
         "LEADERBOARD_ROLLING_POLICY_ID=local-policy\n"
@@ -147,7 +160,9 @@ def test_rolling_wrapper_passes_only_a_complete_reviewed_cohort_scope(tmp_path):
     fake_bin.mkdir()
     (fake_bin / "crontab").write_text('#!/bin/sh\ncat "$FAKE_CRONTAB"\n')
     (fake_bin / "ps").write_text('#!/bin/sh\ncat "$FAKE_PS"\n')
-    (fake_bin / "python3").write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$FAKE_WORKER_ARGS"\n')
+    (fake_bin / "python3").write_text(
+        f'#!/bin/sh\nif [ "$1" = -I ]; then exec {shlex.quote(sys.executable)} "$@"; fi\n'
+        'printf "%s\\n" "$@" > "$FAKE_WORKER_ARGS"\n')
     for name in ("crontab", "ps", "python3"):
         (fake_bin / name).chmod(0o755)
     schedule = tmp_path / "crontab"
@@ -180,7 +195,8 @@ def test_rolling_wrapper_passes_only_a_complete_reviewed_cohort_scope(tmp_path):
     assert not worker_args.exists()
 
 
-def test_finite_trial_host_gate_rejects_old_stats_release(tmp_path):
+def test_finite_trial_host_gate_rejects_old_stats_release(tmp_path, protected_runtime_archive):
+    archive, _ = protected_runtime_archive
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     (fake_bin / "crontab").write_text('#!/bin/sh\ncat "$FAKE_CRONTAB"\n')
@@ -197,17 +213,17 @@ def test_finite_trial_host_gate_rejects_old_stats_release(tmp_path):
         "FAKE_CRONTAB": str(schedule), "FAKE_PS": str(processes),
         "LEADERBOARD_SHADOW_ENV_FILE": str(worker_env),
     }
-    checker = ["bash", str(ROOT / "scripts/vps/verify_finite_trial_host_cutover.sh")]
+    checker = ["bash", str(archive / "scripts/vps/verify_finite_trial_host_cutover.sh")]
     schedule.write_text(
         "*/5 * * * * cd /opt/odds-sync/old && /opt/odds-sync/old/scripts/vps/run_stats_reconciliation.sh\n"
-        f"* * * * * cd {ROOT} && {ROOT}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+        f"* * * * * cd {archive} && {archive}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
     )
     rejected = subprocess.run(checker, env=environment, capture_output=True, text=True, timeout=10)
     assert rejected.returncode != 0
     assert "requires one exact run_stats_reconciliation.sh cron entry" in rejected.stderr
     schedule.write_text(
-        f"*/5 * * * * cd {ROOT} && {ROOT}/scripts/vps/run_stats_reconciliation.sh\n"
-        f"* * * * * cd {ROOT} && {ROOT}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
+        f"*/5 * * * * cd {archive} && {archive}/scripts/vps/run_stats_reconciliation.sh\n"
+        f"* * * * * cd {archive} && {archive}/scripts/vps/run_leaderboard_shadow_worker.sh\n"
     )
     processes.write_text(
         "123 1 Mon Nov 9 08:00:00 2026 bash /opt/odds-sync/old/scripts/vps/run_stats_reconciliation.sh\n"

@@ -27,7 +27,6 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
-require_default_trial_lock_paths_or_exit
 
 : "${LEADERBOARD_FINITE_TRIAL_POLICY_ID:?named finite trial policy is required}"
 : "${LEADERBOARD_FINITE_TRIAL_EXPECTED_DSN_SHA256:?reviewed database URL pin is required}"

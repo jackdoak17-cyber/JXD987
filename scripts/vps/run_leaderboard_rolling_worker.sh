@@ -49,7 +49,6 @@ set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
 set +a
-require_default_trial_lock_paths_or_exit
 
 : "${LEADERBOARD_ROLLING_POLICY_ID:?reviewed rolling policy is required}"
 : "${LEADERBOARD_ROLLING_EXPECTED_DSN_SHA256:?reviewed database URL pin is required}"

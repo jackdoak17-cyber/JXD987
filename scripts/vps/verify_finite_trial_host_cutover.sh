@@ -9,7 +9,6 @@ if [[ $# -gt 1 || ( "$mode" != active && "$mode" != prepare && "$mode" != revert
   exit 2
 fi
 verify_runtime_manifest_or_exit "$0"
-require_default_trial_lock_paths_or_exit
 require_runtime_manifest_entries_or_exit "$0" \
   "scripts/vps/verify_finite_trial_host_cutover.sh" \
   "scripts/vps/run_stats_reconciliation.sh" \
@@ -41,6 +40,7 @@ for entrypoint in run_stats_reconciliation.sh run_leaderboard_shadow_worker.sh; 
     exit 1
   fi
 done
+require_default_trial_lock_paths_or_exit
 
 check_legacy_quarantine() {
   if has_quarantine_marker "$LEGACY_TRIAL_WORKER_LOCK"; then
