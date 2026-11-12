@@ -23,6 +23,7 @@ if __package__:
         TARGET_ENV,
         acquire_hosted_lock,
         connect_hosted,
+        require_hosted_worker_storage,
         reviewed_canary_envelope,
     )
 else:
@@ -30,6 +31,7 @@ else:
         TARGET_ENV,
         acquire_hosted_lock,
         connect_hosted,
+        require_hosted_worker_storage,
         reviewed_canary_envelope,
     )
 
@@ -279,9 +281,10 @@ def restricted_drain_url(worker_url: str, hosted: bool = False) -> str:
     if not drain_url or drain_url == worker_url:
         raise RuntimeError("restricted supervisor needs distinct worker and drain database URLs")
     if hosted:
-        for url, role in ((worker_url, "m3_role_worker"), (drain_url, "m3_role_supervisor")):
-            with closing(connect_hosted(url, role)):
-                pass
+        with closing(connect_hosted(worker_url, "m3_role_worker")) as worker:
+            require_hosted_worker_storage(worker)
+        with closing(connect_hosted(drain_url, "m3_role_supervisor")):
+            pass
         return drain_url
     identities = []
     for url, role in ((worker_url, "m3_role_worker"), (drain_url, "m3_role_supervisor")):

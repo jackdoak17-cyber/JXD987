@@ -66,6 +66,23 @@ def connect_hosted(dsn, role, **kwargs):
     return conn
 
 
+def require_hosted_worker_storage(connection):
+    """Check the effective file and parallel limits on a verified worker connection."""
+    with connection, connection.cursor() as cursor:
+        cursor.execute("set transaction read only")
+        cursor.execute("""
+            select setting, unit, pg_catalog.has_parameter_privilege(current_user,'temp_file_limit','SET'),
+                   pg_catalog.current_setting('max_parallel_workers_per_gather'),
+                   pg_catalog.current_setting('max_parallel_maintenance_workers')
+            from pg_catalog.pg_settings where name='temp_file_limit'
+        """)
+        settings = cursor.fetchone()
+        if settings is None or settings[:3] != ("0", "kB", False):
+            raise RuntimeError("hosted worker requires a server-enforced zero temp_file_limit")
+        if settings[3:] != ("0", "0"):
+            raise RuntimeError("hosted worker requires parallel workers to be disabled")
+
+
 def trusted_file(info):
     return (stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_uid in (0, os.geteuid())
             and not info.st_mode & 0o022)
