@@ -25,9 +25,21 @@ from typing import Any, Callable
 import psycopg2
 from psycopg2.extras import RealDictCursor
 if __package__:
-    from .leaderboard_hosted_boundary import connect_hosted, read_lock_pins, trusted_file, trusted_parent
+    from .leaderboard_hosted_boundary import (
+        connect_hosted,
+        read_lock_pins,
+        reviewed_canary_envelope,
+        trusted_file,
+        trusted_parent,
+    )
 else:
-    from leaderboard_hosted_boundary import connect_hosted, read_lock_pins, trusted_file, trusted_parent
+    from leaderboard_hosted_boundary import (
+        connect_hosted,
+        read_lock_pins,
+        reviewed_canary_envelope,
+        trusted_file,
+        trusted_parent,
+    )
 
 
 DATABASE_URL = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
@@ -1562,8 +1574,7 @@ def main() -> int:
     if args.production_restricted and (
         args.command != "rolling-once" or not args.restricted_worker or not args.require_bound_publication
         or args.production_trial_isolated_test or args.isolated_test_override or args.league_id is None
-        or (args.fixture_limit, args.capture_limit, args.cohort_limit, args.job_limit, args.max_seconds)
-        != (21, 10, 1, 10, 30)
+        or not reviewed_canary_envelope(args)
         or any((args.trial_test_pg_sleep_after_admission, args.trial_test_pg_sleep_after_capture,
                 args.trial_test_pg_sleep_before_recovery))
     ):

@@ -19,9 +19,19 @@ from pathlib import Path
 
 import psycopg2
 if __package__:
-    from .leaderboard_hosted_boundary import TARGET_ENV, acquire_hosted_lock, connect_hosted
+    from .leaderboard_hosted_boundary import (
+        TARGET_ENV,
+        acquire_hosted_lock,
+        connect_hosted,
+        reviewed_canary_envelope,
+    )
 else:
-    from leaderboard_hosted_boundary import TARGET_ENV, acquire_hosted_lock, connect_hosted
+    from leaderboard_hosted_boundary import (
+        TARGET_ENV,
+        acquire_hosted_lock,
+        connect_hosted,
+        reviewed_canary_envelope,
+    )
 
 
 def database_url() -> str:
@@ -487,8 +497,7 @@ def run_trial(args) -> int:
     ):
         raise RuntimeError("restricted supervisor requires scoped rolling and bound publication in disposable mode")
     if hosted and (not restricted or args.production_trial_isolated_test or not url
-                   or (args.fixture_limit, args.capture_limit, args.cohort_limit, args.job_limit, args.max_seconds)
-                   != (21, 10, 1, 10, 30)
+                   or not reviewed_canary_envelope(args)
                    or any((args.test_pg_sleep_after_admission, args.test_pg_sleep_after_capture,
                            args.test_recovery_pg_sleep, args.test_force_uncertain_drain))):
         raise RuntimeError("hosted restricted supervisor requires the reviewed canary envelope")

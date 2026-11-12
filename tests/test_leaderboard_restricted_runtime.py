@@ -211,3 +211,24 @@ def test_missing_contract_entrypoint_fails_with_redacted_error():
     assert PASSWORD not in str(error.value)
     assert error.value.__suppress_context__
     assert connection.transaction_exit == [psycopg2.errors.UndefinedFunction]
+
+
+@pytest.mark.parametrize(("scope", "limits", "allowed"), [
+    ((8, 1), (21, 10, 1, 10, 30), True),
+    ((989, 27223), (29, 29, 0, 0, 30), False),
+    ((989, 27223), (30, 0, 1, 29, 30), False),
+    ((591, 27223), (59, 29, 1, 29, 30), False),
+    ((989, 27224), (59, 29, 1, 29, 30), False),
+    ((989, 27223), (59, 29, 1, 29, 30), True),
+    ((989, 27223), (30, 1, 1, 29, 30), False),
+    ((989, 27223), (30, 0, 1, 30, 30), False),
+    ((989, 27223), (59, 29, 1, 29, 31), False),
+])
+def test_hosted_canary_envelope(scope, limits, allowed):
+    from scripts.leaderboard_hosted_boundary import reviewed_canary_envelope
+
+    args = SimpleNamespace(
+        league_id=scope[0], season_id=scope[1], fixture_limit=limits[0],
+        capture_limit=limits[1], cohort_limit=limits[2], job_limit=limits[3], max_seconds=limits[4],
+    )
+    assert reviewed_canary_envelope(args) is allowed

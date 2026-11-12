@@ -20,6 +20,14 @@ ROLE_PINS = {
 }
 
 
+def reviewed_canary_envelope(args):
+    limits = (args.fixture_limit, args.capture_limit, args.cohort_limit, args.job_limit, args.max_seconds)
+    if limits == (21, 10, 1, 10, 30):
+        return True
+    # Managed settlement requires a linked publication in the same run.
+    return (args.league_id, args.season_id) == (989, 27223) and limits == (59, 29, 1, 29, 30)
+
+
 def hosted_target(dsn, role):
     if __package__:
         from .leaderboard_restricted_runtime import validate_restricted_dsn
