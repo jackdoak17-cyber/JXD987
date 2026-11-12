@@ -1429,7 +1429,22 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
                     )
         check_rolling_guard(conn, False)
         budget.apply_database_timeouts(conn)
-        eligibility_count = refresh_eligibility_if_due(conn)
+        if getattr(args, "production_restricted", False):
+            # The timeout setup starts a transaction. Commit it before setting
+            # isolation so the scoped refresh gets one consistent snapshot.
+            conn.commit()
+            conn.set_session(isolation_level="REPEATABLE READ")
+            try:
+                with conn, conn.cursor() as cur:
+                    cur.execute(
+                        "select leaderboard_role_boundary_v1.refresh_bound_league_eligibility(%s)",
+                        (run_id,),
+                    )
+                    eligibility_count = int(cur.fetchone()[0])
+            finally:
+                conn.set_session(isolation_level="READ COMMITTED")
+        else:
+            eligibility_count = refresh_eligibility_if_due(conn)
         check_rolling_guard(conn, False)
         budget.apply_database_timeouts(conn)
         if args.capture_limit:
