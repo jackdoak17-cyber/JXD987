@@ -48,6 +48,9 @@ DATABASE_URL = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPA
 RELEASE_SHA = os.environ.get("LEADERBOARD_SHADOW_RELEASE_SHA", "development")
 MAX_FIXTURES_PER_RUN = 250
 MAX_SECONDS_PER_RUN = 30.0
+# The fixture limit counts unique jobs. Repeated changes for one fixture
+# also consume work in the manifest precheck and database materializer.
+MAX_GENERATION_EVENTS_PER_TRIAL = 512
 LOCK_TIMEOUT_MS = 2_000
 PREFLIGHT_STATEMENT_TIMEOUT_MS = 5_000
 # Leave enough of the hard run deadline for the mandatory resource check and
@@ -717,7 +720,20 @@ def ensure_generation(
                     if max_materialized_jobs < 1:
                         raise RuntimeError("generation job bound must be positive")
                     # begin_generation holds the cohort cursor lock until this
-                    # transaction ends. Count only max+1 distinct fixtures from
+                    # transaction ends. Check the cursor span before running
+                    # DISTINCT or handing the same interval to the materializer.
+                    cur.execute(
+                        """
+                        select through_cursor - from_cursor
+                        from leaderboard_shadow_v1.cohort_pending_publications
+                        where generation_id=%s
+                        """,
+                        (generation_id,),
+                    )
+                    (event_span,) = cur.fetchone()
+                    if event_span > MAX_GENERATION_EVENTS_PER_TRIAL:
+                        raise RuntimeError("generation exceeds finite trial event bound")
+                    # Count only max+1 distinct fixtures from
                     # its fixed cursor range before materialize_generation can
                     # insert the entire manifest. A large existing generation
                     # is refused too. Raising rolls back a newly begun one.

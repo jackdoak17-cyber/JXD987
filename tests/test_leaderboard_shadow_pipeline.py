@@ -19,6 +19,7 @@ import scripts.leaderboard_shadow_worker as worker_module
 from scripts.leaderboard_shadow_capture import capture_fixture_ids
 from scripts.leaderboard_shadow_worker import (
     MAX_FIXTURES_PER_RUN,
+    MAX_GENERATION_EVENTS_PER_TRIAL,
     MAX_SECONDS_PER_RUN,
     RESOURCE_GUARD_FIXTURE_INTERVAL,
     SAFETY_CHECK_RESERVE_SECONDS,
@@ -693,7 +694,7 @@ def test_generation_progress_survives_a_prepublication_stop(monkeypatch):
 
 def test_full_trial_refuses_oversized_generation_before_materialization():
     class GenerationCursor(FakeCursor):
-        answers = iter([(73,), ("materializing", None, 10)])
+        answers = iter([(73,), (MAX_GENERATION_EVENTS_PER_TRIAL,), ("materializing", None, 10)])
 
         def fetchone(self):
             return next(self.answers)
@@ -703,9 +704,25 @@ def test_full_trial_refuses_oversized_generation_before_materialization():
         worker_module.ensure_generation(
             FakeConnection(cursor), 8, 2026, max_materialized_jobs=9,
         )
+    assert len(cursor.executed) == 3
+    assert cursor.executed[2][1] == (10, 73)
+    assert "materialize_generation" not in cursor.executed[2][0]
+
+
+def test_full_trial_refuses_long_event_span_before_scanning_events():
+    class GenerationCursor(FakeCursor):
+        answers = iter([(73,), (MAX_GENERATION_EVENTS_PER_TRIAL + 1,)])
+
+        def fetchone(self):
+            return next(self.answers)
+
+    cursor = GenerationCursor()
+    with pytest.raises(RuntimeError, match="generation exceeds finite trial event bound"):
+        worker_module.ensure_generation(
+            FakeConnection(cursor), 8, 2026, max_materialized_jobs=29,
+        )
     assert len(cursor.executed) == 2
-    assert cursor.executed[1][1] == (10, 73)
-    assert "materialize_generation" not in cursor.executed[1][0]
+    assert "through_cursor - from_cursor" in cursor.executed[1][0]
 
 
 def test_full_workload_trial_has_no_production_entrypoint():
