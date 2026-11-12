@@ -81,6 +81,9 @@ def require_hosted_worker_storage(connection):
             raise RuntimeError("hosted worker requires a server-enforced zero temp_file_limit scoped to this database")
         if settings[4:] != ("0", "0"):
             raise RuntimeError("hosted worker requires parallel workers to be disabled")
+        cursor.execute("select leaderboard_role_boundary_v1.worker_ddl_fence_ready()")
+        if cursor.fetchone() != (True,):
+            raise RuntimeError("hosted worker requires the enabled worker DDL guard")
 
 
 def trusted_file(info):
