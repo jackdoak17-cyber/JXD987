@@ -133,6 +133,18 @@ def configure_temp_file_limit_if_permitted(conn) -> bool:
     return permitted
 
 
+def verify_hosted_worker_storage(conn) -> None:
+    """Verify a server-enforced zero spill limit on the exact worker connection."""
+    with conn, conn.cursor() as cur:
+        cur.execute("""
+            select setting, unit, has_parameter_privilege(current_user,'temp_file_limit','SET')
+            from pg_catalog.pg_settings where name='temp_file_limit'
+        """)
+        if cur.fetchone() != ("0", "kB", False):
+            raise RuntimeError("hosted worker requires a server-enforced zero temp_file_limit")
+        cur.execute("select set_config('max_parallel_workers_per_gather','0',false)")
+
+
 def apply_preflight_timeouts(conn) -> None:
     """Bound fail-closed evidence checks before the processing budget starts.
 
@@ -1365,7 +1377,11 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
         load_external_resource_evidence(conn)
     # The restricted login cannot write external resource evidence. Admission
     # still validates the freshness of the operator's independently loaded sample.
-    temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
+    if getattr(args, "production_restricted", False):
+        verify_hosted_worker_storage(conn)
+        temp_file_limit_enforced = True
+    else:
+        temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
     budget.apply_database_timeouts(conn)
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
