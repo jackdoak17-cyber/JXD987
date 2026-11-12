@@ -168,34 +168,40 @@ def require_env(dry_run: bool) -> None:
         raise SystemExit(f"Missing env vars: {', '.join(missing)}")
 
 
+def read_remote_table_columns(tables: Sequence[str]) -> Dict[str, Set[str]]:
+    if not tables or not SUPABASE_DB_URL or psycopg2 is None:
+        return {}
+
+    conn = None
+    try:
+        conn = psycopg2.connect(SUPABASE_DB_URL)
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select table_name, column_name
+                from information_schema.columns
+                where table_schema = 'public'
+                  and table_name = any(%s)
+                """,
+                (list(tables),),
+            )
+            columns: Dict[str, Set[str]] = {}
+            for table, column in cur.fetchall():
+                columns.setdefault(table, set()).add(column)
+            return columns
+    except Exception as exc:  # Best-effort schema discovery.
+        log.warning("Remote schema discovery failed for %s: %s", ", ".join(tables), exc)
+        return {}
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def get_remote_table_columns(table: str) -> Optional[Set[str]]:
     if table in REMOTE_TABLE_COLUMNS_CACHE:
         return REMOTE_TABLE_COLUMNS_CACHE[table]
 
-    columns: Optional[Set[str]] = None
-    if SUPABASE_DB_URL and psycopg2 is not None:
-        conn = None
-        try:
-            conn = psycopg2.connect(SUPABASE_DB_URL)
-            cur = conn.cursor()
-            cur.execute(
-                """
-                select column_name
-                from information_schema.columns
-                where table_schema = 'public'
-                  and table_name = %s
-                """,
-                (table,),
-            )
-            fetched = {str(row[0]) for row in cur.fetchall() if row and row[0]}
-            if fetched:
-                columns = fetched
-        except Exception as exc:  # pragma: no cover - best-effort schema discovery
-            log.warning("Remote schema discovery failed for %s: %s", table, exc)
-        finally:
-            if conn is not None:
-                conn.close()
-
+    columns = read_remote_table_columns([table]).get(table)
     if not columns:
         fallback = FALLBACK_REMOTE_COLUMNS.get(table)
         if fallback:
@@ -1587,6 +1593,25 @@ def main():
         players = fetch_players(conn, list(player_ids))
         player_team_history = fetch_player_team_history(conn, list(player_ids))
         sidelined_players = fetch_sidelined_players(conn, list(team_ids))
+
+        if args.scope_explicit_metadata:
+            # These exports are bounded to explicit fixtures. Share one schema
+            # lookup across their core, detail and ancillary payloads.
+            remote_tables = {
+                "seasons": seasons,
+                "rounds": rounds,
+                "teams": teams,
+                "fixtures": fixtures,
+                "fixture_players": fixture_players,
+                "fixture_statistics": fixture_stats,
+                "fixture_player_statistics": fixture_player_stats,
+                "sidelined_players": sidelined_players,
+                "player_team_history": player_team_history,
+            }
+            REMOTE_TABLE_COLUMNS_CACHE.update(read_remote_table_columns([
+                table for table, rows in remote_tables.items()
+                if rows and table not in REMOTE_TABLE_COLUMNS_CACHE
+            ]))
 
         # Apply the target contract before any destructive fixture-scoped
         # operation. upsert_table repeats this defensively, but doing it here
