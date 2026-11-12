@@ -71,15 +71,15 @@ def require_hosted_worker_storage(connection):
     with connection, connection.cursor() as cursor:
         cursor.execute("set transaction read only")
         cursor.execute("""
-            select setting, unit, pg_catalog.has_parameter_privilege(current_user,'temp_file_limit','SET'),
+            select setting, unit, source, pg_catalog.has_parameter_privilege(current_user,'temp_file_limit','SET'),
                    pg_catalog.current_setting('max_parallel_workers_per_gather'),
                    pg_catalog.current_setting('max_parallel_maintenance_workers')
             from pg_catalog.pg_settings where name='temp_file_limit'
         """)
         settings = cursor.fetchone()
-        if settings is None or settings[:3] != ("0", "kB", False):
-            raise RuntimeError("hosted worker requires a server-enforced zero temp_file_limit")
-        if settings[3:] != ("0", "0"):
+        if settings is None or settings[:4] != ("0", "kB", "database user", False):
+            raise RuntimeError("hosted worker requires a server-enforced zero temp_file_limit scoped to this database")
+        if settings[4:] != ("0", "0"):
             raise RuntimeError("hosted worker requires parallel workers to be disabled")
 
 
