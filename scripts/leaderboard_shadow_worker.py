@@ -1015,7 +1015,9 @@ def process_generations(
                 break
             result["jobs"] += 1
             budget.consume()
-        if not budget.available():
+        # Publication consumes no fixture units. A final job may have used
+        # the last unit while leaving time to complete the publication.
+        if budget.remaining_seconds() <= SAFETY_CHECK_RESERVE_SECONDS:
             break
         budget.apply_database_timeouts(conn)
         guard_check(conn, require_external)

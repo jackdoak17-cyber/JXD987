@@ -1183,3 +1183,25 @@ def test_external_resource_evidence_rejects_unknown_fields(tmp_path):
     path.chmod(0o600)
     with pytest.raises(RuntimeError, match="unexpected or missing"):
         load_external_resource_evidence(FakeConnection(FakeCursor()), str(path))
+
+
+def test_bound_generation_can_publish_after_using_last_fixture_unit(monkeypatch):
+    monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
+    monkeypatch.setattr(worker_module, "ensure_bound_generation", lambda *_args: 73)
+    monkeypatch.setattr(worker_module, "process_generation_job", lambda *_args: True)
+    published = []
+    monkeypatch.setattr(
+        worker_module, "finish_generation",
+        lambda _conn, generation, binding: published.append((generation, binding)) or True,
+    )
+    budget = RunBudget.create(1, MAX_SECONDS_PER_RUN)
+
+    progress = worker_module.process_generations(
+        FakeConnection(FakeCursor()), "worker", 1, 1, budget, False,
+        guard_check=lambda *_args: {"ok": True},
+        league_id=8, season_id=2026, publication_binding=(1, 42), manifest_run_id=42,
+    )
+
+    assert budget.processed == 1
+    assert progress == {"cohorts": 1, "jobs": 1, "published": 1}
+    assert published == [(73, (1, 42))]
