@@ -918,6 +918,25 @@ def test_failed_generation_marks_interval_before_failure_record(monkeypatch):
     assert any("fail_generation_job" in query for query, _ in cursor.executed)
 
 
+def test_stage_error_survives_failure_record_error(monkeypatch):
+    class FailedStageAndCleanupCursor(GenerationJobCursor):
+        def execute(self, query, params=None):
+            if "stage_fixture_result" in query:
+                raise RuntimeError("failed stage")
+            if "fail_generation_job" in query:
+                raise RuntimeError("failed cleanup")
+            super().execute(query, params)
+
+    monkeypatch.setattr(worker_module, "apply_recovery_timeouts", lambda *_args: None)
+    monkeypatch.setattr(worker_module, "mark_failed_statement_interval", lambda *_args: None)
+    cursor = FailedStageAndCleanupCursor(staged=True, snapshot_hash="stale-hash")
+
+    with pytest.raises(RuntimeError, match="failed stage") as failure:
+        process_generation_job(GenerationJobConnection(cursor), 1000023, "worker")
+
+    assert str(failure.value.__cause__) == "failed cleanup"
+
+
 def test_failed_active_generation_remains_fatal():
     cursor = GenerationFinishCursor(("processing", 0, 1))
 

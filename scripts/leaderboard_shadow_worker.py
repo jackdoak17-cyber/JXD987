@@ -887,26 +887,29 @@ def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
                         json.dumps(facts),
                     ),
                 )
-                return bool(next(iter(cur.fetchone().values())))
+                staged = bool(next(iter(cur.fetchone().values())))
     except Exception as error:
-        apply_recovery_timeouts(conn)
-        mark_failed_statement_interval(conn)
-        conn.set_session(isolation_level="READ COMMITTED")
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "select leaderboard_shadow_v1.fail_generation_job(%s,%s,%s,%s,%s,true)",
-                    (
-                        generation_id,
-                        job["fixture_id"],
-                        token,
-                        job["fencing_number"],
-                        str(error)[:2000],
-                    ),
-                )
+        try:
+            apply_recovery_timeouts(conn)
+            mark_failed_statement_interval(conn)
+            conn.set_session(isolation_level="READ COMMITTED")
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "select leaderboard_shadow_v1.fail_generation_job(%s,%s,%s,%s,%s,true)",
+                        (
+                            generation_id,
+                            job["fixture_id"],
+                            token,
+                            job["fencing_number"],
+                            str(error)[:2000],
+                        ),
+                    )
+        except Exception as cleanup_error:
+            raise error from cleanup_error
         raise
-    finally:
-        conn.set_session(isolation_level="READ COMMITTED")
+    conn.set_session(isolation_level="READ COMMITTED")
+    return staged
 
 
 def finish_generation(
