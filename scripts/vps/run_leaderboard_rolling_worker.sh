@@ -20,6 +20,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/vps/verify_finite_trial_host_cutover.sh" \
   "scripts/leaderboard_finite_trial_supervisor.py" \
   "scripts/leaderboard_shadow_worker.py" \
+  "scripts/leaderboard_fixture_assembly.py" \
   "scripts/leaderboard_hosted_boundary.py" \
   "scripts/leaderboard_restricted_runtime.py" \
   "scripts/leaderboard_quarantine_release.py" \

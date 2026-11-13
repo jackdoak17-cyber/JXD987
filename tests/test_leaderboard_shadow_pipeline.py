@@ -1208,7 +1208,11 @@ def test_external_resource_evidence_rejects_unknown_fields(tmp_path):
 def test_bound_generation_can_publish_after_using_last_fixture_unit(monkeypatch):
     monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
     monkeypatch.setattr(worker_module, "ensure_bound_generation", lambda *_args: 73)
-    monkeypatch.setattr(worker_module, "process_generation_job", lambda *_args: True)
+    offloads = []
+    monkeypatch.setattr(
+        worker_module, "process_generation_job",
+        lambda *_args, offload_fixture: offloads.append(offload_fixture) or True,
+    )
     published = []
     monkeypatch.setattr(
         worker_module, "finish_generation",
@@ -1225,3 +1229,4 @@ def test_bound_generation_can_publish_after_using_last_fixture_unit(monkeypatch)
     assert budget.processed == 1
     assert progress == {"cohorts": 1, "jobs": 1, "published": 1}
     assert published == [(73, (1, 42))]
+    assert offloads == [True]

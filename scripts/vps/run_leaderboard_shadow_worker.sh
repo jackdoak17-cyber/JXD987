@@ -9,6 +9,7 @@ require_no_cron_transition
 require_runtime_manifest_entries_or_exit "$0" \
   "scripts/leaderboard_shadow_capture.py" \
   "scripts/leaderboard_shadow_worker.py" \
+  "scripts/leaderboard_fixture_assembly.py" \
   "scripts/export_to_supabase.py" \
   "scripts/postmatch_fixture_detail_delivery.py"
 LOCK_FILE="$TRIAL_WORKER_LOCK"

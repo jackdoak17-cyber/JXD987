@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replayable worker and bounded backfill coordinator for leaderboard shadow v1.
 
-This worker performs database-only processing. It never calls Sportmonks or any
+This worker processes data from the existing database. It never calls Sportmonks or any
 paid provider API. Production activation is separately gated by pipeline_state.
 """
 
@@ -25,6 +25,7 @@ from typing import Any, Callable
 import psycopg2
 from psycopg2.extras import RealDictCursor
 if __package__:
+    from .leaderboard_fixture_assembly import read_fixture_stage_input
     from .leaderboard_hosted_boundary import (
         connect_hosted,
         read_lock_pins,
@@ -34,6 +35,7 @@ if __package__:
         trusted_parent,
     )
 else:
+    from leaderboard_fixture_assembly import read_fixture_stage_input
     from leaderboard_hosted_boundary import (
         connect_hosted,
         read_lock_pins,
@@ -830,7 +832,9 @@ def ensure_generation(
     return generation_id
 
 
-def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
+def process_generation_job(
+    conn, generation_id: int, worker_id: str, *, offload_fixture: bool = False,
+) -> bool:
     token = f"{worker_id}:{uuid.uuid4().hex}"
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -846,27 +850,30 @@ def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
         conn.set_session(isolation_level="REPEATABLE READ")
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(
-                    """
-                    with source as materialized (
-                        select leaderboard_shadow_v1.fixture_source_snapshot(%s) as snapshot
+                if offload_fixture:
+                    with conn.cursor() as source_cursor:
+                        observed_hash, facts_json = read_fixture_stage_input(source_cursor, job["fixture_id"])
+                else:
+                    cur.execute(
+                        """
+                        with source as materialized (
+                            select leaderboard_shadow_v1.fixture_source_snapshot(%s) as snapshot
+                        )
+                        select snapshot->>'source_hash' as source_hash,
+                               (snapshot->'facts')::text as facts_json
+                        from source
+                        """,
+                        (job["fixture_id"],),
                     )
-                    select snapshot->>'source_hash' as source_hash,
-                           (snapshot->'facts')::text as facts_json
-                    from source
-                    """,
-                    (job["fixture_id"],),
-                )
-                snapshot = cur.fetchone()
-                observed_hash = snapshot["source_hash"]
+                    snapshot = cur.fetchone()
+                    observed_hash = snapshot["source_hash"]
+                    facts_json = snapshot["facts_json"]
                 excluded = job["change_kind"] == "exclude"
                 if excluded:
                     facts_json = "[]"
                     observed_hash = observed_hash or job["expected_source_hash"]
-                else:
-                    if observed_hash is None:
-                        raise RuntimeError("canonical fixture source is missing")
-                    facts_json = snapshot["facts_json"]
+                elif observed_hash is None:
+                    raise RuntimeError("canonical fixture source is missing")
                 if observed_hash != job["expected_source_hash"]:
                     # Historical publication keeps the automatic source
                     # triggers disabled. If authoritative source data changed
@@ -1018,7 +1025,10 @@ def process_generations(
                 break
             budget.apply_database_timeouts(conn)
             guard_check(conn, require_external)
-            if not process_generation_job(conn, generation_id, worker_id):
+            if not process_generation_job(
+                conn, generation_id, worker_id,
+                **({"offload_fixture": True} if manifest_run_id is not None else {}),
+            ):
                 break
             result["jobs"] += 1
             budget.consume()

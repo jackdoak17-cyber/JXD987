@@ -14,6 +14,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "scripts/vps/run_leaderboard_finite_trial.sh" \
   "scripts/leaderboard_finite_trial_supervisor.py" \
   "scripts/leaderboard_shadow_worker.py" \
+  "scripts/leaderboard_fixture_assembly.py" \
   "scripts/leaderboard_shadow_capture.py" \
   "scripts/export_to_supabase.py" \
   "scripts/postmatch_fixture_detail_delivery.py"

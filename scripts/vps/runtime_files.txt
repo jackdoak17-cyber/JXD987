@@ -22,6 +22,7 @@ scripts/verify_fixture_delivery_parity.py
 scripts/postmatch_fixture_detail_delivery.py
 scripts/leaderboard_shadow_capture.py
 scripts/leaderboard_shadow_worker.py
+scripts/leaderboard_fixture_assembly.py
 scripts/leaderboard_finite_trial_supervisor.py
 scripts/leaderboard_hosted_boundary.py
 scripts/leaderboard_restricted_runtime.py
