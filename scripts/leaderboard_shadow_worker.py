@@ -705,6 +705,63 @@ def pending_cohorts(
         return [(int(row[0]), int(row[1])) for row in cur.fetchall()]
 
 
+def ensure_bound_generation(
+    conn, league_id: int, season_id: int, run_id: int, job_limit: int,
+) -> int | None:
+    """Read a bounded journal before taking the generation write locks."""
+    with conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            select coalesce(publication.published_cursor,0), cursor.committed_version
+            from leaderboard_shadow_v1.cohort_change_cursors cursor
+            left join leaderboard_shadow_v1.cohort_publications publication using(league_id,season_id)
+            where (cursor.league_id,cursor.season_id)=(%s,%s)
+            """,
+            (league_id, season_id),
+        )
+        interval = cur.fetchone()
+        if interval is None or interval[0] == interval[1]:
+            return None
+        start, end = interval
+        if not 0 < end - start <= MAX_GENERATION_EVENTS_PER_TRIAL:
+            raise RuntimeError("generation exceeds finite trial event bound")
+
+        jobs = {}
+        after = start
+        while after < end:
+            cur.execute(
+                """
+                select cohort_version,fixture_id,source_version,source_hash,change_kind
+                from leaderboard_shadow_v1.fixture_change_events
+                where (league_id,season_id)=(%s,%s) and cohort_version>%s and cohort_version<=%s
+                order by cohort_version,fixture_id limit 64
+                """,
+                (league_id, season_id, after, end),
+            )
+            page = cur.fetchall()
+            if not page:
+                raise RuntimeError("generation event history is incomplete")
+            for version, fixture, source_version, source_hash, kind in page:
+                if version != after + 1:
+                    raise RuntimeError("generation event history is discontinuous")
+                jobs[str(fixture)] = [source_version, version, source_hash, kind]
+                after = version
+            if len(jobs) > job_limit:
+                raise RuntimeError("generation exceeds finite trial job bound")
+
+        cur.execute("select leaderboard_shadow_v1.begin_generation(%s,%s)", (league_id, season_id))
+        (generation,) = cur.fetchone()
+        if generation is None:
+            raise RuntimeError("generation source changed during manifest read")
+        cur.execute(
+            "select leaderboard_role_boundary_v1.materialize_bound_manifest(%s,%s,%s::jsonb)",
+            (run_id, generation, json.dumps(jobs)),
+        )
+        if cur.fetchone() != (len(jobs),):
+            raise RuntimeError("guarded generation manifest count differs")
+        return generation
+
+
 def ensure_generation(
     conn, league_id: int, season_id: int, *, max_materialized_jobs: int | None = None,
 ) -> int | None:
@@ -913,6 +970,7 @@ def process_generations(
     max_materialized_jobs: int | None = None,
     league_id: int | None = None, season_id: int | None = None,
     publication_binding: tuple[int, int] | None = None,
+    manifest_run_id: int | None = None,
 ) -> dict[str, int]:
     if (league_id is None) != (season_id is None):
         raise ValueError("generation scope requires league and season together")
@@ -927,17 +985,23 @@ def process_generations(
             break
         budget.apply_database_timeouts(conn)
         guard_check(conn, require_external)
-        generation_id = (
-            ensure_generation(conn, cohort_league_id, cohort_season_id)
-            if max_materialized_jobs is None else
-            ensure_generation(
-                conn, cohort_league_id, cohort_season_id,
-                max_materialized_jobs=min(
-                    max_materialized_jobs,
-                    budget.fixture_limit - budget.processed,
-                ),
+        if manifest_run_id is not None:
+            generation_id = ensure_bound_generation(
+                conn, cohort_league_id, cohort_season_id, manifest_run_id,
+                min(job_limit, budget.fixture_limit - budget.processed),
             )
-        )
+        else:
+            generation_id = (
+                ensure_generation(conn, cohort_league_id, cohort_season_id)
+                if max_materialized_jobs is None else
+                ensure_generation(
+                    conn, cohort_league_id, cohort_season_id,
+                    max_materialized_jobs=min(
+                        max_materialized_jobs,
+                        budget.fixture_limit - budget.processed,
+                    ),
+                )
+            )
         if generation_id is None:
             continue
         result["cohorts"] += 1
@@ -1475,6 +1539,7 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
                 conn, worker_id, args.cohort_limit, remaining_jobs,
                 budget, False, guard_check=check_rolling_guard,
                 progress=generations, max_materialized_jobs=remaining_jobs,
+                manifest_run_id=run_id if getattr(args, "production_restricted", False) else None,
                 league_id=args.league_id, season_id=args.season_id,
                 publication_binding=(
                     (fence, run_id) if getattr(args, "require_bound_publication", False)
