@@ -847,22 +847,26 @@ def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
         with conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(
-                    "select leaderboard_shadow_v1.fixture_source_snapshot(%s) as snapshot",
+                    """
+                    with source as materialized (
+                        select leaderboard_shadow_v1.fixture_source_snapshot(%s) as snapshot
+                    )
+                    select snapshot->>'source_hash' as source_hash,
+                           (snapshot->'facts')::text as facts_json
+                    from source
+                    """,
                     (job["fixture_id"],),
                 )
-                snapshot = cur.fetchone()["snapshot"]
+                snapshot = cur.fetchone()
+                observed_hash = snapshot["source_hash"]
                 excluded = job["change_kind"] == "exclude"
                 if excluded:
-                    facts: list[dict[str, Any]] = []
-                    observed_hash = (
-                        snapshot["source_hash"]
-                        if snapshot else job["expected_source_hash"]
-                    )
+                    facts_json = "[]"
+                    observed_hash = observed_hash or job["expected_source_hash"]
                 else:
-                    if not snapshot:
+                    if observed_hash is None:
                         raise RuntimeError("canonical fixture source is missing")
-                    facts = snapshot["facts"]
-                    observed_hash = snapshot["source_hash"]
+                    facts_json = snapshot["facts_json"]
                 if observed_hash != job["expected_source_hash"]:
                     # Historical publication keeps the automatic source
                     # triggers disabled. If authoritative source data changed
@@ -884,7 +888,7 @@ def process_generation_job(conn, generation_id: int, worker_id: str) -> bool:
                         job["fencing_number"],
                         observed_hash,
                         excluded,
-                        json.dumps(facts),
+                        facts_json,
                     ),
                 )
                 staged = bool(next(iter(cur.fetchone().values())))

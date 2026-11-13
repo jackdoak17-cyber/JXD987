@@ -441,10 +441,10 @@ class GenerationJobCursor(FakeCursor):
                 "change_kind": "upsert",
                 "fencing_number": 4,
             },
-            {"snapshot": {
+            {
                 "source_hash": snapshot_hash,
-                "facts": [{"player_id": 1}],
-            }},
+                "facts_json": '[{"player_id":1,"metrics":{"1":1.00}}]',
+            },
         ]
         if snapshot_hash != "stale-hash":
             rows.append({"capture_fixture_source_changes": [{
@@ -897,6 +897,7 @@ def test_successful_staging_does_not_create_a_duplicate_source_event():
 
     queries = [query for query, _params in cursor.executed]
     assert not any("capture_fixture_source_changes" in query for query in queries)
+    assert cursor.executed[-1][1][-1] == '[{"player_id":1,"metrics":{"1":1.00}}]'
 
 
 def test_failed_generation_marks_interval_before_failure_record(monkeypatch):
