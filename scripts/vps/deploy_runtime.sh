@@ -41,6 +41,7 @@ required_runtime_entries=(
   "scripts/vps/run_stats_reconciliation.sh"
   "scripts/leaderboard_shadow_capture.py"
   "scripts/leaderboard_shadow_worker.py"
+  "scripts/leaderboard_fixture_assembly.py"
   "scripts/leaderboard_finite_trial_supervisor.py"
   "scripts/leaderboard_hosted_boundary.py"
   "scripts/leaderboard_restricted_runtime.py"
