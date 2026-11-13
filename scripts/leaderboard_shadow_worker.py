@@ -749,10 +749,11 @@ def ensure_bound_generation(
             if len(jobs) > job_limit:
                 raise RuntimeError("generation exceeds finite trial job bound")
 
-        cur.execute("select leaderboard_shadow_v1.begin_generation(%s,%s)", (league_id, season_id))
+        cur.execute(
+            "select leaderboard_role_boundary_v1.begin_bound_generation(%s,%s,%s)",
+            (run_id, start, end),
+        )
         (generation,) = cur.fetchone()
-        if generation is None:
-            raise RuntimeError("generation source changed during manifest read")
         cur.execute(
             "select leaderboard_role_boundary_v1.materialize_bound_manifest(%s,%s,%s::jsonb)",
             (run_id, generation, json.dumps(jobs)),
