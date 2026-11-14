@@ -83,7 +83,6 @@ def copy_table(conn, table: str, rows: Sequence[dict], columns: Sequence[str], f
         with conn.cursor() as cur:
             load_fixture_ids(cur, fixture_ids)
             cur.execute(f"delete from public.{table} t using fixture_ids_stage f where t.fixture_id = f.fixture_id")
-        conn.commit()
         return 0
 
     with tempfile.NamedTemporaryFile(prefix=f"{table}_", suffix=".csv", delete=False) as tmp:
@@ -105,10 +104,35 @@ def copy_table(conn, table: str, rows: Sequence[dict], columns: Sequence[str], f
                 f"insert into public.{table} ({','.join(columns)}) "
                 f"select {','.join(columns)} from {stage_name}"
             )
-        conn.commit()
         return len(rows)
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def restore_fixture_tables(
+    conn,
+    fixture_ids: Sequence[int],
+    fixture_players: Sequence[dict],
+    fixture_statistics: Sequence[dict],
+    fixture_player_statistics: Sequence[dict],
+    odds_outcomes: Sequence[dict],
+) -> dict[str, int]:
+    batches = (
+        ("fixture_players", fixture_players),
+        ("fixture_statistics", fixture_statistics),
+        ("fixture_player_statistics", fixture_player_statistics),
+        ("odds_outcomes", odds_outcomes),
+    )
+    try:
+        counts = {
+            table: copy_table(conn, table, rows, list(rows[0].keys()) if rows else [], fixture_ids)
+            for table, rows in batches
+        }
+        conn.commit()
+        return counts
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def main() -> None:
@@ -177,33 +201,13 @@ def main() -> None:
             cur.execute("set lock_timeout = 0")
             cur.execute("set idle_in_transaction_session_timeout = 0")
         pg_conn.commit()
-        exported_fixture_players = copy_table(
+        exported = restore_fixture_tables(
             pg_conn,
-            "fixture_players",
+            fixture_ids,
             fixture_players,
-            list(fixture_players[0].keys()) if fixture_players else [],
-            fixture_ids,
-        )
-        exported_fixture_statistics = copy_table(
-            pg_conn,
-            "fixture_statistics",
             fixture_statistics,
-            list(fixture_statistics[0].keys()) if fixture_statistics else [],
-            fixture_ids,
-        )
-        exported_fixture_player_statistics = copy_table(
-            pg_conn,
-            "fixture_player_statistics",
             fixture_player_statistics,
-            list(fixture_player_statistics[0].keys()) if fixture_player_statistics else [],
-            fixture_ids,
-        )
-        exported_odds_outcomes = copy_table(
-            pg_conn,
-            "odds_outcomes",
             odds_outcomes,
-            list(odds_outcomes[0].keys()) if odds_outcomes else [],
-            fixture_ids,
         )
     finally:
         pg_conn.close()
@@ -213,10 +217,10 @@ def main() -> None:
         json.dumps(
             {
                 "fixtures": len(fixture_ids),
-                "fixture_players_exported": exported_fixture_players,
-                "fixture_statistics_exported": exported_fixture_statistics,
-                "fixture_player_statistics_exported": exported_fixture_player_statistics,
-                "odds_outcomes_exported": exported_odds_outcomes,
+                "fixture_players_exported": exported["fixture_players"],
+                "fixture_statistics_exported": exported["fixture_statistics"],
+                "fixture_player_statistics_exported": exported["fixture_player_statistics"],
+                "odds_outcomes_exported": exported["odds_outcomes"],
             }
         )
     )
