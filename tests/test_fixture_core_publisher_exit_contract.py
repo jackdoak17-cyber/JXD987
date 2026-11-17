@@ -80,6 +80,7 @@ if sys.argv[1] == '-c':
                 payload['metadata'],
                 payload['resolver_release_id'],
                 payload['resolver_state'],
+                datetime.fromisoformat(payload['active_lease_expires_at']) if payload.get('active_lease_expires_at') else None,
             )
     class Connection:
         def set_session(self, **_): pass
