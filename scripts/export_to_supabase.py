@@ -1070,6 +1070,20 @@ def upsert_fixture_core(target_conn, rows: Sequence[Dict]) -> None:
         raise
 
 
+def reviewed_abandoned_result(fixture_id: int, fixture: Sequence,
+                              exclusion: Sequence) -> bool:
+    """The KNVB awarded this stopped match as a 4-0 league result.
+
+    This is a single reviewed exception, not a rule for abandoned matches.
+    https://www.knvb.nl/nieuws/organisatie/berichten/72372/cambuur-go-ahead-eagles-definitief-gestaakt
+    """
+    return (fixture_id == 19714606
+            and tuple(fixture) == (1435, 664, 72, 27958, "FT", 4, 0)
+            and exclusion[0] == "provider_unavailable"
+            and (exclusion[1] or {}).get("provider_status") == "ABANDONED"
+            and exclusion[4] == "stats_integrity_audit")
+
+
 def lock_fixture_recovery(cur, fixture_id: int, snapshot_id: int | None,
                           appearances: Sequence[Dict], team_stats: Sequence[Dict],
                           player_stats: Sequence[Dict]) -> bool:
@@ -1078,11 +1092,13 @@ def lock_fixture_recovery(cur, fixture_id: int, snapshot_id: int | None,
     SQLite is only staging. Replacement, quarantine release, projection and
     accepted-snapshot activation must commit together on the serving database.
     """
-    cur.execute("select home_team_id, away_team_id from public.fixtures where id = %s for update", (fixture_id,))
+    cur.execute("""select home_team_id, away_team_id, league_id, season_id,
+                          status, home_score, away_score
+                   from public.fixtures where id = %s for update""", (fixture_id,))
     fixture = cur.fetchone()
     if not fixture:
         raise ValueError("Fixture recovery has no canonical fixture")
-    cur.execute("""select exclusion_type, evidence, last_checked_at, next_review_at
+    cur.execute("""select exclusion_type, evidence, last_checked_at, next_review_at, source
                    from public.fixture_stats_quality_exclusions
                    where fixture_id = %s for update""", (fixture_id,))
     exclusion = cur.fetchone()
@@ -1091,7 +1107,8 @@ def lock_fixture_recovery(cur, fixture_id: int, snapshot_id: int | None,
     if exclusion[0] != "provider_unavailable" or snapshot_id is None:
         raise ValueError("Fixture quarantine cannot be released by this export")
     old_status = (exclusion[1] or {}).get("provider_status")
-    if old_status and str(old_status).upper() not in {"POST", "POSTP", "POSTPONED"}:
+    reviewed_abandoned = reviewed_abandoned_result(fixture_id, fixture, exclusion)
+    if old_status and str(old_status).upper() not in {"POST", "POSTP", "POSTPONED"} and not reviewed_abandoned:
         raise ValueError("Non-postponement status quarantine requires separate review")
     cur.execute("""select payload, quality_status, last_seen_at, normalized_hash from public.fixture_detail_snapshots
                    where id = %s and fixture_id = %s for update""", (snapshot_id, fixture_id))
@@ -1171,6 +1188,8 @@ def lock_fixture_recovery(cur, fixture_id: int, snapshot_id: int | None,
     home_score, away_score = SyncService(None, None)._extract_scores(data.get("scores") or data.get("score"))
     if home_score is None or away_score is None:
         raise ValueError("Recovery requires explicit completed-match scores")
+    if reviewed_abandoned and (home_score, away_score) != (4, 0):
+        raise ValueError("Adjudicated match score differs from the KNVB final result")
     cur.execute("update public.fixtures set home_score = %s, away_score = %s where id = %s",
                 (home_score, away_score, fixture_id))
     return True
