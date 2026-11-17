@@ -598,7 +598,10 @@ def current_resolved_publication_state(cur) -> dict[str, Any] | None:
     cur.execute(
         """
         select r.id, r.published_at, r.health_checked_at, r.pin_expires_at,
-               r.metadata, resolved.release_id, resolved.state
+               r.metadata, resolved.release_id, resolved.state,
+               (select max(l.expires_at)
+                  from public.fixture_delivery_release_leases l
+                 where l.release_id = r.id and l.expires_at > now())
           from public.fixture_delivery_current_publication p
           left join public.fixture_delivery_releases r on r.id = p.release_id
           cross join lateral public.fixture_delivery_release_resolve(null::uuid) resolved
@@ -617,6 +620,7 @@ def current_resolved_publication_state(cur) -> dict[str, Any] | None:
         "metadata": row[4] if isinstance(row[4], dict) else {},
         "resolver_release_id": str(row[5]) if row[5] is not None else None,
         "resolver_state": str(row[6]) if row[6] is not None else None,
+        "active_lease_expires_at": row[7],
     }
 
 
@@ -643,6 +647,10 @@ def publication_skip_reason(
         candidate_source_at = datetime.fromisoformat(str(candidate_evidence["verified_at"]).replace("Z", "+00:00"))
         if candidate_source_at < existing_source_at:
             return "newer_current_source"
+        if candidate_source_at > existing_source_at:
+            # A reader lease can extend the old release's retention pin. It
+            # must not prevent a newer source from refreshing the publication.
+            return None
 
     if candidate_pin_expires_at < pin:
         return "would_shorten_current_pin"
@@ -697,8 +705,13 @@ def verify_superseded_core_skip(
         candidate_pin = datetime.fromisoformat(str(report["pin_expires_at"]).replace("Z", "+00:00"))
     except (KeyError, TypeError, ValueError) as error:
         raise RuntimeError("fixture publication evidence is malformed") from error
-    if max_age_minutes <= 0 or pin > verified_at + timedelta(minutes=max_age_minutes):
-        raise RuntimeError("current fixture pin exceeds its source evidence")
+    source_valid_until = verified_at + timedelta(minutes=max_age_minutes)
+    if max_age_minutes <= 0 or source_valid_until < observed_at:
+        raise RuntimeError("current fixture source evidence has expired")
+    if pin > source_valid_until:
+        lease_expiry = current.get("active_lease_expires_at")
+        if lease_expiry is None or pin > lease_expiry:
+            raise RuntimeError("current fixture pin exceeds its source evidence and active leases")
     observed_reason = publication_skip_reason(
         current,
         report.get("source_freshness") or {},
@@ -787,7 +800,7 @@ def record_verified_noop(
         """
         update public.fixture_delivery_releases
            set health_checked_at = now(),
-               pin_expires_at = %s,
+               pin_expires_at = greatest(pin_expires_at, %s),
                metadata = coalesce(metadata, '{}'::jsonb) || %s::jsonb
          where id = %s and status = 'published'
         """,
