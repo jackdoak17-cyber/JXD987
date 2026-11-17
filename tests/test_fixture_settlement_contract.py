@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
-import sys
 import tempfile
 import time
 import unittest
@@ -15,16 +13,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class FixtureSettlementContractTests(unittest.TestCase):
     def test_reconcile_cli_exposes_settlement_options(self) -> None:
-        result = subprocess.run(
-            [sys.executable, "scripts/reconcile_recent_fixtures.py", "--help"],
-            cwd=ROOT,
-            env={**os.environ, "PYTHONPATH": str(ROOT), "COLUMNS": "200"},
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        self.assertIn("--completed-hours-back", result.stdout)
-        self.assertIn("--report-json", result.stdout)
+        from typer.main import get_command
+
+        from scripts.reconcile_recent_fixtures import app
+
+        options = {option for param in get_command(app).params
+                   for option in getattr(param, "opts", ())}
+        self.assertIn("--completed-hours-back", options)
+        self.assertIn("--report-json", options)
 
     def test_settlement_wrapper_is_shell_valid_and_marks_delivery_dirty(self) -> None:
         wrapper = ROOT / "scripts/vps/run_postmatch_settlement.sh"
