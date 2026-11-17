@@ -315,6 +315,51 @@ def test_discovery_preserves_unrelated_quarantine(replay, kind, status):
     assert replay.sql("select * from fixture_stats_quality_exclusions") == before
 
 
+def test_reviewed_abandoned_league_result_recovers_only_with_matching_provider_detail(replay):
+    # The KNVB awarded Cambuur's stopped match 4-0; the provider later changed
+    # its original ABANDONED status to FT with lineups and match statistics.
+    data = payload(fixture_id=19714606)
+    data.update(league_id=72, season_id=27958, starting_at="2026-10-31 20:00:00")
+    for participant in data["participants"]:
+        participant["id"] = {101: 1435, 202: 664}[participant["id"]]
+    for collection in ("scores", "statistics"):
+        for row in data[collection]:
+            row["participant_id"] = {101: 1435, 202: 664}[row["participant_id"]]
+    for row in data["lineups"]:
+        row["team_id"] = {101: 1435, 202: 664}[row["team_id"]]
+    data["scores"][0]["score"]["goals"] = 4
+    replay.sql("insert into teams(id) values(1435),(664)")
+    replay.discover(data)
+    replay.quarantine(data["id"])
+    replay.sql("""update fixture_stats_quality_exclusions
+        set source='stats_integrity_audit', evidence='{"provider_status":"ABANDONED"}'::jsonb
+        where fixture_id=%s""", (data["id"],))
+    wrong_score = copy.deepcopy(data)
+    wrong_score["scores"][0]["score"]["goals"] = 3
+    with pytest.raises(ValueError, match="differs from the KNVB final result"):
+        replay.publish(wrong_score)
+    assert replay.sql("select count(*) from fixture_stats_quality_exclusions where fixture_id=%s", (data["id"],)) == [(1,)]
+    assert replay.shots(fixture_id=data["id"]) == []
+    assert replay.publish(data)
+    assert replay.sql("select count(*) from fixture_stats_quality_exclusions where fixture_id=%s", (data["id"],)) == [(0,)]
+    assert replay.sql("select status,home_score,away_score from fixtures where id=%s", (data["id"],)) == [("FT", 4, 0)]
+    assert replay.shots(fixture_id=data["id"]) == [(2,)]
+
+
+def test_reviewed_abandoned_guard_rejects_other_results_and_quarantines():
+    from scripts.export_to_supabase import reviewed_abandoned_result
+
+    fixture = (1435, 664, 72, 27958, "FT", 4, 0)
+    exclusion = ("provider_unavailable", {"provider_status": "ABANDONED"}, None, None,
+                 "stats_integrity_audit")
+    assert reviewed_abandoned_result(19714606, fixture, exclusion)
+    assert not reviewed_abandoned_result(19714607, fixture, exclusion)
+    assert not reviewed_abandoned_result(19714606, fixture[:-1] + (1,), exclusion)
+    assert not reviewed_abandoned_result(19714606, fixture, exclusion[:-1] + ("other",))
+    assert not reviewed_abandoned_result(19714606, fixture, exclusion[:1] +
+                                         ({"provider_status": "CANC"},) + exclusion[2:])
+
+
 def test_discovery_quarantine_failure_rolls_back_core_update(replay):
     replay.discover(payload())
     replay.sql("""create function reject_quarantine() returns trigger language plpgsql as $$
