@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import unittest
 import json
 from datetime import datetime, timedelta, timezone
@@ -31,13 +30,16 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
         cursor.fetchone.return_value = (
             "release-id", now, now, now + timedelta(hours=2), {}, "release-id", "current",
+            now + timedelta(hours=2),
         )
         state = current_resolved_publication_state(cursor)
         cursor.execute.assert_called_once()
         sql = cursor.execute.call_args.args[0]
         self.assertIn("fixture_delivery_release_resolve(null::uuid)", sql)
         self.assertIn("fixture_delivery_releases", sql)
+        self.assertIn("fixture_delivery_release_leases", sql)
         self.assertEqual(state["resolver_state"], "current")
+        self.assertEqual(state["active_lease_expires_at"], now + timedelta(hours=2))
 
     def test_superseded_primary_skip_requires_current_supported_release(self) -> None:
         now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
@@ -104,6 +106,51 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "explicit database endpoint"):
                 validate_session_capable_dsn("postgresql:///postgres")
 
+    def test_active_reader_lease_can_extend_retention_without_hiding_stale_source(self) -> None:
+        now = datetime(2026, 11, 17, 6, 17, tzinfo=UTC)
+        current = {
+            "release_id": "current-release",
+            "resolver_release_id": "current-release",
+            "resolver_state": "current",
+            "health_checked_at": now - timedelta(hours=2),
+            "pin_expires_at": now + timedelta(hours=7),
+            "active_lease_expires_at": now + timedelta(hours=7),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(hours=6)).isoformat(),
+                "max_age_minutes": 540,
+            }},
+        }
+        older_report = {
+            "skipped": True,
+            "published": False,
+            "skip_reason": "newer_current_source",
+            "current_release_id": "current-release",
+            "pin_expires_at": (now + timedelta(hours=2)).isoformat(),
+            "source_freshness": {"verified_at": (now - timedelta(hours=7)).isoformat()},
+        }
+        verify_superseded_core_skip(older_report, current, now=now)
+        current["active_lease_expires_at"] = now + timedelta(hours=6)
+        with self.assertRaisesRegex(RuntimeError, "active leases"):
+            verify_superseded_core_skip(older_report, current, now=now)
+        current["active_lease_expires_at"] = now + timedelta(hours=7)
+        verify_superseded_core_skip(older_report, current, now=now)
+        with self.assertRaisesRegex(RuntimeError, "source evidence has expired"):
+            verify_superseded_core_skip(older_report, current, now=now + timedelta(hours=4))
+
+    def test_newer_fixture_source_is_not_blocked_by_reader_retention_pin(self) -> None:
+        now = datetime(2026, 11, 17, 6, 17, tzinfo=UTC)
+        current = {
+            "pin_expires_at": now + timedelta(hours=7),
+            "metadata": {"last_source_freshness_evidence": {
+                "verified_at": (now - timedelta(hours=6)).isoformat(),
+            }},
+        }
+        fresh = {"verified_at": now.isoformat()}
+        self.assertIsNone(publication_skip_reason(
+            current, fresh, now + timedelta(hours=2),
+            guarded=False, min_interval_seconds=0, now=now,
+        ))
+
     def test_older_fallback_cannot_shorten_primary_noop_before_heartbeat(self) -> None:
         now = datetime(2026, 11, 8, 16, 0, tzinfo=UTC)
         current = {
@@ -142,11 +189,11 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             min_skip_runway_seconds=5700, now=now,
         ))
         current["pin_expires_at"] = now + timedelta(hours=2)
-        self.assertEqual(publication_skip_reason(
+        self.assertIsNone(publication_skip_reason(
             current, fresh, now + timedelta(hours=2),
             guarded=True, min_interval_seconds=3600,
             min_skip_runway_seconds=5700, now=now,
-        ), "recent_publication_satisfies_guard")
+        ))
 
     def test_recent_skip_requires_next_hourly_run_and_max_runtime_runway(self) -> None:
         now = datetime(2026, 11, 8, 21, 11, 7, tzinfo=UTC)
@@ -280,7 +327,7 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         self.assertNotIn("insert into public.fixture_delivery_odds", queries)
         self.assertIn("fixture_delivery_refresh_runs", queries)
         self.assertIn("health_checked_at = now()", queries)
-        self.assertIn("pin_expires_at = %s", queries)
+        self.assertIn("pin_expires_at = greatest(pin_expires_at, %s)", queries)
         self.assertTrue(report["verified_noop"])
         self.assertEqual(report["pin_expires_at"], pin_expires_at.isoformat())
         self.assertEqual(report["projection_rows_written"], 0)
