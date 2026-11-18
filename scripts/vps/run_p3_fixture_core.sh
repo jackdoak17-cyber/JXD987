@@ -57,6 +57,12 @@ export FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SE
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${FIXTURE_CORE_LOCK_RETRY_ATTEMPTS:-160}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DELAY_SECONDS:-15}"
 export ODDS_SYNC_STOP_RETRY_AFTER_LEASE_HANDOFF=true
+# Bound total retry time as well as retry count so the reservation outlives
+# a waiting caller even when individual checks take longer than expected.
+export ODDS_SYNC_LOCK_RETRY_DEADLINE_SECONDS="${FIXTURE_CORE_LOCK_RETRY_DEADLINE_SECONDS:-2400}"
+# The one-hour reservation spans the 40-minute retry horizon and the bounded
+# admitted source run. Priority is released as soon as admitted work ends.
+export FIXTURE_CORE_RESERVATION_TTL_SECONDS="${FIXTURE_CORE_RESERVATION_TTL_SECONDS:-3600}"
 # The exporter treats zero as an unbounded completed-fixture selection. Keep
 # the historical side of this identity refresh bounded by the shared contract
 # as well; the future identity contract is still controlled by the source
@@ -130,18 +136,46 @@ export FIXTURE_DELIVERY_SOURCE_MAX_AGE_MINUTES="${FIXTURE_CORE_JOB_MAX_AGE_MINUT
 # Publish with the existing release-aware, schema-preflighted delivery path.
 # London date boundaries match the public fixture-card contract; the source
 # identity contract itself remains UTC/date-only.
+rm -f /tmp/fixture_core_delivery_report.json
+publisher_status=0
 python scripts/refresh_fixture_delivery.py \
   --start-date "$(TZ=Europe/London date -d "-${FIXTURE_CORE_HISTORY_DAYS} days" +%F)" \
   --end-date "$(TZ=Europe/London date -d "+${FIXTURE_CORE_DELIVERY_DAYS_FORWARD} days" +%F)" \
   --leagues "${STATS_LEAGUES}" \
-  --report-out "/tmp/fixture_core_delivery_report.json"
+  --report-out "/tmp/fixture_core_delivery_report.json" || publisher_status=$?
+if [[ "${publisher_status}" -eq 2 ]]; then
+  # The source export succeeded, but a newer supported publication won the
+  # race. Recheck the live resolver before recording this core run as healthy.
+  python -c 'from scripts.refresh_fixture_delivery import verify_superseded_core_skip_report; verify_superseded_core_skip_report("/tmp/fixture_core_delivery_report.json")'
+elif [[ "${publisher_status}" -ne 0 ]]; then
+  exit "${publisher_status}"
+fi
 CHAIN
 )
+
+# Include the bounded guard claim in the admission deadline.
+export ODDS_SYNC_LOCK_RETRY_STARTED_EPOCH="$(date -u +%s)"
+reservation_status=0
+reservation_owner="$(fixture_core_reservation_claim)" || reservation_status=$?
+if [[ "${reservation_status}" -ne 0 ]]; then
+  started_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  PIPELINE_EVIDENCE_FILE="" record_pipeline_job_run \
+    "${FIXTURE_CORE_JOB_ID}" "Fixture core export" "${reservation_status}" \
+    "${started_at}" "${started_at}" "0"
+  if [[ "${reservation_status}" -eq 2 ]]; then
+    log_info "[SKIPPED] another fixture-core invocation owns the reservation"
+  else
+    log_error "fixture-core reservation could not be claimed"
+  fi
+  finalize_with_healthcheck "${reservation_status}" "${HEALTHCHECK_PING_URL_FIXTURE_CORE:-${HEALTHCHECK_PING_URL:-}}"
+fi
+trap 'fixture_core_reservation_release "${reservation_owner}" || log_error "fixture-core reservation release failed"' EXIT
+export FIXTURE_CORE_RESERVATION_OWNER="${reservation_owner}"
 
 status=0
 ODDS_SYNC_P3_MAX_DURATION_SECONDS="${FIXTURE_CORE_MAX_RUNTIME_SECONDS}" \
 ODDS_SYNC_MIN_NORMAL_LEASE_SECONDS="${FIXTURE_CORE_MIN_NORMAL_LEASE_SECONDS}" \
-ODDS_SYNC_JOB_PRIORITY="normal" \
+ODDS_SYNC_JOB_PRIORITY="fixture_core" \
   run_recorded_pipeline_job \
     "${FIXTURE_CORE_JOB_ID}" \
     "Fixture core export" \
