@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import tempfile
+import time
 from datetime import date, datetime
 from pathlib import Path
 from unittest.mock import Mock
@@ -316,6 +317,164 @@ def test_normal_fixture_to_played_complete(replay):
     assert replay.publish(payload())
     assert replay.shots() == [(2,)]
     assert replay.shots(player=22) == [(0,)]  # Only an explicit provider zero.
+
+
+def test_atomic_importer_waits_for_source_publication_fence_then_commits(replay, postgres):
+    """The real fixture-detail RPC must finish after the leaderboard's source lock."""
+    data = payload()
+    replay.discover(data)
+    assessment = delivery.assess_provider_payload(data)
+    snapshot_id = delivery.persist_provider_snapshot(
+        replay.url, data["id"], 8, 10, data, assessment,
+        delivery.provider_payload_hash(data), delivery.normalized_provider_hash(data),
+    )
+    assert assessment.status == "ready"
+    delivery.store_provider_detail(replay.engine, replay.client, data["id"], data, assessment)
+
+    url, data_dir = postgres
+    publisher = connect_owned_postgres(url, data_dir)
+    observer = connect_owned_postgres(url, data_dir)
+    importer_pid = replay.sql("select pg_backend_pid()")[0][0]
+    outcome = {}
+
+    def run_importer():
+        try:
+            replay.export(data, snapshot_id)
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run_importer, daemon=True)
+    try:
+        with publisher.cursor() as cur:
+            cur.execute("lock table public.fixture_player_statistics in share mode nowait")
+        thread.start()
+        deadline = time.monotonic() + 5
+        waiting = False
+        while time.monotonic() < deadline:
+            with observer.cursor() as cur:
+                cur.execute(
+                    "select wait_event_type from pg_stat_activity where pid = %s",
+                    (importer_pid,),
+                )
+                waiting = cur.fetchone() == ("Lock",)
+            observer.commit()
+            if waiting or "error" in outcome:
+                break
+            time.sleep(0.05)
+        assert waiting, f"Importer did not wait on source publication lock: {outcome}"
+        with observer.cursor() as cur:
+            cur.execute(
+                "select count(*) from public.fixture_player_statistics where fixture_id = %s",
+                (FIXTURE,),
+            )
+            assert cur.fetchone() == (0,)
+        observer.commit()
+    finally:
+        publisher.commit()
+        thread.join(timeout=10)
+        publisher.close()
+        observer.close()
+
+    assert not thread.is_alive(), "Importer did not finish after publication released its lock"
+    assert not outcome, f"Importer failed after publication released its lock: {outcome}"
+    assert replay.shots() == [(2,)]
+    with replay.engine.connect() as source:
+        raw = source.connection.driver_connection
+        assert not delivery.compare_snapshots(
+            delivery.source_snapshot(raw, FIXTURE),
+            delivery.target_snapshot(replay.conn, FIXTURE),
+        )
+
+
+def test_source_publication_lock_refuses_active_atomic_importer(replay, postgres):
+    """An in-flight importer must block the publisher's fail-fast source fence."""
+    data = payload()
+    replay.discover(data)
+    assessment = delivery.assess_provider_payload(data)
+    snapshot_id = delivery.persist_provider_snapshot(
+        replay.url, data["id"], 8, 10, data, assessment,
+        delivery.provider_payload_hash(data), delivery.normalized_provider_hash(data),
+    )
+    assert assessment.status == "ready"
+    delivery.store_provider_detail(replay.engine, replay.client, data["id"], data, assessment)
+    replay.sql("""
+        create function public.wait_for_importer_probe() returns trigger
+        language plpgsql as $$
+        begin
+            perform pg_advisory_lock(741911);
+            perform pg_advisory_unlock(741911);
+            return new;
+        end $$;
+        create trigger wait_for_importer_probe before insert
+        on public.fixture_player_statistics for each row
+        execute function public.wait_for_importer_probe()
+    """)
+
+    url, data_dir = postgres
+    publisher = connect_owned_postgres(url, data_dir)
+    observer = connect_owned_postgres(url, data_dir)
+    importer_pid = replay.sql("select pg_backend_pid()")[0][0]
+    outcome = {}
+
+    def run_importer():
+        try:
+            replay.export(data, snapshot_id)
+        except BaseException as exc:
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run_importer, daemon=True)
+    try:
+        with publisher.cursor() as cur:
+            cur.execute("select pg_advisory_lock(741911)")
+        publisher.commit()
+        thread.start()
+        deadline = time.monotonic() + 5
+        active = False
+        while time.monotonic() < deadline:
+            with observer.cursor() as cur:
+                cur.execute("""
+                    select exists (
+                        select 1 from pg_locks
+                        where pid = %s and granted and mode = 'RowExclusiveLock'
+                          and relation = 'public.fixture_player_statistics'::regclass
+                    ), wait_event_type
+                    from pg_stat_activity where pid = %s
+                """, (importer_pid, importer_pid))
+                held_lock, wait_type = cur.fetchone()
+                active = held_lock and wait_type == "Lock"
+            observer.commit()
+            if active or "error" in outcome:
+                break
+            time.sleep(0.05)
+        assert active, f"Atomic importer did not hold the source write lock: {outcome}"
+        with pytest.raises(psycopg2.errors.LockNotAvailable):
+            with publisher.cursor() as cur:
+                cur.execute("lock table public.fixture_player_statistics in share mode nowait")
+        publisher.rollback()
+        with observer.cursor() as cur:
+            cur.execute(
+                "select count(*) from public.fixture_player_statistics where fixture_id = %s",
+                (FIXTURE,),
+            )
+            assert cur.fetchone() == (0,)
+        observer.commit()
+    finally:
+        with publisher.cursor() as cur:
+            cur.execute("select pg_advisory_unlock(741911)")
+        publisher.commit()
+        thread.join(timeout=10)
+        publisher.close()
+        observer.close()
+
+    assert not thread.is_alive(), "Atomic importer did not finish after the probe released"
+    assert not outcome, f"Atomic importer failed after the probe released: {outcome}"
+    assert replay.shots() == [(2,)]
+    with replay.engine.connect() as source:
+        raw = source.connection.driver_connection
+        assert not delivery.compare_snapshots(
+            delivery.source_snapshot(raw, FIXTURE),
+            delivery.target_snapshot(replay.conn, FIXTURE),
+        )
 
 
 def test_batched_export_keeps_per_fixture_snapshot_lineage_in_disposable_postgres(
