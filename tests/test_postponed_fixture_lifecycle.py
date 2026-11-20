@@ -319,7 +319,10 @@ def test_normal_fixture_to_played_complete(replay):
     assert replay.shots(player=22) == [(0,)]  # Only an explicit provider zero.
 
 
-def test_atomic_importer_waits_for_source_publication_fence_then_commits(replay, postgres):
+@pytest.mark.parametrize("source_table", (
+    "fixture_players", "fixture_statistics", "fixture_player_statistics",
+))
+def test_atomic_importer_waits_for_source_publication_fence_then_commits(replay, postgres, source_table):
     """The real fixture-detail RPC must finish after the leaderboard's source lock."""
     data = payload()
     replay.discover(data)
@@ -346,7 +349,7 @@ def test_atomic_importer_waits_for_source_publication_fence_then_commits(replay,
     thread = threading.Thread(target=run_importer, daemon=True)
     try:
         with publisher.cursor() as cur:
-            cur.execute("lock table public.fixture_player_statistics in share mode nowait")
+            cur.execute(f"lock table public.{source_table} in share mode nowait")
         thread.start()
         deadline = time.monotonic() + 5
         waiting = False
@@ -364,7 +367,7 @@ def test_atomic_importer_waits_for_source_publication_fence_then_commits(replay,
         assert waiting, f"Importer did not wait on source publication lock: {outcome}"
         with observer.cursor() as cur:
             cur.execute(
-                "select count(*) from public.fixture_player_statistics where fixture_id = %s",
+                f"select count(*) from public.{source_table} where fixture_id = %s",
                 (FIXTURE,),
             )
             assert cur.fetchone() == (0,)
@@ -386,7 +389,10 @@ def test_atomic_importer_waits_for_source_publication_fence_then_commits(replay,
         )
 
 
-def test_source_publication_lock_refuses_active_atomic_importer(replay, postgres):
+@pytest.mark.parametrize("source_table", (
+    "fixture_players", "fixture_statistics", "fixture_player_statistics",
+))
+def test_source_publication_lock_refuses_active_atomic_importer(replay, postgres, source_table):
     """An in-flight importer must block the publisher's fail-fast source fence."""
     data = payload()
     replay.discover(data)
@@ -397,7 +403,7 @@ def test_source_publication_lock_refuses_active_atomic_importer(replay, postgres
     )
     assert assessment.status == "ready"
     delivery.store_provider_detail(replay.engine, replay.client, data["id"], data, assessment)
-    replay.sql("""
+    replay.sql(f"""
         create function public.wait_for_importer_probe() returns trigger
         language plpgsql as $$
         begin
@@ -406,7 +412,7 @@ def test_source_publication_lock_refuses_active_atomic_importer(replay, postgres
             return new;
         end $$;
         create trigger wait_for_importer_probe before insert
-        on public.fixture_player_statistics for each row
+        on public.{source_table} for each row
         execute function public.wait_for_importer_probe()
     """)
 
@@ -436,10 +442,10 @@ def test_source_publication_lock_refuses_active_atomic_importer(replay, postgres
                     select exists (
                         select 1 from pg_locks
                         where pid = %s and granted and mode = 'RowExclusiveLock'
-                          and relation = 'public.fixture_player_statistics'::regclass
+                          and relation = %s::regclass
                     ), wait_event_type
                     from pg_stat_activity where pid = %s
-                """, (importer_pid, importer_pid))
+                """, (importer_pid, f"public.{source_table}", importer_pid))
                 held_lock, wait_type = cur.fetchone()
                 active = held_lock and wait_type == "Lock"
             observer.commit()
@@ -449,11 +455,11 @@ def test_source_publication_lock_refuses_active_atomic_importer(replay, postgres
         assert active, f"Atomic importer did not hold the source write lock: {outcome}"
         with pytest.raises(psycopg2.errors.LockNotAvailable):
             with publisher.cursor() as cur:
-                cur.execute("lock table public.fixture_player_statistics in share mode nowait")
+                cur.execute(f"lock table public.{source_table} in share mode nowait")
         publisher.rollback()
         with observer.cursor() as cur:
             cur.execute(
-                "select count(*) from public.fixture_player_statistics where fixture_id = %s",
+                f"select count(*) from public.{source_table} where fixture_id = %s",
                 (FIXTURE,),
             )
             assert cur.fetchone() == (0,)
