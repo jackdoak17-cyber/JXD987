@@ -663,8 +663,14 @@ def stage_and_upsert(
         f"    {league_filter}\n"
         f")"
     )
-    src_cte = f"""
-{fixture_window_sql}, src as (
+    create_source_tables_sql = f"""
+create temp table odds_outcomes_scopes on commit drop as
+select distinct fixture_id, bookmaker_id, market_key
+from odds_outcomes_stage;
+create unique index on odds_outcomes_scopes (fixture_id, bookmaker_id, market_key);
+
+create temp table odds_outcomes_src on commit drop as
+{fixture_window_sql}
   -- The database uniqueness rule treats NULL lines as the -9999 sentinel.
   -- Normalize the same way here or a feed containing both NULL and -9999
   -- produces two source rows that collide during the insert.
@@ -679,8 +685,66 @@ def stage_and_upsert(
   where price_decimal is null or (price_decimal > {ODDS_MIN_PRICE} and price_decimal <= {ODDS_MAX_PRICE})
   order by fixture_id, bookmaker_id, market_key, selection_key,
            coalesce(line, -9999),
-           last_updated_at desc nulls last
+           last_updated_at desc nulls last;
+create unique index on odds_outcomes_src (
+  fixture_id, bookmaker_id, market_key, selection_key, (coalesce(line, -9999))
+);
+analyze odds_outcomes_scopes;
+analyze odds_outcomes_src;
+"""
+    src_cte = f"""
+{fixture_window_sql}, src as (
+  select * from odds_outcomes_src
 )
+"""
+    change_counts_sql = f"""{src_cte}, classified as (
+  select
+    case
+      when o.id is null then 'inserted'
+      when fw.is_settled then 'unchanged'
+      when o.price_decimal is distinct from s.price_decimal
+        or o.price_american is distinct from s.price_american then 'price_changed'
+      when o.participant_type is distinct from s.participant_type
+        or o.participant_id is distinct from s.participant_id then 'participant_changed'
+      when o.last_updated_at is distinct from s.last_updated_at then 'timestamp_only'
+      else 'unchanged'
+    end as change_kind,
+    (
+      o.id is not null
+      and not fw.is_settled
+      and (
+        o.price_decimal is distinct from s.price_decimal
+        or o.price_american is distinct from s.price_american
+        or o.participant_type is distinct from s.participant_type
+        or o.participant_id is distinct from s.participant_id
+        or o.last_updated_at is distinct from s.last_updated_at
+      )
+    ) as will_update,
+    (
+      o.id is not null
+      and not fw.is_settled
+      and (
+        o.participant_type is distinct from s.participant_type
+        or o.participant_id is distinct from s.participant_id
+      )
+    ) as participant_changed
+  from src s
+  join fixture_window fw on fw.id = s.fixture_id
+  left join public.odds_outcomes o
+    on o.fixture_id = s.fixture_id
+   and o.bookmaker_id = s.bookmaker_id
+   and o.market_key = s.market_key
+   and o.selection_key = s.selection_key
+   and coalesce(o.line, -9999) = coalesce(s.line, -9999)
+)
+select
+  count(*) filter (where change_kind = 'inserted')::bigint as inserted,
+  count(*) filter (where will_update)::bigint as updated,
+  count(*) filter (where change_kind = 'price_changed')::bigint as price_changed,
+  count(*) filter (where participant_changed)::bigint as participant_changed,
+  count(*) filter (where change_kind = 'timestamp_only')::bigint as timestamp_only,
+  count(*) filter (where change_kind = 'unchanged')::bigint as unchanged
+from classified;
 """
     upsert_sql = f"""{src_cte}
 insert into public.odds_outcomes as o (
@@ -700,9 +764,9 @@ on conflict (
 ) do update set
   price_decimal = excluded.price_decimal,
   price_american = excluded.price_american,
-  participant_type = coalesce(excluded.participant_type, o.participant_type),
-  participant_id = coalesce(excluded.participant_id, o.participant_id),
-  last_updated_at = coalesce(excluded.last_updated_at, o.last_updated_at)
+  participant_type = excluded.participant_type,
+  participant_id = excluded.participant_id,
+  last_updated_at = excluded.last_updated_at
 where
   not exists (
     select 1 from fixture_window fw
@@ -711,55 +775,13 @@ where
   and (
     o.price_decimal is distinct from excluded.price_decimal
   or o.price_american is distinct from excluded.price_american
-  or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
-  or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
-  or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at)
+  or o.participant_type is distinct from excluded.participant_type
+  or o.participant_id is distinct from excluded.participant_id
+  or o.last_updated_at is distinct from excluded.last_updated_at
   );
 """
     src_count_sql = f"""{src_cte}
-select count(*)::bigint from src;
-"""
-    upsert_counts_sql = f"""{src_cte},
-upserted as (
-  insert into public.odds_outcomes as o (
-    fixture_id, bookmaker_id, market_key, selection_key, line,
-    price_decimal, price_american, participant_type, participant_id, last_updated_at
-  )
-  select
-    fixture_id, bookmaker_id, market_key, selection_key, line,
-    price_decimal, price_american, participant_type, participant_id, last_updated_at
-  from src
-  on conflict (
-    fixture_id,
-    bookmaker_id,
-    market_key,
-    selection_key,
-    (coalesce(line, -9999))
-  ) do update set
-    price_decimal = excluded.price_decimal,
-    price_american = excluded.price_american,
-    participant_type = coalesce(excluded.participant_type, o.participant_type),
-    participant_id = coalesce(excluded.participant_id, o.participant_id),
-    last_updated_at = coalesce(excluded.last_updated_at, o.last_updated_at)
-  where
-    not exists (
-      select 1 from fixture_window fw
-      where fw.id = o.fixture_id and fw.is_settled
-    )
-    and (
-      o.price_decimal is distinct from excluded.price_decimal
-    or o.price_american is distinct from excluded.price_american
-    or o.participant_type is distinct from coalesce(excluded.participant_type, o.participant_type)
-    or o.participant_id is distinct from coalesce(excluded.participant_id, o.participant_id)
-    or o.last_updated_at is distinct from coalesce(excluded.last_updated_at, o.last_updated_at)
-    )
-  returning (xmax = 0) as inserted
-)
-select
-  count(*)::bigint as upserted_total,
-  coalesce(sum(case when inserted then 1 else 0 end), 0)::bigint as inserted,
-  coalesce(sum(case when not inserted then 1 else 0 end), 0)::bigint as updated
-from upserted;
+select 'src_count', count(*)::bigint from src;
 """
     match_delete_sql = f"""
 {fixture_window_sql},
@@ -1047,15 +1069,21 @@ select 'deleted_missing_markets', count(*)::bigint from deleted;
     deleted_existing_sql = f"""
 {fixture_window_sql}, deleted as (
   delete from public.odds_outcomes o
-  using (
-    select distinct fixture_id, bookmaker_id, market_key
-    from odds_outcomes_stage
-  ) s
+  using odds_outcomes_scopes s
   join fixture_window fw on fw.id = s.fixture_id
   where o.fixture_id = s.fixture_id
     and o.bookmaker_id = s.bookmaker_id
     and o.market_key = s.market_key
     and not fw.is_settled
+    and not exists (
+      select 1
+      from odds_outcomes_src src
+      where src.fixture_id = o.fixture_id
+        and src.bookmaker_id = o.bookmaker_id
+        and src.market_key = o.market_key
+        and src.selection_key = o.selection_key
+        and coalesce(src.line, -9999) = coalesce(o.line, -9999)
+    )
   returning 1
 )
 select 'deleted_existing', count(*)::bigint from deleted;
@@ -1070,13 +1098,19 @@ select 'deleted_existing', count(*)::bigint from deleted;
     if use_advisory_lock:
         sql_lines.append(f"select pg_advisory_xact_lock({advisory_lock_key});")
     sql_lines += [
-        "create temp table odds_outcomes_stage",
-        "  (like public.odds_outcomes including defaults) on commit drop;",
+        "create temp table odds_outcomes_stage on commit drop as",
+        f"  select {cols_sql} from public.odds_outcomes with no data;",
         copy_line,
+        "",
+        create_source_tables_sql,
         "",
         "select 'stage_count', count(*)::bigint from odds_outcomes_stage;",
         "",
         deleted_existing_sql,
+        "",
+        src_count_sql,
+        "",
+        change_counts_sql,
         "",
     ]
     if missing_markets_sql:
@@ -1105,6 +1139,10 @@ select 'deleted_existing', count(*)::bigint from deleted;
             "upserted_total": 0,
             "inserted": 0,
             "updated": 0,
+            "price_changed": 0,
+            "participant_changed": 0,
+            "timestamp_only": 0,
+            "unchanged": 0,
         }
         conn = psycopg2.connect(db_url)
         try:
@@ -1116,8 +1154,8 @@ select 'deleted_existing', count(*)::bigint from deleted;
             if use_advisory_lock:
                 cur.execute(f"select pg_advisory_xact_lock({advisory_lock_key});")
             cur.execute(
-                "create temp table odds_outcomes_stage "
-                "(like public.odds_outcomes including defaults) on commit drop;"
+                "create temp table odds_outcomes_stage on commit drop as "
+                f"select {cols_sql} from public.odds_outcomes with no data;"
             )
             copy_sql = (
                 f"COPY odds_outcomes_stage ({cols_sql}) "
@@ -1125,6 +1163,7 @@ select 'deleted_existing', count(*)::bigint from deleted;
             )
             with csv_path.open("r", encoding="utf-8") as f:
                 cur.copy_expert(copy_sql, f)
+            cur.execute(create_source_tables_sql)
             cur.execute("select count(*)::bigint from odds_outcomes_stage;")
             row = cur.fetchone()
             if row:
@@ -1132,22 +1171,27 @@ select 'deleted_existing', count(*)::bigint from deleted;
             cur.execute(deleted_existing_sql)
             row = cur.fetchone()
             if row:
-                counts["deleted_existing"] = int(row[0])
+                counts["deleted_existing"] = int(row[-1])
             if missing_markets_sql:
                 cur.execute(missing_markets_sql)
                 row = cur.fetchone()
                 if row:
                     counts["deleted_missing_markets"] = int(row[-1])
+            cur.execute(change_counts_sql)
+            row = cur.fetchone()
+            if row and len(row) >= 6:
+                counts["inserted"] = int(row[0])
+                counts["updated"] = int(row[1])
+                counts["price_changed"] = int(row[2])
+                counts["participant_changed"] = int(row[3])
+                counts["timestamp_only"] = int(row[4])
+                counts["unchanged"] = int(row[5])
             cur.execute(src_count_sql)
             row = cur.fetchone()
             if row:
-                counts["src_count"] = int(row[0])
-            cur.execute(upsert_counts_sql)
-            row = cur.fetchone()
-            if row and len(row) >= 3:
-                counts["upserted_total"] = int(row[0])
-                counts["inserted"] = int(row[1])
-                counts["updated"] = int(row[2])
+                counts["src_count"] = int(row[-1])
+            cur.execute(upsert_sql)
+            counts["upserted_total"] = counts["inserted"] + counts["updated"]
             cur.execute(match_delete_sql)
             cur.execute(match_update_sql)
             cur.execute(team_delete_sql)
@@ -1162,7 +1206,6 @@ select 'deleted_existing', count(*)::bigint from deleted;
 
     if not shutil.which("psql"):
         counts = stage_and_upsert_psycopg()
-        counts["unchanged"] = max(0, counts["src_count"] - counts["upserted_total"])
         return counts
 
     sql = "\n".join(sql_lines)
@@ -1233,13 +1276,21 @@ select 'deleted_existing', count(*)::bigint from deleted;
         "upserted_total": 0,
         "inserted": 0,
         "updated": 0,
+        "price_changed": 0,
+        "participant_changed": 0,
+        "timestamp_only": 0,
+        "unchanged": 0,
     }
     for line in output.splitlines():
         parts = line.split("\t")
-        if len(parts) >= 3 and all(part.strip().isdigit() for part in parts[:3]):
-            counts["upserted_total"] = int(parts[0])
-            counts["inserted"] = int(parts[1])
-            counts["updated"] = int(parts[2])
+        if len(parts) >= 6 and all(part.strip().isdigit() for part in parts[:6]):
+            counts["inserted"] = int(parts[0])
+            counts["updated"] = int(parts[1])
+            counts["price_changed"] = int(parts[2])
+            counts["participant_changed"] = int(parts[3])
+            counts["timestamp_only"] = int(parts[4])
+            counts["unchanged"] = int(parts[5])
+            counts["upserted_total"] = counts["inserted"] + counts["updated"]
             continue
         if len(parts) >= 2 and parts[0] in counts:
             try:
@@ -1248,7 +1299,6 @@ select 'deleted_existing', count(*)::bigint from deleted;
                 counts[parts[0]] = 0
     if counts["src_count"] == 0 and counts["stage_count"] > 0:
         counts["src_count"] = counts["stage_count"]
-    counts["unchanged"] = max(0, counts["src_count"] - counts["upserted_total"])
     return counts
 
 
@@ -1848,6 +1898,9 @@ def main() -> None:
         "upserted_total": 0,
         "inserted": 0,
         "updated": 0,
+        "price_changed": 0,
+        "participant_changed": 0,
+        "timestamp_only": 0,
         "unchanged": 0,
     }
     ingest_ok = True
@@ -1855,7 +1908,6 @@ def main() -> None:
     error_message: Optional[str] = None
     psql_err_tail = ""
     psql_out_tail = ""
-
     try:
         counts = stage_and_upsert(
             DB_URL,
@@ -1878,7 +1930,7 @@ def main() -> None:
     except Exception as exc:
         ingest_ok = False
         error_stage = "stage_upsert"
-        error_message = str(exc)
+        error_message = re.sub(r"postgres(?:ql)?://[^\s\"\']+", "[redacted database URL]", str(exc))
         psql_err_tail = tail_text(err_path)
         psql_out_tail = tail_text(out_path)
         print(f"Stage upsert failed: {error_message}", flush=True)
@@ -2088,6 +2140,9 @@ def main() -> None:
         "rows_inserted": counts.get("inserted", 0),
         "updated_rows": counts.get("updated", 0),
         "rows_updated": counts.get("updated", 0),
+        "price_changed_rows": counts.get("price_changed", 0),
+        "participant_changed_rows": counts.get("participant_changed", 0),
+        "timestamp_only_changed_rows": counts.get("timestamp_only", 0),
         "unchanged_rows": counts.get("unchanged", 0),
         "rows_unchanged_skipped": counts.get("unchanged", 0),
         "partial_run": partial_run,

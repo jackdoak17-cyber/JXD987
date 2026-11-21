@@ -20,6 +20,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/sync.py" \
   "scripts/sync_odds.py" \
   "scripts/odds_quote_verification.py" \
+  "scripts/p3_stage_evidence_freshness.py" \
   "scripts/validate_odds_api_market_catalog.py" \
   "scripts/export_odds_to_supabase_psql.py" \
   "scripts/odds_retention_psql.py" \
@@ -152,6 +153,19 @@ for stage_path in "${HISTORY_STAGE}" "${P3_STAGE}"; do
     fi
   fi
 done
+# The stage transport permits up to eight hours of reuse, while the moneyline
+# guard accepts provider evidence for six hours by default. Reserve the full
+# remaining pipeline deadline so an interrupted publish cannot replay evidence
+# that will expire during export or validation.
+if [[ "${stage_invalid}" -eq 0 && -f "${P3_REPORT}" ]]; then
+  if ! python scripts/p3_stage_evidence_freshness.py \
+    --report "${P3_REPORT}" \
+    --max-age-hours "${MONEYLINE_PROVIDER_REPORT_MAX_AGE_HOURS:-6}" \
+    --remaining-runtime-seconds "${ODDS_P3_PIPELINE_MAX_DURATION_SECONDS}" \
+    --safety-seconds 60; then
+    stage_invalid=1
+  fi
+fi
 if [[ "${stage_invalid}" -ne 0 ]]; then
   log_info "discarding invalid or expired P3 stages before provider fetch"
   rm -f "${HISTORY_STAGE}" "${P3_STAGE}" "${HISTORY_STAGE}.sha256" "${P3_STAGE}.sha256"
