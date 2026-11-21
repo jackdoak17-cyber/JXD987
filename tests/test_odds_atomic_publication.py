@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import os
 import subprocess
+import socket
 import sys
 import tempfile
 import unittest
@@ -44,6 +45,18 @@ class AtomicOddsPublicationTests(unittest.TestCase):
             quotes.archive_claimed(claims, spool)
             self.assertTrue((spool / "processed" / "p2.json").exists())
             self.assertFalse((pending / "p2.json").exists())
+
+    def test_dead_local_claim_is_recovered_without_waiting_thirty_minutes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            spool = Path(directory)
+            pending = spool / "pending"
+            pending.mkdir()
+            dead = pending / f".p2.json.processing-{socket.gethostname()}-999999999"
+            dead.write_text("evidence", encoding="utf-8")
+            claims = quotes.claim_pending(spool)
+            self.assertEqual([original.name for original, _claimed in claims], ["p2.json"])
+            quotes.restore_claimed(claims)
+            self.assertTrue((pending / "p2.json").exists())
 
     def test_monotonic_match_without_exact_ledger_is_rejected(self) -> None:
         document = {"run_id": "observed-run-1001", "quotes": [{"fixture_id": 1001}]}

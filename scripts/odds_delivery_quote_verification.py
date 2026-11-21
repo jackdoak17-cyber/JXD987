@@ -217,7 +217,18 @@ def claim_pending(spool_dir: Path) -> List[tuple[Path, Path]]:
     processed.mkdir(parents=True, exist_ok=True)
     stale_claim_cutoff = utc_now() - timedelta(minutes=30)
     for claimed in pending.glob(".*.processing-*"):
-        if datetime.fromtimestamp(claimed.stat().st_mtime, timezone.utc) >= stale_claim_cutoff:
+        age_expired = datetime.fromtimestamp(claimed.stat().st_mtime, timezone.utc) < stale_claim_cutoff
+        owner_dead = False
+        suffix = claimed.name.rsplit(".processing-", 1)[-1]
+        host, separator, raw_pid = suffix.rpartition("-")
+        if separator and host == socket.gethostname() and raw_pid.isdecimal():
+            try:
+                os.kill(int(raw_pid), 0)
+            except ProcessLookupError:
+                owner_dead = True
+            except PermissionError:
+                pass
+        if not age_expired and not owner_dead:
             continue
         original_name = claimed.name[1:].split(".processing-", 1)[0]
         original = pending / original_name
