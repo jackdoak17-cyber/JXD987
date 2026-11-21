@@ -614,8 +614,10 @@ def publication_skip_reason(
         if candidate_source_at < existing_source_at:
             return "newer_current_source"
 
-    if candidate_pin_expires_at < pin:
-        return "would_shorten_current_pin"
+    # This is a retention deadline, potentially extended by certification
+    # readers. Publishing a new release leaves the old release and its leases
+    # intact; a verified no-op also retains the longer pin via greatest().
+    # Compare source provenance above, not independent retention deadlines.
 
     # The fallback's one-hour throttle is safe only when the current release
     # has the same minimum runway verified by the workflow after publication.
