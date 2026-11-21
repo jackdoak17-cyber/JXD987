@@ -34,7 +34,7 @@ bc359de6b970dac768e32bf2f70dc8b71c9b39d5  scripts/vps/common.sh
 71d0234c94ecdbe2f662f0c779173f24c5e1e0f5  scripts/vps/run_p1.sh
 51e18c3fe2aea9073cd2c75b5a2c9215bb82a081  scripts/vps/run_p2.sh
 bb5c7ff333d58cf10057d5f9d1e4d4d744bef61f  scripts/vps/run_p3.sh
-f374e3ad21ed53498ca9d7f35dfc82da6c58b807  scripts/vps/run_odds_p3.sh
+3561a4a5550530189d7b9c54121bec793ededcc8  scripts/vps/run_odds_p3.sh
 e7b729188187ebf0076c3257ad781bd4aa46b87c  scripts/vps/run_p3_fixture_core.sh
 649d9378314774bec9e570e7a9303de2c230eeb2  scripts/vps/run_postmatch_settlement.sh
 c4b76b52642c66576372a64093b928f035a6e5ae  scripts/vps/run_models.sh
