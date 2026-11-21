@@ -132,6 +132,9 @@ class AtomicOddsPublication:
             )
 
     def _assert_prior_usable_remains_exact(self) -> None:
+        # A deliberately removed/rebound participant key is an absence, not a
+        # surviving price. For a surviving player/team identity, require fresh
+        # exact evidence before changing the price or source timestamp.
         with self.connection.cursor() as cur:
             cur.execute(
                 """
@@ -143,6 +146,8 @@ class AtomicOddsPublication:
                    and o.market_key = p.market_key
                    and o.selection_key = p.selection_key
                    and coalesce(o.line, -9999::numeric) = p.line_key
+                   and coalesce(o.participant_type, 'team') = p.participant_type
+                   and coalesce(o.participant_id, 0) = p.participant_id
                   left join public.odds_quote_verifications v
                     on v.fixture_id = o.fixture_id
                    and v.bookmaker_id = o.bookmaker_id
@@ -217,6 +222,13 @@ class AtomicOddsPublication:
         if self.mode == "p3":
             self._validate_p3_moneyline()
         self.release_report = reconcile(self.connection, commit=False)
+        # The reconciler narrows its own statements to 60 s. Restore the
+        # exporter's existing bound for the quote RPC and final identity read.
+        with self.connection.cursor() as cur:
+            cur.execute(
+                "select set_config('statement_timeout', %s, true)",
+                (os.environ.get("ODDS_STATEMENT_TIMEOUT", "180000") + "ms",),
+            )
         self.quote_report = record_claimed(self.connection, self.prepared)
         self._assert_prior_usable_remains_exact()
 

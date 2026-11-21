@@ -266,6 +266,46 @@ class AtomicOddsPostgresTests(unittest.TestCase):
         self.assertEqual(self.identities(), ("2.0", "2.0", "2.0"))
         self.assertTrue((self.spool / "pending" / "p2-test.json").exists())
 
+    def test_other_player_same_fixture_line_does_not_poison_identity_check(self) -> None:
+        """Exercise the defensive participant join even beyond today's raw key."""
+        context = AtomicOddsPublication(
+            "delivery", self.url, self.sqlite_db, [384], self.spool,
+        )
+        try:
+            with context.connection.cursor() as cur:
+                # The current raw index also prevents this duplicate key. Drop
+                # it only inside this transaction to test the invariant if a
+                # future source schema permits participant-aware raw keys.
+                cur.execute("drop index public.odds_outcomes_identity")
+                cur.execute("""
+                    create temp table odds_pre_usable(
+                      fixture_id bigint, bookmaker_id int, market_key text,
+                      selection_key text, line_key numeric, price_decimal numeric,
+                      last_updated_at timestamptz, starting_at timestamp,
+                      participant_type text, participant_id bigint
+                    ) on commit drop
+                """)
+                cur.execute("""
+                    insert into odds_pre_usable values
+                    (1001,2,'player_shots','over',4.5,2.0,%s,
+                     now()+interval '12 hours','player',101)
+                """, (SOURCE_OLD,))
+                for player_id, price in ((101, 3.0), (202, 9.0)):
+                    cur.execute("""
+                        insert into public.odds_outcomes(
+                          fixture_id,bookmaker_id,market_key,selection_key,line,
+                          price_decimal,price_american,participant_type,
+                          participant_id,last_updated_at
+                        ) values(1001,2,'player_shots','over',4.5,%s,200,'player',%s,%s)
+                    """, (price, player_id, SOURCE_NEW))
+                cur.execute("""
+                    insert into public.odds_quote_verifications values
+                    (1001,2,'player_shots','over','player',101,4.5,3.0,%s,now(),'new-run-101')
+                """, (SOURCE_NEW,))
+            context._assert_prior_usable_remains_exact()
+        finally:
+            context.close()  # Rollback restores the production-shaped index.
+
     def test_success_publishes_all_three_then_archives(self) -> None:
         self.observation()
         self.publish()
