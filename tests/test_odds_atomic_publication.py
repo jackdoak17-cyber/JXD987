@@ -12,11 +12,19 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from scripts import export_odds_to_supabase_psql as exporter
 from scripts import odds_delivery_quote_verification as quotes
 from scripts.odds_atomic_publication import AtomicOddsPublication
 
 
 class AtomicOddsPublicationTests(unittest.TestCase):
+    def test_direct_export_cli_fails_before_opening_any_source(self) -> None:
+        with patch.dict(os.environ, {"ODDS_ATOMIC_PUBLISH_MODE": ""}), patch.object(
+            sys, "argv", ["export_odds_to_supabase_psql.py"]
+        ):
+            with self.assertRaisesRegex(SystemExit, "requires ODDS_ATOMIC_PUBLISH_MODE"):
+                exporter.main()
+
     def test_pending_files_restore_after_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             spool = Path(directory)

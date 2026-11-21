@@ -115,15 +115,15 @@ class AtomicOddsPublication:
                    and v.line_key = coalesce(o.line, -9999::numeric)
                    and v.price_decimal = o.price_decimal
                    and v.source_last_updated_at is not distinct from o.last_updated_at
-                 where f.starting_at > (now() at time zone 'utc')
+                 where f.starting_at > (statement_timestamp() at time zone 'utc')
                    and o.market_key = any(%s)
                    and o.price_decimal > 1 and o.price_decimal <= 500
-                   and v.last_verified_at <= now() + interval '2 minutes'
-                   and v.last_verified_at >= now() -
+                   and v.last_verified_at <= statement_timestamp() + interval '2 minutes'
+                   and v.last_verified_at >= statement_timestamp() -
                      case
-                       when f.starting_at <= (now() at time zone 'utc') + interval '2 hours'
+                       when f.starting_at <= (statement_timestamp() at time zone 'utc') + interval '2 hours'
                          then interval '2 hours'
-                       when f.starting_at <= (now() at time zone 'utc') + interval '1 day'
+                       when f.starting_at <= (statement_timestamp() at time zone 'utc') + interval '1 day'
                          then interval '3 hours'
                        else interval '8 hours'
                      end
@@ -164,12 +164,12 @@ class AtomicOddsPublication:
                      v.fixture_id is null
                      or v.price_decimal is distinct from o.price_decimal
                      or v.source_last_updated_at is distinct from o.last_updated_at
-                     or v.last_verified_at > now() + interval '2 minutes'
-                     or v.last_verified_at < now() -
+                     or v.last_verified_at > statement_timestamp() + interval '2 minutes'
+                     or v.last_verified_at < statement_timestamp() -
                        case
-                         when p.starting_at <= (now() at time zone 'utc') + interval '2 hours'
+                         when p.starting_at <= (statement_timestamp() at time zone 'utc') + interval '2 hours'
                            then interval '2 hours'
-                         when p.starting_at <= (now() at time zone 'utc') + interval '1 day'
+                         when p.starting_at <= (statement_timestamp() at time zone 'utc') + interval '1 day'
                            then interval '3 hours'
                          else interval '8 hours'
                        end

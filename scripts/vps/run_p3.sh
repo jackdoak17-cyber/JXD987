@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Retired odds publisher: this chain exports canonical prices without the
+# matching quote-observation spool and cannot satisfy atomic publication.
+echo "run_p3.sh is retired for odds publication; use the installed run_odds_p3.sh pipeline" >&2
+exit 2
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"

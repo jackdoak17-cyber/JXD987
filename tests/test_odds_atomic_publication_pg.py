@@ -266,6 +266,49 @@ class AtomicOddsPostgresTests(unittest.TestCase):
         self.assertEqual(self.identities(), ("2.0", "2.0", "2.0"))
         self.assertTrue((self.spool / "pending" / "p2-test.json").exists())
 
+    def test_snapshot_freshness_uses_statement_time_after_transaction_ages(self) -> None:
+        context = AtomicOddsPublication("delivery", self.url, self.sqlite_db, [384], self.spool)
+        try:
+            with context.connection.cursor() as cur:
+                cur.execute("update public.fixtures set starting_at=clock_timestamp()+interval '1 hour' where id=1001")
+                cur.execute("""
+                    update public.odds_quote_verifications
+                       set last_verified_at=clock_timestamp()-interval '2 hours'+interval '200 milliseconds'
+                     where fixture_id=1001
+                """)
+                cur.execute("select pg_sleep(0.4)")
+            context.capture_pre_usable()
+            with context.connection.cursor() as cur:
+                cur.execute("select count(*) from odds_pre_usable")
+                self.assertEqual(cur.fetchone()[0], 0)
+        finally:
+            context.close()
+
+    def test_final_freshness_uses_statement_time_after_transaction_ages(self) -> None:
+        context = AtomicOddsPublication("delivery", self.url, self.sqlite_db, [384], self.spool)
+        try:
+            with context.connection.cursor() as cur:
+                cur.execute("update public.fixtures set starting_at=clock_timestamp()+interval '1 hour' where id=1001")
+            context.capture_pre_usable()
+            with context.connection.cursor() as cur:
+                cur.execute("select count(*) from odds_pre_usable")
+                self.assertEqual(cur.fetchone()[0], 1)
+                cur.execute("""
+                    update public.odds_outcomes
+                       set price_decimal=2.5, last_updated_at=%s where fixture_id=1001
+                """, (SOURCE_NEW,))
+                cur.execute("""
+                    update public.odds_quote_verifications
+                       set price_decimal=2.5, source_last_updated_at=%s,
+                           last_verified_at=clock_timestamp()-interval '2 hours'+interval '200 milliseconds'
+                     where fixture_id=1001
+                """, (SOURCE_NEW,))
+                cur.execute("select pg_sleep(0.4)")
+            with self.assertRaisesRegex(RuntimeError, "without fresh exact evidence"):
+                context._assert_prior_usable_remains_exact()
+        finally:
+            context.close()
+
     def test_other_player_same_fixture_line_does_not_poison_identity_check(self) -> None:
         """Exercise the defensive participant join even beyond today's raw key."""
         context = AtomicOddsPublication(

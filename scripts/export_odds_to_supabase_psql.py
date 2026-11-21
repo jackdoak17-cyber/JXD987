@@ -1575,6 +1575,17 @@ def main() -> None:
     parser.set_defaults(include_fixture_leagues=True)
     args = parser.parse_args()
 
+    # Every supported production publisher must hold the installed writer
+    # admission and supply the matching quote/release transaction callback.
+    # A direct CLI call without a mode used to expose canonical prices before
+    # their exact verification and readable release were committed.
+    atomic_mode = os.environ.get("ODDS_ATOMIC_PUBLISH_MODE", "").strip()
+    if atomic_mode not in {"p3", "delivery"}:
+        raise SystemExit(
+            "odds export requires ODDS_ATOMIC_PUBLISH_MODE=p3 or delivery "
+            "under the corresponding installed locked runner"
+        )
+
     if not DB_URL:
         raise SystemExit("Missing SUPABASE_DB_URL")
     if not os.path.exists(args.db):
@@ -1917,7 +1928,6 @@ def main() -> None:
     error_message: Optional[str] = None
     psql_err_tail = ""
     psql_out_tail = ""
-    atomic_mode = os.environ.get("ODDS_ATOMIC_PUBLISH_MODE", "").strip()
     atomic_context = None
     try:
         if atomic_mode:

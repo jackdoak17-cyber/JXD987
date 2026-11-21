@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Retired odds publisher: the per-league export lacks the shared release and
+# exact quote-observation transaction required by the installed pipelines.
+echo "run_sync.sh is retired for odds publication; use the installed run_odds_p3.sh or run_odds_delivery.sh pipeline" >&2
+exit 2
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=./common.sh
 source "${SCRIPT_DIR}/common.sh"
