@@ -237,10 +237,10 @@ python scripts/validate_moneyline_coverage.py \
   --out-json "/tmp/moneyline_coverage_report_p3.json" \
   --out-md "/tmp/moneyline_coverage_report_p3.md"
 
-# Consume evidence after canonical publication and validation. A writer outage
-# cannot bypass coverage checks; the pending spool remains retryable.
-python scripts/odds_quote_verification.py record \
-  --spool-dir "${VERIFICATION_SPOOL_DIR}"
+# Keep provider observations pending until website odds delivery has reconciled
+# the published fixture release. Its verifier consumes the spool after that
+# reconciliation, so a new observation cannot replace the identity of a price
+# that customers are still seeing from the previous release.
 
 # Only discard resumable stages after publication and validation both succeed.
 rm -f "${HISTORY_STAGE}" "${P3_STAGE}" "${HISTORY_STAGE}.sha256" "${P3_STAGE}.sha256"
