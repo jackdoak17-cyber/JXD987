@@ -79,6 +79,13 @@ class FixtureSettlementContractTests(unittest.TestCase):
         self.assertNotIn("--refresh-history", source)
         self.assertNotIn("refresh_fixture_delivery.py", source)
 
+    def test_odds_p3_leaves_observations_for_published_release_reconciliation(self) -> None:
+        source = (ROOT / "scripts/vps/run_odds_p3.sh").read_text(encoding="utf-8")
+        self.assertIn('--verification-out "${VERIFICATION_SPOOL_DIR}/pending/p3-', source)
+        self.assertIn('validate_moneyline_coverage.py', source)
+        self.assertNotIn('python scripts/odds_quote_verification.py record', source)
+        self.assertIn('rm -f "${HISTORY_STAGE}" "${P3_STAGE}"', source)
+
     def test_odds_wrappers_record_pipeline_heartbeats(self) -> None:
         for wrapper_name, job_id, job_name in (
             ("run_p1.sh", "run_p1", "P1 odds fetch"),
