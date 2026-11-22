@@ -2142,6 +2142,7 @@ def main() -> None:
         "publication_committed": (
             atomic_context.committed if atomic_context is not None else ingest_ok
         ),
+        "total_rows": total_rows,
         "atomic_publish_mode": atomic_mode or None,
         "atomic_quote_verification": (
             atomic_context.quote_report if atomic_context is not None else None
