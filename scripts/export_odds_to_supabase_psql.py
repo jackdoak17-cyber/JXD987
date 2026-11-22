@@ -2155,6 +2155,7 @@ def main() -> None:
         ),
         "total_rows": total_rows,
         "atomic_publish_mode": atomic_mode or None,
+        "atomic_pool_mode": getattr(atomic_context, "pool_mode", None),
         "atomic_quote_verification": (
             atomic_context.quote_report if atomic_context is not None else None
         ),
