@@ -12,6 +12,8 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +41,34 @@ def moneyline_module():
     return validate_moneyline_coverage
 
 
+class PublicationPhaseTrace:
+    """Record bounded phase evidence without SQL text, parameters or credentials."""
+
+    def __init__(self) -> None:
+        self.timings: list[dict[str, Any]] = []
+        self.failed_phase: str | None = None
+
+    @contextmanager
+    def step(self, name: str):
+        started = time.monotonic()
+        status = "ok"
+        try:
+            yield
+        except BaseException:
+            status = "failed"
+            self.failed_phase = name
+            raise
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+            self.timings.append({"phase": name, "status": status, "elapsed_ms": elapsed_ms})
+            try:
+                print(f"Odds publication phase {name}: {status} in {elapsed_ms}ms", flush=True)
+            except OSError:
+                # A closed log pipe must not mask a database error or turn a
+                # committed transaction into an apparent publication failure.
+                pass
+
+
 class AtomicOddsPublication:
     def __init__(
         self, mode: str, db_url: str, sqlite_db: Path, league_ids: list[int],
@@ -57,6 +87,10 @@ class AtomicOddsPublication:
         self.moneyline_report: dict[str, Any] | None = None
         self.release_report: dict[str, Any] | None = None
         self.quote_report: dict[str, int] | None = None
+        self.phase_trace = PublicationPhaseTrace()
+
+    def phase_step(self, name: str):
+        return self.phase_trace.step(name)
 
     def prepare(self) -> None:
         """Acquire odds after writer admission, then freeze current evidence."""
@@ -220,17 +254,22 @@ class AtomicOddsPublication:
 
     def before_commit(self) -> None:
         if self.mode == "p3":
-            self._validate_p3_moneyline()
-        self.release_report = reconcile(self.connection, commit=False)
+            with self.phase_step("moneyline_validation"):
+                self._validate_p3_moneyline()
+        with self.phase_step("release_reconcile"):
+            self.release_report = reconcile(self.connection, commit=False)
         # The reconciler narrows its own statements to 60 s. Restore the
         # exporter's existing bound for the quote RPC and final identity read.
-        with self.connection.cursor() as cur:
-            cur.execute(
-                "select set_config('statement_timeout', %s, true)",
-                (os.environ.get("ODDS_STATEMENT_TIMEOUT", "180000") + "ms",),
-            )
-        self.quote_report = record_claimed(self.connection, self.prepared)
-        self._assert_prior_usable_remains_exact()
+        with self.phase_step("restore_statement_timeout"):
+            with self.connection.cursor() as cur:
+                cur.execute(
+                    "select set_config('statement_timeout', %s, true)",
+                    (os.environ.get("ODDS_STATEMENT_TIMEOUT", "180000") + "ms",),
+                )
+        with self.phase_step("quote_record"):
+            self.quote_report = record_claimed(self.connection, self.prepared)
+        with self.phase_step("prior_usable_assert"):
+            self._assert_prior_usable_remains_exact()
 
     def mark_committed(self) -> None:
         self.committed = True
