@@ -20,6 +20,10 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/sync.py" \
   "scripts/sync_odds.py" \
   "scripts/odds_quote_verification.py" \
+  "scripts/odds_delivery_quote_verification.py" \
+  "scripts/odds_atomic_publication.py" \
+  "scripts/reconcile_fixture_delivery_odds.py" \
+  "scripts/validate_moneyline_coverage.py" \
   "scripts/p3_stage_evidence_freshness.py" \
   "scripts/validate_odds_api_market_catalog.py" \
   "scripts/export_odds_to_supabase_psql.py" \
@@ -85,10 +89,10 @@ if ! [[ "${ODDS_P3_STAGE_MAX_AGE_MINUTES}" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
-# Provider fetch/parsing and Supabase publication do not need the shared SQLite
-# writer lock. They run under a dedicated P3 overlap lock. Only the complete,
-# validated mutation bundles are applied under the settlement-aware writer
-# lease, so a normal handoff never repeats an eight-minute provider fetch.
+# Provider fetch/parsing runs under the dedicated P3 overlap lock. Stage apply
+# and atomic publication each use the settlement-aware writer admission; the
+# publisher releases that writer flock after preparing a stable SQLite CSV and
+# acquiring its database transaction lock. A handoff reuses the saved stages.
 export ODDS_SYNC_LOCK_RETRY_ATTEMPTS="${ODDS_SYNC_LOCK_RETRY_ATTEMPTS:-${ODDS_P3_LOCK_RETRY_ATTEMPTS:-60}}"
 export ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS="${ODDS_SYNC_LOCK_RETRY_DELAY_SECONDS:-${ODDS_P3_LOCK_RETRY_DELAY_SECONDS:-15}}"
 export ODDS_SYNC_P3_MAX_DURATION_SECONDS="${ODDS_P3_APPLY_MAX_RUNTIME_SECONDS:-300}"
@@ -102,20 +106,6 @@ fi
 
 CHAIN_COMMAND=$(cat <<'CHAIN'
 set -euo pipefail
-
-build_moneyline_provider_report_args() {
-  local primary_report="$1"
-  MONEYLINE_PROVIDER_REPORT_ARGS=(--provider-report "${primary_report}")
-  # The coverage window spans the P1/P2/P3 lanes. Include the freshest evidence
-  # from the other lanes so a P3 validation cannot misclassify an imminent
-  # fixture simply because it is owned by P2 or P1.
-  local report_path
-  for report_path in /tmp/odds_sync_report_p2.json /tmp/odds_sync_report_p1.json; do
-    if [[ -f "${report_path}" ]]; then
-      MONEYLINE_PROVIDER_REPORT_ARGS+=(--provider-report "${report_path}")
-    fi
-  done
-}
 
 cd "${REPO_ROOT}"
 source .venv/bin/activate
@@ -206,7 +196,7 @@ APPLY_COMMAND=$(printf \
 run_with_global_lock_and_retry "${APPLY_COMMAND}"
 
 export ODDS_SYNC_REPORT_PATH="${P3_REPORT}"
-python scripts/export_odds_to_supabase_psql.py \
+PUBLISH_ARGS=(python scripts/export_odds_to_supabase_psql.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_EXPORT_DAYS_BACK}" \
   --days-forward "${DAYS_FORWARD}" \
@@ -218,8 +208,12 @@ python scripts/export_odds_to_supabase_psql.py \
   --max-runtime-minutes "${INGEST_MAX_RUNTIME_MINUTES}" \
   --report-out "/tmp/odds_ingest_report_p3.json" \
   --skip-retention \
-  --skip-retention-snapshots \
-  ${COVERAGE_ARGS}
+  --skip-retention-snapshots)
+if [[ -n "${COVERAGE_ARGS}" ]]; then
+  PUBLISH_ARGS+=(--skip-coverage --skip-verification)
+fi
+printf -v PUBLISH_COMMAND '%q ' "${PUBLISH_ARGS[@]}"
+run_with_global_lock_and_retry "ODDS_ATOMIC_PUBLISH_MODE=p3 ${PUBLISH_COMMAND}"
 
 python scripts/odds_retention_psql.py \
   --days-back "${RETENTION_DAYS_BACK}" \
@@ -228,19 +222,8 @@ python scripts/odds_retention_psql.py \
   --snapshot-days "${RETENTION_SNAPSHOT_DAYS}" \
   --report-out "/tmp/odds_retention_report_p3.json"
 
-build_moneyline_provider_report_args "${P3_REPORT}"
-python scripts/validate_moneyline_coverage.py \
-  --leagues "${ODDS_LEAGUES}" \
-  --days-forward "${MONEYLINE_COVERAGE_DAYS_FORWARD}" \
-  --fail-below-pct "${MONEYLINE_COVERAGE_MIN_PCT}" \
-  "${MONEYLINE_PROVIDER_REPORT_ARGS[@]}" \
-  --out-json "/tmp/moneyline_coverage_report_p3.json" \
-  --out-md "/tmp/moneyline_coverage_report_p3.md"
-
-# Keep provider observations pending until website odds delivery has reconciled
-# the published fixture release. Its verifier consumes the spool after that
-# reconciliation, so a new observation cannot replace the identity of a price
-# that customers are still seeing from the previous release.
+# The atomic exporter has checked moneyline coverage and committed canonical
+# odds, readable release odds and exact quote observations together.
 
 # Only discard resumable stages after publication and validation both succeed.
 rm -f "${HISTORY_STAGE}" "${P3_STAGE}" "${HISTORY_STAGE}.sha256" "${P3_STAGE}.sha256"

@@ -621,6 +621,7 @@ def stage_and_upsert(
     err_path: Optional[str],
     out_path: Optional[str],
     calendar_window: bool = False,
+    atomic_context=None,
 ) -> Dict[str, int]:
     cols = [
         "fixture_id",
@@ -1144,15 +1145,18 @@ select 'deleted_existing', count(*)::bigint from deleted;
             "timestamp_only": 0,
             "unchanged": 0,
         }
-        conn = psycopg2.connect(db_url)
+        conn = atomic_context.connection if atomic_context is not None else psycopg2.connect(db_url)
         try:
             cur = conn.cursor()
-            cur.execute(f"set statement_timeout = '{statement_timeout}';")
-            cur.execute(f"set lock_timeout = '{lock_timeout}';")
-            cur.execute(f"set idle_in_transaction_session_timeout = '{idle_tx_timeout}';")
-            cur.execute("begin;")
-            if use_advisory_lock:
-                cur.execute(f"select pg_advisory_xact_lock({advisory_lock_key});")
+            if atomic_context is None:
+                cur.execute(f"set statement_timeout = '{statement_timeout}';")
+                cur.execute(f"set lock_timeout = '{lock_timeout}';")
+                cur.execute(f"set idle_in_transaction_session_timeout = '{idle_tx_timeout}';")
+                cur.execute("begin;")
+                if use_advisory_lock:
+                    cur.execute(f"select pg_advisory_xact_lock({advisory_lock_key});")
+            else:
+                atomic_context.capture_pre_usable()
             cur.execute(
                 "create temp table odds_outcomes_stage on commit drop as "
                 f"select {cols_sql} from public.odds_outcomes with no data;"
@@ -1199,11 +1203,16 @@ select 'deleted_existing', count(*)::bigint from deleted;
             cur.execute(cleanup_goals_sql)
             cur.execute(cleanup_match_sql)
             cur.execute(cleanup_team_sql)
+            if atomic_context is not None:
+                atomic_context.before_commit()
             cur.execute("commit;")
             return counts
         finally:
-            conn.close()
+            if atomic_context is None:
+                conn.close()
 
+    if atomic_context is not None:
+        return stage_and_upsert_psycopg()
     if not shutil.which("psql"):
         counts = stage_and_upsert_psycopg()
         return counts
@@ -1566,6 +1575,17 @@ def main() -> None:
     parser.set_defaults(include_fixture_leagues=True)
     args = parser.parse_args()
 
+    # Every supported production publisher must hold the installed writer
+    # admission and supply the matching quote/release transaction callback.
+    # A direct CLI call without a mode used to expose canonical prices before
+    # their exact verification and readable release were committed.
+    atomic_mode = os.environ.get("ODDS_ATOMIC_PUBLISH_MODE", "").strip()
+    if atomic_mode not in {"p3", "delivery"}:
+        raise SystemExit(
+            "odds export requires ODDS_ATOMIC_PUBLISH_MODE=p3 or delivery "
+            "under the corresponding installed locked runner"
+        )
+
     if not DB_URL:
         raise SystemExit("Missing SUPABASE_DB_URL")
     if not os.path.exists(args.db):
@@ -1908,7 +1928,21 @@ def main() -> None:
     error_message: Optional[str] = None
     psql_err_tail = ""
     psql_out_tail = ""
+    atomic_context = None
     try:
+        if atomic_mode:
+            if partial_run:
+                raise RuntimeError("atomic odds publication refuses a partial CSV export")
+            from odds_atomic_publication import AtomicOddsPublication
+
+            atomic_context = AtomicOddsPublication(
+                atomic_mode, DB_URL, Path(args.db), effective_leagues,
+                Path(os.environ.get(
+                    "ODDS_QUOTE_VERIFICATION_SPOOL_DIR",
+                    "/var/lib/odds-sync/quote-verifications",
+                )),
+            )
+            atomic_context.prepare()
         counts = stage_and_upsert(
             DB_URL,
             Path(args.csv_out),
@@ -1921,7 +1955,11 @@ def main() -> None:
             err_path,
             out_path,
             args.calendar_window,
+            atomic_context=atomic_context,
         )
+        if atomic_context is not None:
+            atomic_context.mark_committed()
+            atomic_context.finalize()
         print(
             f"Stage count={counts['stage_count']} src_count={counts['src_count']} inserted={counts['inserted']} "
             f"updated={counts['updated']} unchanged={counts['unchanged']}",
@@ -1929,11 +1967,18 @@ def main() -> None:
         )
     except Exception as exc:
         ingest_ok = False
-        error_stage = "stage_upsert"
+        error_stage = (
+            "post_commit_finalization"
+            if atomic_context is not None and atomic_context.committed
+            else "stage_upsert"
+        )
         error_message = re.sub(r"postgres(?:ql)?://[^\s\"\']+", "[redacted database URL]", str(exc))
         psql_err_tail = tail_text(err_path)
         psql_out_tail = tail_text(out_path)
         print(f"Stage upsert failed: {error_message}", flush=True)
+    finally:
+        if atomic_context is not None:
+            atomic_context.close()
 
     retention_deleted = 0
     if ingest_ok and not args.skip_retention:
@@ -2094,6 +2139,16 @@ def main() -> None:
 
     report = {
         "ok": ingest_ok,
+        "publication_committed": (
+            atomic_context.committed if atomic_context is not None else ingest_ok
+        ),
+        "atomic_publish_mode": atomic_mode or None,
+        "atomic_quote_verification": (
+            atomic_context.quote_report if atomic_context is not None else None
+        ),
+        "fixture_delivery_odds_sync": (
+            atomic_context.release_report if atomic_context is not None else None
+        ),
         "error_stage": error_stage,
         "error_message": error_message,
         "psql_err_tail": psql_err_tail,
