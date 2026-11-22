@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 import unittest
 
+from scripts.prepare_player_stats_live_pair import pair_sql
+
 
 ROOT = Path(__file__).resolve().parents[1]
 ORIGINAL = ROOT / "supabase/migrations/20260824_player_stats_read_model.sql"
@@ -192,6 +194,21 @@ class PlayerStatsReadModelSqlTest(unittest.TestCase):
                 ):
                     with self.subTest(large_case=case):
                         compare(case)
+
+                signature = "integer,integer,bigint,text,numeric,text,text,text,boolean,integer,integer"
+                run(f"alter function public.player_stats_season_table({signature}) rename to player_stats_season_table_candidate;")
+                run(f"alter function public.player_stats_season_table_original({signature}) rename to player_stats_season_table;")
+                fingerprint = run(
+                    f"select md5(pg_get_functiondef('public.player_stats_season_table({signature})'::regprocedure));"
+                )
+                output = run(pair_sql(28, fingerprint))
+                parity_line = next(line for line in output.splitlines()
+                                   if len(line.split("|")) == 7)
+                fields = parity_line.split("|")
+                self.assertGreater(float(fields[0]), 0)
+                self.assertGreater(float(fields[1]), 0)
+                self.assertEqual(fields[2:5], ["50", "50", "t"])
+                self.assertEqual(fields[5], fields[6])
             finally:
                 subprocess.run([binaries["pg_ctl"], "-D", str(data), "-m", "immediate",
                                 "-w", "stop"], check=True, capture_output=True, text=True)
