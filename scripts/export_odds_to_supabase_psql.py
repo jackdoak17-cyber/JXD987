@@ -21,6 +21,7 @@ import urllib.parse
 import tempfile
 import time
 import re
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -1148,6 +1149,12 @@ select 'deleted_existing', count(*)::bigint from deleted;
         conn = atomic_context.connection if atomic_context is not None else psycopg2.connect(db_url)
         try:
             cur = conn.cursor()
+            phase_step = atomic_context.phase_step if atomic_context is not None else lambda _: nullcontext()
+
+            def run_sql(phase: str, statement: str) -> None:
+                with phase_step(phase):
+                    cur.execute(statement)
+
             if atomic_context is None:
                 cur.execute(f"set statement_timeout = '{statement_timeout}';")
                 cur.execute(f"set lock_timeout = '{lock_timeout}';")
@@ -1156,8 +1163,9 @@ select 'deleted_existing', count(*)::bigint from deleted;
                 if use_advisory_lock:
                     cur.execute(f"select pg_advisory_xact_lock({advisory_lock_key});")
             else:
-                atomic_context.capture_pre_usable()
-            cur.execute(
+                with phase_step("capture_pre_usable"):
+                    atomic_context.capture_pre_usable()
+            run_sql("stage_create",
                 "create temp table odds_outcomes_stage on commit drop as "
                 f"select {cols_sql} from public.odds_outcomes with no data;"
             )
@@ -1166,22 +1174,23 @@ select 'deleted_existing', count(*)::bigint from deleted;
                 "FROM STDIN WITH (FORMAT csv, HEADER true);"
             )
             with csv_path.open("r", encoding="utf-8") as f:
-                cur.copy_expert(copy_sql, f)
-            cur.execute(create_source_tables_sql)
-            cur.execute("select count(*)::bigint from odds_outcomes_stage;")
+                with phase_step("stage_copy"):
+                    cur.copy_expert(copy_sql, f)
+            run_sql("source_tables_build", create_source_tables_sql)
+            run_sql("stage_count", "select count(*)::bigint from odds_outcomes_stage;")
             row = cur.fetchone()
             if row:
                 counts["stage_count"] = int(row[0])
-            cur.execute(deleted_existing_sql)
+            run_sql("delete_existing", deleted_existing_sql)
             row = cur.fetchone()
             if row:
                 counts["deleted_existing"] = int(row[-1])
             if missing_markets_sql:
-                cur.execute(missing_markets_sql)
+                run_sql("delete_missing_markets", missing_markets_sql)
                 row = cur.fetchone()
                 if row:
                     counts["deleted_missing_markets"] = int(row[-1])
-            cur.execute(change_counts_sql)
+            run_sql("change_classification", change_counts_sql)
             row = cur.fetchone()
             if row and len(row) >= 6:
                 counts["inserted"] = int(row[0])
@@ -1190,22 +1199,22 @@ select 'deleted_existing', count(*)::bigint from deleted;
                 counts["participant_changed"] = int(row[3])
                 counts["timestamp_only"] = int(row[4])
                 counts["unchanged"] = int(row[5])
-            cur.execute(src_count_sql)
+            run_sql("source_count", src_count_sql)
             row = cur.fetchone()
             if row:
                 counts["src_count"] = int(row[-1])
-            cur.execute(upsert_sql)
+            run_sql("canonical_upsert", upsert_sql)
             counts["upserted_total"] = counts["inserted"] + counts["updated"]
-            cur.execute(match_delete_sql)
-            cur.execute(match_update_sql)
-            cur.execute(team_delete_sql)
-            cur.execute(team_update_sql)
-            cur.execute(cleanup_goals_sql)
-            cur.execute(cleanup_match_sql)
-            cur.execute(cleanup_team_sql)
+            run_sql("match_alias_delete", match_delete_sql)
+            run_sql("match_alias_update", match_update_sql)
+            run_sql("team_alias_delete", team_delete_sql)
+            run_sql("team_alias_update", team_update_sql)
+            run_sql("goals_cleanup", cleanup_goals_sql)
+            run_sql("match_cleanup", cleanup_match_sql)
+            run_sql("team_cleanup", cleanup_team_sql)
             if atomic_context is not None:
                 atomic_context.before_commit()
-            cur.execute("commit;")
+            run_sql("transaction_commit", "commit;")
             return counts
         finally:
             if atomic_context is None:
@@ -1942,7 +1951,8 @@ def main() -> None:
                     "/var/lib/odds-sync/quote-verifications",
                 )),
             )
-            atomic_context.prepare()
+            with atomic_context.phase_step("prepare"):
+                atomic_context.prepare()
         counts = stage_and_upsert(
             DB_URL,
             Path(args.csv_out),
@@ -1959,7 +1969,8 @@ def main() -> None:
         )
         if atomic_context is not None:
             atomic_context.mark_committed()
-            atomic_context.finalize()
+            with atomic_context.phase_step("post_commit_finalization"):
+                atomic_context.finalize()
         print(
             f"Stage count={counts['stage_count']} src_count={counts['src_count']} inserted={counts['inserted']} "
             f"updated={counts['updated']} unchanged={counts['unchanged']}",
@@ -2152,6 +2163,12 @@ def main() -> None:
         ),
         "error_stage": error_stage,
         "error_message": error_message,
+        "publication_failed_phase": (
+            atomic_context.phase_trace.failed_phase if atomic_context is not None else None
+        ),
+        "publication_phase_timings": (
+            atomic_context.phase_trace.timings if atomic_context is not None else []
+        ),
         "psql_err_tail": psql_err_tail,
         "psql_out_tail": psql_out_tail,
         "csv_summary": csv_summary_data,
