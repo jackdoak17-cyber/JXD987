@@ -12,6 +12,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -69,6 +70,24 @@ class PublicationPhaseTrace:
                 pass
 
 
+def atomic_pool_mode(db_url: str) -> str:
+    """Validate an explicit transaction-pool choice without rewriting the DSN."""
+    mode = os.environ.get("ODDS_ATOMIC_POOL_MODE", "session")
+    if mode not in {"session", "transaction"}:
+        raise ValueError("ODDS_ATOMIC_POOL_MODE must be session or transaction")
+    if mode == "transaction":
+        try:
+            parsed = psycopg2.extensions.parse_dsn(db_url)
+        except psycopg2.Error:
+            raise ValueError("atomic transaction pool requires a valid existing database DSN") from None
+        host = parsed.get("host", "")
+        if not re.fullmatch(r"[A-Za-z0-9-]+\.pooler\.supabase\.com", host):
+            raise ValueError("atomic transaction pool requires the existing Supavisor pooler host")
+        if parsed.get("port") not in {"5432", "6543"}:
+            raise ValueError("atomic transaction pool requires an explicit 5432 or 6543 source port")
+    return mode
+
+
 class AtomicOddsPublication:
     def __init__(
         self, mode: str, db_url: str, sqlite_db: Path, league_ids: list[int],
@@ -80,7 +99,11 @@ class AtomicOddsPublication:
         self.sqlite_db = sqlite_db
         self.league_ids = league_ids
         self.spool_dir = spool_dir
-        self.connection = psycopg2.connect(db_url, connect_timeout=10)
+        self.pool_mode = atomic_pool_mode(db_url)
+        connect_options = {"connect_timeout": 10}
+        if self.pool_mode == "transaction":
+            connect_options["port"] = 6543
+        self.connection = psycopg2.connect(db_url, **connect_options)
         self.claims: list[tuple[Path, Path]] = []
         self.prepared: list[tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]] = []
         self.committed = False
