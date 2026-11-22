@@ -55,6 +55,51 @@ class AtomicPoolModeTests(unittest.TestCase):
             construct(dsn)
         connect.assert_called_once_with(dsn, connect_timeout=10, port=6543)
 
+    def test_incomplete_transaction_handshake_retries_once_before_any_sql(self):
+        connection = unittest.mock.Mock()
+        with patch.dict(os.environ, {"ODDS_ATOMIC_POOL_MODE": "transaction"}), patch(
+            "scripts.odds_atomic_publication.psycopg2.connect",
+            side_effect=[psycopg2.OperationalError("server didn't return client encoding"), connection],
+        ) as connect, patch("scripts.odds_atomic_publication.time.sleep") as sleep:
+            publication = construct(POOLER_DSN)
+        self.assertIs(publication.connection, connection)
+        self.assertEqual(connect.call_args_list, [
+            unittest.mock.call(POOLER_DSN, connect_timeout=10, port=6543),
+            unittest.mock.call(POOLER_DSN, connect_timeout=10, port=6543),
+        ])
+        sleep.assert_called_once_with(0.15)
+        connection.cursor.assert_not_called()
+        self.assertFalse(publication.committed)
+
+    def test_repeated_incomplete_handshake_fails_without_a_third_attempt(self):
+        failure = psycopg2.OperationalError("server didn't return client encoding")
+        with patch.dict(os.environ, {"ODDS_ATOMIC_POOL_MODE": "transaction"}), patch(
+            "scripts.odds_atomic_publication.psycopg2.connect", side_effect=failure
+        ) as connect, patch("scripts.odds_atomic_publication.time.sleep") as sleep:
+            with self.assertRaises(psycopg2.OperationalError) as raised:
+                construct(POOLER_DSN)
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(connect.call_count, 2)
+        sleep.assert_called_once_with(0.15)
+
+    def test_other_connection_failures_and_session_mode_never_retry(self):
+        for mode, message in [
+            ("session", "server didn't return client encoding"),
+            ("transaction", "password authentication failed"),
+            ("transaction", "connection timed out"),
+            ("transaction", "server closed the connection unexpectedly"),
+        ]:
+            with self.subTest(mode=mode, message=message), patch.dict(
+                os.environ, {"ODDS_ATOMIC_POOL_MODE": mode}
+            ), patch("scripts.odds_atomic_publication.psycopg2.connect",
+                     side_effect=psycopg2.OperationalError(message)) as connect, patch(
+                "scripts.odds_atomic_publication.time.sleep"
+            ) as sleep:
+                with self.assertRaises(psycopg2.OperationalError):
+                    construct(POOLER_DSN)
+                self.assertEqual(connect.call_count, 1)
+                sleep.assert_not_called()
+
     def test_unknown_mode_fails_before_connect(self):
         with patch.dict(os.environ, {"ODDS_ATOMIC_POOL_MODE": "other"}), patch(
             "scripts.odds_atomic_publication.psycopg2.connect"
