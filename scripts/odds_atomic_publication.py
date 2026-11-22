@@ -127,42 +127,57 @@ class AtomicOddsPublication:
 
     def capture_pre_usable(self) -> None:
         """Remember exact customer quotes usable under the current kickoff tier."""
+        markets = sorted(CUSTOMER_MARKETS)
         with self.connection.cursor() as cur:
             cur.execute(
                 """
                 create temp table odds_pre_usable on commit drop as
-                select o.fixture_id, o.bookmaker_id, o.market_key, o.selection_key,
-                       coalesce(o.line, -9999::numeric) as line_key,
-                       o.price_decimal, o.last_updated_at,
-                       f.starting_at,
-                       coalesce(o.participant_type, 'team') as participant_type,
-                       coalesce(o.participant_id, 0) as participant_id
+                with future_raw as materialized (
+                  select o.fixture_id, o.bookmaker_id, o.market_key, o.selection_key,
+                         coalesce(o.line, -9999::numeric) as line_key,
+                         o.price_decimal, o.last_updated_at, f.starting_at,
+                         coalesce(o.participant_type, 'team') as participant_type,
+                         coalesce(o.participant_id, 0) as participant_id
                   from public.odds_outcomes o
                   join public.fixtures f on f.id = o.fixture_id
-                  join public.odds_quote_verifications v
-                    on v.fixture_id = o.fixture_id
-                   and v.bookmaker_id = o.bookmaker_id
-                   and v.market_key = o.market_key
-                   and v.selection_key = o.selection_key
-                   and v.participant_type = coalesce(o.participant_type, 'team')
-                   and v.participant_id = coalesce(o.participant_id, 0)
-                   and v.line_key = coalesce(o.line, -9999::numeric)
-                   and v.price_decimal = o.price_decimal
-                   and v.source_last_updated_at is not distinct from o.last_updated_at
-                 where f.starting_at > (statement_timestamp() at time zone 'utc')
-                   and o.market_key = any(%s)
-                   and o.price_decimal > 1 and o.price_decimal <= 500
-                   and v.last_verified_at <= statement_timestamp() + interval '2 minutes'
-                   and v.last_verified_at >= statement_timestamp() -
-                     case
-                       when f.starting_at <= (statement_timestamp() at time zone 'utc') + interval '2 hours'
-                         then interval '2 hours'
-                       when f.starting_at <= (statement_timestamp() at time zone 'utc') + interval '1 day'
-                         then interval '3 hours'
-                       else interval '8 hours'
-                     end
+                  where f.starting_at > (statement_timestamp() at time zone 'utc')
+                    and o.market_key = any(%s)
+                    and o.price_decimal > 1 and o.price_decimal <= 500
+                ),
+                recent_verifications as materialized (
+                  select v.fixture_id, v.bookmaker_id, v.market_key, v.selection_key,
+                         v.participant_type, v.participant_id, v.line_key, v.price_decimal,
+                         v.source_last_updated_at, v.last_verified_at
+                  from public.odds_quote_verifications v
+                  where v.market_key = any(%s)
+                    and v.last_verified_at >= statement_timestamp() - interval '8 hours'
+                    and v.last_verified_at <= statement_timestamp() + interval '2 minutes'
+                )
+                select o.fixture_id, o.bookmaker_id, o.market_key, o.selection_key,
+                       o.line_key, o.price_decimal, o.last_updated_at, o.starting_at,
+                       o.participant_type, o.participant_id
+                from future_raw o
+                join recent_verifications v
+                  on v.fixture_id = o.fixture_id
+                 and v.bookmaker_id = o.bookmaker_id
+                 and v.market_key = o.market_key
+                 and v.selection_key = o.selection_key
+                 and v.participant_type = o.participant_type
+                 and v.participant_id = o.participant_id
+                 and v.line_key = o.line_key
+                 and v.price_decimal = o.price_decimal
+                 and v.source_last_updated_at is not distinct from o.last_updated_at
+                where v.last_verified_at <= statement_timestamp() + interval '2 minutes'
+                  and v.last_verified_at >= statement_timestamp() -
+                    case
+                      when o.starting_at <= (statement_timestamp() at time zone 'utc') + interval '2 hours'
+                        then interval '2 hours'
+                      when o.starting_at <= (statement_timestamp() at time zone 'utc') + interval '1 day'
+                        then interval '3 hours'
+                      else interval '8 hours'
+                    end
                 """,
-                (sorted(CUSTOMER_MARKETS),),
+                (markets, markets),
             )
 
     def _assert_prior_usable_remains_exact(self) -> None:
