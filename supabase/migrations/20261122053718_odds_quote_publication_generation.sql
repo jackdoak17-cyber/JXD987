@@ -80,18 +80,36 @@ END
 $function$;
 REVOKE ALL ON FUNCTION operations.odds_quote_publication_bump() FROM PUBLIC;
 
+-- TRUNCATE takes ACCESS EXCLUSIVE before its BEFORE trigger runs. Allowing
+-- that trigger to wait on the singleton could invert the quote writer's
+-- singleton -> ledger lock order. There is no scheduled TRUNCATE owner:
+-- reject it rather than risk a concurrent publication deadlock. Privileged
+-- maintenance must use reviewed row DELETE under existing writer admission.
+CREATE FUNCTION operations.odds_quote_publication_reject_truncate()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+BEGIN
+  RAISE EXCEPTION 'Quote-table TRUNCATE is prohibited during publication'
+    USING ERRCODE = '55000';
+END
+$function$;
+REVOKE ALL ON FUNCTION operations.odds_quote_publication_reject_truncate() FROM PUBLIC;
+
 CREATE TRIGGER odds_quote_generation_dml
 BEFORE INSERT OR UPDATE OR DELETE ON public.odds_outcomes
 FOR EACH STATEMENT EXECUTE FUNCTION operations.odds_quote_publication_bump();
 CREATE TRIGGER odds_quote_generation_truncate
 BEFORE TRUNCATE ON public.odds_outcomes
-FOR EACH STATEMENT EXECUTE FUNCTION operations.odds_quote_publication_bump();
+FOR EACH STATEMENT EXECUTE FUNCTION operations.odds_quote_publication_reject_truncate();
 CREATE TRIGGER odds_quote_verification_generation_dml
 BEFORE INSERT OR UPDATE OR DELETE ON public.odds_quote_verifications
 FOR EACH STATEMENT EXECUTE FUNCTION operations.odds_quote_publication_bump();
 CREATE TRIGGER odds_quote_verification_generation_truncate
 BEFORE TRUNCATE ON public.odds_quote_verifications
-FOR EACH STATEMENT EXECUTE FUNCTION operations.odds_quote_publication_bump();
+FOR EACH STATEMENT EXECUTE FUNCTION operations.odds_quote_publication_reject_truncate();
 CREATE TRIGGER odds_quote_maintenance_generation_update
 BEFORE UPDATE ON operations.quote_verification_maintenance
 FOR EACH STATEMENT EXECUTE FUNCTION operations.odds_quote_publication_bump();
@@ -133,18 +151,24 @@ BEGIN
   SELECT count(*) INTO healthy_triggers
   FROM (
     VALUES
-      (expected_odds, 'odds_quote_generation_dml'::name, 30),
-      (expected_odds, 'odds_quote_generation_truncate'::name, 34),
-      (expected_verifications, 'odds_quote_verification_generation_dml'::name, 30),
-      (expected_verifications, 'odds_quote_verification_generation_truncate'::name, 34),
+      (expected_odds, 'odds_quote_generation_dml'::name, 30,
+       'operations.odds_quote_publication_bump()'::regprocedure),
+      (expected_odds, 'odds_quote_generation_truncate'::name, 34,
+       'operations.odds_quote_publication_reject_truncate()'::regprocedure),
+      (expected_verifications, 'odds_quote_verification_generation_dml'::name, 30,
+       'operations.odds_quote_publication_bump()'::regprocedure),
+      (expected_verifications, 'odds_quote_verification_generation_truncate'::name, 34,
+       'operations.odds_quote_publication_reject_truncate()'::regprocedure),
       ('operations.quote_verification_maintenance'::regclass::oid,
-       'odds_quote_maintenance_generation_update'::name, 18)
-  ) AS e(relid, trigger_name, trigger_type)
+       'odds_quote_maintenance_generation_update'::name, 18,
+       'operations.odds_quote_publication_bump()'::regprocedure)
+  ) AS e(relid, trigger_name, trigger_type, function_oid)
   JOIN pg_catalog.pg_trigger t
     ON t.tgrelid = e.relid AND t.tgname = e.trigger_name
    AND t.tgtype::integer = e.trigger_type
-   AND t.tgfoid = 'operations.odds_quote_publication_bump()'::regprocedure
-   AND t.tgenabled = 'A' AND NOT t.tgisinternal;
+   AND t.tgfoid = e.function_oid
+   AND t.tgenabled = 'A' AND NOT t.tgisinternal
+   AND t.tgqual IS NULL AND t.tgattr::text = '' AND t.tgnargs = 0;
   IF healthy_triggers <> 5 THEN
     RAISE EXCEPTION 'Quote publication generation triggers unavailable'
       USING ERRCODE = '55000';
@@ -153,6 +177,33 @@ BEGIN
 END
 $function$;
 REVOKE ALL ON FUNCTION operations.odds_quote_publication_generation() FROM PUBLIC;
+
+-- CREATE FUNCTION can inherit direct EXECUTE grants from ALTER DEFAULT
+-- PRIVILEGES. Revoking PUBLIC alone would leave those grants in place.
+DO $function_privacy$
+DECLARE role_name text;
+BEGIN
+  FOREACH role_name IN ARRAY ARRAY[
+    'anon', 'authenticated', 'service_role',
+    'statsweb_pool', 'oddssearch_operations_reader'
+  ] LOOP
+    IF to_regrole(role_name) IS NOT NULL THEN
+      EXECUTE format(
+        'REVOKE ALL ON FUNCTION operations.odds_quote_publication_bump() FROM %I',
+        role_name
+      );
+      EXECUTE format(
+        'REVOKE ALL ON FUNCTION operations.odds_quote_publication_reject_truncate() FROM %I',
+        role_name
+      );
+      EXECUTE format(
+        'REVOKE ALL ON FUNCTION operations.odds_quote_publication_generation() FROM %I',
+        role_name
+      );
+    END IF;
+  END LOOP;
+END
+$function_privacy$;
 
 COMMENT ON TABLE operations.odds_quote_publication_state IS
   'Private monotonic generation of committed raw and exact-verification quote mutations; never a quote observation time or publication timestamp.';

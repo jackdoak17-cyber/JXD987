@@ -76,6 +76,10 @@ OBSERVATION = {
     "line": 4.5,
     "price_decimal": 2.2,
 }
+DENIED_ROLES = (
+    "anon", "authenticated", "service_role",
+    "statsweb_pool", "oddssearch_operations_reader",
+)
 
 
 @unittest.skipUnless(
@@ -98,6 +102,20 @@ class QuotePublicationGenerationPGTests(unittest.TestCase):
                 cursor.execute("drop schema if exists public cascade")
                 cursor.execute("create schema public")
                 cursor.execute(SCHEMA)
+                # Supabase can have explicit per-schema default grants. These
+                # must not survive merely because PUBLIC was revoked.
+                for role in DENIED_ROLES:
+                    cursor.execute("select to_regrole(%s)", (role,))
+                    if cursor.fetchone()[0] is None:
+                        cursor.execute(f"create role {role} nologin")
+                    cursor.execute(
+                        f"alter default privileges in schema operations "
+                        f"grant execute on functions to {role}"
+                    )
+                    cursor.execute(
+                        f"alter default privileges in schema operations "
+                        f"grant select on tables to {role}"
+                    )
                 cursor.execute(recorder)
                 cursor.execute(
                     "select md5(prosrc) from pg_proc "
@@ -139,12 +157,12 @@ class QuotePublicationGenerationPGTests(unittest.TestCase):
         self.cursor.execute("select count(*) from public.odds_outcomes where fixture_id=1001")
         self.assertEqual(self.cursor.fetchone()[0], 0)
 
-    def test_truncate_both_tables_and_state_rollback(self) -> None:
-        self.cursor.execute("savepoint before_change")
-        self.cursor.execute("truncate public.odds_outcomes")
-        self.cursor.execute("truncate public.odds_quote_verifications")
-        self.assertEqual(self.generation(), self.start_generation + 2)
-        self.cursor.execute("rollback to savepoint before_change")
+    def test_uncoordinated_truncate_is_rejected_without_commit(self) -> None:
+        for table in ("public.odds_outcomes", "public.odds_quote_verifications"):
+            self.cursor.execute("savepoint before_truncate")
+            with self.assertRaisesRegex(psycopg2.Error, "TRUNCATE is prohibited"):
+                self.cursor.execute(f"truncate {table}")
+            self.cursor.execute("rollback to savepoint before_truncate")
         self.assertEqual(self.generation(), self.start_generation)
 
     def test_missing_or_disabled_guard_fails_closed(self) -> None:
@@ -181,13 +199,89 @@ class QuotePublicationGenerationPGTests(unittest.TestCase):
         self.assertEqual(self.generation(), self.start_generation)
 
     def test_no_public_or_web_role_privileges(self) -> None:
+        for role in ("public", *DENIED_ROLES):
+            self.cursor.execute(
+                "select has_function_privilege(%s,"
+                "'operations.odds_quote_publication_generation()','EXECUTE'),"
+                "has_function_privilege(%s,"
+                "'operations.odds_quote_publication_bump()','EXECUTE'),"
+                "has_function_privilege(%s,"
+                "'operations.odds_quote_publication_reject_truncate()','EXECUTE'),"
+                "has_table_privilege(%s,"
+                "'operations.odds_quote_publication_state','SELECT')",
+                (role, role, role, role),
+            )
+            self.assertEqual(self.cursor.fetchone(), (False, False, False, False), role)
+
+    def test_same_name_limited_or_conditional_trigger_fails_closed(self) -> None:
+        for replacement in (
+            "before insert or update of price_decimal or delete",
+            "before insert or update or delete",
+        ):
+            self.cursor.execute("savepoint before_replacement")
+            self.cursor.execute(
+                "drop trigger odds_quote_generation_dml on public.odds_outcomes"
+            )
+            when_clause = "when (false)" if "update of" not in replacement else ""
+            self.cursor.execute(
+                f"create trigger odds_quote_generation_dml {replacement} "
+                f"on public.odds_outcomes for each statement {when_clause} "
+                "execute function operations.odds_quote_publication_bump()"
+            )
+            self.cursor.execute(
+                "alter table public.odds_outcomes "
+                "enable always trigger odds_quote_generation_dml"
+            )
+            with self.assertRaisesRegex(psycopg2.Error, "triggers unavailable"):
+                self.generation()
+            self.cursor.execute("rollback to savepoint before_replacement")
+        self.cursor.execute("savepoint before_arguments")
         self.cursor.execute(
-            "select has_function_privilege('public',"
-            "'operations.odds_quote_publication_generation()','EXECUTE'),"
-            "has_table_privilege('public',"
-            "'operations.odds_quote_publication_state','SELECT')"
+            "drop trigger odds_quote_generation_dml on public.odds_outcomes"
         )
-        self.assertEqual(self.cursor.fetchone(), (False, False))
+        self.cursor.execute(
+            "create trigger odds_quote_generation_dml "
+            "before insert or update or delete on public.odds_outcomes "
+            "for each statement execute function "
+            "operations.odds_quote_publication_bump('ignored')"
+        )
+        self.cursor.execute(
+            "alter table public.odds_outcomes "
+            "enable always trigger odds_quote_generation_dml"
+        )
+        with self.assertRaisesRegex(psycopg2.Error, "triggers unavailable"):
+            self.generation()
+        self.cursor.execute("rollback to savepoint before_arguments")
+        self.assertEqual(self.generation(), self.start_generation)
+
+    def test_truncate_does_not_wait_on_writer_singleton_before_rejection(self) -> None:
+        self.cursor.execute(QUOTE, (1001, "test_player_over", 2.2, 10))
+        done = threading.Event()
+        failure: list[BaseException] = []
+
+        def attempted_truncate() -> None:
+            try:
+                with psycopg2.connect(self.url) as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute("set local statement_timeout='2s'")
+                        cursor.execute("truncate public.odds_quote_verifications")
+            except psycopg2.Error as exc:
+                if "TRUNCATE is prohibited" not in str(exc):
+                    failure.append(exc)
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=attempted_truncate, daemon=True)
+        thread.start()
+        self.assertTrue(done.wait(1), "TRUNCATE waited on the writer's singleton")
+        thread.join(timeout=1)
+        self.assertFalse(failure, failure)
+        # This acquires the ledger lock after the rejected TRUNCATE has left.
+        self.cursor.execute(
+            "update public.odds_quote_verifications "
+            "set price_decimal=price_decimal where fixture_id=-1"
+        )
+        self.assertGreater(self.generation(), self.start_generation)
 
     def test_actual_recorder_maintenance_first_and_monotonic_replay(self) -> None:
         self.cursor.execute(QUOTE, (1001, "test_player_over", 2.2, 10))
