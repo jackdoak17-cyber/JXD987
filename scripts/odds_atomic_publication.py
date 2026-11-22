@@ -103,7 +103,21 @@ class AtomicOddsPublication:
         connect_options = {"connect_timeout": 10}
         if self.pool_mode == "transaction":
             connect_options["port"] = 6543
-        self.connection = psycopg2.connect(db_url, **connect_options)
+        for attempt in range(2):
+            try:
+                self.connection = psycopg2.connect(db_url, **connect_options)
+                break
+            except psycopg2.OperationalError as exc:
+                # Supavisor can finish a cold-pool handshake before receiving
+                # the backend parameter status. No connection or publication
+                # SQL exists yet; retry this precise startup failure once.
+                if (
+                    self.pool_mode != "transaction"
+                    or attempt != 0
+                    or str(exc) != "server didn't return client encoding"
+                ):
+                    raise
+                time.sleep(0.15)
         self.claims: list[tuple[Path, Path]] = []
         self.prepared: list[tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]] = []
         self.committed = False
