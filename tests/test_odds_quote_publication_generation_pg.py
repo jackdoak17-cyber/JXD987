@@ -158,12 +158,21 @@ class QuotePublicationGenerationPGTests(unittest.TestCase):
         self.assertEqual(self.cursor.fetchone()[0], 0)
 
     def test_uncoordinated_truncate_is_rejected_without_commit(self) -> None:
+        self.cursor.execute(QUOTE, (1001, "test_player_over", 2.2, 10))
+        self.cursor.execute(
+            "insert into public.odds_quote_verifications values "
+            "(1001,2,'player_shots','test_player_over','player',10,4.5,"
+            "2.2,now(),now(),'existing-run')"
+        )
+        before = self.generation()
         for table in ("public.odds_outcomes", "public.odds_quote_verifications"):
             self.cursor.execute("savepoint before_truncate")
             with self.assertRaisesRegex(psycopg2.Error, "TRUNCATE is prohibited"):
                 self.cursor.execute(f"truncate {table}")
             self.cursor.execute("rollback to savepoint before_truncate")
-        self.assertEqual(self.generation(), self.start_generation)
+            self.cursor.execute(f"select count(*) from {table} where fixture_id=1001")
+            self.assertEqual(self.cursor.fetchone()[0], 1)
+            self.assertEqual(self.generation(), before)
 
     def test_missing_or_disabled_guard_fails_closed(self) -> None:
         self.cursor.execute("savepoint before_guard")
@@ -258,6 +267,7 @@ class QuotePublicationGenerationPGTests(unittest.TestCase):
         self.cursor.execute(QUOTE, (1001, "test_player_over", 2.2, 10))
         done = threading.Event()
         failure: list[BaseException] = []
+        result_codes: list[str] = []
 
         def attempted_truncate() -> None:
             try:
@@ -266,7 +276,8 @@ class QuotePublicationGenerationPGTests(unittest.TestCase):
                         cursor.execute("set local statement_timeout='2s'")
                         cursor.execute("truncate public.odds_quote_verifications")
             except psycopg2.Error as exc:
-                if "TRUNCATE is prohibited" not in str(exc):
+                result_codes.append(exc.pgcode)
+                if exc.pgcode != "55000" or "TRUNCATE is prohibited" not in str(exc):
                     failure.append(exc)
             finally:
                 done.set()
@@ -276,6 +287,7 @@ class QuotePublicationGenerationPGTests(unittest.TestCase):
         self.assertTrue(done.wait(1), "TRUNCATE waited on the writer's singleton")
         thread.join(timeout=1)
         self.assertFalse(failure, failure)
+        self.assertEqual(result_codes, ["55000"])
         # This acquires the ledger lock after the rejected TRUNCATE has left.
         self.cursor.execute(
             "update public.odds_quote_verifications "
