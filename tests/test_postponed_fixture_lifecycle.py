@@ -1050,6 +1050,35 @@ def test_fixture_core_cannot_fall_back_to_unguarded_rest(monkeypatch):
     assert exporter.upsert_table("fixtures", [{"id": FIXTURE}], "id", True) == (1, 0)
 
 
+def test_fixture_core_skips_noop_updates_but_delivers_real_changes(replay):
+    replay.discover(payload("NS"))
+    replay.sql("""
+      create table fixture_update_audit(fixture_id bigint not null);
+      create function record_fixture_update() returns trigger language plpgsql as $$
+      begin
+        insert into fixture_update_audit values(new.id);
+        return null;
+      end $$;
+      create trigger record_fixture_update
+      after update on fixtures for each row execute function record_fixture_update();
+    """)
+    columns = (
+        "id", "home_team_id", "away_team_id", "league_id", "season_id",
+        "starting_at", "status", "status_code", "home_score", "away_score",
+    )
+    current = dict(zip(columns, replay.sql(
+        f"select {','.join(columns)} from fixtures where id=%s", (FIXTURE,),
+    )[0]))
+
+    upsert_fixture_core(replay.conn, [current])
+    assert replay.sql("select count(*) from fixture_update_audit") == [(0,)]
+
+    changed = dict(current, status="FT" if current["status"] != "FT" else "NS")
+    upsert_fixture_core(replay.conn, [changed])
+    assert replay.sql("select fixture_id from fixture_update_audit") == [(FIXTURE,)]
+    assert replay.sql("select status from fixtures where id=%s", (FIXTURE,)) == [(changed["status"],)]
+
+
 def test_core_batch_preserves_normal_results_and_withholds_only_recovery(replay):
     replay.discover(payload())
     replay.quarantine()

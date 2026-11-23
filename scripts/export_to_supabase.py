@@ -1025,16 +1025,25 @@ def upsert_fixture_core(target_conn, rows: Sequence[Dict]) -> None:
                 columns = list(batch[0])
                 if not {"home_score", "away_score"} <= set(columns):
                     raise ValueError("Fixture core export requires explicit score fields")
+                update_columns = [key for key in columns if key != "id"]
+                if not update_columns:
+                    raise ValueError("Fixture core export requires mutable columns")
                 for row in batch:
                     if set(row) != set(columns):
                         raise ValueError("Fixture core batch has inconsistent columns")
                     postponed = {str(row.get(key) or "").upper() for key in ("status", "status_code")} & {"POST", "POSTP", "POSTPONED"}
                     if postponed or row["id"] in recovering_ids:
                         row["home_score"] = row["away_score"] = None
-                statement = sql.SQL("insert into public.fixtures ({}) values %s on conflict (id) do update set {}").format(
+                statement = sql.SQL(
+                    "insert into public.fixtures as target ({}) values %s "
+                    "on conflict (id) do update set {} "
+                    "where ({}) is distinct from ({})"
+                ).format(
                     sql.SQL(",").join(map(sql.Identifier, columns)),
                     sql.SQL(",").join(sql.SQL("{} = excluded.{}").format(sql.Identifier(key), sql.Identifier(key))
-                                      for key in columns if key != "id"),
+                                      for key in update_columns),
+                    sql.SQL(",").join(sql.Identifier("target", key) for key in update_columns),
+                    sql.SQL(",").join(sql.Identifier("excluded", key) for key in update_columns),
                 )
                 execute_values(cur, statement, [[Json(row.get(key)) if isinstance(row.get(key), (dict, list))
                                                 else row.get(key) for key in columns] for row in batch], page_size=500)
