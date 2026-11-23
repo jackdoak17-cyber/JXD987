@@ -19,6 +19,12 @@ SOURCE = b"run_stats_reconciliation.sh"
 LINE = re.compile(rb"((?:[^\s#]+[ \t]+){5}cd )(/[a-zA-Z0-9_./-]+)"
                   rb" && \2/scripts/vps/(run_stats_reconciliation\.sh|run_leaderboard_shadow_worker\.sh)"
                   rb"([ \t][^\r\n]*\n|\n)")
+SOURCE_LINE = re.compile(
+    rb"((?:[^\s#]+[ \t]+){5}cd )(/[a-zA-Z0-9_./-]+)"
+    rb' && STATS_TX_URL="\$\(cat /etc/oddssearch/stats-export-transaction\.url\)"'
+    rb' && test -n "\$STATS_TX_URL" && SUPABASE_DB_URL_SESSION="\$STATS_TX_URL" '
+    rb"\2/scripts/vps/run_stats_reconciliation\.sh([ \t][^\r\n]*\n|\n)"
+)
 MAX_BYTES = 256 * 1024
 
 
@@ -184,10 +190,11 @@ def validate_switch(before, after, from_root, to_root):
             raise ValueError("unrelated crontab byte changed")
         elif not old.lstrip().startswith(b"#"):
             if SOURCE in old:
-                if not LINE.fullmatch(old) or LINE.fullmatch(old)[3] != SOURCE:
+                source = SOURCE_LINE.fullmatch(old)
+                if not source:
                     raise ValueError("source entry is not canonical")
                 source_count += 1
-                source_root = LINE.fullmatch(old)[2]
+                source_root = source[2]
     if worker_count != 1 or source_count != 1:
         raise ValueError("worker or unchanged source entry is missing or duplicated")
     return source_root
