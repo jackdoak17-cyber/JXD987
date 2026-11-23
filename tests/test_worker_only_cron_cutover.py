@@ -64,7 +64,13 @@ def fixture():
         ))
     worker_old = f"1-4 * * * * cd {old} && {old}/scripts/vps/run_leaderboard_shadow_worker.sh\n".encode()
     worker_new = f"1-4 * * * * cd {new} && {new}/scripts/vps/run_leaderboard_shadow_worker.sh\n".encode()
-    source_line = f"*/5 * * * * cd {source} && {source}/scripts/vps/run_stats_reconciliation.sh\n".encode()
+    source_line = (
+        f'*/5 * * * * cd {source} && '
+        'STATS_TX_URL="$(cat /etc/oddssearch/stats-export-transaction.url)" && '
+        'test -n "$STATS_TX_URL" && '
+        'SUPABASE_DB_URL_SESSION="$STATS_TX_URL" '
+        f'{source}/scripts/vps/run_stats_reconciliation.sh\n'
+    ).encode()
     frozen = source_line + worker_old + b"# unrelated settings stay identical\n"
     target = source_line + worker_new + b"# unrelated settings stay identical\n"
     reviewed = root / "reviewed-cron"
@@ -171,6 +177,9 @@ rejects("symlink worker marker untouched", lambda p,o,n,s,b,t,f,x: p.marker.syml
 rejects("legacy worker marker blocks switch", lambda p,o,n,s,b,t,f,x: p.legacy_marker.write_text("foreign"))
 rejects("legacy heavy marker blocks switch", lambda p,o,n,s,b,t,f,x: p.legacy_heavy_marker.write_text("foreign"))
 rejects("changed source line rejected", lambda p,o,n,s,b,t,f,x: f.write_bytes(t.replace(s, s.replace(b"*/5", b"*/6"))))
+rejects("changed source transaction URL rejected", lambda p,o,n,s,b,t,f,x: f.write_bytes(t.replace(b"stats-export-transaction.url", b"other.url")))
+rejects("missing source transaction guard rejected", lambda p,o,n,s,b,t,f,x: f.write_bytes(t.replace(b'test -n "$STATS_TX_URL" && ', b"")))
+rejects("changed source transaction variable rejected", lambda p,o,n,s,b,t,f,x: f.write_bytes(t.replace(b"SUPABASE_DB_URL_SESSION", b"SUPABASE_DB_URL")))
 rejects("unrelated byte change rejected", lambda p,o,n,s,b,t,f,x: f.write_bytes(t.replace(b"unrelated", b"changed")))
 rejects("duplicate source entry rejected", lambda p,o,n,s,b,t,f,x: f.write_bytes(t.replace(s, s+s)))
 rejects("wrong release target rejected", lambda p,o,n,s,b,t,f,x: f.write_bytes(t.replace(os.fsencode(n), os.fsencode(o))))
