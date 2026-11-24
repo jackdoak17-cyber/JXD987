@@ -106,4 +106,48 @@ expect_rejected 'old statistics supervisor'
 
 TEST_PROCESS_FILE="$tmp/missing-process-list" expect_rejected 'unavailable process snapshot'
 
+python3 - "$ROOT" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location(
+    "install_leaderboard_crontab",
+    root / "scripts/vps/install_leaderboard_crontab.py",
+)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+old = b"/opt/odds-sync/old-release"
+new = b"/opt/odds-sync/new-release"
+source_tail = b" >> /var/log/stats-reconciliation-supervisor.log 2>&1\n"
+worker_tail = b" >> /var/log/oddssearch-leaderboard-worker.log 2>&1\n"
+source = (
+    b"*/5 * * * * cd " + old
+    + b' && STATS_TX_URL="$(cat /etc/oddssearch/stats-export-transaction.url)"'
+    + b' && test -n "$STATS_TX_URL" && SUPABASE_DB_URL_SESSION="$STATS_TX_URL" '
+    + old + b"/scripts/vps/run_stats_reconciliation.sh" + source_tail
+)
+worker = b"* * * * * cd " + old + b" && " + old + b"/scripts/vps/run_leaderboard_shadow_worker.sh" + worker_tail
+frozen = module.FROZEN_PREFIX + source + module.FROZEN_PREFIX + worker
+target = (
+    source.replace(old, new)
+    + worker.replace(old, new)
+)
+module.validate_switch(frozen, target, "prepare", new)
+
+for bad in (
+    target.replace(b"SUPABASE_DB_URL_SESSION", b"SUPABASE_DB_URL"),
+    target.replace(b"stats-export-transaction.url", b"stats-export-session.url"),
+    target.replace(b"*/5 * * * *", b"*/6 * * * *"),
+):
+    try:
+        module.validate_switch(frozen, bad, "prepare", new)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("transaction source cron mutation was accepted")
+PY
+
 echo 'finite-trial host composition: reservation, quarantine and verifier PASS'
