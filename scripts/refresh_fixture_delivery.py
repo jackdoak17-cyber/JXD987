@@ -58,7 +58,7 @@ MONEYLINE_MARKETS = {
 }
 MIN_FORM_SAMPLE = 5
 SEMANTIC_FINGERPRINT_VERSION = 1
-PROJECTION_ALGORITHM_VERSION = "fixture-delivery-v2-official-standings"
+PROJECTION_ALGORITHM_VERSION = "fixture-delivery-v3-canonical-ranks-at-read-time"
 METRIC_WINDOWS = tuple(range(5, 16))
 METRIC_MODES = ("overall", "venue")
 METRIC_SEASON_SCOPES = ("all", "current")
@@ -139,10 +139,9 @@ def semantic_projection_fingerprint(
     end: date,
     leagues: list[int],
     *,
-    official_standings: dict[tuple[int, int], dict[int, dict[str, int]]] | None = None,
     algorithm_version: str = PROJECTION_ALGORITHM_VERSION,
 ) -> dict[str, Any]:
-    """Hash every stable input that can affect schedule, standings, or metrics."""
+    """Hash every stable input that can affect schedule or fixture metrics."""
     payload = {
         "fingerprint_version": SEMANTIC_FINGERPRINT_VERSION,
         "algorithm_version": algorithm_version,
@@ -167,18 +166,6 @@ def semantic_projection_fingerprint(
         "completed": [
             {field: row.get(field) for field in COMPLETED_SEMANTIC_FIELDS}
             for row in completed
-        ],
-        "official_standings": [
-            {
-                "league_id": league_id,
-                "season_id": season_id,
-                "team_id": team_id,
-                **{field: values[field] for field in (
-                    "rank", "points", "played", "goals_for", "goals_against", "goal_diff"
-                )},
-            }
-            for (league_id, season_id), table in sorted((official_standings or {}).items())
-            for team_id, values in sorted(table.items())
         ],
     }
     canonical = json.dumps(
@@ -750,7 +737,6 @@ def record_verified_noop(
     """Record fresh verification evidence without rewriting projection rows."""
     component_reads = {
         "schedule": source_rows,
-        "standings": completed_rows,
         "metrics": completed_rows,
         "odds": 0,
     }
@@ -1207,133 +1193,6 @@ def validate_schedule_projection(cur, rows: list[dict[str, Any]], release_id: st
         )
 
 
-def load_official_standings(
-    cur,
-    completed: list[dict[str, Any]],
-) -> dict[tuple[int, int], dict[int, dict[str, int]]]:
-    """Load the provider table for every fixture scope and reject gaps.
-
-    Federation corrections and competition tie breakers cannot be recovered
-    from scores alone. The score-derived calculation below remains an audit
-    oracle, but customer-facing fixture ranks must use this official source.
-    """
-    scopes = {
-        (int(row["league_id"]), int(row["season_id"]))
-        for row in completed
-        if row.get("season_id") is not None
-    }
-    if not scopes:
-        return {}
-    league_ids = sorted({scope[0] for scope in scopes})
-    season_ids = sorted({scope[1] for scope in scopes})
-    cur.execute(
-        """
-        select league_id, season_id, team_id, position, points, played,
-               goals_for, goals_against, goal_diff
-          from public.official_team_standings
-         where league_id = any(%s)
-           and season_id = any(%s)
-         order by league_id, season_id, position, team_id
-        """,
-        (league_ids, season_ids),
-    )
-    grouped: dict[tuple[int, int], dict[int, dict[str, int]]] = defaultdict(dict)
-    for row in cur.fetchall():
-        key = (int(row[0]), int(row[1]))
-        if key not in scopes:
-            continue
-        team_id = int(row[2])
-        if team_id in grouped[key]:
-            raise RuntimeError(f"duplicate official standing for scope={key} team={team_id}")
-        grouped[key][team_id] = {
-            "rank": int(row[3]),
-            "points": int(row[4]),
-            "played": int(row[5]),
-            "goals_for": int(row[6]),
-            "goals_against": int(row[7]),
-            "goal_diff": int(row[8]),
-        }
-
-    missing_scopes = sorted(scopes - set(grouped))
-    if missing_scopes:
-        raise RuntimeError(f"official standings missing fixture scopes: {missing_scopes[:20]}")
-    expected_teams: dict[tuple[int, int], set[int]] = defaultdict(set)
-    for row in completed:
-        if row.get("season_id") is None:
-            continue
-        key = (int(row["league_id"]), int(row["season_id"]))
-        expected_teams[key].update((int(row["home_team_id"]), int(row["away_team_id"])))
-    missing_teams = {
-        key: sorted(team_ids - set(grouped[key]))
-        for key, team_ids in expected_teams.items()
-        if team_ids - set(grouped[key])
-    }
-    if missing_teams:
-        raise RuntimeError(f"official standings missing fixture teams: {missing_teams}")
-    return grouped
-
-
-def compute_standings(completed: list[dict[str, Any]]) -> dict[tuple[int, int], dict[int, dict[str, int]]]:
-    """Independently derive raw standings for audits and offline tests only."""
-    grouped: dict[tuple[int, int], dict[int, dict[str, int]]] = defaultdict(dict)
-    for row in completed:
-        if row.get("season_id") is None:
-            continue
-        key = (int(row["league_id"]), int(row["season_id"]))
-        home_id, away_id = int(row["home_team_id"]), int(row["away_team_id"])
-        hs, aws = int(row["home_score"]), int(row["away_score"])
-        table = grouped[key]
-        for team_id in (home_id, away_id):
-            table.setdefault(
-                team_id,
-                {
-                    "points": 0,
-                    "played": 0,
-                    "goals_for": 0,
-                    "goals_against": 0,
-                    "goal_diff": 0,
-                },
-            )
-        table[home_id]["played"] += 1
-        table[away_id]["played"] += 1
-        table[home_id]["goals_for"] += hs
-        table[home_id]["goals_against"] += aws
-        table[home_id]["goal_diff"] += hs - aws
-        table[away_id]["goals_for"] += aws
-        table[away_id]["goals_against"] += hs
-        table[away_id]["goal_diff"] += aws - hs
-        if hs > aws:
-            table[home_id]["points"] += 3
-        elif aws > hs:
-            table[away_id]["points"] += 3
-        else:
-            table[home_id]["points"] += 1
-            table[away_id]["points"] += 1
-    for table in grouped.values():
-        ranked = sorted(
-            table.items(),
-            key=lambda item: (
-                -item[1]["points"],
-                -(item[1]["goals_for"] - item[1]["goals_against"]),
-                -item[1]["goals_for"],
-            ),
-        )
-        for rank, (team_id, values) in enumerate(ranked, start=1):
-            values["rank"] = rank
-    return grouped
-
-
-def strict_current_season_rank(
-    standings: dict[tuple[int, int], dict[int, dict[str, int]]],
-    league_id: int,
-    season_id: int,
-    team_id: int,
-) -> int | None:
-    current = standings.get((league_id, season_id), {}).get(team_id)
-    return int(current["rank"]) if current else None
-
-
-
 def empty_metrics() -> dict[str, Any]:
     return {
         "avgPoints": None,
@@ -1692,14 +1551,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if row["league_id"] not in EXCLUDED_CUPS and not is_hidden(row)
             ]
             completed = all_completed_fixtures(cur, leagues)
-            official_standings = load_official_standings(cur, completed)
             semantic_fingerprint = semantic_projection_fingerprint(
                 valid_schedule,
                 completed,
                 start,
                 end,
                 leagues,
-                official_standings=official_standings,
             )
             report["semantic_projection_fingerprint"] = semantic_fingerprint
             current_release_id, stored_fingerprint = current_publication_semantic_state(cur)
