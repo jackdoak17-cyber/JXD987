@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       official_standings_contract:
-        description: "Validate current official standings only (no writes)"
+        description: "Validate fixture-backed official standings only (no writes)"
         required: false
         type: boolean
         default: false
@@ -81,7 +81,7 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Validate every supported current table without publishing
+      - name: Validate every supported fixture-backed table without publishing
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
           SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
@@ -101,7 +101,7 @@ jobs:
           )"
           python3 scripts/sync_official_standings.py \
             --leagues "${LEAGUES}" \
-            --current-only \
+            --all-fixture-seasons \
             --dry-run \
             --expect-standing "27903:65:6:27" \
             --report-out official-standings-contract.json

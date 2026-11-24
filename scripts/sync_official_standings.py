@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--season-id", type=int, action="append", default=[])
     parser.add_argument("--current-only", action="store_true", help="refresh only the latest started season per league")
     parser.add_argument(
+        "--all-fixture-seasons",
+        action="store_true",
+        help="refresh every selected season that has at least one local fixture",
+    )
+    parser.add_argument(
         "--expect-standing",
         action="append",
         default=[],
@@ -104,6 +109,7 @@ def load_targets(
     season_ids: list[int],
     *,
     current_only: bool = False,
+    all_fixture_seasons: bool = False,
 ) -> list[SeasonTarget]:
     if season_ids:
         cur.execute(
@@ -116,7 +122,7 @@ def load_targets(
             """,
             (leagues, season_ids),
         )
-    elif current_only:
+    elif current_only or all_fixture_seasons:
         cur.execute(
             """
             with candidates as (
@@ -140,10 +146,10 @@ def load_targets(
             )
             select c.league_id, c.id, c.start_date::text
               from candidates c
-             where c.season_rank = 1
+             where %s or c.season_rank = 1
              order by c.league_id, c.start_date, c.id
             """,
-            (leagues,),
+            (leagues, all_fixture_seasons),
         )
     else:
         # Refresh the latest started season for every supported league and
@@ -535,6 +541,8 @@ def main() -> int:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     leagues = parse_leagues(args.leagues)
+    if args.current_only and args.all_fixture_seasons:
+        raise ValueError("--current-only and --all-fixture-seasons are mutually exclusive")
     expectations = parse_expectations(args.expect_standing)
     report: dict[str, Any] = {
         "started_at": datetime.now(UTC).isoformat(),
@@ -547,7 +555,13 @@ def main() -> int:
     client = SportMonksClient()
     try:
         with conn.cursor() as cur:
-            targets = load_targets(cur, leagues, args.season_id, current_only=bool(args.current_only))
+            targets = load_targets(
+                cur,
+                leagues,
+                args.season_id,
+                current_only=bool(args.current_only),
+                all_fixture_seasons=bool(args.all_fixture_seasons),
+            )
         conn.rollback()
         if not targets:
             raise RuntimeError("no standings seasons matched the requested scope")
