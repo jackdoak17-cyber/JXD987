@@ -107,7 +107,7 @@ All live values must be reread immediately before each mutating phase. This snap
 - Existing real-data certifications cover:
   - authenticated customer catalogue and result paths: `CERT_LEADERBOARDS_FULL=1`;
   - direct source-to-browser accuracy: `CERT_LEADERBOARDS_SOURCE_ORACLE=1`;
-  - five-concurrent-user bounded latency: `CERT_LEADERBOARDS_CONCURRENCY=1`.
+  - five simultaneous request bounded latency through one authenticated session: `CERT_LEADERBOARDS_CONCURRENCY=1`.
 - The website treats an invalid or incomplete published shadow payload as unavailable rather than silently accepting malformed data.
 
 ## 5. Definition of done
@@ -150,13 +150,13 @@ The first controller set reviewed with this plan is superseded and must not be e
 |---|---|---|
 | `leaderboard-2bd-rebaseline.sh` | Rebaseline only the importer after 20 genuine samples | `ce051d7b117c9146a7b0af1e27070863508960b05a61c927a4d4dd7f9cf83f6e` |
 | `leaderboard-2bd-resume.sh` | Clear resource pause only if the full installed guard passes | `7928aed70d3af56ed4b712c0436796cb41964b6b5f053a6db3e9d96c7741bbc8` |
-| `leaderboard-2bd-owned-250.sh` | One 250-bound, 30-second final-release canary with deterministic reconciliation | `6f2e44576a73697a1652ab3b515ebdde61e4f6642191f1689aa05a07ce753e85` |
+| `leaderboard-2bd-owned-250.sh` | One 250-bound, 30-second final-release canary with deterministic reconciliation | `d617034a77a17a05054f8380f87f8b60ba1e7c805a878a0a4beb5d072bf6a0e5` |
 | `leaderboard-2bd-enable-scheduled.sh` | Enable normal bounded schedule using the latest exact canary and a fresh full guard | `4c76643949883cfd629e8f5f8c66857dfb0a2139a65639397b43ccdd847d5662` |
-| `leaderboard-2bd-disable-scheduled.sh` | Fence new starts, disable, then recover at most one exact final-release run | `e5e60fd4d8ad499b9ec0dab9f0973a3b6cb5d3d29e61a9756e8ee549f902d10a` |
+| `leaderboard-2bd-disable-scheduled.sh` | Fence new starts, disable, then recover at most one exact final-release run | `ded7a1afc8d121b3c392b418ca62f19dba52a99b0a1da6219f1ec0f4e8bdfaf7` |
 
-The offline controller contract is `test-leaderboard-2bd-controller-contracts.py`, SHA-256 `f52aa436d0f1e8a5a2c059eec342c9bb08ba815c258ad3f062c0ab6bf3708c28`. Seven tests pass, including lost enable acknowledgement, open-run reconciliation, publisher reservation ordering, latest-run binding, fresh full-guard evaluation, and rollback fencing order. These are offline contracts, not hosted proof.
+The offline controller contract is `test-leaderboard-2bd-controller-contracts.py`, SHA-256 `1fc1fa5a44bbdf5015746a3afdeba5cf3576c5cdaabb7c4a4011f8ce52c5e5a3`. Nine tests pass. The tests execute the actual canary shell cleanup functions—with only the root-owner assertion adapted to the local test UID—with disable, recovery, and marker-removal failures injected; each failure must retain the fence. They also execute rollback marker creation, simulate a publisher deferral, resume with the exact retained token, remove the marker only after success, and refuse a foreign marker. The remaining contracts cover publisher reservation ordering, latest-run binding, fresh full-guard evaluation, and rollback fencing order. These are offline contracts, not hosted proof.
 
-Each mutating controller checks both the fixture-core reservation and the normal publisher time window before holding the canonical writer lock. Busy or reserved slots return a clean deferral. The canary records that enable was attempted **before** the ambiguous commit boundary; cleanup commits worker=false first, then recovers at most one exact new final-release run/resource window, removes only its owned marker, and prints PASS only after reconciliation. Scheduled enable requires the supplied run to be the latest worker run, successful, exact-release, positive-work, statement-accounted, and resource-window closed; it refreshes external disk evidence and runs the complete installed guard in the enabling transaction. Rollback creates the worker quarantine first, waits for the owned worker exclusion, disables and commits, then recovers an exact abandoned final-release run without editing crontab.
+Each mutating controller checks both the fixture-core reservation and the normal publisher time window before holding the canonical writer lock. Forward mutations return a clean deferral when busy or reserved. The canary records that enable was attempted **before** the ambiguous commit boundary; every cleanup operation explicitly propagates failure, and state flags clear only after their operation succeeds. Cleanup commits worker=false first, then recovers at most one exact new final-release run/resource window, removes only its owned marker, and prints PASS only after reconciliation. Scheduled enable requires the supplied run to be the latest worker run, successful, exact-release, positive-work, statement-accounted, and resource-window closed; it refreshes external disk evidence and runs the complete installed guard in the enabling transaction. Rollback creates the worker quarantine first, prints its recovery token, and waits for the owned worker exclusion. A later ordinary deferral intentionally retains the fence. A retry must supply the exact token, verify the same root-owned marker, finish disable/recovery, and remove it only after success; a missing or foreign token is refused. Rollback never edits crontab.
 
 ## 8. Execution plan
 
@@ -258,7 +258,7 @@ Owner: Operations lead.
 
 Exit criterion: the normal scheduled worker starts and completes a positive run from the final release.
 
-Rollback: run `leaderboard-2bd-disable-scheduled.sh`. It creates the owned worker quarantine before waiting for the worker lock, commits worker=false before recovery, verifies/reconciles at most one exact final-release open run/resource window, leaves backfill false, and removes its marker only after success. Do not edit crontab; its entries already point at the immutable final release. If the exact process does not yield within the bounded wait, retain the fence and escalate for separately authorized exact-process termination.
+Rollback: run `leaderboard-2bd-disable-scheduled.sh`. It creates the owned worker quarantine before waiting for the worker lock and prints the exact recovery token to the private operator log. It commits worker=false before recovery, verifies/reconciles at most one exact final-release open run/resource window, leaves backfill false, and removes its marker only after success. A publisher/lock deferral retains the fence; rerun with `EXPECTED_RETAINED_FENCE_TOKEN` set to that exact token. A retry without the token or with a foreign marker must refuse to proceed. Do not edit crontab; its entries already point at the immutable final release. If the exact process does not yield within the bounded wait, retain the fence and escalate for separately authorized exact-process termination.
 
 ### Phase 6 — bounded backlog drain
 
@@ -360,14 +360,14 @@ Start this gate only after the authenticated Production smoke passes.
 
 Schedule one low-volume authenticated probe in every UTC observation day, after a normal publisher cycle. Each probe must record the exact deployment/publication and enforce these initial named limits:
 
-- published leaderboard age no greater than 15 minutes;
+- for every eligible source change, elapsed time from that change to its committed publication no greater than 15 minutes; an unchanged cohort is not failed merely because its last publication timestamp is older;
 - oldest dirty leaderboard queue age no greater than 15 minutes after the initial drain is complete;
 - zero open worker runs outside an actively observed bounded invocation;
 - installed resource guard `ok=true` with no breaches;
 - latest normal odds-delivery report `ok=true`, `committed=true`, and no more than 20 minutes old;
 - authenticated reader response successful, nonempty where required, and bound to the expected current publication.
 
-A missing observation cannot certify that day. Tighten these limits if the measured steady state supports it; do not loosen them during the seven-day gate without a new review.
+A missing observation cannot certify that day. The daily probe is a checkpoint, not the only evidence: retain intervening worker runs, queue snapshots, publication receipts, source reconciliation, and normal odds-delivery records to judge the entire observation period. Tighten these limits if the measured steady state supports it; do not loosen them during the seven-day gate without a new review.
 
 For seven consecutive days require:
 
@@ -377,7 +377,7 @@ For seven consecutive days require:
 - queue age stays bounded and publications stay current;
 - no reader 5xx or incomplete-payload error;
 - representative source-oracle checks continue to pass;
-- p95 and maximum concurrency test bounds remain within the existing contract;
+- p95 and maximum five-request latency bounds remain within the existing contract;
 - no manual counter reset, limit increase, hidden retry, or data repair is needed.
 
 Any material failure resets the gate only after the cause is fixed and a new final-release canary passes. The new system may remain active internally if the failure is understood and customer launch stays closed; otherwise use the dormant reader rollback.
@@ -416,7 +416,7 @@ The reviewer should answer each item explicitly:
 - [ ] Does resume rerun the complete installed guard transactionally?
 - [ ] Does the canary require positive work, exact resource accounting, lost-ack-safe cleanup, exact open-run recovery, and disable-before-PASS?
 - [ ] Does scheduled enable require the supplied run to be the latest closed successful run and rerun the full guard with the fresh disk observation?
-- [ ] Does rollback fence new starts before disabling and recover exact work without editing crontab?
+- [ ] Does rollback fence new starts before disabling, resume an exact retained fence after deferral, refuse foreign markers, and recover exact work without editing crontab?
 - [ ] Is backfill correctly excluded from initial activation?
 - [ ] Are the backlog stop conditions strict enough without inventing new thresholds?
 - [ ] Do the three website certification suites cover customer behavior, source accuracy, and the accurately described five-request latency scope?
