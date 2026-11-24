@@ -3,7 +3,7 @@
 
 The customer website never calls SportMonks. This bounded worker fetches the
 provider table, validates it as a complete season snapshot, and replaces the
-canonical season and compatibility cache in one transaction. A failed fetch
+single canonical season table in one transaction. A failed fetch
 or validation leaves the last-known-good table untouched.
 """
 
@@ -202,6 +202,49 @@ def verify_expectations(
             )
 
 
+def load_fixture_team_ids(cur, target: SeasonTarget) -> set[int]:
+    """Return every real team referenced by fixtures in the standings scope.
+
+    SportMonks can publish placeholder fixtures whose participant is literally
+    named ``TBC``. That provider placeholder is not a football team and cannot
+    have a standings row; every other fixture participant is mandatory.
+    """
+    cur.execute(
+        """
+        with fixture_teams as (
+          select f.home_team_id as team_id
+            from public.fixtures f
+           where f.league_id = %s and f.season_id = %s
+          union
+          select f.away_team_id as team_id
+            from public.fixtures f
+           where f.league_id = %s and f.season_id = %s
+        )
+        select ft.team_id
+          from fixture_teams ft
+          join public.teams t on t.id = ft.team_id
+         where lower(trim(t.name)) <> 'tbc'
+         order by ft.team_id
+        """,
+        (target.league_id, target.season_id, target.league_id, target.season_id),
+    )
+    return {int(row[0]) for row in cur.fetchall()}
+
+
+def verify_fixture_team_completeness(
+    target: SeasonTarget,
+    standings: list[dict[str, Any]],
+    expected_team_ids: set[int],
+) -> None:
+    actual_team_ids = {int(row["team_id"]) for row in standings}
+    missing = sorted(expected_team_ids - actual_team_ids)
+    if missing:
+        raise ValueError(
+            f"official standings are missing fixture teams for league={target.league_id} "
+            f"season={target.season_id}: {missing}"
+        )
+
+
 def fetch_rows(client: SportMonksClient, endpoint: str, **params: object) -> list[dict[str, Any]]:
     return [
         row
@@ -274,6 +317,19 @@ def normalize_standings(
         team_name = str(participant.get("name") or "").strip()
         if not team_name:
             raise ValueError(f"participant name missing for team {team_id}")
+        group_id = optional_int(row.get("group_id"))
+        group_name: str | None = None
+        if group_id is not None:
+            group = row.get("group")
+            if not isinstance(group, dict):
+                raise ValueError(
+                    f"SportMonks standing for team {team_id} is missing the requested group include"
+                )
+            if required_int(group.get("id"), "standing.group.id") != group_id:
+                raise ValueError(f"group identity mismatch for team {team_id}")
+            group_name = str(group.get("name") or "").strip()
+            if not group_name:
+                raise ValueError(f"group name missing for team {team_id}")
         details = detail_values(row)
         missing_details = [name for name, type_id in DETAIL_TYPES.items() if type_id not in details]
         if missing_details:
@@ -283,7 +339,8 @@ def normalize_standings(
                 "league_id": target.league_id,
                 "season_id": target.season_id,
                 "stage_id": stage_id,
-                "group_id": optional_int(row.get("group_id")),
+                "group_id": group_id,
+                "group_name": group_name,
                 "team_id": team_id,
                 "provider_standing_id": required_int(row.get("id"), "standing.id"),
                 "standing_rule_id": optional_int(row.get("standing_rule_id")),
@@ -369,7 +426,7 @@ def fetch_season(client: SportMonksClient, target: SeasonTarget) -> dict[str, An
     standings = list(
         client.fetch_collection(
             f"standings/seasons/{target.season_id}",
-            includes=["details", "participant"],
+            includes=["details", "participant", "group"],
             per_page=100,
         )
     )
@@ -409,7 +466,7 @@ def publish_season(cur, target: SeasonTarget, snapshot: dict[str, Any], fetched_
         cur,
         """
         insert into public.official_team_standings (
-          league_id, season_id, stage_id, group_id, team_id,
+          league_id, season_id, stage_id, group_id, group_name, team_id,
           provider_standing_id, standing_rule_id, round_id, position, points,
           played, wins, draws, losses, goals_for, goals_against, goal_diff,
           result, team_name, team_short_code, team_image_path,
@@ -418,7 +475,7 @@ def publish_season(cur, target: SeasonTarget, snapshot: dict[str, Any], fetched_
         """,
         [
             (
-                row["league_id"], row["season_id"], row["stage_id"], row["group_id"], row["team_id"],
+                row["league_id"], row["season_id"], row["stage_id"], row["group_id"], row["group_name"], row["team_id"],
                 row["provider_standing_id"], row["standing_rule_id"], row["round_id"], row["position"], row["points"],
                 row["played"], row["wins"], row["draws"], row["losses"], row["goals_for"], row["goals_against"], row["goal_diff"],
                 row["result"], row["team_name"], row["team_short_code"], row["team_image_path"], digest, fetched_at,
@@ -522,8 +579,12 @@ def main() -> int:
         for target in targets:
             LOG.info("Fetching official standings league=%s season=%s", target.league_id, target.season_id)
             try:
+                with conn.cursor() as cur:
+                    expected_team_ids = load_fixture_team_ids(cur, target)
+                conn.rollback()
                 snapshot = fetch_season(client, target)
                 verify_expectations(target, snapshot["standings"], expectations)
+                verify_fixture_team_completeness(target, snapshot["standings"], expected_team_ids)
                 if not args.dry_run:
                     with conn.cursor() as cur:
                         publish_season(cur, target, snapshot, datetime.now(UTC))
@@ -534,6 +595,7 @@ def main() -> int:
                         "season_id": target.season_id,
                         "stage_id": snapshot["stage_id"],
                         "rows": len(snapshot["standings"]),
+                        "fixture_teams": len(expected_team_ids),
                         "corrections": len(snapshot["corrections"]),
                         "payload_hash": snapshot["payload_hash"],
                         "status": "validated" if args.dry_run else "published",
