@@ -2,8 +2,18 @@ name: Fixture Delivery Production Failover
 
 on:
   schedule:
-    - cron: "35 * * * *"
+    # Publish shortly before the legacy VPS publisher tick. The VPS keeps its
+    # normal guard and skips while this release is fresh, so the canonical
+    # publisher can retire legacy standings tables without a stale runtime
+    # trying to write them.
+    - cron: "5 * * * *"
   workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "Ignore only the minimum publish interval for a reviewed cutover"
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: fixture-delivery-production-failover
@@ -18,6 +28,7 @@ jobs:
       PYTHONUNBUFFERED: "1"
       PGSSLMODE: require
       SOURCE_RECOVERY_MARGIN_MINUTES: "480"
+      FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS: ${{ inputs.force_publish && '0' || '3600' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -179,7 +190,7 @@ jobs:
             --leagues "${STATS_LEAGUES}" \
             --report-out "/tmp/fixture_failover_delivery_report.json" \
             --skip-if-publication-active \
-            --min-publish-interval-seconds 3600 \
+            --min-publish-interval-seconds "${FIXTURE_DELIVERY_PUBLISH_MIN_INTERVAL_SECONDS}" \
             2>&1 | tee /tmp/fixture_failover_delivery.log
           publish_statuses=("${PIPESTATUS[@]}")
           set -e
