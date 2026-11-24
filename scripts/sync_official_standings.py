@@ -49,7 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--leagues", help="comma-separated league IDs; defaults to config/league_ids.txt")
     parser.add_argument("--season-id", type=int, action="append", default=[])
-    parser.add_argument("--current-only", action="store_true", help="refresh only the latest started season per league")
+    parser.add_argument(
+        "--current-only",
+        action="store_true",
+        help="refresh only the latest started season per league (the default unless explicit season IDs are supplied)",
+    )
     parser.add_argument(
         "--all-fixture-seasons",
         action="store_true",
@@ -127,7 +131,11 @@ def load_targets(
             """,
             (leagues, season_ids),
         )
-    elif current_only or all_fixture_seasons:
+    else:
+        # Routine runs deliberately refresh only the latest started season for
+        # each supported league. Historical backfill is an explicit operation
+        # because SportMonks does not publish a table for every old season that
+        # still has fixtures in our database.
         cur.execute(
             """
             with candidates as (
@@ -155,43 +163,6 @@ def load_targets(
              order by c.league_id, c.start_date, c.id
             """,
             (leagues, all_fixture_seasons),
-        )
-    else:
-        # Refresh the latest started season for every supported league and
-        # backfill any older season that the website can source from fixtures.
-        cur.execute(
-            """
-            with candidates as (
-              select
-                s.league_id,
-                s.id,
-                s.start_date,
-                row_number() over (
-                  partition by s.league_id
-                  order by s.start_date desc nulls last, s.id desc
-                ) as season_rank
-              from public.seasons s
-              where s.league_id = any(%s)
-                and (s.start_date is null or s.start_date <= current_date)
-                and exists (
-                  select 1
-                    from public.fixtures f
-                   where f.league_id = s.league_id
-                     and f.season_id = s.id
-                )
-            )
-            select c.league_id, c.id, c.start_date::text
-              from candidates c
-             where c.season_rank = 1
-                or not exists (
-                  select 1
-                    from public.official_team_standings o
-                   where o.league_id = c.league_id
-                     and o.season_id = c.id
-                )
-             order by c.league_id, c.start_date, c.id
-            """,
-            (leagues,),
         )
     rows = [SeasonTarget(int(row[0]), int(row[1]), row[2]) for row in cur.fetchall()]
     missing = set(season_ids) - {row.season_id for row in rows}

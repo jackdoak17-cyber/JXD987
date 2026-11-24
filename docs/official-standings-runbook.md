@@ -21,11 +21,19 @@ Fixture-derived standings remain an independent audit only.
    ```bash
    python scripts/sync_official_standings.py \
      --leagues "$(source scripts/vps/common.sh; supported_league_csv)" \
+     --all-fixture-seasons \
+     --continue-on-error \
      --report-out /tmp/official-standings-initial.json
    ```
 
-   The initial run refreshes every current season and backfills seasons with
-   fixtures that do not yet have an official snapshot.
+   Inspect the complete report before continuing. The reviewed provider
+   inventory validates 71 of 72 fixture-backed seasons. League `989`, season
+   `22847`, currently has no SportMonks standings and must be the only reported
+   failure; it remains unavailable in the website rather than falling back to
+   a reconstructed table. Any different or additional failure stops release.
+   Routine P3 runs omit both flags and refresh only the latest started season
+   for every supported league, so the known historical absence cannot block
+   current-table freshness.
 4. Verify the canonical table and `team_standings_cache` have identical rank,
    points, played and goal totals for every published scope.
 5. Deploy the website change and run its team Stats API/browser certification.

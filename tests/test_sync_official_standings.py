@@ -4,12 +4,26 @@ import pytest
 
 from scripts.sync_official_standings import (
     SeasonTarget,
+    load_targets,
     normalize_corrections,
     normalize_standings,
     parse_expectations,
     selected_stage,
     verify_expectations,
 )
+
+
+class RecordingCursor:
+    def __init__(self) -> None:
+        self.query = ""
+        self.params = ()
+
+    def execute(self, query, params) -> None:
+        self.query = query
+        self.params = params
+
+    def fetchall(self):
+        return [(9, 27903, "2026-08-01")]
 
 
 def details(*, played: int, wins: int, draws: int, losses: int, goals_for: int, goals_against: int):
@@ -199,3 +213,14 @@ def test_exact_provider_expectation_guards_southampton_contract() -> None:
 
     with pytest.raises(ValueError, match="standing expectation failed"):
         verify_expectations(target, standings, parse_expectations(["27903:65:3:31"]))
+
+
+def test_routine_target_scope_is_current_only_not_implicit_historical_backfill() -> None:
+    cursor = RecordingCursor()
+
+    targets = load_targets(cursor, [9], [])
+
+    assert targets == [SeasonTarget(league_id=9, season_id=27903, start_date="2026-08-01")]
+    assert "season_rank = 1" in cursor.query
+    assert "official_team_standings" not in cursor.query
+    assert cursor.params == ([9], False)
