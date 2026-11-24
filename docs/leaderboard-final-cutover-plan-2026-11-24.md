@@ -30,12 +30,14 @@ This plan intentionally eliminates unnecessary migration delay. It does **not** 
 
 The new system is implemented and substantially tested. It has already completed many successful production shadow worker runs and produced published cohorts. The final repaired immutable Operations release is installed on the VPS, and both scheduled source reconciliation and the disabled leaderboard worker point at it.
 
-The final release has not yet completed its own production canary. It is blocked by two truthful admission gates:
+The final release has not yet completed its own production canary. The normal unattended path is blocked by two truthful admission gates:
 
 - the repaired source release needs 20 comparable successful performance samples before its importer baseline can be replaced;
 - the rolling 24-hour worker temporary-data total must fall below the existing 512 MiB limit.
 
-Those gates protect the shared database, not customer continuity. Once they pass, the cutover should proceed without an artificial soak between phases.
+The 512 MiB figure is an inherited conservative application-accounting safeguard. The available record does **not** show that it is a measured database disruption threshold, that Jack personally selected it, or that the recent database-wide fallback bytes were caused by leaderboard SQL. It remains binding for unattended processing. This revision adds an independently reviewable one-time supervised canary exception; it does not authorize the scheduled worker while the normal guard is red.
+
+Those gates protect the shared database, not customer continuity. Once the normal guard passes, the cutover should proceed without an artificial soak between phases.
 
 The seven-day gate begins **after** the new reader is active internally. It is a pre-launch stability gate, not a reason to keep the legacy reader serving production traffic.
 
@@ -71,12 +73,28 @@ If no new worker temp is added, the current hourly ledger is projected to fall u
 
 All live values must be reread immediately before each mutating phase. This snapshot is evidence for review, not an instruction to reuse stale numbers.
 
+### 3.1 Later accounting and source evidence
+
+A read-only database check at `2026-11-24 13:11:54 UTC` found:
+
+- current repaired-source performance at **15 / 20** comparable samples, latest run successful on `a41e89b4837a`;
+- the installed importer baseline still on the older `62427a05507c` release, so importer-only rebaseline remains pending;
+- 305 statement-exact worker runs in the rolling window with **0 temporary bytes and 0 failures**;
+- six database-window fallback runs with **968,593,596 temporary bytes**, five of them failed;
+- zero open rolling reservations and no installed rolling policy.
+
+Across all retained history, statement-exact accounting reports 1,773 runs and 30,171,136 temporary bytes in one positive run, while database-window fallback reports eight runs and 1,232,337,197 bytes. Fallback measures the whole database during a worker interval; it is deliberately conservative and does not attribute those bytes solely to leaderboards.
+
+The 512 MiB number first appears as an initial testing/backfill stop condition and was later reused as a conservative rolling daily budget. That provenance supports keeping an automatic pause, but not describing the number as a proven failure point or an individually approved capacity limit.
+
+The existing dormant rolling-worker path is **not** the shortcut for this exception. Production currently has no rolling policy, its protected VPS environment has no rolling-policy pins, and the installed first-policy opening requires the normal temporary-data guard to be below 512 MiB. Creating a new rolling policy would therefore add a larger unreviewed transition without solving the present gate.
+
 ## 4. What is already complete
 
 ### 4.1 Database and policy
 
 - The rolling 24-hour resource policy is installed.
-- The hard limits remain 5 GiB worker WAL, 512 MiB worker temp, 3 GiB shadow storage, 1.0 index-to-heap ratio, and 20 GiB minimum available database disk.
+- The installed unattended safeguards remain 5 GiB worker WAL, 512 MiB worker temp, 3 GiB shadow storage, 1.0 index-to-heap ratio, and 20 GiB minimum available database disk. The 512 MiB value is an application-accounting tripwire, not a PostgreSQL `temp_file_limit` or measured service-failure threshold.
 - Sticky resource-pause and guarded-resume behavior is installed.
 - `rebaseline_importer_only_v3(bigint,timestamptz)` is installed as `SECURITY INVOKER`, owned by `postgres`, with only explicit owner execution.
 - `resume_resource_guard_v2(bigint,timestamptz)` is installed with the same ownership and execution boundary.
@@ -116,8 +134,8 @@ The new system is implemented when all of the following are true:
 
 1. Final source release has at least 20 genuine comparable successful samples.
 2. Importer baseline is moved to that release without clearing the resource pause or enabling work.
-3. Full resource guard passes with fresh external disk evidence and unchanged limits.
-4. Exact final-release canary claims at least one item and completes all claimed items with zero failures.
+3. Importer-only rebaseline is complete and every fresh guard predicate except an explicitly reviewed supervised-canary temp exception is green.
+4. Exact final-release canary claims at least one item and completes all claimed items with zero failures and exact accounting; after any exception, the 512 MiB normal limit is restored before the quarantine is removed.
 5. Scheduled bounded worker is enabled; backfill remains disabled unless a separate gap audit proves it is required.
 6. Capture queue and generation backlog drain without resource breaches or stuck leases.
 7. All changed cohorts publish and the publication cursor is caught up.
@@ -132,7 +150,7 @@ The seven-day gate is required for launch readiness, but it does not block inter
 
 - Do not generate manual source successes to reach the 20-sample gate.
 - Do not reset resource counters or delete hourly resource history.
-- Do not raise the 512 MiB temp limit, 5 GiB WAL limit, database capacity, or application timeouts as a shortcut.
+- Do not raise the 512 MiB temp limit, 5 GiB WAL limit, database capacity, or application timeouts for unattended work or as an open-ended shortcut. The one supervised-canary exception in Phase 3A is the only proposed departure: it is exact-evidence-bound, fenced, short-lived, and must restore 512 MiB before unfencing.
 - Do not hold the canonical writer lock while waiting for a future gate.
 - Do not run certification, source reconciliation, and leaderboard heavy work concurrently.
 - Do not enable backfill during initial activation.
@@ -144,19 +162,21 @@ The seven-day gate is required for launch readiness, but it does not block inter
 
 ## 7. Prepared production controls
 
-The first controller set reviewed with this plan is superseded and must not be executed. The corrected local set below addresses the independent review findings. It is not yet authorized or staged on the VPS; staging, remote byte-for-byte hash verification, and an independent rereview are required before execution.
+The first controller set reviewed with this plan is superseded and must not be executed. Four unchanged controllers below were staged and hash-verified in the private VPS review directory. The canary and offline test hashes changed for this exception revision; their earlier staged copies are superseded and must not be executed. The new canary/test are local only and require independent rereview, fresh private staging, and remote byte-for-byte verification before execution.
 
 | Controller | Purpose | SHA-256 |
 |---|---|---|
 | `leaderboard-2bd-rebaseline.sh` | Rebaseline only the importer after 20 genuine samples | `ce051d7b117c9146a7b0af1e27070863508960b05a61c927a4d4dd7f9cf83f6e` |
 | `leaderboard-2bd-resume.sh` | Clear resource pause only if the full installed guard passes | `7928aed70d3af56ed4b712c0436796cb41964b6b5f053a6db3e9d96c7741bbc8` |
-| `leaderboard-2bd-owned-250.sh` | One 250-bound, 30-second final-release canary with deterministic reconciliation | `d617034a77a17a05054f8380f87f8b60ba1e7c805a878a0a4beb5d072bf6a0e5` |
+| `leaderboard-2bd-owned-250.sh` | One 250-bound, 30-second final-release canary with deterministic reconciliation and an opt-in reviewed temp exception | `6a8e41095530842ef614da13a8459ab3ebafc618b3797fc9e237cdeb496ff328` |
 | `leaderboard-2bd-enable-scheduled.sh` | Enable normal bounded schedule using the latest exact canary and a fresh full guard | `4c76643949883cfd629e8f5f8c66857dfb0a2139a65639397b43ccdd847d5662` |
 | `leaderboard-2bd-disable-scheduled.sh` | Fence new starts, disable, then recover at most one exact final-release run | `ded7a1afc8d121b3c392b418ca62f19dba52a99b0a1da6219f1ec0f4e8bdfaf7` |
 
-The offline controller contract is `test-leaderboard-2bd-controller-contracts.py`, SHA-256 `1fc1fa5a44bbdf5015746a3afdeba5cf3576c5cdaabb7c4a4011f8ce52c5e5a3`. Nine tests pass. The tests execute the actual canary shell cleanup functions—with only the root-owner assertion adapted to the local test UID—with disable, recovery, and pre-unlink marker-validation failures injected. Disable or recovery failure must retain the fence; a pre-unlink validation failure also leaves it untouched. They also execute rollback marker creation, simulate a publisher deferral, resume with the exact retained token, remove the marker only after success, and refuse a foreign marker. The remaining contracts cover publisher reservation ordering, latest-run binding, fresh full-guard evaluation, and rollback fencing order. These are offline contracts, not hosted proof.
+The offline controller contract is `test-leaderboard-2bd-controller-contracts.py`, SHA-256 `a1912ac26de33616e4166025f38413c15798481cdab2201f139e239da83f5667`. Ten tests pass. The tests execute the actual canary shell cleanup functions—with only the root-owner assertion adapted to the local test UID—with disable, recovery, exception restoration, and pre-unlink marker-validation failures injected. Disable, recovery, or normal-limit restoration failure must retain the fence; a pre-unlink validation failure also leaves it untouched. They also execute rollback marker creation, simulate a publisher deferral, resume with the exact retained token, remove the marker only after success, and refuse a foreign marker. The remaining contracts cover publisher reservation ordering, latest-run binding, fresh full-guard evaluation, exact exception arithmetic/accounting, restoration-before-unfencing, and rollback fencing order. These are offline contracts, not hosted proof.
 
 Each mutating controller checks both the fixture-core reservation and the normal publisher time window before holding the canonical writer lock. Forward mutations return a clean deferral when busy or reserved. The canary records that enable was attempted **before** the ambiguous commit boundary; every cleanup operation explicitly propagates failure, and state flags clear only after their operation succeeds. Cleanup commits worker=false first, then recovers at most one exact new final-release run/resource window, removes only its owned marker, and prints PASS only after reconciliation. Scheduled enable requires the supplied run to be the latest worker run, successful, exact-release, positive-work, statement-accounted, and resource-window closed; it refreshes external disk evidence and runs the complete installed guard in the enabling transaction. Rollback creates the worker quarantine first, prints its recovery token, and waits for the owned worker exclusion. A later ordinary deferral intentionally retains the fence. A retry must supply the exact token, verify the same root-owned marker, finish disable/recovery, and remove it only after success; a missing or foreign token is refused. Rollback never edits crontab.
+
+The canary's exception path is disabled unless the operator explicitly supplies `SUPERVISED_TEMP_EXCEPTION=1`. It pins the reviewed 968,593,596-byte rolling value, allows exactly 64 MiB of temporary-data headroom by temporarily setting the application tripwire to 1,035,702,460 bytes, and refuses any changed composition or any other guard breach. It requires at least one statement-exact run in the current rolling window, zero statement-exact temporary bytes in that window, and database-window fallback bytes equal to the reviewed rolling total. The canary itself must finish with `resource_accounting_mode='statement_exact'` and no more than 64 MiB attributed temp. Cleanup disables and reconciles the run, restores 536,870,912 bytes, reruns the full guard, and only then removes its fence. Any lost acknowledgement, fallback accounting, ingestion/disk deterioration, restoration failure, or evidence drift retains the quarantine and returns failure.
 
 Marker removal consists of unlinking the owned marker and then syncing its parent directory. A final parent-sync error can therefore return failure after the marker is already absent. That is not the original worker-start hazard because database disable and exact run recovery have already succeeded on the removal path. Operator response: do not assume the marker remains; verify its actual presence/absence, `worker_enabled=false`, `backfill_enabled=false`, and zero open worker runs before retrying or declaring cleanup complete.
 
@@ -224,6 +244,29 @@ Exit criterion: full installed guard is green with worker still disabled.
 
 Rollback: `resume_resource_guard_v2` is transactional and reruns the guard after clearing the pause. Any breach aborts and restores the sticky pause automatically.
 
+### Phase 3A — optional supervised canary exception
+
+Owner: Operations lead; independent reviewer approval required for the exact canary hash.
+
+This phase may run **before** Phase 3 only if importer-only rebaseline has completed and the normal 512 MiB temp tripwire is the sole remaining breach. It completes the final-release canary early; it does not authorize scheduled work. If the rolling temp has already fallen to 512 MiB or below, skip this phase and use Phases 3 and 4 normally.
+
+1. Require source baseline `a41e89b4837a`, at least 20 genuine comparable samples, a fresh successful source run, worker=false, backfill=false, capture=true, zero open runs, and no rolling reservation or transition/quarantine marker.
+2. Enter the reviewed publisher time window, require no active fixture-core reservation, and acquire the same certification/worker/heavy/canonical exclusions as the normal canary.
+3. Create and fsync the owned worker quarantine **before** any database exception is attempted.
+4. Refresh genuine disk evidence and run the complete installed guard at the normal 536,870,912-byte temp limit.
+5. Require the guard's only breach to be `rolling_temp_bytes_limit`, with rolling temp exactly 968,593,596 bytes and rolling WAL no more than 5 GiB. Any different value or additional breach requires a new review; do not round or silently rebaseline this exception.
+6. Recheck the rolling accounting composition: at least one statement-exact run, zero statement-exact temp bytes, and database-window fallback temp equal to 968,593,596 bytes. The current reviewed evidence is 305 exact runs/0 temp and six fallback runs/968,593,596 temp, five failed.
+7. With the quarantine and exclusions still held, temporarily set only the application temp tripwire to **1,035,702,460 bytes**: the reviewed value plus an explicit 64 MiB canary allowance. Do not change WAL, disk, shadow-size, index, source-health, timeout, cost, or capacity settings. Rerun the full guard and require it to be green.
+8. Execute the same 250-fixture/250-capture/250-job, 30-second internal/45-second outer canary once. Require positive work, succeeded=claimed, failed=0, exact final release, `statement_exact` accounting, attributed temp no more than 64 MiB, and a closed resource window.
+9. Regardless of success, disable the worker and recover at most one exact new final-release run. Then restore the 536,870,912-byte normal limit and rerun the full guard.
+10. A successful cleanup may legitimately end paused again on `rolling_temp_bytes_limit`; that is the intended unattended safeguard. Remove the owned quarantine only after worker=false, backfill=false, zero open runs, the normal limit restored, and no additional guard breach. Print PASS only after those checks.
+
+Exit criterion: one positive exact-final-release canary passes, the normal 512 MiB tripwire is restored, worker/backfill are false, no run is open, and the canary run ID/evidence is retained for later scheduled enable.
+
+Failure handling: lost acknowledgement, fallback accounting, any non-temp breach, source/disk deterioration, threshold-restoration failure, or exact-run recovery failure returns failure and retains the quarantine. If marker unlink or parent-directory sync reports an error, verify actual marker presence, worker=false, backfill=false, zero open runs, and the normal temp limit before retrying. Do not enable scheduled work while the normal full guard remains red.
+
+After a successful Phase 3A canary, wait for the ordinary rolling window to clear, execute Phase 3 at the unchanged 512 MiB limit, and proceed directly to Phase 5 using the preserved canary run ID—provided it is still the latest worker run and all Phase 5 predicates pass. Do not rerun Phase 4 merely because the normal window cleared.
+
 ### Phase 4 — exact-final-release canary
 
 Owner: Operations lead, with normal publisher priority.
@@ -231,7 +274,7 @@ Owner: Operations lead, with normal publisher priority.
 1. Enter a safe phase of the normal 15-minute publisher cycle.
 2. Hold certification, worker, heavy, reservation, and canonical-writer exclusions in the reviewed order.
 3. Require fresh disk evidence and no quarantine/transition marker.
-4. Execute `leaderboard-2bd-owned-250.sh` once.
+4. Execute `leaderboard-2bd-owned-250.sh` once with `SUPERVISED_TEMP_EXCEPTION` absent or `0`. The exception form belongs only to Phase 3A.
 5. The controller may temporarily enable the worker only for one direct run bounded by:
    - fixture limit 250;
    - capture limit 250;
@@ -410,13 +453,14 @@ Do not use file modification time as a substitute for provider observation time.
 The reviewer should answer each item explicitly:
 
 - [ ] Is the accelerated pre-launch decision acceptable: activate after canary, then run the seven-day gate while active internally?
-- [ ] Are the 20-sample and rolling-resource gates preserved without a shortcut?
+- [ ] Is the 20-sample importer gate preserved, and is the temp departure limited to the exact one-time fenced canary rather than unattended processing?
 - [ ] Do the five corrected controllers bind the exact final release and fail closed on drift?
 - [ ] Are lock ordering and normal Odds Search publisher priority preserved?
 - [ ] Do rebaseline, resume, canary, scheduled enable, and rollback all defer for an active publisher reservation and unsafe publisher time window?
 - [ ] Does rebaseline change only importer evidence and leave pause/worker/backfill unchanged?
 - [ ] Does resume rerun the complete installed guard transactionally?
 - [ ] Does the canary require positive work, exact resource accounting, lost-ack-safe cleanup, exact open-run recovery, and disable-before-PASS?
+- [ ] Does the supervised exception admit only the reviewed 968,593,596-byte fallback composition, cap the canary allowance at 64 MiB, restore 512 MiB before unfencing, and refuse every other breach?
 - [ ] Does scheduled enable require the supplied run to be the latest closed successful run and rerun the full guard with the fresh disk observation?
 - [ ] Does rollback fence new starts before disabling, resume an exact retained fence after deferral, refuse foreign markers, and recover exact work without editing crontab?
 - [ ] Is backfill correctly excluded from initial activation?
@@ -433,8 +477,10 @@ The reviewer should answer each item explicitly:
 These are dependencies, not promises:
 
 - Source baseline: as soon as 20 natural comparable samples exist.
-- Resource window: earliest projected clearance is approximately 23:00 UTC on 24 November if no new worker temp is added.
-- Rebaseline + resume + canary: approximately 30 minutes once both gates are ready and the normal writer is idle.
+- Supervised canary: may run after importer rebaseline and independent approval if the exact reviewed temp evidence is unchanged and every other guard is green; 23:00 is not treated as a database-safety boundary.
+- Normal resource window: earliest projected clearance is approximately 23:00 UTC on 24 November if no new worker temp is added. This still gates scheduled unattended activation.
+- Rebaseline + supervised canary: approximately 30 minutes once the importer gate, rereview, and normal-writer slot are ready.
+- Normal resume: immediately when the unchanged full guard becomes green; no second canary is required if the preserved exception-canary run remains the latest exact successful run.
 - Initial scheduled activation: immediately after a positive canary.
 - Backlog drain: determined by real bounded throughput; do not estimate from queue depth alone before the first final-release runs.
 - Reader certification and Production switch: same day as backlog/publication completion if all three suites pass.
@@ -443,4 +489,4 @@ These are dependencies, not promises:
 
 ## 12. Reviewer handoff state
 
-At review time, no step in this document authorizes an immediate mutation by itself. The worker and backfill are still disabled, capture is enabled, the resource pause is active, and no worker run is open. The next permitted mutation is the importer-only rebaseline, but only after the live 20-sample predicate and every controller precondition pass.
+At review time, no step in this document authorizes an immediate mutation by itself. The worker and backfill are still disabled, capture is enabled, the resource pause is active, and no worker run is open. The repaired release has 15/20 comparable samples, so the next permitted mutation remains importer-only rebaseline after the live 20-sample predicate and every controller precondition pass. The supervised exception canary is a later, separately reviewed mutation; it is not permission to enable scheduled work while the normal guard is red.
