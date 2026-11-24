@@ -451,29 +451,6 @@ def publish_season(cur, target: SeasonTarget, snapshot: dict[str, Any], fetched_
             page_size=100,
         )
 
-    # Existing website consumers keep their stable read contract while the
-    # cache becomes an atomic projection of the official provider table.
-    cur.execute(
-        "delete from public.team_standings_cache where league_id = %s and season_id = %s",
-        (target.league_id, target.season_id),
-    )
-    execute_values(
-        cur,
-        """
-        insert into public.team_standings_cache (
-          league_id, season_id, team_id, rank, points, played,
-          goals_for, goals_against, goal_diff, updated_at
-        ) values %s
-        """,
-        [
-            (
-                row["league_id"], row["season_id"], row["team_id"], row["position"], row["points"], row["played"],
-                row["goals_for"], row["goals_against"], row["goal_diff"], fetched_at,
-            )
-            for row in standings
-        ],
-        page_size=100,
-    )
     cur.execute(
         """
         insert into public.official_standings_sync_runs (
