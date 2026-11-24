@@ -12,10 +12,17 @@ import sys
 
 
 FROZEN_PREFIX = b"# oddssearch-cutover "
-ENTRIES = {b"run_stats_reconciliation.sh", b"run_leaderboard_shadow_worker.sh"}
+SOURCE = b"run_stats_reconciliation.sh"
+ENTRIES = {SOURCE, b"run_leaderboard_shadow_worker.sh"}
 LINE = re.compile(rb"((?:[^\s#]+[ \t]+){5}cd )(/[a-zA-Z0-9_./-]+)"
                   rb" && \2/scripts/vps/(run_stats_reconciliation\.sh|run_leaderboard_shadow_worker\.sh)"
                   rb"([ \t][^\r\n]*\n|\n)")
+SOURCE_LINE = re.compile(
+    rb"((?:[^\s#]+[ \t]+){5}cd )(/[a-zA-Z0-9_./-]+)"
+    rb' && STATS_TX_URL="\$\(cat /etc/oddssearch/stats-export-transaction\.url\)"'
+    rb' && test -n "\$STATS_TX_URL" && SUPABASE_DB_URL_SESSION="\$STATS_TX_URL" '
+    rb"\2/scripts/vps/run_stats_reconciliation\.sh([ \t][^\r\n]*\n|\n)"
+)
 MAX_BYTES = 256 * 1024
 BARRIER = {
     3: "/var/lock/oddssearch-leaderboard-shadow.lock",
@@ -49,6 +56,17 @@ def reviewed_bytes(path):
         return stream.read(MAX_BYTES + 1)
 
 
+def scheduled_entry(line):
+    """Return the cron fields that must survive a release-root switch."""
+    direct = LINE.fullmatch(line)
+    if direct:
+        return (b"direct", direct[1], direct[2], direct[3], direct[4])
+    source = SOURCE_LINE.fullmatch(line)
+    if source:
+        return (b"transaction-source", source[1], source[2], SOURCE, source[3])
+    return None
+
+
 def validate_switch(frozen, destination, mode, root):
     for schedule in (frozen, destination):
         if len(schedule) > MAX_BYTES or not schedule.endswith(b"\n") or b"\r" in schedule or b"\0" in schedule:
@@ -63,9 +81,9 @@ def validate_switch(frozen, destination, mode, root):
             if old != new or (not old.lstrip().startswith(b"#") and any(name in old for name in ENTRIES)):
                 raise ValueError("reviewed crontab changes unrelated or unfrozen lines")
             continue
-        source = LINE.fullmatch(old.removeprefix(FROZEN_PREFIX))
-        target = LINE.fullmatch(new)
-        if not source or not target or any(source[group] != target[group] for group in (1, 3, 4)):
+        source = scheduled_entry(old.removeprefix(FROZEN_PREFIX))
+        target = scheduled_entry(new)
+        if not source or not target or any(source[group] != target[group] for group in (0, 1, 3, 4)):
             raise ValueError("reviewed crontab changes an entrant's cadence or command arguments")
         if target[3] in changed or sum(new.count(name) for name in ENTRIES) != 1:
             raise ValueError("reviewed crontab duplicates a scheduled entrant")
