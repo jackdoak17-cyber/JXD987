@@ -29,7 +29,9 @@ from scripts.leaderboard_shadow_worker import (
     configure_temp_file_limit_if_permitted,
     claim_dirty,
     finish_generation,
+    finish_failed_worker_run,
     finish_worker_run,
+    finish_worker_run_database_fallback,
     finish_worker_run_with_resource_check,
     load_external_resource_evidence,
     pending_cohorts,
@@ -762,6 +764,140 @@ def test_worker_finish_is_included_in_final_resource_evidence(monkeypatch):
 
     assert evidence == {"ok": True}
     assert calls == ["finish", "timeouts", "guard"]
+
+
+class FallbackAccountingCursor(FakeCursor):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = iter(rows)
+
+    def execute(self, query, params=None):
+        super().execute(query, params)
+        normalized = " ".join(query.split())
+        if normalized.startswith("update leaderboard_shadow_v1.worker_runs"):
+            self.rowcount = 1
+
+    def fetchone(self):
+        return next(self.rows)
+
+
+def test_failed_worker_fallback_closes_without_rescanning_statement_stats():
+    cursor = FallbackAccountingCursor([
+        {"singleton": True},
+        {
+            "run_id": 73,
+            "finished_at": None,
+            "resource_window_finished_at": None,
+            "resource_start_wal_lsn": "0/1000",
+            "resource_start_database_temp_bytes": 1_000,
+            "active_run_id": 73,
+        },
+        {"wal_bytes": 2_048, "database_temp_bytes": 1_500},
+    ])
+
+    evidence = finish_worker_run_database_fallback(
+        FakeConnection(cursor), 73, 4, 4, 1, "checkpoint timed out",
+    )
+
+    statements = [query for query, _ in cursor.executed]
+    assert evidence == {
+        "ok": True,
+        "finished": True,
+        "mode": "database_window_fallback",
+        "wal_bytes": 2_048,
+        "temp_bytes": 500,
+        "database_temp_stats_regressed": False,
+    }
+    assert not any("m3_raw_statement_resource_totals" in query for query in statements)
+    assert not any("checkpoint_worker_resource_window" in query for query in statements)
+    assert any("pg_stat_database" in query for query in statements)
+    assert any("resource_accounting_mode='database_window_fallback'" in query
+               for query in statements)
+    assert any("set_config('oddssearch.worker_run_id',''" in query for query in statements)
+    assert any("set_config('oddssearch.worker_failed_statement','false'" in query
+               for query in statements)
+
+
+def test_failed_worker_fallback_marks_temp_counter_regression_fail_closed():
+    cursor = FallbackAccountingCursor([
+        {"singleton": True},
+        {
+            "run_id": 74,
+            "finished_at": None,
+            "resource_window_finished_at": None,
+            "resource_start_wal_lsn": "0/2000",
+            "resource_start_database_temp_bytes": 2_000,
+            "active_run_id": 74,
+        },
+        {"wal_bytes": 512, "database_temp_bytes": 1_500},
+    ])
+
+    evidence = finish_worker_run_database_fallback(
+        FakeConnection(cursor), 74, 0, 0, 1, "checkpoint timed out",
+    )
+
+    assert evidence["ok"] is False
+    assert evidence["temp_bytes"] == 0
+    pipeline_update = next(
+        entry for entry in cursor.executed
+        if entry[0].startswith("update leaderboard_shadow_v1.pipeline_state")
+    )
+    assert pipeline_update[1] == (512, 0, True, True)
+
+
+def test_failed_worker_fallback_only_relabels_an_already_closed_run():
+    cursor = FallbackAccountingCursor([
+        {"singleton": True},
+        {
+            "run_id": 75,
+            "finished_at": "2026-11-24T00:00:00Z",
+            "resource_window_finished_at": "2026-11-24T00:00:00Z",
+            "resource_start_wal_lsn": None,
+            "resource_start_database_temp_bytes": None,
+            "active_run_id": None,
+        },
+    ])
+
+    evidence = finish_worker_run_database_fallback(
+        FakeConnection(cursor), 75, 3, 3, 1, "post-finish guard failed",
+    )
+
+    statements = [query for query, _ in cursor.executed]
+    assert evidence == {"ok": True, "already_finished": True}
+    assert not any("pg_stat_database" in query for query in statements)
+    assert not any("durable_resource_wal_bytes" in query for query in statements)
+    assert any("finished_at is not null" in query for query in statements)
+
+
+def test_failed_worker_finalizer_uses_only_the_database_fallback(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        worker_module,
+        "apply_recovery_timeouts",
+        lambda *_args: calls.append("timeouts"),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "mark_failed_statement_interval",
+        lambda *_args: calls.append("mark"),
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "finish_worker_run_database_fallback",
+        lambda *_args, **_kwargs: calls.append("fallback") or {"ok": True},
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "finish_worker_run",
+        lambda *_args, **_kwargs: pytest.fail("exact checkpoint was repeated"),
+    )
+
+    evidence = finish_failed_worker_run(
+        object(), 76, 5, 4, RuntimeError("processing failed"),
+    )
+
+    assert evidence == {"ok": True}
+    assert calls == ["timeouts", "mark", "fallback"]
 
 
 def test_resource_guard_checkpoints_an_active_run_before_enforcement():

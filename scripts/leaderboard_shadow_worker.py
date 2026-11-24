@@ -410,6 +410,180 @@ def finish_worker_run(
             )
 
 
+def finish_worker_run_database_fallback(
+    conn, run_id: int, claimed: int, succeeded: int, failed: int,
+    failure_summary: str,
+) -> dict[str, Any]:
+    """Close a failed run without rescanning pg_stat_statements.
+
+    The normal checkpoint is exact but can itself be the statement that times
+    out when the statistics view is congested.  Repeating that same checkpoint
+    in the exception handler can leave the run open until a later cron tick.
+    This failure-only path uses the checkpoint function's conservative
+    database-wide WAL/temp accounting instead.  It never turns a failed run
+    into a success and remains atomic with the run close.
+    """
+
+    with conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                select singleton
+                from leaderboard_shadow_v1.pipeline_state
+                where singleton
+                for update
+                """
+            )
+            if not cur.fetchone():
+                raise RuntimeError("leaderboard shadow pipeline state is missing")
+            cur.execute(
+                """
+                select run.run_id, run.finished_at,
+                       run.resource_window_finished_at,
+                       run.resource_start_wal_lsn,
+                       run.resource_start_database_temp_bytes,
+                       nullif(current_setting('oddssearch.worker_run_id',true),'')::bigint
+                         as active_run_id
+                from leaderboard_shadow_v1.worker_runs run
+                where run.run_id=%s
+                for update
+                """,
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if not run:
+                raise RuntimeError("failed worker run is missing during fallback finalization")
+
+            if run["finished_at"] is not None:
+                if run["resource_window_finished_at"] is None:
+                    raise RuntimeError("finished worker run has an open resource window")
+                cur.execute(
+                    """
+                    update leaderboard_shadow_v1.worker_runs
+                    set heartbeat_at=clock_timestamp(),
+                        claimed_count=%s, succeeded_count=%s, failed_count=%s,
+                        failure_summary=%s
+                    where run_id=%s and finished_at is not null
+                      and resource_window_finished_at is not null
+                    """,
+                    (claimed, succeeded, failed, failure_summary, run_id),
+                )
+                cur.execute(
+                    """
+                    update leaderboard_shadow_v1.pipeline_state
+                    set last_worker_heartbeat_at=clock_timestamp(),
+                        updated_at=clock_timestamp()
+                    where singleton
+                    """
+                )
+                cur.execute("select set_config('oddssearch.worker_run_id','',false)")
+                cur.execute("select set_config('oddssearch.worker_failed_statement','false',false)")
+                return {"ok": True, "already_finished": True}
+
+            if run["active_run_id"] != run_id:
+                raise RuntimeError("fallback finalization does not own the active worker run")
+            if (
+                run["resource_start_wal_lsn"] is None
+                or run["resource_start_database_temp_bytes"] is None
+            ):
+                raise RuntimeError("failed worker run has no recoverable resource window")
+
+            cur.execute(
+                """
+                select greatest(
+                         pg_wal_lsn_diff(pg_current_wal_insert_lsn(),%s::pg_lsn),0
+                       )::numeric as wal_bytes,
+                       database.temp_bytes::bigint as database_temp_bytes
+                from pg_stat_database database
+                where database.datname=current_database()
+                """,
+                (run["resource_start_wal_lsn"],),
+            )
+            measurement = cur.fetchone()
+            if not measurement:
+                raise RuntimeError("database resource counters are unavailable")
+
+            database_temp = int(measurement["database_temp_bytes"])
+            start_temp = int(run["resource_start_database_temp_bytes"])
+            temp_regressed = database_temp < start_temp
+            temp_bytes = 0 if temp_regressed else database_temp - start_temp
+            wal_bytes = measurement["wal_bytes"]
+
+            cur.execute(
+                """
+                update leaderboard_shadow_v1.pipeline_state
+                set durable_resource_wal_bytes=durable_resource_wal_bytes+%s,
+                    durable_resource_temp_bytes=durable_resource_temp_bytes+%s,
+                    resource_paused=resource_paused or %s,
+                    resource_pause_reason=case when %s then concat_ws(
+                      ',',nullif(resource_pause_reason,''),
+                      'database_temp_stats_reset_or_regressed'
+                    ) else resource_pause_reason end,
+                    last_worker_heartbeat_at=clock_timestamp(),
+                    updated_at=clock_timestamp()
+                where singleton
+                """,
+                (wal_bytes, temp_bytes, temp_regressed, temp_regressed),
+            )
+            cur.execute(
+                """
+                update leaderboard_shadow_v1.worker_runs
+                set heartbeat_at=clock_timestamp(), finished_at=clock_timestamp(),
+                    claimed_count=%s, succeeded_count=%s, failed_count=%s,
+                    failure_summary=%s,
+                    wal_bytes=coalesce(wal_bytes,0)+%s,
+                    resource_temp_bytes=coalesce(resource_temp_bytes,0)+%s,
+                    resource_accounting_mode='database_window_fallback',
+                    resource_start_wal_lsn=null,
+                    resource_start_database_temp_bytes=null,
+                    resource_start_statement_counters=null,
+                    resource_start_pgss_stats_reset=null,
+                    resource_start_pgss_dealloc=null,
+                    resource_window_finished_at=clock_timestamp()
+                where run_id=%s and finished_at is null
+                """,
+                (
+                    claimed,
+                    succeeded,
+                    failed,
+                    failure_summary,
+                    wal_bytes,
+                    temp_bytes,
+                    run_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("failed worker run changed during fallback finalization")
+            cur.execute("select set_config('oddssearch.worker_run_id','',false)")
+            cur.execute("select set_config('oddssearch.worker_failed_statement','false',false)")
+            return {
+                "ok": not temp_regressed,
+                "finished": True,
+                "mode": "database_window_fallback",
+                "wal_bytes": wal_bytes,
+                "temp_bytes": temp_bytes,
+                "database_temp_stats_regressed": temp_regressed,
+            }
+
+
+def finish_failed_worker_run(
+    conn, run_id: int, claimed: int, succeeded: int,
+    error: Exception,
+) -> dict[str, Any]:
+    """Bound and conservatively finalize an unsuccessful worker run."""
+
+    apply_recovery_timeouts(conn)
+    mark_failed_statement_interval(conn)
+    return finish_worker_run_database_fallback(
+        conn,
+        run_id,
+        claimed,
+        succeeded,
+        1,
+        str(error)[:2000],
+    )
+
+
 def finish_worker_run_with_resource_check(
     conn,
     run_id: int,
@@ -1718,18 +1892,15 @@ def main() -> int:
                 "interrupted_run_recovery": recovery_evidence,
             }, sort_keys=True))
         except Exception as error:
-            apply_recovery_timeouts(conn)
-            mark_failed_statement_interval(conn)
             # budget.processed advances only after a capture or generation job
             # committed successfully. Preserve that authoritative progress in
             # run evidence even when a later guard or publication check fails.
-            finish_worker_run(
+            finish_failed_worker_run(
                 conn,
                 run_id,
                 budget.processed,
                 budget.processed,
-                1,
-                str(error)[:2000],
+                error,
             )
             raise
     finally:
