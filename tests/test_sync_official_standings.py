@@ -10,6 +10,7 @@ from scripts.sync_official_standings import (
     parse_expectations,
     selected_stage,
     verify_expectations,
+    verify_fixture_team_completeness,
 )
 
 
@@ -202,6 +203,50 @@ def test_duplicate_team_is_rejected() -> None:
 
     with pytest.raises(ValueError, match="duplicate team"):
         normalize_standings(target, 77480001, [row, duplicate])
+
+
+def test_grouped_table_preserves_provider_group_identity_and_name() -> None:
+    target = SeasonTarget(league_id=9, season_id=27903, start_date="2026-08-01")
+    west = standing(
+        65, 1, 27, played=16, wins=9, draws=4, losses=3, goals_for=31, goals_against=15,
+    )
+    east = standing(
+        66, 1, 28, played=16, wins=8, draws=4, losses=4, goals_for=25, goals_against=18,
+    )
+    west.update({"group_id": 253478, "group": {"id": 253478, "name": "Western Conference"}})
+    east.update({"group_id": 253479, "group": {"id": 253479, "name": "Eastern Conference"}})
+
+    normalized = normalize_standings(target, 77480001, [west, east])
+
+    assert [(row["group_id"], row["group_name"], row["position"]) for row in normalized] == [
+        (253478, "Western Conference", 1),
+        (253479, "Eastern Conference", 1),
+    ]
+
+
+def test_grouped_table_fails_closed_without_group_include() -> None:
+    target = SeasonTarget(league_id=9, season_id=27903, start_date="2026-08-01")
+    rows = [
+        standing(65, 1, 27, played=16, wins=9, draws=4, losses=3, goals_for=31, goals_against=15),
+        standing(66, 2, 28, played=16, wins=8, draws=4, losses=4, goals_for=25, goals_against=18),
+    ]
+    rows[0]["group_id"] = 253478
+
+    with pytest.raises(ValueError, match="missing the requested group include"):
+        normalize_standings(target, 77480001, rows)
+
+
+def test_fixture_team_completeness_requires_every_real_participant() -> None:
+    target = SeasonTarget(league_id=9, season_id=27903, start_date="2026-08-01")
+    standings = [
+        {"team_id": 65},
+        {"team_id": 66},
+    ]
+
+    verify_fixture_team_completeness(target, standings, {65, 66})
+
+    with pytest.raises(ValueError, match=r"missing fixture teams.*67"):
+        verify_fixture_team_completeness(target, standings, {65, 66, 67})
 
 
 def test_exact_provider_expectation_guards_southampton_contract() -> None:

@@ -465,10 +465,9 @@ def finish_run(cur, run_id: str, status: str, stats: dict[str, Any], error: str 
     )
 
 
-DELIVERY_COMPONENTS = ("schedule", "standings", "metrics", "odds")
+DELIVERY_COMPONENTS = ("schedule", "metrics", "odds")
 EXPECTED_DELIVERY_PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "fixture_delivery_schedule": ("release_id", "fixture_id"),
-    "fixture_delivery_standings": ("release_id", "league_id", "season_id", "team_id"),
     "fixture_delivery_metrics": (
         "release_id",
         "fixture_id",
@@ -804,13 +803,11 @@ def validate_release_components(
     cur,
     release_id: str,
     schedule_fixture_ids: list[int],
-    expected_standings: dict[tuple[int, int], dict[int, dict[str, int]]] | None = None,
 ) -> dict[str, int]:
     """Validate component completeness before exposing a release."""
     counts: dict[str, int] = {}
     for component, table in (
         ("schedule", "fixture_delivery_schedule"),
-        ("standings", "fixture_delivery_standings"),
         ("metrics", "fixture_delivery_metrics"),
         ("odds", "fixture_delivery_odds"),
     ):
@@ -868,31 +865,6 @@ def validate_release_components(
             f"fixture delivery metrics row count mismatch: expected={len(metric_rows)} actual={counts['metrics']}"
         )
 
-    if expected_standings is not None:
-        cur.execute(
-            """
-            select league_id, season_id, team_id, rank, points, played,
-                   goals_for, goals_against, goal_diff
-              from public.fixture_delivery_standings
-             where release_id = %s
-            """,
-            (release_id,),
-        )
-        standings_rows = [
-            {
-                "league_id": int(row[0]),
-                "season_id": int(row[1]),
-                "team_id": int(row[2]),
-                "rank": int(row[3]),
-                "points": int(row[4]),
-                "played": int(row[5]),
-                "goals_for": int(row[6]),
-                "goals_against": int(row[7]),
-                "goal_diff": int(row[8]),
-            }
-            for row in cur.fetchall()
-        ]
-        validate_standings_rows(expected_standings, standings_rows)
 
     cur.execute(
         "select distinct fixture_id from public.fixture_delivery_odds where release_id = %s",
@@ -952,44 +924,6 @@ def validate_metric_identity_set(
         )
 
 
-def validate_standings_rows(
-    expected_standings: dict[tuple[int, int], dict[int, dict[str, int]]],
-    actual_rows: Iterable[dict[str, Any]],
-) -> None:
-    """Require the published standings to match the source-derived set and values."""
-    expected = {
-        (league_id, season_id, team_id): values
-        for (league_id, season_id), table in expected_standings.items()
-        for team_id, values in table.items()
-    }
-    rows = list(actual_rows)
-    actual_keys = [
-        (int(row["league_id"]), int(row["season_id"]), int(row["team_id"]))
-        for row in rows
-    ]
-    actual = dict(zip(actual_keys, rows))
-    if len(actual_keys) != len(actual) or set(actual) != set(expected):
-        missing = sorted(set(expected) - set(actual), key=str)
-        extra = sorted(set(actual) - set(expected), key=str)
-        raise RuntimeError(
-            "fixture delivery standings identity mismatch: "
-            f"missing={missing[:20]} extra={extra[:20]}"
-        )
-
-    fields = ("rank", "points", "played", "goals_for", "goals_against", "goal_diff")
-    for key, expected_values in expected.items():
-        row = actual[key]
-        mismatches = {
-            field: (expected_values[field], int(row[field]))
-            for field in fields
-            if int(row[field]) != int(expected_values[field])
-        }
-        if mismatches:
-            raise RuntimeError(
-                "fixture delivery standings values mismatch: "
-                f"key={key} values={mismatches}"
-            )
-
 
 def publish_release(
     cur,
@@ -1013,7 +947,7 @@ def publish_release(
                health_checked_at = now(),
                pin_expires_at = coalesce(%s, now() + interval '2 hours'),
                source_watermark = %s,
-               schedule_rows = %s, standings_rows = %s,
+               schedule_rows = %s,
                metrics_rows = %s, odds_rows = %s,
                metadata = coalesce(metadata, '{}'::jsonb) || %s::jsonb
          where id = %s and status = 'building'
@@ -1022,7 +956,6 @@ def publish_release(
             pin_expires_at,
             source_watermark,
             counts.get("schedule", 0),
-            counts.get("standings", 0),
             counts.get("metrics", 0),
             counts.get("odds", 0),
             json.dumps(publication_metadata),
@@ -1400,50 +1333,6 @@ def strict_current_season_rank(
     return int(current["rank"]) if current else None
 
 
-def write_standings(cur, standings: dict[tuple[int, int], dict[int, dict[str, int]]], completed: list[dict[str, Any]], release_id: str) -> int:
-    latest: dict[tuple[int, int], datetime] = {}
-    for row in completed:
-        if row.get("season_id") is None:
-            continue
-        key = (int(row["league_id"]), int(row["season_id"]))
-        latest[key] = max(latest.get(key, datetime.min.replace(tzinfo=UTC)), row["starting_at"])
-    values = []
-    for (league_id, season_id), table in standings.items():
-        for team_id, stats in table.items():
-            values.append(
-                (
-                    release_id,
-                    league_id,
-                    season_id,
-                    team_id,
-                    stats["rank"],
-                    stats["points"],
-                    stats["played"],
-                    stats["goals_for"],
-                    stats["goals_against"],
-                    stats["goals_for"] - stats["goals_against"],
-                    latest[(league_id, season_id)],
-                )
-            )
-    if values:
-        execute_values(
-            cur,
-            """
-            insert into public.fixture_delivery_standings
-              (release_id, league_id, season_id, team_id, rank, points, played,
-               goals_for, goals_against, goal_diff, source_max_starting_at)
-            values %s
-            on conflict (release_id, league_id, season_id, team_id) do update set
-              rank = excluded.rank, points = excluded.points, played = excluded.played,
-              goals_for = excluded.goals_for, goals_against = excluded.goals_against,
-              goal_diff = excluded.goal_diff, source_max_starting_at = excluded.source_max_starting_at,
-              computed_at = now()
-            """,
-            values,
-            page_size=1000,
-        )
-    return len(values)
-
 
 def empty_metrics() -> dict[str, Any]:
     return {
@@ -1595,7 +1484,6 @@ def write_metrics(
     cur,
     schedule: list[dict[str, Any]],
     completed: list[dict[str, Any]],
-    standings: dict[tuple[int, int], dict[int, dict[str, int]]],
     release_id: str,
 ) -> tuple[int, dict[str, int]]:
     history_by_team_league = build_league_scoped_history(completed)
@@ -1648,12 +1536,6 @@ def write_metrics(
                             (
                                 release_id,
                                 fixture["id"], team_id, side, window, mode, season_scope, Json(metrics),
-                                strict_current_season_rank(
-                                    standings,
-                                    int(fixture["league_id"]),
-                                    int(fixture["season_id"]) if fixture.get("season_id") is not None else 0,
-                                    team_id,
-                                ),
                                 max_source,
                             )
                         )
@@ -1666,10 +1548,10 @@ def write_metrics(
             """
             insert into public.fixture_delivery_metrics
               (release_id, fixture_id, team_id, side, metrics_window, metrics_mode,
-               season_scope, metrics, league_rank, source_max_starting_at)
+               season_scope, metrics, source_max_starting_at)
             values %s
             on conflict (release_id, fixture_id, team_id, side, metrics_window, metrics_mode, season_scope) do update set
-              metrics = excluded.metrics, league_rank = excluded.league_rank,
+              metrics = excluded.metrics,
               source_max_starting_at = excluded.source_max_starting_at, computed_at = now()
             """,
             values,
@@ -1828,7 +1710,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         cur,
                         current_release_id,
                         [int(row["id"]) for row in valid_schedule],
-                        official_standings,
                     )
                 except RuntimeError as error:
                     report["semantic_noop_rejected_reason"] = str(error)
@@ -1868,24 +1749,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "source_watermark": max((row["starting_at"] for row in source), default=None),
             })
             report["components"]["schedule"] = {"rows_read": len(source), "rows_written": schedule_written, "rejected_cup_rows": rejected_cups}
-
-            standings = official_standings
-            standings_run = start_run(cur, "standings", start, end, release_id)
-            standings_written = write_standings(cur, standings, completed, release_id)
-            official_rows = sum(len(table) for table in standings.values())
-            finish_run(cur, standings_run, "succeeded", {
-                "rows_read": official_rows,
-                "rows_written": standings_written,
-                "source": "sportmonks_official",
-            })
-            report["components"]["standings"] = {
-                "rows_read": official_rows,
-                "rows_written": standings_written,
-                "source": "sportmonks_official",
-            }
-
             metrics_run = start_run(cur, "metrics", start, end, release_id)
-            metrics_written, metrics_coverage = write_metrics(cur, valid_schedule, completed, standings, release_id)
+            metrics_written, metrics_coverage = write_metrics(cur, valid_schedule, completed, release_id)
             finish_run(cur, metrics_run, "succeeded", {
                 "rows_read": len(completed),
                 "rows_written": metrics_written,
@@ -1907,7 +1772,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 cur,
                 release_id,
                 [int(row["id"]) for row in valid_schedule],
-                standings,
             )
             source_watermark = max((row["starting_at"] for row in source), default=None)
             finalize_release(

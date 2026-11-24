@@ -249,7 +249,6 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
     def test_delivery_schema_contract_accepts_live_primary_keys(self) -> None:
         cursor = SchemaCursor([
             ("fixture_delivery_schedule", ["release_id", "fixture_id"]),
-            ("fixture_delivery_standings", ["release_id", "league_id", "season_id", "team_id"]),
             ("fixture_delivery_metrics", [
                 "release_id", "fixture_id", "team_id", "side", "metrics_window",
                 "metrics_mode", "season_scope",
@@ -265,7 +264,6 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
     def test_delivery_schema_contract_rejects_old_metrics_key(self) -> None:
         cursor = SchemaCursor([
             ("fixture_delivery_schedule", ["release_id", "fixture_id"]),
-            ("fixture_delivery_standings", ["release_id", "league_id", "season_id", "team_id"]),
             ("fixture_delivery_metrics", [
                 "release_id", "fixture_id", "team_id", "side", "metrics_window", "metrics_mode",
             ]),

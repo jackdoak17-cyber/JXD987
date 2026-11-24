@@ -210,25 +210,13 @@ def load_delivery_metrics(cur, release_id: str, fixture_ids: list[int]) -> list[
         cur,
         """
         select fixture_id, team_id, side, metrics_window, metrics_mode,
-               metrics, league_rank, source_max_starting_at
+               metrics, source_max_starting_at
           from public.fixture_delivery_metrics
          where release_id = %s and fixture_id = any(%s)
         """,
         (release_id, fixture_ids),
     )
 
-
-def load_delivery_standings(cur, release_id: str) -> list[dict[str, Any]]:
-    return query_rows(
-        cur,
-        """
-        select league_id, season_id, team_id, rank, points, played,
-               goals_for, goals_against, goal_diff
-          from public.fixture_delivery_standings
-         where release_id = %s
-        """,
-        (release_id,),
-    )
 
 
 def load_source_odds(cur, fixture_ids: list[int]) -> list[dict[str, Any]]:
@@ -463,29 +451,9 @@ def verify(cur, start: date, end: date, leagues: list[int], release_id: str | No
                         continue
                     if not close_enough(actual.get("metrics"), expected):
                         mismatches.append({"kind": "metric_value", "key": key, "expected": expected, "actual": actual.get("metrics")})
-                    if not close_enough(actual.get("league_rank"), rank):
-                        mismatches.append({"kind": "metric_rank", "key": key, "expected": rank, "actual": actual.get("league_rank")})
                     if not close_enough(actual.get("source_max_starting_at"), source_max):
                         mismatches.append({"kind": "metric_source_watermark", "key": key, "expected": normalize_value(source_max), "actual": normalize_value(actual.get("source_max_starting_at"))})
 
-    delivery_standings = load_delivery_standings(cur, selected_id)
-    expected_standings_rows = {
-        (league_id, season_id, team_id): values
-        for (league_id, season_id), table in standings.items()
-        for team_id, values in table.items()
-    }
-    if len(delivery_standings) != len(expected_standings_rows):
-        mismatches.append({"kind": "standings_count", "expected": len(expected_standings_rows), "actual": len(delivery_standings)})
-    for row in delivery_standings:
-        key = (int(row["league_id"]), int(row["season_id"]), int(row["team_id"]))
-        expected = expected_standings_rows.get(key)
-        if expected is None:
-            mismatches.append({"kind": "standings_extra", "key": key})
-            continue
-        for field in ("rank", "points", "played", "goals_for", "goals_against", "goal_diff"):
-            expected_value = expected[field] if field != "goal_diff" else expected["goals_for"] - expected["goals_against"]
-            if not close_enough(row[field], expected_value):
-                mismatches.append({"kind": "standings_value", "key": key, "field": field, "expected": expected_value, "actual": row[field]})
 
     source_odds = load_source_odds(cur, sorted(delivery_by_id))
     delivery_odds = load_delivery_odds(cur, selected_id, sorted(delivery_by_id))
