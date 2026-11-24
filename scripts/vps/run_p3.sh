@@ -24,6 +24,7 @@ require_runtime_manifest_entries_or_exit "$0" \
   "jxd/sync.py" \
   "config/odds_api_leagues.json" \
   "scripts/sync_odds.py" \
+  "scripts/sync_official_standings.py" \
   "scripts/export_odds_to_supabase_psql.py" \
   "scripts/odds_retention_psql.py" \
   "scripts/reconcile_recent_fixtures.py" \
@@ -101,7 +102,13 @@ python scripts/sync_odds.py \
   --refresh-only \
   --report-out "/tmp/odds_refresh_report_p3.json"
 
-# Step 2: Odds fetch scoped to P3 fixtures only
+# Step 2: Publish validated official league tables for each league's latest
+# started season. Historical backfill is a separate reviewed release action.
+python scripts/sync_official_standings.py \
+  --leagues "${STATS_LEAGUES}" \
+  --report-out "/tmp/official_standings_report_p3.json"
+
+# Step 3: Odds fetch scoped to P3 fixtures only
 python scripts/sync_odds.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_SYNC_DAYS_BACK}" \
@@ -111,7 +118,7 @@ python scripts/sync_odds.py \
   --report-out "/tmp/odds_sync_report_p3.json" \
   --unmatched-out "/tmp/unmatched_players_p3.json"
 
-# Step 3: Ingest full window (Path B)
+# Step 4: Ingest full window (Path B)
 python scripts/export_odds_to_supabase_psql.py \
   --leagues "${ODDS_LEAGUES}" \
   --days-back "${ODDS_EXPORT_DAYS_BACK}" \
@@ -126,14 +133,14 @@ python scripts/export_odds_to_supabase_psql.py \
   --skip-retention-snapshots \
   ${COVERAGE_ARGS}
 
-# Step 4: Retention only on P3
+# Step 5: Retention only on P3
 python scripts/odds_retention_psql.py \
   --days-back "${RETENTION_DAYS_BACK}" \
   --days-forward "${RETENTION_DAYS_FORWARD}" \
   --snapshot-days "${RETENTION_SNAPSHOT_DAYS}" \
   --report-out "/tmp/odds_retention_report_p3.json"
 
-# Step 5: Publish the persistent Fixtures Data Delivery v2 read models.
+# Step 6: Publish the persistent Fixtures Data Delivery v2 read models.
 # This is the only user-facing fixture delivery source after cutover. A failed
 # refresh fails P3 instead of hiding a stale or incomplete read model.
 FIXTURE_DELIVERY_STATUS=0
@@ -148,7 +155,7 @@ else
   FIXTURE_DELIVERY_STATUS=1
 fi
 
-# Step 6: Hard guard for the user-facing fixtures window.
+# Step 7: Hard guard for the user-facing fixtures window.
 set +e
 python scripts/validate_moneyline_coverage.py \
   --leagues "${ODDS_LEAGUES}" \
@@ -212,7 +219,7 @@ if [[ "${MONEYLINE_VALIDATION_STATUS}" -ne 0 ]]; then
   fi
 fi
 
-# Step 7: Best-effort betting picks publish (uses odds already ingested into Supabase).
+# Step 8: Best-effort betting picks publish (uses odds already ingested into Supabase).
 if [[ "${RUN_MODELS_PUBLISH}" == "true" || "${RUN_MODELS_PUBLISH}" == "1" ]]; then
   if [[ "${MODELS_PUBLISH_AFTER_P3}" == "true" || "${MODELS_PUBLISH_AFTER_P3}" == "1" ]]; then
     if [[ -d "${MODELS_REPO_ROOT}" ]]; then

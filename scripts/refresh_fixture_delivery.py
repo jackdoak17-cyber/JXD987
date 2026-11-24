@@ -58,7 +58,7 @@ MONEYLINE_MARKETS = {
 }
 MIN_FORM_SAMPLE = 5
 SEMANTIC_FINGERPRINT_VERSION = 1
-PROJECTION_ALGORITHM_VERSION = "fixture-delivery-v1"
+PROJECTION_ALGORITHM_VERSION = "fixture-delivery-v2-official-standings"
 METRIC_WINDOWS = tuple(range(5, 16))
 METRIC_MODES = ("overall", "venue")
 METRIC_SEASON_SCOPES = ("all", "current")
@@ -139,6 +139,7 @@ def semantic_projection_fingerprint(
     end: date,
     leagues: list[int],
     *,
+    official_standings: dict[tuple[int, int], dict[int, dict[str, int]]] | None = None,
     algorithm_version: str = PROJECTION_ALGORITHM_VERSION,
 ) -> dict[str, Any]:
     """Hash every stable input that can affect schedule, standings, or metrics."""
@@ -166,6 +167,18 @@ def semantic_projection_fingerprint(
         "completed": [
             {field: row.get(field) for field in COMPLETED_SEMANTIC_FIELDS}
             for row in completed
+        ],
+        "official_standings": [
+            {
+                "league_id": league_id,
+                "season_id": season_id,
+                "team_id": team_id,
+                **{field: values[field] for field in (
+                    "rank", "points", "played", "goals_for", "goals_against", "goal_diff"
+                )},
+            }
+            for (league_id, season_id), table in sorted((official_standings or {}).items())
+            for team_id, values in sorted(table.items())
         ],
     }
     canonical = json.dumps(
@@ -1261,7 +1274,74 @@ def validate_schedule_projection(cur, rows: list[dict[str, Any]], release_id: st
         )
 
 
+def load_official_standings(
+    cur,
+    completed: list[dict[str, Any]],
+) -> dict[tuple[int, int], dict[int, dict[str, int]]]:
+    """Load the provider table for every fixture scope and reject gaps.
+
+    Federation corrections and competition tie breakers cannot be recovered
+    from scores alone. The score-derived calculation below remains an audit
+    oracle, but customer-facing fixture ranks must use this official source.
+    """
+    scopes = {
+        (int(row["league_id"]), int(row["season_id"]))
+        for row in completed
+        if row.get("season_id") is not None
+    }
+    if not scopes:
+        return {}
+    league_ids = sorted({scope[0] for scope in scopes})
+    season_ids = sorted({scope[1] for scope in scopes})
+    cur.execute(
+        """
+        select league_id, season_id, team_id, position, points, played,
+               goals_for, goals_against, goal_diff
+          from public.official_team_standings
+         where league_id = any(%s)
+           and season_id = any(%s)
+         order by league_id, season_id, position, team_id
+        """,
+        (league_ids, season_ids),
+    )
+    grouped: dict[tuple[int, int], dict[int, dict[str, int]]] = defaultdict(dict)
+    for row in cur.fetchall():
+        key = (int(row[0]), int(row[1]))
+        if key not in scopes:
+            continue
+        team_id = int(row[2])
+        if team_id in grouped[key]:
+            raise RuntimeError(f"duplicate official standing for scope={key} team={team_id}")
+        grouped[key][team_id] = {
+            "rank": int(row[3]),
+            "points": int(row[4]),
+            "played": int(row[5]),
+            "goals_for": int(row[6]),
+            "goals_against": int(row[7]),
+            "goal_diff": int(row[8]),
+        }
+
+    missing_scopes = sorted(scopes - set(grouped))
+    if missing_scopes:
+        raise RuntimeError(f"official standings missing fixture scopes: {missing_scopes[:20]}")
+    expected_teams: dict[tuple[int, int], set[int]] = defaultdict(set)
+    for row in completed:
+        if row.get("season_id") is None:
+            continue
+        key = (int(row["league_id"]), int(row["season_id"]))
+        expected_teams[key].update((int(row["home_team_id"]), int(row["away_team_id"])))
+    missing_teams = {
+        key: sorted(team_ids - set(grouped[key]))
+        for key, team_ids in expected_teams.items()
+        if team_ids - set(grouped[key])
+    }
+    if missing_teams:
+        raise RuntimeError(f"official standings missing fixture teams: {missing_teams}")
+    return grouped
+
+
 def compute_standings(completed: list[dict[str, Any]]) -> dict[tuple[int, int], dict[int, dict[str, int]]]:
+    """Independently derive raw standings for audits and offline tests only."""
     grouped: dict[tuple[int, int], dict[int, dict[str, int]]] = defaultdict(dict)
     for row in completed:
         if row.get("season_id") is None:
@@ -1730,12 +1810,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 if row["league_id"] not in EXCLUDED_CUPS and not is_hidden(row)
             ]
             completed = all_completed_fixtures(cur, leagues)
+            official_standings = load_official_standings(cur, completed)
             semantic_fingerprint = semantic_projection_fingerprint(
                 valid_schedule,
                 completed,
                 start,
                 end,
                 leagues,
+                official_standings=official_standings,
             )
             report["semantic_projection_fingerprint"] = semantic_fingerprint
             current_release_id, stored_fingerprint = current_publication_semantic_state(cur)
@@ -1746,7 +1828,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         cur,
                         current_release_id,
                         [int(row["id"]) for row in valid_schedule],
-                        compute_standings(completed),
+                        official_standings,
                     )
                 except RuntimeError as error:
                     report["semantic_noop_rejected_reason"] = str(error)
@@ -1787,11 +1869,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             })
             report["components"]["schedule"] = {"rows_read": len(source), "rows_written": schedule_written, "rejected_cup_rows": rejected_cups}
 
-            standings = compute_standings(completed)
+            standings = official_standings
             standings_run = start_run(cur, "standings", start, end, release_id)
             standings_written = write_standings(cur, standings, completed, release_id)
-            finish_run(cur, standings_run, "succeeded", {"rows_read": len(completed), "rows_written": standings_written})
-            report["components"]["standings"] = {"rows_read": len(completed), "rows_written": standings_written}
+            official_rows = sum(len(table) for table in standings.values())
+            finish_run(cur, standings_run, "succeeded", {
+                "rows_read": official_rows,
+                "rows_written": standings_written,
+                "source": "sportmonks_official",
+            })
+            report["components"]["standings"] = {
+                "rows_read": official_rows,
+                "rows_written": standings_written,
+                "source": "sportmonks_official",
+            }
 
             metrics_run = start_run(cur, "metrics", start, end, release_id)
             metrics_written, metrics_coverage = write_metrics(cur, valid_schedule, completed, standings, release_id)

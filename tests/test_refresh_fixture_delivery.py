@@ -15,6 +15,7 @@ from scripts.refresh_fixture_delivery import (
     compute_standings,
     fingerprints_match,
     history_rows_for_fixture,
+    load_official_standings,
     semantic_projection_fingerprint,
     strict_current_season_rank,
     validate_delivery_schema,
@@ -55,6 +56,38 @@ class FreshnessCursor:
 
 
 class FixtureDeliveryMetricsTests(unittest.TestCase):
+    def test_fixture_delivery_uses_official_points_and_rank(self) -> None:
+        cursor = SchemaCursor([
+            (9, 27903, 65, 6, 27, 16, 31, 15, 16),
+            (9, 27903, 66, 5, 28, 16, 25, 18, 7),
+        ])
+        completed = [{
+            "league_id": 9,
+            "season_id": 27903,
+            "home_team_id": 65,
+            "away_team_id": 66,
+        }]
+
+        standings = load_official_standings(cursor, completed)
+
+        self.assertEqual(standings[(9, 27903)][65]["rank"], 6)
+        self.assertEqual(standings[(9, 27903)][65]["points"], 27)
+        self.assertIn("official_team_standings", cursor.query)
+
+    def test_fixture_delivery_rejects_missing_official_team(self) -> None:
+        cursor = SchemaCursor([
+            (9, 27903, 65, 6, 27, 16, 31, 15, 16),
+        ])
+        completed = [{
+            "league_id": 9,
+            "season_id": 27903,
+            "home_team_id": 65,
+            "away_team_id": 66,
+        }]
+
+        with self.assertRaisesRegex(RuntimeError, "missing fixture teams"):
+            load_official_standings(cursor, completed)
+
     def test_source_freshness_accepts_recent_durable_pipeline_evidence(self) -> None:
         now = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
         cursor = FreshnessCursor(now - timedelta(minutes=30))
