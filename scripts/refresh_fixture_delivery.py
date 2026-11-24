@@ -947,7 +947,7 @@ def publish_release(
                health_checked_at = now(),
                pin_expires_at = coalesce(%s, now() + interval '2 hours'),
                source_watermark = %s,
-               schedule_rows = %s, standings_rows = %s,
+               schedule_rows = %s,
                metrics_rows = %s, odds_rows = %s,
                metadata = coalesce(metadata, '{}'::jsonb) || %s::jsonb
          where id = %s and status = 'building'
@@ -956,7 +956,6 @@ def publish_release(
             pin_expires_at,
             source_watermark,
             counts.get("schedule", 0),
-            counts.get("standings", 0),
             counts.get("metrics", 0),
             counts.get("odds", 0),
             json.dumps(publication_metadata),
