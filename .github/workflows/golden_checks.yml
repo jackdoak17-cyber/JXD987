@@ -2,9 +2,16 @@ name: Golden Checks
 
 on:
   workflow_dispatch:
+    inputs:
+      official_standings_contract:
+        description: "Validate current official standings only (no writes)"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   golden:
+    if: ${{ !inputs.official_standings_contract }}
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
@@ -56,3 +63,50 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python3 scripts/golden_checks.py --backend supabase --league-id 8 --team-id 19 --player-name "Bukayo Saka"
+
+  official-standings-contract:
+    if: ${{ inputs.official_standings_contract }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate every supported current table without publishing
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+        run: |
+          LEAGUES="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          all_leagues = {
+              int(value)
+              for value in Path("config/league_ids.txt").read_text().splitlines()
+              if value.strip()
+          }
+          excluded = set(json.loads(Path("config/odds_api_sync_excluded_leagues.json").read_text()))
+          print(",".join(str(value) for value in sorted(all_leagues - excluded)))
+          PY
+          )"
+          python3 scripts/sync_official_standings.py \
+            --leagues "${LEAGUES}" \
+            --current-only \
+            --dry-run \
+            --expect-standing "27903:65:6:27" \
+            --report-out official-standings-contract.json
+
+      - name: Upload sanitised contract evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-standings-contract
+          path: official-standings-contract.json
+          if-no-files-found: error
