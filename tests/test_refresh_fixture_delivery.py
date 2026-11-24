@@ -12,12 +12,9 @@ from scripts.refresh_fixture_delivery import (
     all_completed_fixtures,
     build_season_scoped_history,
     calculate_metrics,
-    compute_standings,
     fingerprints_match,
     history_rows_for_fixture,
-    load_official_standings,
     semantic_projection_fingerprint,
-    strict_current_season_rank,
     validate_delivery_schema,
     validate_source_fixture_identity,
     verify_fixture_source_freshness,
@@ -56,38 +53,6 @@ class FreshnessCursor:
 
 
 class FixtureDeliveryMetricsTests(unittest.TestCase):
-    def test_fixture_delivery_uses_official_points_and_rank(self) -> None:
-        cursor = SchemaCursor([
-            (9, 27903, 65, 6, 27, 16, 31, 15, 16),
-            (9, 27903, 66, 5, 28, 16, 25, 18, 7),
-        ])
-        completed = [{
-            "league_id": 9,
-            "season_id": 27903,
-            "home_team_id": 65,
-            "away_team_id": 66,
-        }]
-
-        standings = load_official_standings(cursor, completed)
-
-        self.assertEqual(standings[(9, 27903)][65]["rank"], 6)
-        self.assertEqual(standings[(9, 27903)][65]["points"], 27)
-        self.assertIn("official_team_standings", cursor.query)
-
-    def test_fixture_delivery_rejects_missing_official_team(self) -> None:
-        cursor = SchemaCursor([
-            (9, 27903, 65, 6, 27, 16, 31, 15, 16),
-        ])
-        completed = [{
-            "league_id": 9,
-            "season_id": 27903,
-            "home_team_id": 65,
-            "away_team_id": 66,
-        }]
-
-        with self.assertRaisesRegex(RuntimeError, "missing fixture teams"):
-            load_official_standings(cursor, completed)
-
     def test_source_freshness_accepts_recent_durable_pipeline_evidence(self) -> None:
         now = datetime(2026, 10, 20, 12, 0, tzinfo=UTC)
         cursor = FreshnessCursor(now - timedelta(minutes=30))
@@ -390,58 +355,6 @@ class FixtureDeliveryMetricsTests(unittest.TestCase):
         self.assertEqual(venue["sampleStatus"], "partial")
         self.assertEqual(overall["metricsSource"], "overall")
         self.assertEqual(venue["metricsSource"], "venue")
-
-    def test_standings_equal_totals_preserve_strict_row_order_tie_break(self) -> None:
-        standings = compute_standings(
-            [
-                {
-                    "id": 2,
-                    "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
-                    "league_id": 8,
-                    "season_id": 28083,
-                    "home_team_id": 20,
-                    "away_team_id": 21,
-                    "home_score": 1,
-                    "away_score": 1,
-                },
-                {
-                    "id": 1,
-                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
-                    "league_id": 8,
-                    "season_id": 28083,
-                    "home_team_id": 10,
-                    "away_team_id": 11,
-                    "home_score": 1,
-                    "away_score": 1,
-                },
-            ]
-        )
-
-        ranked = standings[(8, 28083)]
-
-        self.assertEqual(ranked[20]["rank"], 1)
-        self.assertEqual(ranked[21]["rank"], 2)
-        self.assertEqual(ranked[10]["rank"], 3)
-        self.assertEqual(ranked[11]["rank"], 4)
-
-    def test_strict_current_season_rank_does_not_fallback_to_prior_season(self) -> None:
-        standings = compute_standings(
-            [
-                {
-                    "id": 1,
-                    "starting_at": datetime(2026, 8, 15, tzinfo=UTC),
-                    "league_id": 8,
-                    "season_id": 28083,
-                    "home_team_id": 20,
-                    "away_team_id": 21,
-                    "home_score": 1,
-                    "away_score": 0,
-                }
-            ]
-        )
-
-        self.assertEqual(strict_current_season_rank(standings, 8, 28083, 20), 1)
-        self.assertIsNone(strict_current_season_rank(standings, 8, 28083, 10))
 
     def test_completed_fixture_query_matches_strict_oracle_order(self) -> None:
         source = inspect.getsource(all_completed_fixtures)

@@ -9,7 +9,6 @@ from scripts import refresh_fixture_delivery as publisher
 from scripts.refresh_fixture_delivery import (
     bounded_release_pin_expires_at,
     build_season_scoped_history,
-    compute_standings,
     current_resolved_publication_state,
     finalize_release,
     iso_date,
@@ -226,7 +225,7 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             19000,
             fingerprint,
             source_freshness,
-            {"schedule": 10, "standings": 20, "metrics": 880, "odds": 30},
+            {"schedule": 10, "metrics": 880, "odds": 30},
             pin_expires_at,
             report,
         )
@@ -292,7 +291,7 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
         publish_release(
             cursor,
             "00000000-0000-4000-8000-000000000001",
-            {"schedule": 1, "standings": 0, "metrics": 44, "odds": 0},
+            {"schedule": 1, "metrics": 44, "odds": 0},
             datetime(2026, 8, 22, tzinfo=UTC),
         )
 
@@ -336,7 +335,7 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             connection,
             cursor,
             "00000000-0000-4000-8000-000000000001",
-            {"schedule": 1, "standings": 0, "metrics": 44, "odds": 0},
+            {"schedule": 1, "metrics": 44, "odds": 0},
             datetime(2026, 8, 22, tzinfo=UTC),
             report,
         )
@@ -358,7 +357,7 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             connection,
             cursor,
             "00000000-0000-4000-8000-000000000001",
-            {"schedule": 1, "standings": 0, "metrics": 44, "odds": 0},
+            {"schedule": 1, "metrics": 44, "odds": 0},
             datetime(2026, 8, 22, tzinfo=UTC),
             report,
         )
@@ -385,24 +384,6 @@ class FixtureDeliveryReleaseContractTests(unittest.TestCase):
             ]
         )
         self.assertEqual(history, {})
-
-    def test_null_season_rows_do_not_crash_standings_or_create_a_rank(self) -> None:
-        standings = compute_standings(
-            [
-                {
-                    "id": 1,
-                    "starting_at": datetime(2026, 8, 22, tzinfo=UTC),
-                    "league_id": 8,
-                    "season_id": None,
-                    "home_team_id": 10,
-                    "away_team_id": 20,
-                    "home_score": 1,
-                    "away_score": 0,
-                }
-            ]
-        )
-        self.assertEqual(standings, {})
-
 
 if __name__ == "__main__":
     unittest.main()
