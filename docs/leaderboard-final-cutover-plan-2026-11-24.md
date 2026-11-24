@@ -1,6 +1,6 @@
 # Final leaderboard cutover plan — accelerated pre-launch rollout
 
-Status: **review required**
+Status: **execution in progress — final-release canary passed; scheduled activation waiting for the ordinary guard**
 
 Plan date: **24 November 2026**
 
@@ -89,6 +89,17 @@ The 512 MiB number first appears as an initial testing/backfill stop condition a
 
 The existing dormant rolling-worker path is **not** the shortcut for this exception. Production currently has no rolling policy, its protected VPS environment has no rolling-policy pins, and the installed first-policy opening requires the normal temporary-data guard to be below 512 MiB. Creating a new rolling policy would therefore add a larger unreviewed transition without solving the present gate.
 
+### 3.2 Execution evidence — 14:35 UTC
+
+- The normal scheduler produced the twentieth genuine comparable source sample at `2026-11-24 14:23:53 UTC`; the latest sample was successful with 20 work units.
+- Importer-only rebaseline passed at `14:24:26 UTC`, moving the pinned importer evidence to `a41e89b4837a` with 20 samples while worker/backfill remained false and the resource pause remained true.
+- The first Phase 3A admission safely rejected before worker enable because the installed sticky guard preserved the previous source-regression pause token. It opened no worker run, restored the ordinary 512 MiB limit, consumed approval `20261124a`, and retained quarantine.
+- The retry corrected only the fenced transaction's pause recomputation to mirror `resume_resource_guard_v2`: clear the sticky pause inside the transaction, then rerun the full guard from fresh evidence. The failed-admission fence was removed only after proving worker/backfill false, normal limit restored, zero open runs, and exact binding to the consumed first approval.
+- The replacement one-use approval `20261124b` was consumed. Canary run **2361** completed at `14:35:53 UTC`: 65 claimed, 65 succeeded, 0 failed, final release `2bdbe78...`, `statement_exact`, 5,726,512 WAL bytes, 0 temp bytes, and a closed resource window.
+- Final cleanup restored 536,870,912 bytes, left worker/backfill false, left zero open runs, removed the owned quarantine, and refreshed the guard to the sole expected breach `rolling_temp_bytes_limit` at 968,593,596 bytes.
+
+No scheduled worker was enabled. Normal activation still requires the rolling temp value to age under 512 MiB, a successful guarded resume, and scheduled enable bound to canary run 2361.
+
 ## 4. What is already complete
 
 ### 4.1 Database and policy
@@ -168,12 +179,12 @@ The first controller set reviewed with this plan is superseded and must not be e
 |---|---|---|
 | `leaderboard-2bd-rebaseline.sh` | Rebaseline only the importer after 20 genuine samples | `ce051d7b117c9146a7b0af1e27070863508960b05a61c927a4d4dd7f9cf83f6e` |
 | `leaderboard-2bd-resume.sh` | Clear resource pause only if the full installed guard passes | `7928aed70d3af56ed4b712c0436796cb41964b6b5f053a6db3e9d96c7741bbc8` |
-| `leaderboard-2bd-owned-250.sh` | One 250-bound, 30-second final-release canary with deterministic reconciliation and an opt-in reviewed temp exception | `93d06e4df5e514775db0c15c826f0b3b47be945827e39a50365fabe0db47231f` |
+| `leaderboard-2bd-owned-250.sh` | One 250-bound, 30-second final-release canary with deterministic reconciliation and an opt-in reviewed temp exception | `4a05fc40e887c502a8fd0da61fa57b5775938b9dea6de489ca47108c94bffc94` |
 | `leaderboard-2bd-enable-scheduled.sh` | Enable normal bounded schedule using the latest exact canary and a fresh full guard | `4c76643949883cfd629e8f5f8c66857dfb0a2139a65639397b43ccdd847d5662` |
 | `leaderboard-2bd-disable-scheduled.sh` | Fence new starts, disable, then recover at most one exact final-release run | `ded7a1afc8d121b3c392b418ca62f19dba52a99b0a1da6219f1ec0f4e8bdfaf7` |
-| `leaderboard-2bd-supervised-temp-exception.approval` | Exact root-only, single-use approval consumed before the exception transaction | `c5808a00bc0a487c00814751afc52b8f447430c377e3f920c3896eb9bc8e7246` |
+| `leaderboard-2bd-supervised-temp-exception-b.approval` | Replacement exact root-only, single-use approval consumed before the successful exception transaction | `5cf0c8edc268712a965f4d859266671ed9de022cf26690866c3fc9696e91922e` |
 
-The offline controller contract is `test-leaderboard-2bd-controller-contracts.py`, SHA-256 `a20385892f0281586807f3d94e112785aac97d7c3b7e93485117c7b299aca7d3`. Eleven tests pass. The tests execute the actual canary shell cleanup functions—with only the root-owner assertion adapted to the local test UID—and assert both marker state and final temp limit for rejected verification, lost preparation acknowledgement, disable failure, recovery failure, limit-restoration failure, post-canary health failure, marker validation failure, and success. They also consume the actual approval artifact, recreate its source file, and prove that the durable consumed claim refuses a second invocation. Rollback marker creation/recovery/refusal tests and the prior publisher, latest-run, full-guard, and lock-order contracts remain. These are offline contracts, not hosted proof.
+The offline controller contract is `test-leaderboard-2bd-controller-contracts.py`, SHA-256 `a058ed2407f0833ddf3c6e1b4b0bb4a3b82858299e8830a14a0065d6b889a122`. Eleven tests pass. The tests execute the actual canary shell cleanup functions—with only the root-owner assertion adapted to the local test UID—and assert both marker state and final temp limit for rejected verification, lost preparation acknowledgement, disable failure, recovery failure, limit-restoration failure, post-canary health failure, marker validation failure, and success. They also verify that both exception admission and final health explicitly clear sticky pause tokens inside their fenced transactions before recomputing the full guard. They consume the actual approval artifact, recreate its source file, and prove that the durable consumed claim refuses a second invocation. Rollback marker creation/recovery/refusal tests and the prior publisher, latest-run, full-guard, and lock-order contracts remain. These are offline contracts; run 2361 is the hosted proof.
 
 Each mutating controller checks both the fixture-core reservation and the normal publisher time window before holding the canonical writer lock. Forward mutations return a clean deferral when busy or reserved. The canary records that enable was attempted **before** the ambiguous commit boundary; every cleanup operation explicitly propagates failure, and state flags clear only after their operation succeeds. Cleanup commits worker=false first, then recovers at most one exact new final-release run/resource window. It removes only its owned marker and prints PASS only when the canary verdict itself passed and every cleanup check succeeded; a rejected, interrupted, or unverified canary retains the fence. Scheduled enable requires the supplied run to be the latest worker run, successful, exact-release, positive-work, statement-accounted, and resource-window closed; it refreshes external disk evidence and runs the complete installed guard in the enabling transaction. Rollback creates the worker quarantine first, prints its recovery token, and waits for the owned worker exclusion. A later ordinary deferral intentionally retains the fence. A retry must supply the exact token, verify the same root-owned marker, finish disable/recovery, and remove it only after success; a missing or foreign token is refused. Rollback never edits crontab.
 
@@ -255,7 +266,7 @@ This phase may run **before** Phase 3 only if importer-only rebaseline has compl
 
 1. Require source baseline `a41e89b4837a`, at least 20 genuine comparable samples, a fresh successful source run, worker=false, backfill=false, capture=true, zero open runs, and no rolling reservation or transition/quarantine marker.
 2. Enter the reviewed publisher time window, require no active fixture-core reservation, and acquire the same certification/worker/heavy/canonical exclusions as the normal canary.
-3. Validate the exact root-owned mode-0600 approval artifact and require that its durable consumed path does not exist. The approval binds worker/source releases, latest run `2360`, the six fallback run IDs/charges/outcomes, reviewed temp, allowance, and temporary limit.
+3. Validate the exact root-owned mode-0600 approval artifact and require that its durable consumed path does not exist. Approval `20261124b` binds worker/source releases, latest run `2360`, the six fallback run IDs/charges/outcomes, reviewed temp, allowance, and temporary limit. Approval `20261124a` remains consumed as evidence of the earlier safe rejection and cannot be reused.
 4. Create and fsync the owned worker quarantine **before** any database exception is attempted. Atomically claim the approval by exclusively creating and syncing the consumed file, then remove and sync the source approval. Never delete the consumed claim in normal cleanup or rollback.
 5. Refresh genuine disk evidence and run the complete installed guard at the normal 536,870,912-byte temp limit.
 6. Require the guard's only breach to be `rolling_temp_bytes_limit`, with rolling temp exactly 968,593,596 bytes and rolling WAL no more than 5 GiB. Any different value or additional breach requires a new review; do not round or silently rebaseline this exception.
@@ -496,4 +507,4 @@ These are dependencies, not promises:
 
 ## 12. Reviewer handoff state
 
-At review time, no step in this document authorizes an immediate mutation by itself. The worker and backfill are still disabled, capture is enabled, the resource pause is active, and no worker run is open. The repaired release has 15/20 comparable samples, so the next permitted mutation remains importer-only rebaseline after the live 20-sample predicate and every controller precondition pass. The supervised exception canary is a later, separately reviewed mutation; it is not permission to enable scheduled work while the normal guard is red.
+At the latest execution handoff, importer rebaseline and final-release canary run 2361 have passed. The worker and backfill are disabled, capture is enabled, the ordinary 512 MiB limit is restored, quarantine is absent, no worker run is open, and the resource pause has only `rolling_temp_bytes_limit`. The next permitted mutation is the ordinary guarded resume after rolling temp falls to or below 536,870,912 bytes, followed by scheduled enable bound to run 2361. The successful canary is not permission to enable scheduled work while the normal guard is red.
