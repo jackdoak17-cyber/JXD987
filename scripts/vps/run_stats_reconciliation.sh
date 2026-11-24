@@ -11,11 +11,21 @@ require_runtime_manifest_entries_or_exit "$0" \
   "config/league_ids.txt" \
   "scripts/reconcile_stats_provider_queue.py"
 
+# The cron entry injects the transaction-pool URL for the bounded source job.
+# Keep it before the repository environment is loaded, then use the same URL
+# for the one-statement completion heartbeat.  A short INSERT does not need a
+# reserved session-pool connection, and using one can deadlock its own evidence
+# write while the source worker legitimately occupies the small transaction
+# pool with bounded parallel database work.
+STATS_RECONCILE_TRANSACTION_DATABASE_URL="${SUPABASE_DB_URL_SESSION:-}"
 if [[ -f "${REPO_ROOT}/.env" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "${REPO_ROOT}/.env"
   set +a
+fi
+if [[ -n "${STATS_RECONCILE_TRANSACTION_DATABASE_URL}" ]]; then
+  export OPERATIONS_CHECK_RUNNER_DATABASE_URL="${STATS_RECONCILE_TRANSACTION_DATABASE_URL}"
 fi
 require_default_trial_lock_paths_or_exit
 
