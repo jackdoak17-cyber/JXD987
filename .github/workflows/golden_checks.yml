@@ -8,10 +8,20 @@ on:
         required: false
         type: boolean
         default: false
+      official_standings_publish:
+        description: "Publish validated official standings to Production"
+        required: false
+        type: boolean
+        default: false
+      official_standings_all_fixture_seasons:
+        description: "Include the reviewed historical fixture-backed seasons"
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   golden:
-    if: ${{ !inputs.official_standings_contract }}
+    if: ${{ !inputs.official_standings_contract && !inputs.official_standings_publish }}
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
@@ -65,7 +75,7 @@ jobs:
         run: python3 scripts/golden_checks.py --backend supabase --league-id 8 --team-id 19 --player-name "Bukayo Saka"
 
   official-standings-contract:
-    if: ${{ inputs.official_standings_contract }}
+    if: ${{ inputs.official_standings_contract || inputs.official_standings_publish }}
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: .
@@ -81,10 +91,12 @@ jobs:
       - name: Install Python dependencies
         run: pip install -r requirements.txt
 
-      - name: Validate every supported fixture-backed table without publishing
+      - name: Validate or publish the selected official standings scope
         env:
           SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
           SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+          PUBLISH: ${{ inputs.official_standings_publish }}
+          ALL_FIXTURE_SEASONS: ${{ inputs.official_standings_all_fixture_seasons }}
         run: |
           LEAGUES="$(python3 - <<'PY'
           import json
@@ -99,18 +111,58 @@ jobs:
           print(",".join(str(value) for value in sorted(all_leagues - excluded)))
           PY
           )"
-          python3 scripts/sync_official_standings.py \
-            --leagues "${LEAGUES}" \
-            --all-fixture-seasons \
-            --continue-on-error \
-            --dry-run \
-            --expect-standing "27903:65:6:27" \
+          args=(
+            --leagues "${LEAGUES}"
+            --expect-standing "27903:65:6:27"
             --report-out official-standings-contract.json
+          )
+          if [[ "${ALL_FIXTURE_SEASONS}" == "true" ]]; then
+            args+=(--all-fixture-seasons --continue-on-error)
+          fi
+          if [[ "${PUBLISH}" != "true" ]]; then
+            args+=(--dry-run)
+          fi
+
+          set +e
+          python3 scripts/sync_official_standings.py "${args[@]}"
+          sync_status=$?
+          set -e
+
+          python3 - "${ALL_FIXTURE_SEASONS}" "${sync_status}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          include_history = sys.argv[1] == "true"
+          exit_status = int(sys.argv[2])
+          report = json.loads(Path("official-standings-contract.json").read_text())
+          failures = [
+              (row.get("league_id"), row.get("season_id"), row.get("error"))
+              for row in report.get("seasons", [])
+              if row.get("status") == "failed"
+          ]
+          if include_history:
+              expected = [(989, 22847, "SportMonks returned no standings")]
+              if failures != expected or exit_status != 1:
+                  raise SystemExit(
+                      f"historical exception drift: status={exit_status} failures={failures!r}"
+                  )
+              successful = [
+                  row for row in report.get("seasons", [])
+                  if row.get("status") in {"validated", "published"}
+              ]
+              if len(successful) != 71:
+                  raise SystemExit(f"expected 71 validated historical/current seasons; got {len(successful)}")
+          elif failures or exit_status != 0 or report.get("status") != "succeeded":
+              raise SystemExit(
+                  f"current standings publication failed: status={exit_status} failures={failures!r}"
+              )
+          PY
 
       - name: Upload sanitised contract evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: official-standings-contract
+          name: official-standings-contract-${{ github.run_id }}
           path: official-standings-contract.json
           if-no-files-found: error
