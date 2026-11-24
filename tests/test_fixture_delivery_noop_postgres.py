@@ -87,19 +87,6 @@ class FixtureDeliveryNoopPostgresTests(unittest.TestCase):
                   away_score integer,
                   primary key (release_id, fixture_id)
                 );
-                create table public.fixture_delivery_standings (
-                  release_id uuid not null,
-                  league_id bigint not null,
-                  season_id bigint not null,
-                  team_id bigint not null,
-                  rank integer not null,
-                  points integer not null,
-                  played integer not null,
-                  goals_for integer not null,
-                  goals_against integer not null,
-                  goal_diff integer not null,
-                  primary key (release_id, league_id, season_id, team_id)
-                );
                 create table public.fixture_delivery_metrics (
                   release_id uuid not null,
                   fixture_id bigint not null,
@@ -139,7 +126,6 @@ class FixtureDeliveryNoopPostgresTests(unittest.TestCase):
                          public.fixture_delivery_refresh_runs,
                          public.fixture_delivery_odds,
                          public.fixture_delivery_metrics,
-                         public.fixture_delivery_standings,
                          public.fixture_delivery_schedule,
                          public.fixture_delivery_current_publication,
                          public.fixture_delivery_releases restart identity;
@@ -154,11 +140,8 @@ class FixtureDeliveryNoopPostgresTests(unittest.TestCase):
                 values ('fixtures', %s);
                 insert into public.fixture_delivery_schedule values
                   (%s, 1001, 10, 20, 'NS', 'NS', null, null);
-                insert into public.fixture_delivery_standings values
-                  (%s, 8, 28083, 10, 1, 3, 1, 2, 0, 2),
-                  (%s, 8, 28083, 20, 2, 0, 1, 0, 2, -2);
                 """,
-                (RELEASE_ID, Json(fingerprint), RELEASE_ID, RELEASE_ID, RELEASE_ID, RELEASE_ID),
+                (RELEASE_ID, Json(fingerprint), RELEASE_ID, RELEASE_ID),
             )
             metric_rows = [
                 (RELEASE_ID, 1001, 10 if side == "home" else 20, side, window, mode, scope)
@@ -175,12 +158,6 @@ class FixtureDeliveryNoopPostgresTests(unittest.TestCase):
 
     def test_verified_noop_renews_same_complete_release_without_projection_writes(self) -> None:
         source = [{"id": 1001, "status": "NS", "status_code": "NS", "home_score": None, "away_score": None}]
-        expected_standings = {
-            (8, 28083): {
-                10: {"rank": 1, "points": 3, "played": 1, "goals_for": 2, "goals_against": 0, "goal_diff": 2},
-                20: {"rank": 2, "points": 0, "played": 1, "goals_for": 0, "goals_against": 2, "goal_diff": -2},
-            }
-        }
         report = {"components": {}}
         fingerprint = {
             "version": 1,
@@ -196,7 +173,6 @@ class FixtureDeliveryNoopPostgresTests(unittest.TestCase):
                 cur,
                 RELEASE_ID,
                 [1001],
-                expected_standings,
             )
             source_verified_at = datetime.fromisoformat(freshness["verified_at"])
             for interval_hours in (1, 2):
