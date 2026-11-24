@@ -144,16 +144,19 @@ The seven-day gate is required for launch readiness, but it does not block inter
 
 ## 7. Prepared production controls
 
-Four exact-final-release controllers have been staged privately on the VPS. They are not part of this documentation PR and must be reviewed separately before execution.
+The first controller set reviewed with this plan is superseded and must not be executed. The corrected local set below addresses the independent review findings. It is not yet authorized or staged on the VPS; staging, remote byte-for-byte hash verification, and an independent rereview are required before execution.
 
 | Controller | Purpose | SHA-256 |
 |---|---|---|
-| `leaderboard-2bd-rebaseline.sh` | Rebaseline only the importer after 20 genuine samples | `35d27eb190bade3af763a2353bc63b67424119c682dfc23b87d15f55026fb6d4` |
-| `leaderboard-2bd-resume.sh` | Clear resource pause only if the full installed guard passes | `0c6d6897da1cb6a37885bea351d7a617e208514a12af1d27c1f70e669afdb1d0` |
-| `leaderboard-2bd-owned-250.sh` | One 250-bound, 30-second final-release canary | `73af188121cfa72716c4d6ef5b89016b76dd5f4b128bf7249011e64aca7308e4` |
-| `leaderboard-2bd-enable-scheduled.sh` | Enable normal bounded schedule using an exact canary run ID | `f59a68db840015c295bf7dfec0c3c47db80832cc89f0e70451522ad8da35e038` |
+| `leaderboard-2bd-rebaseline.sh` | Rebaseline only the importer after 20 genuine samples | `ce051d7b117c9146a7b0af1e27070863508960b05a61c927a4d4dd7f9cf83f6e` |
+| `leaderboard-2bd-resume.sh` | Clear resource pause only if the full installed guard passes | `7928aed70d3af56ed4b712c0436796cb41964b6b5f053a6db3e9d96c7741bbc8` |
+| `leaderboard-2bd-owned-250.sh` | One 250-bound, 30-second final-release canary with deterministic reconciliation | `6f2e44576a73697a1652ab3b515ebdde61e4f6642191f1689aa05a07ce753e85` |
+| `leaderboard-2bd-enable-scheduled.sh` | Enable normal bounded schedule using the latest exact canary and a fresh full guard | `4c76643949883cfd629e8f5f8c66857dfb0a2139a65639397b43ccdd847d5662` |
+| `leaderboard-2bd-disable-scheduled.sh` | Fence new starts, disable, then recover at most one exact final-release run | `e5e60fd4d8ad499b9ec0dab9f0973a3b6cb5d3d29e61a9756e8ee549f902d10a` |
 
-Each controller pins the immutable release, current crontab, runtime manifest, key source hashes, database identity, expected function definition/ACL, normal lock order, fresh provider disk evidence, disabled backfill, and zero open runs. Busy locks are clean deferrals. No controller changes resource limits.
+The offline controller contract is `test-leaderboard-2bd-controller-contracts.py`, SHA-256 `f52aa436d0f1e8a5a2c059eec342c9bb08ba815c258ad3f062c0ab6bf3708c28`. Seven tests pass, including lost enable acknowledgement, open-run reconciliation, publisher reservation ordering, latest-run binding, fresh full-guard evaluation, and rollback fencing order. These are offline contracts, not hosted proof.
+
+Each mutating controller checks both the fixture-core reservation and the normal publisher time window before holding the canonical writer lock. Busy or reserved slots return a clean deferral. The canary records that enable was attempted **before** the ambiguous commit boundary; cleanup commits worker=false first, then recovers at most one exact new final-release run/resource window, removes only its owned marker, and prints PASS only after reconciliation. Scheduled enable requires the supplied run to be the latest worker run, successful, exact-release, positive-work, statement-accounted, and resource-window closed; it refreshes external disk evidence and runs the complete installed guard in the enabling transaction. Rollback creates the worker quarantine first, waits for the owned worker exclusion, disables and commits, then recovers an exact abandoned final-release run without editing crontab.
 
 ## 8. Execution plan
 
@@ -161,11 +164,12 @@ Each controller pins the immutable release, current crontab, runtime manifest, k
 
 Owner: reviewer + Operations lead.
 
-1. Review this plan and the four staged controller files.
-2. Confirm the GitHub Operations `main` SHA remains `2bdbe78...` or explicitly rebind every hash if it changes.
+1. Review this plan, the five corrected controllers, and their offline contract.
+2. Confirm the deployed runtime bytes still match Operations commit `2bdbe78...`. A documentation-only change to GitHub `main` does not restart qualification when every deployed runtime byte and manifest hash remains identical.
 3. Confirm the VPS runtime path, manifest hash, crontab hash, environment release SHA, and database DSN identity still match the reviewed values.
 4. Confirm no transition/quarantine marker exists and no certification or source-heavy job owns an exclusion lock.
 5. Confirm normal odds delivery has a recent committed success.
+6. Rehash the corrected controllers locally, copy them to a new private root-owned staging location, and independently verify every remote byte/hash before admission.
 
 Exit criterion: plan and controller review approved with no source drift.
 
@@ -189,12 +193,13 @@ Rollback: none required; no mutation occurs.
 
 Owner: Operations lead under certification, worker, heavy, and canonical-writer exclusion.
 
-1. Obtain fresh provider disk evidence with an actual observation timestamp no more than 210 seconds old.
-2. Recheck worker=false, backfill=false, capture=true, resource_paused=true, and zero open worker runs.
-3. Verify the installed rebaseline function definition, owner, invoker mode, and ACL.
-4. Execute `leaderboard-2bd-rebaseline.sh` once.
-5. Verify the importer release, sample count, target work units, total baseline, execution baseline, and processing baseline all match the current performance view.
-6. Verify resource pause remains true and worker/backfill remain false.
+1. Enter the reviewed publisher time window and require no active fixture-core reservation before taking the canonical writer lock. Otherwise defer cleanly.
+2. Obtain fresh provider disk evidence with an actual observation timestamp no more than 210 seconds old.
+3. Recheck worker=false, backfill=false, capture=true, resource_paused=true, and zero open worker runs.
+4. Verify the installed rebaseline function definition, owner, invoker mode, and ACL.
+5. Execute `leaderboard-2bd-rebaseline.sh` once.
+6. Verify the importer release, sample count, target work units, total baseline, execution baseline, and processing baseline all match the current performance view.
+7. Verify resource pause remains true and worker/backfill remain false.
 
 Exit criterion: importer baseline points at `a41e89b4837a` with at least 20 samples; no processing is enabled.
 
@@ -204,13 +209,14 @@ Rollback: the database function is transactional. Any failed predicate leaves th
 
 Owner: Operations lead.
 
-1. Wait until rolling worker temp is at or below 536,870,912 bytes.
-2. Require rolling worker WAL at or below 5,368,709,120 bytes.
-3. Require shadow bytes, index ratio, actual available database disk, source regression, and evidence freshness to pass the installed guard.
-4. Obtain a new provider disk observation within the 210-second admission margin.
-5. Recheck worker=false, backfill=false, capture=true, zero open runs, and rebaselined source release.
-6. Execute `leaderboard-2bd-resume.sh` once.
-7. Verify `resource_paused=false`, pause reason null, `last_resource_evidence.ok=true`, no breaches, and worker/backfill still false.
+1. Enter the reviewed publisher time window and require no active fixture-core reservation before taking the canonical writer lock. Otherwise defer cleanly.
+2. Wait until rolling worker temp is at or below 536,870,912 bytes.
+3. Require combined rolling worker-and-capture WAL at or below 5,368,709,120 bytes, preserving the installed attribution rules.
+4. Require shadow bytes, index ratio, actual available database disk, source regression, and evidence freshness to pass the installed guard.
+5. Obtain a new provider disk observation within the 210-second admission margin.
+6. Recheck worker=false, backfill=false, capture=true, zero open runs, and rebaselined source release.
+7. Execute `leaderboard-2bd-resume.sh` once.
+8. Verify `resource_paused=false`, pause reason null, `last_resource_evidence.ok=true`, no breaches, and worker/backfill still false.
 
 Exit criterion: full installed guard is green with worker still disabled.
 
@@ -232,25 +238,27 @@ Owner: Operations lead, with normal publisher priority.
    - 45-second outer process limit.
 6. Require exactly one new worker-run row.
 7. Require claimed count greater than zero, succeeded=claimed, failed=0, final release SHA `2bdbe78...`, exact statement accounting, closed resource window, and zero open runs.
-8. Require the controller to disable the worker before releasing locks.
+8. Once enable is attempted, require cleanup to reconcile state even if commit acknowledgement is lost: commit worker=false, recover at most one exact new run/resource window, verify zero open runs, remove only the owned quarantine, and only then print PASS.
 
 Exit criterion: one positive exact-final-release canary passes and returns its exact run ID.
 
-Rollback: any failure disables the worker and retains the owned quarantine marker. Do not remove the marker until the failed run and cleanup are independently verified.
+Rollback: any failure still runs the same disable/recovery reconciliation. Remove the owned marker if and only if the database is verified disabled with no open run. Retain it when reconciliation itself is incomplete; never print PASS before cleanup.
 
 ### Phase 5 — enable normal bounded processing
 
 Owner: Operations lead.
 
 1. Supply the exact successful canary run ID to `leaderboard-2bd-enable-scheduled.sh`.
-2. Recheck the full source/runtime/crontab binding and fresh disk evidence.
+2. Enter the reviewed publisher time window, require no active fixture-core reservation, and recheck the full source/runtime/crontab binding and fresh disk evidence.
 3. Require worker=false, backfill=false, capture=true, resource_paused=false, and zero open runs.
-4. Enable only `worker_enabled=true`; leave backfill false.
-5. Observe the next scheduled invocation from the protected final runtime.
+4. Require the supplied ID to be the **latest** worker run, with positive work, success, exact release, exact accounting, and a closed resource window. A later failed or incomplete run invalidates the supplied ID.
+5. Refresh external disk evidence inside the enabling transaction and require the complete installed guard to be green using that observation.
+6. Enable only `worker_enabled=true`; leave backfill false.
+7. Observe the next scheduled invocation from the protected final runtime.
 
 Exit criterion: the normal scheduled worker starts and completes a positive run from the final release.
 
-Rollback: set worker=false in one guarded transaction, confirm zero open runs, and leave backfill false. If a run is open, stop only its exact verified worker process, finalize/recover its exact resource window, then disable.
+Rollback: run `leaderboard-2bd-disable-scheduled.sh`. It creates the owned worker quarantine before waiting for the worker lock, commits worker=false before recovery, verifies/reconciles at most one exact final-release open run/resource window, leaves backfill false, and removes its marker only after success. Do not edit crontab; its entries already point at the immutable final release. If the exact process does not yield within the bounded wait, retain the fence and escalate for separately authorized exact-process termination.
 
 ### Phase 6 — bounded backlog drain
 
@@ -296,11 +304,13 @@ Owner: website + Operations engineer in an exclusive certification slot.
 2. Verify the Preview uses the shadow RPC and returns the expected model/publication evidence.
 3. Run the existing authenticated customer acceptance suite with `CERT_LEADERBOARDS_FULL=1`.
 4. Run the direct database/source-to-browser oracle with `CERT_LEADERBOARDS_SOURCE_ORACLE=1`.
-5. Run the five-concurrent-user latency suite with `CERT_LEADERBOARDS_CONCURRENCY=1`.
+5. Run the five-request latency suite with `CERT_LEADERBOARDS_CONCURRENCY=1`. It sends five simultaneous copies of one seeded request through one authenticated session; report only that proven scope, not multi-account capacity.
 6. Require all tests to pass with nonempty results where the contract requires them.
 7. Require no malformed/incomplete payload fallback, no unexpected legacy-reader use, no 5xx response, and all request limits under the existing 10-second hard test bound.
 8. Compare representative player totals, per-90, averages, ratios, last-5, last-10, season, position, league, and historical-season queries to independent source evidence.
-9. Preserve private HTML/JSON evidence and exact source/deployment hashes.
+9. Attach an independent expected-ranking comparison for at least one representative cohort so omission of an expected top player cannot pass merely because the oracle recomputes only players returned by the API.
+10. Certify one pinned Preview commit, preserve its deployment ID/publication evidence, and deploy that exact source commit to Production without rebuilding from a different tree.
+11. Preserve private HTML/JSON evidence and exact source/deployment hashes.
 
 Exit criterion: all three release-gate suites pass against the same complete publication and exact Preview source.
 
@@ -317,10 +327,11 @@ Owner: website release owner.
 5. Run a small authenticated Production smoke covering player total, per-90, last-N, season, multi-league, and one derived ratio.
 6. Verify logs show the shadow path, not the legacy flexible batch reader.
 7. Verify no customer-facing error and no malformed shadow payload.
+8. Retain the exact Production deployment ID and the publication ID/cursor returned by the authenticated smoke.
 
 Exit criterion: the new published reader is the Production default and smoke evidence passes.
 
-Rollback: set the server-only flag false and redeploy/roll back the exact environment binding. The legacy reader remains dormant but available during the seven-day gate.
+Rollback: set the server-only flag false and roll back to the previously pinned flag-off deployment. Before stopping any legacy-only refresh, prove that this exact flag-off deployment still returns **current** data, not merely a successful stale response. The legacy reader remains dormant but usable during the seven-day gate.
 
 ### Phase 9 — retire the legacy path
 
@@ -345,7 +356,18 @@ Dormant rollback code is not the same as operating the old system. It may remain
 
 ### Phase 10 — seven-day pre-launch stability gate
 
-Start this gate immediately after the Production reader cutover.
+Start this gate only after the authenticated Production smoke passes.
+
+Schedule one low-volume authenticated probe in every UTC observation day, after a normal publisher cycle. Each probe must record the exact deployment/publication and enforce these initial named limits:
+
+- published leaderboard age no greater than 15 minutes;
+- oldest dirty leaderboard queue age no greater than 15 minutes after the initial drain is complete;
+- zero open worker runs outside an actively observed bounded invocation;
+- installed resource guard `ok=true` with no breaches;
+- latest normal odds-delivery report `ok=true`, `committed=true`, and no more than 20 minutes old;
+- authenticated reader response successful, nonempty where required, and bound to the expected current publication.
+
+A missing observation cannot certify that day. Tighten these limits if the measured steady state supports it; do not loosen them during the seven-day gate without a new review.
 
 For seven consecutive days require:
 
@@ -360,6 +382,8 @@ For seven consecutive days require:
 
 Any material failure resets the gate only after the cause is fixed and a new final-release canary passes. The new system may remain active internally if the failure is understood and customer launch stays closed; otherwise use the dormant reader rollback.
 
+Retire the legacy website branch only after seven consecutive observed passing days. Remove legacy database RPCs later, in the separately dependency-reviewed migration described in Phase 9.
+
 ## 9. Evidence required at each handoff
 
 Every mutating phase must preserve:
@@ -372,6 +396,7 @@ Every mutating phase must preserve:
 - fresh provider disk value and actual observation time;
 - source performance view and sample count;
 - worker-run ID and resource accounting;
+- combined rolling worker-and-capture WAL against the unchanged 5 GiB limit;
 - queue/generation/publication counts;
 - private logs and SHA-256 manifest;
 - explicit statement that no limit, timeout, counter, quota, or capacity setting changed.
@@ -384,17 +409,21 @@ The reviewer should answer each item explicitly:
 
 - [ ] Is the accelerated pre-launch decision acceptable: activate after canary, then run the seven-day gate while active internally?
 - [ ] Are the 20-sample and rolling-resource gates preserved without a shortcut?
-- [ ] Do the four staged controllers bind the exact final release and fail closed on drift?
+- [ ] Do the five corrected controllers bind the exact final release and fail closed on drift?
 - [ ] Are lock ordering and normal Odds Search publisher priority preserved?
+- [ ] Do rebaseline, resume, canary, scheduled enable, and rollback all defer for an active publisher reservation and unsafe publisher time window?
 - [ ] Does rebaseline change only importer evidence and leave pause/worker/backfill unchanged?
 - [ ] Does resume rerun the complete installed guard transactionally?
-- [ ] Does the canary require positive work, exact resource accounting, cleanup, and disable-on-exit?
-- [ ] Does scheduled enable require the exact canary run ID?
+- [ ] Does the canary require positive work, exact resource accounting, lost-ack-safe cleanup, exact open-run recovery, and disable-before-PASS?
+- [ ] Does scheduled enable require the supplied run to be the latest closed successful run and rerun the full guard with the fresh disk observation?
+- [ ] Does rollback fence new starts before disabling and recover exact work without editing crontab?
 - [ ] Is backfill correctly excluded from initial activation?
 - [ ] Are the backlog stop conditions strict enough without inventing new thresholds?
-- [ ] Do the three website certification suites cover customer behavior, source accuracy, and concurrency?
+- [ ] Do the three website certification suites cover customer behavior, source accuracy, and the accurately described five-request latency scope?
+- [ ] Does independent expected-ranking evidence prevent an omitted top player from escaping the source oracle?
 - [ ] Is the Production reader rollback a server-only flag/deployment change?
 - [ ] Is the legacy reader dormant—not serving traffic—during the seven-day rollback window?
+- [ ] Is the seven-day gate based on seven observed authenticated days with named publication-age, queue-age, and odds-delivery limits?
 - [ ] Are database function removals deferred to a separate dependency-reviewed migration?
 
 ## 11. Estimated fastest timeline
