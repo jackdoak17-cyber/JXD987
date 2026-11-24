@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     # A provider stall must produce a visible failed run, never an unbounded
     # Actions job that prevents the next scheduled refresh from starting.
-    timeout-minutes: 20
+    timeout-minutes: 22
     env:
       PYTHONPATH: .
       # Daily runs only need to refresh the recent form/stat window. Older
@@ -173,3 +173,24 @@ jobs:
               -H "Content-Type: application/json" \
               -d "{\"p_league_id\":${league_id},\"p_recent_days\":30,\"p_last_n\":1}"
           done
+
+      # Run after the existing ingestion and publishing work so a provider
+      # standings failure cannot prevent those established customer updates.
+      - name: Publish validated current SportMonks standings
+        env:
+          SPORTMONKS_API_TOKEN: ${{ secrets.SPORTMONKS_API_TOKEN }}
+          SUPABASE_DB_URL_SESSION: ${{ secrets.SUPABASE_DB_URL_SESSION }}
+        run: |
+          python3 scripts/sync_official_standings.py \
+            --leagues "$LEAGUE_IDS" \
+            --current-only \
+            --report-out /tmp/official-standings-current.json
+
+      - name: Upload official standings evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: official-standings-current-${{ github.run_id }}
+          path: /tmp/official-standings-current.json
+          if-no-files-found: warn
+          retention-days: 7
