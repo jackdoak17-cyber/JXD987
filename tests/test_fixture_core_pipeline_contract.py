@@ -132,6 +132,14 @@ run_recorded_pipeline_job "test_fixture_core" "test fixture core" "true" ""
             source,
         )
         self.assertIn('sleep "${STATS_RECONCILE_SUCCESS_HANDOFF_SECONDS}"', source)
+        self.assertIn(
+            'STATS_RECONCILE_TRANSACTION_DATABASE_URL="${SUPABASE_DB_URL_SESSION:-}"',
+            source,
+        )
+        self.assertIn(
+            'OPERATIONS_CHECK_RUNNER_DATABASE_URL="${STATS_RECONCILE_TRANSACTION_DATABASE_URL}"',
+            source,
+        )
 
     def test_squad_cursor_advances_after_completed_batch_when_fleet_check_is_red(self) -> None:
         source = (ROOT / "scripts/vps/run_squad_reconciliation.sh").read_text(encoding="utf-8")
