@@ -102,8 +102,8 @@ python scripts/sync_odds.py \
   --refresh-only \
   --report-out "/tmp/odds_refresh_report_p3.json"
 
-# Step 2: Publish validated official league tables. The worker also backfills
-# any website season that has fixtures but no official snapshot yet.
+# Step 2: Publish validated official league tables for each league's latest
+# started season. Historical backfill is a separate reviewed release action.
 python scripts/sync_official_standings.py \
   --leagues "${STATS_LEAGUES}" \
   --report-out "/tmp/official_standings_report_p3.json"
