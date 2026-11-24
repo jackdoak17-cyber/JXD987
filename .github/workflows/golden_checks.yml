@@ -67,6 +67,8 @@ jobs:
   official-standings-contract:
     if: ${{ inputs.official_standings_contract }}
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .
     steps:
       - name: Checkout
         uses: actions/checkout@v4
