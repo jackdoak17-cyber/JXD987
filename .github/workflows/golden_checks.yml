@@ -102,11 +102,13 @@ jobs:
           python3 scripts/sync_official_standings.py \
             --leagues "${LEAGUES}" \
             --all-fixture-seasons \
+            --continue-on-error \
             --dry-run \
             --expect-standing "27903:65:6:27" \
             --report-out official-standings-contract.json
 
       - name: Upload sanitised contract evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: official-standings-contract

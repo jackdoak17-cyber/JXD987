@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
         help="refresh every selected season that has at least one local fixture",
     )
     parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="validate every target and report all failures before returning non-zero",
+    )
+    parser.add_argument(
         "--expect-standing",
         action="append",
         default=[],
@@ -565,6 +570,7 @@ def main() -> int:
         conn.rollback()
         if not targets:
             raise RuntimeError("no standings seasons matched the requested scope")
+        had_failure = False
         for target in targets:
             LOG.info("Fetching official standings league=%s season=%s", target.league_id, target.season_id)
             try:
@@ -592,14 +598,16 @@ def main() -> int:
                     {"league_id": target.league_id, "season_id": target.season_id, "status": "failed", "error": str(exc)}
                 )
                 report["status"] = "failed"
-                report["finished_at"] = datetime.now(UTC).isoformat()
-                write_report(args.report_out, report)
-                raise
-        report["status"] = "succeeded"
+                had_failure = True
+                if not args.continue_on_error:
+                    report["finished_at"] = datetime.now(UTC).isoformat()
+                    write_report(args.report_out, report)
+                    raise
+        report["status"] = "failed" if had_failure else "succeeded"
         report["finished_at"] = datetime.now(UTC).isoformat()
         report["sportmonks_calls"] = client.stats
         write_report(args.report_out, report)
-        return 0
+        return 1 if had_failure else 0
     finally:
         conn.close()
 
