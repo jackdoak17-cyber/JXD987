@@ -25,7 +25,8 @@ assert '"/var/lib/oddssearch/leaderboard-shadow-resource.json"' in WORKER.read_t
 
 
 def exercise(name: str, evidence, *, expected_worker: bool, new_mtime=False,
-             hold_heavy=False, file_kind="regular"):
+             hold_heavy=False, hold_canonical=False, reservation_active=False,
+             publisher_phases=None, expected_skip=None, file_kind="regular"):
     with tempfile.TemporaryDirectory(prefix="shadow-resource-deferral-") as directory:
         home = Path(directory)
         release = home / "release"
@@ -35,8 +36,13 @@ def exercise(name: str, evidence, *, expected_worker: bool, new_mtime=False,
         (release / "scripts/leaderboard_shadow_worker.py").write_text("# fake worker target\n")
         worker_lock = home / "worker.lock"
         heavy_lock = home / "heavy.lock"
+        canonical_lock = home / "canonical.lock"
+        reservation_file = home / "canonical.lock.fixture-core-reservation"
         worker_lock.touch()
         heavy_lock.touch()
+        canonical_lock.touch()
+        if reservation_active:
+            reservation_file.write_text("fixture-core-owner 4102444800\n")
         (vps / "common.sh").write_text(
             f'TRIAL_WORKER_LOCK="{worker_lock}"\n'
             f'TRIAL_HEAVY_LOCK="{heavy_lock}"\n'
@@ -46,6 +52,8 @@ def exercise(name: str, evidence, *, expected_worker: bool, new_mtime=False,
             'require_runtime_manifest_entries_or_exit() { :; }\n'
             'check_trial_lock_fd() { :; }\n'
             'has_quarantine_marker() { return 1; }\n'
+            'fixture_core_reservation_file() { printf %s "$ODDS_SYNC_LOCK_FILE.fixture-core-reservation"; }\n'
+            'fixture_core_reservation_active() { [[ -f "$1" ]]; }\n'
             'run_with_database_heavy_lock() {\n'
             '  local wait="$1"; shift\n'
             '  ( exec 8<"$TRIAL_HEAVY_LOCK"; flock -n 8 || exit 75; "$@" )\n'
@@ -85,17 +93,36 @@ def exercise(name: str, evidence, *, expected_worker: bool, new_mtime=False,
         fake_flock.write_text(
             f'#!{sys.executable}\n'
             'import fcntl, sys\n'
-            'try: fcntl.flock(int(sys.argv[-1]), fcntl.LOCK_EX | fcntl.LOCK_NB)\n'
+            'mode = fcntl.LOCK_UN if "-u" in sys.argv else fcntl.LOCK_EX | fcntl.LOCK_NB\n'
+            'try: fcntl.flock(int(sys.argv[-1]), mode)\n'
             'except BlockingIOError: raise SystemExit(1)\n'
         )
         fake_flock.chmod(0o755)
+        phases = list(publisher_phases or [300, 300])
+        epochs = [1_800_000_000 - (1_800_000_000 % 900) + phase for phase in phases]
+        date_state = home / "date-state"
+        fake_date = bin_dir / "date"
+        fake_date.write_text(
+            f'#!{sys.executable}\n'
+            'import json, pathlib, sys\n'
+            f'values = {epochs!r}\n'
+            f'state = pathlib.Path({str(date_state)!r})\n'
+            'index = int(state.read_text()) if state.exists() else 0\n'
+            'state.write_text(str(index + 1))\n'
+            'print(values[min(index, len(values) - 1)])\n'
+        )
+        fake_date.chmod(0o755)
         env = dict(os.environ,
                    PATH=f"{bin_dir}:{os.environ['PATH']}",
-                   LEADERBOARD_SHADOW_ENV_FILE=str(envfile))
+                   LEADERBOARD_SHADOW_ENV_FILE=str(envfile),
+                   ODDS_SYNC_LOCK_FILE=str(canonical_lock))
         held_fd = os.open(heavy_lock, os.O_RDONLY) if hold_heavy else None
+        canonical_fd = os.open(canonical_lock, os.O_RDONLY) if hold_canonical else None
         try:
             if held_fd is not None:
                 fcntl.flock(held_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if canonical_fd is not None:
+                fcntl.flock(canonical_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             process = subprocess.Popen(["bash", str(vps / WRAPPER.name)], env=env,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        text=True, start_new_session=True)
@@ -108,6 +135,8 @@ def exercise(name: str, evidence, *, expected_worker: bool, new_mtime=False,
         finally:
             if held_fd is not None:
                 os.close(held_fd)
+            if canonical_fd is not None:
+                os.close(canonical_fd)
         assert process.returncode == 0, (name, stdout, stderr)
         if expected_worker:
             assert args_record.exists(), (name, "worker was skipped", stderr)
@@ -116,7 +145,9 @@ def exercise(name: str, evidence, *, expected_worker: bool, new_mtime=False,
             assert args[0] == str(release / "scripts/leaderboard_shadow_worker.py")
         else:
             assert not args_record.exists(), (name, "worker was called")
-            if not hold_heavy:
+            if expected_skip:
+                assert expected_skip in stderr, (name, stderr)
+            elif not hold_heavy:
                 assert "[SKIPPED] fresh provider disk observation unavailable" in stderr
         print(f"PASS {name}")
 
@@ -141,3 +172,20 @@ exercise("symlink evidence defers", None, expected_worker=False, file_kind="syml
 exercise("directory evidence defers before read", None, expected_worker=False, file_kind="directory")
 exercise("busy source-priority heavy lock defers before worker", sample(30),
          expected_worker=False, hold_heavy=True)
+exercise("publisher reserved phase defers before evidence", sample(30),
+         expected_worker=False, publisher_phases=[720],
+         expected_skip="publisher-safe window unavailable")
+exercise("last phase with full worker reserve remains admitted", sample(30),
+         expected_worker=True, publisher_phases=[674, 674])
+exercise("insufficient worker reserve defers", sample(30),
+         expected_worker=False, publisher_phases=[675],
+         expected_skip="publisher-safe window unavailable")
+exercise("window is rechecked after evidence admission", sample(30),
+         expected_worker=False, publisher_phases=[300, 675],
+         expected_skip="publisher-safe window unavailable")
+exercise("active fixture-core reservation defers", sample(30),
+         expected_worker=False, reservation_active=True,
+         expected_skip="fixture-core reservation active")
+exercise("busy canonical writer defers", sample(30),
+         expected_worker=False, hold_canonical=True,
+         expected_skip="canonical writer slot unavailable")
