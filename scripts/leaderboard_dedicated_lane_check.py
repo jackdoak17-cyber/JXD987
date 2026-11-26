@@ -7,7 +7,9 @@ import argparse
 import datetime as dt
 import json
 import os
+from pathlib import Path
 import re
+import stat
 import sys
 
 import psycopg2
@@ -16,6 +18,7 @@ from psycopg2.extras import RealDictCursor
 
 P95 = "source_ingestion_processing_p95_regressed_gt_10pct"
 MIB = 1024 * 1024
+MAX_RESOURCE_EVIDENCE_AGE_SECONDS = 4 * 60
 
 
 def safe(value):
@@ -26,6 +29,29 @@ def safe(value):
     if isinstance(value, (dt.datetime, dt.date)):
         return value.isoformat()
     return value
+
+
+def validate_resource_evidence(
+    path: Path, now: dt.datetime | None = None,
+) -> dict:
+    """Reject stale disk evidence before the wrapper creates its quarantine."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, encoding="utf-8") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077:
+            raise RuntimeError("disk resource evidence file is untrusted")
+        evidence = json.load(source)
+    if set(evidence) != {"disk_available_bytes", "observed_at"}:
+        raise RuntimeError("disk resource evidence has unexpected or missing fields")
+    if type(evidence["disk_available_bytes"]) is not int or evidence["disk_available_bytes"] <= 0:
+        raise RuntimeError("disk resource evidence has an invalid capacity")
+    observed = dt.datetime.fromisoformat(str(evidence["observed_at"]).replace("Z", "+00:00"))
+    if observed.tzinfo is None:
+        raise RuntimeError("disk resource evidence timestamp has no timezone")
+    age = ((now or dt.datetime.now(dt.timezone.utc)) - observed).total_seconds()
+    if not 0 <= age <= MAX_RESOURCE_EVIDENCE_AGE_SECONDS:
+        raise RuntimeError("disk resource evidence is not fresh enough to start the lane")
+    return evidence
 
 
 def database_snapshot(connection) -> dict:
@@ -144,6 +170,11 @@ def main() -> int:
     dsn = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
     if not dsn:
         raise RuntimeError("database URL is required")
+    if args.mode == "before":
+        resource_evidence = os.environ.get("LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE", "")
+        if not resource_evidence:
+            raise RuntimeError("disk resource evidence path is required")
+        validate_resource_evidence(Path(resource_evidence))
     with psycopg2.connect(
         dsn, connect_timeout=5,
         options="-c statement_timeout=5000 -c lock_timeout=1000 -c default_transaction_read_only=on",
