@@ -1,5 +1,7 @@
 # Final leaderboard cutover plan — accelerated pre-launch rollout
 
+> **26 November architecture update:** the shared-resource recovery path in this document is superseded for review by [Leaderboard dedicated resource lane plan](./leaderboard-dedicated-resource-lane-plan-2026-11-26.md). The older execution evidence remains historical and must not be read as current admission authority.
+
 Status: **execution in progress — final-release canary passed; scheduled activation waiting for the ordinary guard**
 
 Plan date: **24 November 2026**
