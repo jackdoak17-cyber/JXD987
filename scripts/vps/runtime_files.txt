@@ -22,11 +22,14 @@ scripts/verify_fixture_delivery_parity.py
 scripts/postmatch_fixture_detail_delivery.py
 scripts/leaderboard_shadow_capture.py
 scripts/leaderboard_shadow_worker.py
+scripts/leaderboard_resource_meter.py
+scripts/leaderboard_dedicated_lane_check.py
 scripts/leaderboard_finite_trial_supervisor.py
 scripts/leaderboard_hosted_boundary.py
 scripts/leaderboard_restricted_runtime.py
 scripts/leaderboard_quarantine_release.py
 scripts/vps/run_leaderboard_shadow_worker.sh
+scripts/vps/run_leaderboard_dedicated_lane.sh
 scripts/vps/run_leaderboard_finite_trial.sh
 scripts/vps/run_leaderboard_rolling_worker.sh
 scripts/vps/verify_finite_trial_host_cutover.sh

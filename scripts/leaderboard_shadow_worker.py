@@ -49,6 +49,7 @@ RESOURCE_EVIDENCE_FILE = os.environ.get(
     "LEADERBOARD_SHADOW_RESOURCE_EVIDENCE_FILE",
     "/var/lib/oddssearch/leaderboard-shadow-resource.json",
 )
+SOURCE_P95_BREACH = "source_ingestion_processing_p95_regressed_gt_10pct"
 
 
 @dataclass(frozen=True)
@@ -238,6 +239,20 @@ def validate_activation_override(conn, isolated_test_override: bool) -> bool:
     return True
 
 
+def validate_source_p95_yellow_lane(args) -> bool:
+    if not args.allow_source_p95_yellow:
+        return False
+    if args.command != "run-once" or args.isolated_test_override:
+        raise RuntimeError("source-p95 yellow is restricted to the production dedicated lane")
+    token = os.environ.get("LEADERBOARD_DEDICATED_LANE_TOKEN", "")
+    pinned_release = os.environ.get("LEADERBOARD_DEDICATED_LANE_RELEASE_SHA", "")
+    if not re.fullmatch(r"[0-9a-f]{32}", token):
+        raise RuntimeError("dedicated lane token is missing or invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}", RELEASE_SHA) or pinned_release != RELEASE_SHA:
+        raise RuntimeError("dedicated lane release differs from its reviewed pin")
+    return True
+
+
 def load_external_resource_evidence(conn, path: str = RESOURCE_EVIDENCE_FILE) -> dict[str, Any]:
     file_stat = os.stat(path, follow_symlinks=False)
     if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_mode & 0o022:
@@ -284,7 +299,40 @@ def require_backfill_enabled(conn, allow_disabled: bool) -> None:
         raise RuntimeError("leaderboard shadow backfill is not enabled")
 
 
-def enforce_resource_guard(conn, require_external: bool) -> dict[str, Any]:
+def classify_resource_evidence(
+    evidence: dict[str, Any], *, allow_source_p95_yellow: bool = False,
+) -> dict[str, Any]:
+    """Keep every resource breach hard-red except the reviewed lane warning.
+
+    The database guard deliberately persists the old importer-p95 breach.  A
+    dedicated lane may treat *only* that one token as yellow; it must not hide
+    or remove the stored pause and it must never accept a second breach.
+    """
+
+    if evidence.get("ok"):
+        return evidence
+    breaches = evidence.get("breaches")
+    if allow_source_p95_yellow and breaches == [SOURCE_P95_BREACH]:
+        accepted = dict(evidence)
+        warnings = list(accepted.get("warnings") or [])
+        if SOURCE_P95_BREACH not in warnings:
+            warnings.append(SOURCE_P95_BREACH)
+        accepted.update({
+            "ok": True,
+            "breaches": [],
+            "warnings": warnings,
+            "dedicated_lane_source_p95_yellow": True,
+        })
+        return accepted
+    raise RuntimeError(
+        "leaderboard shadow resource guard paused processing: "
+        + ",".join(breaches or [])
+    )
+
+
+def enforce_resource_guard(
+    conn, require_external: bool, *, allow_source_p95_yellow: bool = False,
+) -> dict[str, Any]:
     with conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -303,12 +351,9 @@ def enforce_resource_guard(conn, require_external: bool) -> dict[str, Any]:
                 (require_external,),
             )
             evidence = cur.fetchone()["evidence"]
-    if not evidence.get("ok"):
-        raise RuntimeError(
-            "leaderboard shadow resource guard paused processing: "
-            + ",".join(evidence.get("breaches", []))
-        )
-    return evidence
+    return classify_resource_evidence(
+        evidence, allow_source_p95_yellow=allow_source_p95_yellow,
+    )
 
 
 def apply_recovery_timeouts(conn) -> None:
@@ -591,6 +636,7 @@ def finish_worker_run_with_resource_check(
     succeeded: int,
     failed: int,
     require_external: bool,
+    guard_check: Callable[[Any, bool], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Record the run, then persist a resource snapshot after final writes.
 
@@ -601,7 +647,8 @@ def finish_worker_run_with_resource_check(
 
     finish_worker_run(conn, run_id, claimed, succeeded, failed)
     apply_recovery_timeouts(conn)
-    return enforce_resource_guard(conn, require_external)
+    guard_check = guard_check or enforce_resource_guard
+    return guard_check(conn, require_external)
 
 
 def refresh_eligibility_if_due(conn, max_age_seconds: int = 600) -> int:
@@ -1720,6 +1767,7 @@ def main() -> int:
     parser.add_argument("--league-id", type=int)
     parser.add_argument("--season-id", type=int)
     parser.add_argument("--batch-size", type=int, default=250)
+    parser.add_argument("--allow-source-p95-yellow", action="store_true")
     parser.add_argument("--trial-policy-id")
     parser.add_argument("--trial-test-pg-sleep-after-admission", type=float, default=0)
     parser.add_argument("--trial-test-pg-sleep-after-capture", type=float, default=0)
@@ -1743,6 +1791,7 @@ def main() -> int:
     ):
         parser.error("hosted restricted worker requires the reviewed canary envelope")
     worker_id = f"{socket.gethostname()}:{os.getpid()}"
+    allow_source_p95_yellow = validate_source_p95_yellow_lane(args)
 
     if args.production_restricted:
         token = os.environ.get("LEADERBOARD_FINITE_TRIAL_CONNECTION_TOKEN", "")
@@ -1824,7 +1873,12 @@ def main() -> int:
             load_external_resource_evidence(conn)
         temp_file_limit_enforced = configure_temp_file_limit_if_permitted(conn)
         budget.apply_database_timeouts(conn)
-        resource_evidence = enforce_resource_guard(conn, require_external)
+        guard_check = lambda connection, external: enforce_resource_guard(
+            connection,
+            external,
+            allow_source_p95_yellow=allow_source_p95_yellow,
+        )
+        resource_evidence = guard_check(conn, require_external)
         if args.command in {"backfill", "backfill-all"}:
             require_backfill_enabled(conn, allow_disabled)
             if args.command == "backfill":
@@ -1838,7 +1892,7 @@ def main() -> int:
                 if not budget.available():
                     break
                 budget.apply_database_timeouts(conn)
-                enforce_resource_guard(conn, require_external)
+                guard_check(conn, require_external)
                 batch_size = min(args.batch_size, budget.fixture_limit - budget.processed)
                 enqueued = enqueue_backfill(conn, league_id, season_id, batch_size)
                 budget.processed += enqueued
@@ -1869,15 +1923,18 @@ def main() -> int:
                 require_external,
                 league_id=args.league_id,
                 season_id=args.season_id,
+                guard_check=guard_check,
             )
             generations = process_generations(
                 conn, worker_id, args.cohort_limit, args.job_limit, budget, require_external,
+                guard_check=guard_check,
             )
             claimed = capture["claimed"] + generations["jobs"]
             succeeded = capture["acknowledged"] + generations["jobs"]
             failed = capture["failed"]
             resource_evidence = finish_worker_run_with_resource_check(
                 conn, run_id, claimed, succeeded, failed, require_external,
+                guard_check=guard_check,
             )
             print(json.dumps({
                 "capture": capture,
