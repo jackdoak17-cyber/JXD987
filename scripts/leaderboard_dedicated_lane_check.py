@@ -90,13 +90,29 @@ def validate_before(
     source = snapshot["source"]
     now = dt.datetime.now(dt.timezone.utc)
     source_age = (now - source["latest_observed_at"]).total_seconds()
-    breaches = status.get("resource_guard", {}).get("breaches")
+    guard = status.get("resource_guard", {})
+    breaches = guard.get("breaches")
+    green = (
+        guard.get("ok") is True
+        and breaches == []
+        and status.get("resource_paused") is False
+        and status.get("resource_pause_reason") is None
+    )
+    p95_yellow = (
+        guard.get("ok") is False
+        and breaches == [P95]
+        and status.get("resource_paused") is True
+        and status.get("resource_pause_reason") == P95
+    )
     if status.get("release_sha") not in {release_sha, previous_release_sha}:
         raise RuntimeError("worker release differs from the dedicated-lane pin")
-    if not (status.get("worker_enabled") is True and status.get("capture_enabled") is True
-            and status.get("backfill_enabled") is False and status.get("resource_paused") is True
-            and status.get("resource_pause_reason") == P95 and breaches == [P95]):
-        raise RuntimeError("pipeline state is outside the p95-only lane envelope")
+    if not (
+        status.get("worker_enabled") is True
+        and status.get("capture_enabled") is True
+        and status.get("backfill_enabled") is False
+        and (green or p95_yellow)
+    ):
+        raise RuntimeError("pipeline state is outside the green-or-p95 lane envelope")
     if source.get("latest_status") != "success" or source.get("latest_release_id") != source.get("release_id"):
         raise RuntimeError("latest source cycle is not a successful matching release")
     if source.get("sample_count", 0) < 20 or source.get("latest_work_units", 0) < 1:
@@ -115,7 +131,13 @@ def validate_before(
                   "open_trial_reservations", "open_rolling_reservations"):
         if database[field] != 0:
             raise RuntimeError(f"database admission found nonzero {field}")
-    return {"ok": True, "mode": "before", "source_age_seconds": round(source_age, 3), **snapshot}
+    return {
+        "ok": True,
+        "mode": "before",
+        "resource_envelope": "green" if green else "source_p95_yellow",
+        "source_age_seconds": round(source_age, 3),
+        **snapshot,
+    }
 
 
 def validate_after(snapshot: dict, connection, release_sha: str, run_id: int) -> dict:

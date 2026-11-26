@@ -57,6 +57,15 @@ def test_preflight_accepts_only_the_reviewed_p95_lane_envelope():
     result = validate_before(snapshot(), RELEASE)
     assert result["ok"] is True
     assert result["mode"] == "before"
+    assert result["resource_envelope"] == "source_p95_yellow"
+
+
+def test_preflight_accepts_the_fully_green_resource_envelope():
+    value = snapshot()
+    value["status"].update({"resource_paused": False, "resource_pause_reason": None})
+    value["status"]["resource_guard"] = {"ok": True, "breaches": []}
+    result = validate_before(value, RELEASE)
+    assert result["resource_envelope"] == "green"
 
 
 def test_preflight_accepts_only_the_exact_reviewed_previous_release_for_first_run():
@@ -68,8 +77,8 @@ def test_preflight_accepts_only_the_exact_reviewed_previous_release_for_first_ru
 
 
 @pytest.mark.parametrize(("section", "field", "value", "message"), [
-    ("status", "resource_pause_reason", "rolling_wal_bytes_limit", "p95-only"),
-    ("status", "worker_enabled", False, "p95-only"),
+    ("status", "resource_pause_reason", "rolling_wal_bytes_limit", "green-or-p95"),
+    ("status", "worker_enabled", False, "green-or-p95"),
     ("database", "total_connections", 68, "75 percent"),
     ("database", "active_connections", 11, "active database"),
     ("database", "lock_waiters", 1, "lock_waiters"),
