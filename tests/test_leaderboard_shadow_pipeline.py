@@ -922,6 +922,61 @@ def test_resource_guard_checkpoints_an_active_run_before_enforcement():
     assert "enforce_resource_guard" in cursor.executed[2][0]
 
 
+def test_dedicated_lane_accepts_only_the_single_source_p95_warning():
+    evidence = {
+        "ok": False,
+        "breaches": [worker_module.SOURCE_P95_BREACH],
+        "warnings": [],
+        "rolling_wal_bytes": 123,
+    }
+
+    accepted = worker_module.classify_resource_evidence(
+        evidence, allow_source_p95_yellow=True,
+    )
+
+    assert accepted["ok"] is True
+    assert accepted["breaches"] == []
+    assert accepted["warnings"] == [worker_module.SOURCE_P95_BREACH]
+    assert accepted["dedicated_lane_source_p95_yellow"] is True
+    assert accepted["rolling_wal_bytes"] == 123
+    assert evidence["ok"] is False
+    assert evidence["breaches"] == [worker_module.SOURCE_P95_BREACH]
+
+
+@pytest.mark.parametrize("breaches", [
+    ["rolling_wal_bytes_limit"],
+    [worker_module.SOURCE_P95_BREACH, "rolling_temp_bytes_limit"],
+    [],
+])
+def test_dedicated_lane_never_accepts_another_resource_breach(breaches):
+    with pytest.raises(RuntimeError, match="resource guard paused processing"):
+        worker_module.classify_resource_evidence(
+            {"ok": False, "breaches": breaches},
+            allow_source_p95_yellow=True,
+        )
+
+
+def test_dedicated_lane_override_requires_exact_token_command_and_release(monkeypatch):
+    release = "a" * 40
+    args = SimpleNamespace(
+        allow_source_p95_yellow=True,
+        command="run-once",
+        isolated_test_override=False,
+    )
+    monkeypatch.setattr(worker_module, "RELEASE_SHA", release)
+    monkeypatch.setenv("LEADERBOARD_DEDICATED_LANE_TOKEN", "b" * 32)
+    monkeypatch.setenv("LEADERBOARD_DEDICATED_LANE_RELEASE_SHA", release)
+    assert worker_module.validate_source_p95_yellow_lane(args) is True
+
+    monkeypatch.setenv("LEADERBOARD_DEDICATED_LANE_RELEASE_SHA", "c" * 40)
+    with pytest.raises(RuntimeError, match="release differs"):
+        worker_module.validate_source_p95_yellow_lane(args)
+
+    args.command = "backfill"
+    with pytest.raises(RuntimeError, match="restricted to the production dedicated lane"):
+        worker_module.validate_source_p95_yellow_lane(args)
+
+
 def test_worker_run_opens_and_closes_the_durable_resource_window():
     cursor = WorkerAccountingCursor([(73,), ({"ok": True},)])
     connection = FakeConnection(cursor)
