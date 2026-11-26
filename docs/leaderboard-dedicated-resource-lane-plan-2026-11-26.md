@@ -1,6 +1,6 @@
 # Leaderboard dedicated resource lane plan
 
-Status: **review draft — no Production change is authorised by this document**
+Status: **review draft — user-performed Small compute resize complete; no leaderboard workload is authorised by this document**
 
 Plan date: **26 November 2026**
 
@@ -12,7 +12,7 @@ The new leaderboard can continue using the existing Supabase database, but it mu
 
 The recommended route is:
 
-1. upgrade the database from its current Micro-sized profile to **Medium**;
+1. upgrade the database from its original Micro-sized profile to **Small**;
 2. give the leaderboard its own scheduled operating windows;
 3. allow only one leaderboard database connection and one bounded batch at a time;
 4. measure CPU, memory, disk I/O, connections, WAL, temporary files and table growth before and after every batch;
@@ -64,13 +64,30 @@ Supabase's current sizing guide describes:
 
 Official reference: [Supabase Compute and Disk](https://supabase.com/docs/guides/platform/compute-and-disk).
 
-The current database size and memory evidence make **Medium the smallest sensible target**. Small would already be at or just beyond its recommended database size.
+Small is slightly below the guide's recommended database-size envelope because the database is about 51.7 GB. That recommendation is not a hard storage limit. Given the measured low CPU use, healthy disk headroom and Jack's cost ceiling, **Small is the right launch compromise**: it doubles memory and raises the connection ceiling while the dedicated lane limits workload concurrency.
 
 Supabase says a compute change usually takes less than two minutes of downtime, although it can take longer. Because the product has not launched, this is the best time to make the change.
 
-The current official guide lists Medium at approximately **$60/month**, compared with approximately **$10/month** for Micro. Billing is hourly and the dashboard must show the final price before approval.
+The current official guide lists Small at approximately **$15/month**, compared with approximately **$10/month** for Micro. Billing is hourly and the dashboard shows the final price.
 
-> **Simple explanation:** The database is currently running on roughly 1 GB of memory even though it stores about 52 GB of data. The upgrade does not make queries magically perfect, but it gives the shared system breathing room before we ask it to clear a backlog.
+> **Simple explanation:** The database was running on roughly 1 GB of memory even though it stores about 52 GB of data. Small doubles that memory. It is not unlimited capacity, so the metered lane remains essential.
+
+### 2.2 Completed resize evidence
+
+Jack initiated the Micro-to-Small resize through Supabase. Read-only verification at 20:33 UTC on 26 November found:
+
+- project `ACTIVE_HEALTHY`;
+- unchanged project, database host and Postgres 17 identity;
+- 90 maximum connections, matching Small;
+- 512 MB shared buffers, up from 256 MB;
+- 1,924,177,920 bytes total host memory, about 1.79 GiB usable;
+- 700,493,824 bytes available memory, about 36%;
+- swap use about 28%, improved from the pre-resize 38–47% sample;
+- 37 total connections, 3 active, zero lock waiters and zero idle-in-transaction sessions;
+- zero open leaderboard worker runs;
+- no OOM, disk-full, deadlock or connection-exhaustion signal.
+
+The 29 fatal log entries at 20:29 UTC were the expected `administrator command` and `database system is shutting down` connection terminations during the platform resize. They are not continuing database faults.
 
 ## 3. What “a separate slot” does and does not mean
 
@@ -163,8 +180,8 @@ These are launch limits, not permanent claims about maximum capacity. They must 
 | CPU non-I/O usage | below 50% over 5 min | above 70% for 2 samples or above 85% once | n/a |
 | I/O wait | below 20% over 5 min | above 30% for 2 samples | n/a |
 | Per-device disk busy | below 70% over 5 min | above 80% for 2 samples | platform capacity |
-| Memory available after Medium upgrade | at least 25% and 768 MiB | below 20% or 512 MiB | n/a |
-| Connection use | no more than 75% of `max_connections` | no more than 15% free or any pool wait | 120 expected on Medium |
+| Memory available after Small upgrade | at least 25% and 384 MiB | below 20% or 256 MiB | n/a |
+| Connection use | no more than 75% of `max_connections` | no more than 15% free or any pool wait | 90 on Small |
 | Active DB sessions | no more than 10 | more than 15 | n/a |
 | Lock waiters / idle in transaction | 0 / 0 | any new occurrence | 0 expected |
 | Free database disk | above 40 GiB | below 30 GiB | existing 20 GiB stop |
@@ -196,17 +213,17 @@ Exit: review approved and exact bytes pinned.
 
 > **Simple explanation:** Agree the rules and label every part before touching Production.
 
-### Phase 1 — upgrade Supabase compute to Medium
+### Phase 1 — upgrade Supabase compute to Small
 
 Technical steps:
 
 1. Fence leaderboard starts and stop the source supervisor at a clean boundary.
 2. Verify zero open leaderboard runs, zero open generation/resource windows and zero active publisher transactions.
 3. Save a private before-snapshot of database identity, publications, queue state, connections, Metrics API values and source health.
-4. Upgrade Supabase compute from Micro to Medium in the dashboard.
+4. Upgrade Supabase compute from Micro to Small in the dashboard.
 5. Wait for `ACTIVE_HEALTHY` and database connectivity to return.
 6. Verify Postgres version and project identity did not change.
-7. Confirm expected Medium capacity: about 4 GB RAM and 120 max connections.
+7. Confirm expected Small capacity: about 2 GB RAM and 90 max connections.
 8. Run read-only publication and source-integrity checks.
 9. Resume the source publisher/importer only. Keep leaderboard processing paused.
 10. Observe at least one ordinary successful source cycle and collect a 15-minute quiet resource baseline.
@@ -218,6 +235,8 @@ Rollback:
 - source services resume only after database identity and integrity pass.
 
 > **Simple explanation:** Give the database more breathing room, then prove normal Odds Search still works before leaderboards run.
+
+Current status: steps 1–8 are complete from the user-initiated resize and read-only verification. Steps 9–10 remain: observe one normal source cycle and collect a quiet post-resize baseline before any leaderboard canary.
 
 ### Phase 2 — implement the dedicated-window controller
 
@@ -352,7 +371,7 @@ Reader rollback remains a server-side flag/deployment rollback. Database data is
 
 ## 9. When to build a truly separate compute road
 
-Move ranking calculation off the primary database if any of these happens after the Medium upgrade:
+Move ranking calculation off the primary database if any of these happens after the Small upgrade:
 
 - two resource-triggered pauses in one UTC day;
 - the backlog cannot decrease across four green operating windows;
@@ -377,20 +396,21 @@ These are working estimates, not guarantees:
 | Work | Estimate |
 |---|---:|
 | Final review and exact-byte freeze | 1–2 hours |
-| Medium compute upgrade and post-upgrade source smoke | 30–60 minutes, including observation |
+| Small compute upgrade | complete |
+| Post-upgrade source smoke and quiet baseline | 15–30 minutes after normal scheduling resumes |
 | Controller implementation and offline tests | 4–8 hours |
 | Supervised ramp A–C | about 3 hours |
 | Backlog drain | likely 4–12 hours at the proposed ceiling; measured progress decides |
 | Reader certification and Production switch | 2–4 hours after a clean drain |
 | Seven-day pre-launch observation | starts after the switch; it does not delay internal activation |
 
-The fastest credible target is to activate the new reader within roughly one day of an approved plan, provided the Medium upgrade, controller tests, ramp and drain all pass. A resource trip extends the timeline because the system should stop rather than damage normal ingestion.
+The fastest credible target is to activate the new reader within roughly one day of an approved plan, provided the post-Small source check, controller tests, ramp and drain all pass. A resource trip extends the timeline because the system should stop rather than damage normal ingestion.
 
 ## 11. Approval requested
 
 The reviewer is asked to approve or reject these specific decisions:
 
-- [ ] Upgrade Production Supabase compute from Micro to Medium before the drain.
+- [x] Upgrade Production Supabase compute from Micro to Small before the drain and verify the new capacity.
 - [ ] Replace the importer p95 as the sole leaderboard lock with the dedicated-window policy, while preserving it as a warning and post-window outcome check.
 - [ ] Use the thresholds in Section 6 as the initial fail-closed limits.
 - [ ] Permit no more than four bounded batches per 15-minute leaderboard lane after the supervised ramp passes.
