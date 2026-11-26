@@ -1,8 +1,14 @@
 import datetime as dt
+import json
+import os
 
 import pytest
 
-from scripts.leaderboard_dedicated_lane_check import P95, validate_before
+from scripts.leaderboard_dedicated_lane_check import (
+    P95,
+    validate_before,
+    validate_resource_evidence,
+)
 
 
 NOW = dt.datetime.now(dt.timezone.utc)
@@ -81,3 +87,32 @@ def test_preflight_rejects_stale_source_evidence():
     value["source"]["latest_observed_at"] = NOW - dt.timedelta(minutes=16)
     with pytest.raises(RuntimeError, match="stale"):
         validate_before(value, RELEASE)
+
+
+def write_resource_evidence(tmp_path, observed_at):
+    path = tmp_path / "resource.json"
+    path.write_text(json.dumps({
+        "disk_available_bytes": 80 * 1024**3,
+        "observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+    }))
+    os.chmod(path, 0o600)
+    return path
+
+
+def test_resource_evidence_preflight_accepts_a_fresh_private_observation(tmp_path):
+    path = write_resource_evidence(tmp_path, NOW - dt.timedelta(seconds=239))
+    result = validate_resource_evidence(path, NOW)
+    assert result["disk_available_bytes"] == 80 * 1024**3
+
+
+def test_resource_evidence_preflight_defers_before_the_database_ttl_gap(tmp_path):
+    path = write_resource_evidence(tmp_path, NOW - dt.timedelta(seconds=241))
+    with pytest.raises(RuntimeError, match="not fresh enough"):
+        validate_resource_evidence(path, NOW)
+
+
+def test_resource_evidence_preflight_rejects_an_untrusted_file(tmp_path):
+    path = write_resource_evidence(tmp_path, NOW)
+    os.chmod(path, 0o644)
+    with pytest.raises(RuntimeError, match="untrusted"):
+        validate_resource_evidence(path, NOW)
