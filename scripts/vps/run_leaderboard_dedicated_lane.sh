@@ -145,7 +145,7 @@ PY
   LEADERBOARD_DEDICATED_LANE_TOKEN="$(openssl rand -hex 16)"
   "$ROOT/.venv/bin/python3" "$ROOT/scripts/leaderboard_shadow_worker.py" run-once \
     --allow-source-p95-yellow --fixture-limit 250 --max-seconds 180 \
-    --capture-limit 250 --cohort-limit 3 --job-limit 250 \
+    --capture-limit 250 --cohort-limit 8 --job-limit 250 \
     "${scope_args[@]}" >"$work/worker.json"
 }
 
