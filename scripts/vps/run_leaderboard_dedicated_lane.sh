@@ -50,6 +50,19 @@ require_default_trial_lock_paths_or_exit
 [[ "$LEADERBOARD_SHADOW_RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
 export LEADERBOARD_DEDICATED_LANE_RELEASE_SHA="$LEADERBOARD_SHADOW_RELEASE_SHA"
 
+scope_args=()
+if [[ -n ${LEADERBOARD_DEDICATED_LANE_COHORT:-} ]]; then
+  if [[ ! $LEADERBOARD_DEDICATED_LANE_COHORT =~ ^([1-9][0-9]*)/([1-9][0-9]*)$ ]]; then
+    echo "dedicated lane cohort scope must be league/season" >&2
+    exit 1
+  fi
+  scope_args=(
+    --league-id "${BASH_REMATCH[1]}"
+    --season-id "${BASH_REMATCH[2]}"
+    --cohort-limit 1
+  )
+fi
+
 exec 9<"$TRIAL_WORKER_LOCK"
 check_trial_lock_fd worker "$TRIAL_WORKER_LOCK" 9
 flock -n 9 || exit 0
@@ -133,7 +146,7 @@ PY
   LEADERBOARD_DEDICATED_LANE_TOKEN="$(openssl rand -hex 16)"
   "$ROOT/.venv/bin/python3" "$ROOT/scripts/leaderboard_shadow_worker.py" run-once \
     --allow-source-p95-yellow --fixture-limit 250 --max-seconds 180 \
-    --capture-limit 250 --job-limit 250 >"$work/worker.json"
+    --capture-limit 250 --job-limit 250 "${scope_args[@]}" >"$work/worker.json"
 }
 
 set +e
