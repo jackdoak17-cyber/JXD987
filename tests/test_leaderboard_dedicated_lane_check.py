@@ -106,8 +106,8 @@ def test_preflight_rejects_stale_source_evidence():
 def test_preflight_reserves_the_lane_for_a_just_completed_source_cycle():
     assert MAX_SOURCE_EVIDENCE_AGE_SECONDS == 5 * 60
     value = snapshot()
-    value["source"]["latest_observed_at"] = NOW - dt.timedelta(
-        seconds=MAX_SOURCE_EVIDENCE_AGE_SECONDS - 1
+    value["source"]["latest_observed_at"] = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        seconds=MAX_SOURCE_EVIDENCE_AGE_SECONDS - 5
     )
     assert validate_before(value, RELEASE)["ok"] is True
 

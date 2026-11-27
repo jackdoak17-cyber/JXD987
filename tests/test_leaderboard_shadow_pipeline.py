@@ -587,6 +587,9 @@ def test_generation_keeps_legacy_guard_at_each_work_boundary(monkeypatch):
     events = []
     monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
     monkeypatch.setattr(
+        worker_module, "reconcile_cohort_source_changes", lambda *_args: 0,
+    )
+    monkeypatch.setattr(
         worker_module, "ensure_generation",
         lambda *_args: events.append("generation") or 73,
     )
@@ -608,7 +611,7 @@ def test_generation_keeps_legacy_guard_at_each_work_boundary(monkeypatch):
     )
     assert result == {"cohorts": 1, "jobs": 1, "published": 1}
     assert events == [
-        "legacy_guard", "generation", "legacy_guard", "job",
+        "legacy_guard", "legacy_guard", "generation", "legacy_guard", "job",
         "legacy_guard", "publish",
     ]
 
@@ -616,6 +619,9 @@ def test_generation_keeps_legacy_guard_at_each_work_boundary(monkeypatch):
 def test_generation_supplied_guard_stops_before_job(monkeypatch):
     events = []
     monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
+    monkeypatch.setattr(
+        worker_module, "reconcile_cohort_source_changes", lambda *_args: 0,
+    )
     monkeypatch.setattr(
         worker_module, "ensure_generation",
         lambda *_args: events.append("generation") or 73,
@@ -632,7 +638,7 @@ def test_generation_supplied_guard_stops_before_job(monkeypatch):
     def guarded(_conn, require_external):
         assert require_external is True
         events.append("supplied_guard")
-        if events.count("supplied_guard") == 2:
+        if events.count("supplied_guard") == 3:
             raise RuntimeError("admission stopped")
         return {"ok": True}
 
@@ -642,7 +648,9 @@ def test_generation_supplied_guard_stops_before_job(monkeypatch):
             RunBudget.create(MAX_FIXTURES_PER_RUN, MAX_SECONDS_PER_RUN), True,
             guard_check=guarded,
         )
-    assert events == ["supplied_guard", "generation", "supplied_guard"]
+    assert events == [
+        "supplied_guard", "supplied_guard", "generation", "supplied_guard",
+    ]
 
 
 def test_rolling_generation_only_selects_the_capture_cohort(monkeypatch):
@@ -652,6 +660,9 @@ def test_rolling_generation_only_selects_the_capture_cohort(monkeypatch):
         lambda _conn, limit, league_id, season_id: (
             selected.append((limit, league_id, season_id)) or [(271, 27897)]
         ),
+    )
+    monkeypatch.setattr(
+        worker_module, "reconcile_cohort_source_changes", lambda *_args: 0,
     )
     monkeypatch.setattr(worker_module, "ensure_generation", lambda *_a, **_kw: 73)
     monkeypatch.setattr(worker_module, "process_generation_job", lambda *_a: True)
@@ -666,10 +677,57 @@ def test_rolling_generation_only_selects_the_capture_cohort(monkeypatch):
     assert result == {"cohorts": 1, "jobs": 1, "published": 1}
 
 
+def test_generation_reconciles_all_cohort_sources_before_manifest(monkeypatch):
+    events = []
+    monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_a: [(648, 23265)])
+    monkeypatch.setattr(
+        worker_module, "reconcile_cohort_source_changes",
+        lambda _conn, league, season: events.append(("reconcile", league, season)) or 4,
+    )
+    monkeypatch.setattr(
+        worker_module, "ensure_generation",
+        lambda *_a, **_kw: events.append(("generation",)) or 73,
+    )
+    monkeypatch.setattr(worker_module, "process_generation_job", lambda *_a: False)
+    monkeypatch.setattr(worker_module, "finish_generation", lambda *_a: False)
+
+    worker_module.process_generations(
+        FakeConnection(FakeCursor()), "worker", 1, 1,
+        RunBudget.create(250, MAX_SECONDS_PER_RUN), False,
+        guard_check=lambda *_a: {"ok": True},
+        league_id=648, season_id=23265,
+    )
+
+    assert events == [("reconcile", 648, 23265), ("generation",)]
+
+
+def test_cohort_source_reconciliation_uses_recorded_and_current_fixtures():
+    class ReconcileCursor(FakeCursor):
+        answers = iter([([11, 12, 13],), (3,)])
+
+        def fetchone(self):
+            return next(self.answers)
+
+    cursor = ReconcileCursor()
+    changed = worker_module.reconcile_cohort_source_changes(
+        FakeConnection(cursor), 648, 23265,
+    )
+
+    assert changed == 3
+    assert "fixture_source_versions" in cursor.executed[0][0]
+    assert "public.fixtures" in cursor.executed[0][0]
+    assert cursor.executed[0][1] == (648, 23265, 648, 23265)
+    assert "capture_fixture_source_changes" in cursor.executed[1][0]
+    assert cursor.executed[1][1] == ([11, 12, 13],)
+
+
 def test_generation_progress_survives_a_prepublication_stop(monkeypatch):
     events = []
     progress = {"cohorts": 0, "jobs": 0, "published": 0}
     monkeypatch.setattr(worker_module, "pending_cohorts", lambda *_args: [(8, 2026)])
+    monkeypatch.setattr(
+        worker_module, "reconcile_cohort_source_changes", lambda *_args: 0,
+    )
     monkeypatch.setattr(worker_module, "ensure_generation", lambda *_args: 73)
     monkeypatch.setattr(worker_module, "process_generation_job", lambda *_args: True)
     monkeypatch.setattr(
@@ -679,7 +737,7 @@ def test_generation_progress_survives_a_prepublication_stop(monkeypatch):
 
     def guarded(_conn, _require_external):
         events.append("guard")
-        if len(events) == 3:
+        if len(events) == 4:
             raise RuntimeError("prepublication stop")
         return {"ok": True}
 
@@ -690,7 +748,7 @@ def test_generation_progress_survives_a_prepublication_stop(monkeypatch):
             guard_check=guarded, progress=progress,
         )
     assert progress == {"cohorts": 1, "jobs": 1, "published": 0}
-    assert events == ["guard", "guard", "guard"]
+    assert events == ["guard", "guard", "guard", "guard"]
 
 
 def test_full_trial_refuses_oversized_generation_before_materialization():
