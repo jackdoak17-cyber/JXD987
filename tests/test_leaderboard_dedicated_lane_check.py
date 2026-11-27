@@ -146,7 +146,7 @@ def test_dedicated_wrapper_uses_the_reviewed_three_minute_budget():
         encoding="utf-8"
     )
     assert "PUBLISHER_WORK_RESERVE_SECONDS=195" in wrapper
-    assert "PUBLISHER_WINDOW_END_SECONDS=840" in wrapper
+    assert "PUBLISHER_WINDOW_END_SECONDS=900" in wrapper
     assert "--fixture-limit 250 --max-seconds 180" in wrapper
     assert "LEADERBOARD_DEDICATED_LANE_COHORT" in wrapper
     assert '--cohort-limit 1' in wrapper
