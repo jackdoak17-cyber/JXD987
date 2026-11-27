@@ -74,6 +74,7 @@ class Connection:
 
 def prepare_generation(monkeypatch):
     monkeypatch.setattr(worker, "pending_cohorts", lambda *_a: [(271, 27897)])
+    monkeypatch.setattr(worker, "reconcile_cohort_source_changes", lambda *_a: 0)
     monkeypatch.setattr(worker, "ensure_generation", lambda *_a, **_kw: GENERATION)
     monkeypatch.setattr(worker, "process_generation_job", lambda *_a: True)
 
@@ -140,6 +141,11 @@ def prepare_rolling(monkeypatch):
     monkeypatch.setattr(worker, "configure_temp_file_limit_if_permitted", lambda *_a: False)
     monkeypatch.setattr(worker, "refresh_eligibility_if_due", lambda *_a: 0)
     monkeypatch.setattr(worker, "apply_recovery_timeouts", lambda *_a: None)
+    monkeypatch.setattr(
+        worker,
+        "warm_current_player_last_n_reader",
+        lambda *_a: {"league_count": 1, "row_count": 1, "generation_key": "warm"},
+    )
 
 
 @pytest.mark.parametrize("required,transitioned,published", [
@@ -149,11 +155,24 @@ def test_rolling_opt_in_checks_schema_then_uses_admitted_binding(
     monkeypatch, required, transitioned, published,
 ):
     prepare_rolling(monkeypatch)
+    warm_calls = []
+    monkeypatch.setattr(
+        worker,
+        "warm_current_player_last_n_reader",
+        lambda *_a: warm_calls.append("warm") or {
+            "league_count": 1, "row_count": 1, "generation_key": "warm",
+        },
+    )
     # Legacy mode works with the original paired SQL, without SQL 92 installed.
     conn = Connection(transitioned=transitioned, schema_present=required)
     result = worker.run_rolling_worker(conn, rolling_args(required), "owner")
     assert result["generations"] == {"cohorts": 1, "jobs": 1, "published": published}
     assert (result["fence"], result["run_id"]) == (FENCE, RUN_ID)
+    assert warm_calls == (["warm"] if published else [])
+    assert result["reader_cache_warm"] == (
+        {"league_count": 1, "row_count": 1, "generation_key": "warm"}
+        if published else None
+    )
     publications = [(query, params) for query, params in conn.queries
                     if query in {LEGACY_SQL, BOUND_SQL}]
     assert publications == [

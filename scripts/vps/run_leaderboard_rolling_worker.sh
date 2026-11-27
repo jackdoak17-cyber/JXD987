@@ -112,5 +112,5 @@ exec python3 "$ROOT/scripts/leaderboard_finite_trial_supervisor.py" \
   --cohort-limit "$LEADERBOARD_ROLLING_COHORT_LIMIT" \
   --job-limit "$LEADERBOARD_ROLLING_JOB_LIMIT" \
   "${scope_args[@]}" \
-  --max-seconds 30 --deadline-seconds 45 --grace-seconds 5 \
+  --max-seconds 30 --deadline-seconds 60 --grace-seconds 5 \
   --drain-seconds 10 --recovery-seconds 15

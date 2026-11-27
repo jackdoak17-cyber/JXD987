@@ -36,6 +36,7 @@ MAX_FIXTURES_PER_RUN = 250
 MAX_SECONDS_PER_RUN = 180.0
 LOCK_TIMEOUT_MS = 2_000
 PREFLIGHT_STATEMENT_TIMEOUT_MS = 5_000
+READER_CACHE_WARM_TIMEOUT_MS = 15_000
 # Leave enough of the hard run deadline for the mandatory resource check and
 # transaction cleanup.  Starting another fixture with only milliseconds left
 # turns an otherwise healthy bounded run into a statement-timeout failure.
@@ -1327,6 +1328,59 @@ def status(conn) -> dict[str, Any]:
         return cur.fetchone()["payload"]
 
 
+def warm_current_player_last_n_reader(conn) -> dict[str, Any]:
+    """Populate the shared-buffer hot set used by all current Last-N reads.
+
+    The covering index deliberately stores the complete metrics payload so one
+    dynamic reader serves every selectable statistic. A cold all-league probe
+    can therefore be I/O bound even though the same request is fast once the
+    index pages are resident. Run one bounded, read-only representative query
+    after the rolling lane closes successfully; subsequent customer requests
+    reuse the same index pages regardless of their selected statistic.
+    """
+
+    started_at = time.monotonic()
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select set_config('lock_timeout', %s, true)",
+                (f"{LOCK_TIMEOUT_MS}ms",),
+            )
+            cur.execute(
+                "select set_config('statement_timeout', %s, true)",
+                (f"{READER_CACHE_WARM_TIMEOUT_MS}ms",),
+            )
+            cur.execute(
+                """
+                with leagues as materialized (
+                  select array_agg(distinct league_id order by league_id)::integer[] as ids
+                  from leaderboard_shadow_v1.current_player_eligibility
+                ), payload as materialized (
+                  select public.player_stat_leaderboard_shadow_v3(
+                    leagues.ids,
+                    array_fill(null::integer, array[cardinality(leagues.ids)]),
+                    581, 5, 'per90', 1, null, null, 'current', null, null, 1
+                  ) as value
+                  from leagues
+                  where cardinality(leagues.ids) > 0
+                )
+                select cardinality(leagues.ids)::integer,
+                       jsonb_array_length(payload.value -> 'rows')::integer,
+                       payload.value ->> 'generation_key'
+                from leagues cross join payload
+                """
+            )
+            row = cur.fetchone()
+    if not row or int(row[0]) < 1 or int(row[1]) < 1 or not row[2]:
+        raise RuntimeError("leaderboard reader cache warm returned incomplete evidence")
+    return {
+        "league_count": int(row[0]),
+        "row_count": int(row[1]),
+        "generation_key": str(row[2]),
+        "elapsed_ms": round((time.monotonic() - started_at) * 1000, 2),
+    }
+
+
 TRIAL_STATEMENTS = {
     "isolated": {
         "begin": "select admission_proto.begin_bound_worker_trial_for_test(%s,%s,%s) as decision",
@@ -1707,6 +1761,12 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
                     else None
                 ),
             )
+        reader_cache_warm = None
+        if generations["published"]:
+            reader_cache_warm = warm_current_player_last_n_reader(conn)
+            # The warm is part of the admitted read workload. Recheck the full
+            # resource policy after it, before the rolling window can settle.
+            check_rolling_guard(conn, False)
         check_rolling_guard(conn, False)
         apply_recovery_timeouts(conn)
         with conn:
@@ -1741,6 +1801,7 @@ def run_rolling_worker(conn, args, worker_id: str) -> dict[str, Any]:
             "elapsed_ms": round((time.monotonic() - budget.started_at) * 1000, 2),
             "temp_file_limit_enforced": temp_file_limit_enforced,
             "outcome": outcome,
+            "reader_cache_warm": reader_cache_warm,
             **({"state": "prepared_pending"} if prepared_pending else {}),
         }
     except Exception:
