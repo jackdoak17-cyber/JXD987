@@ -20,6 +20,7 @@ P95 = "source_ingestion_processing_p95_regressed_gt_10pct"
 MIB = 1024 * 1024
 MAX_RESOURCE_EVIDENCE_AGE_SECONDS = 4 * 60
 MAX_RUN_DURATION_SECONDS = 125
+MAX_SOURCE_EVIDENCE_AGE_SECONDS = 12 * 60
 
 
 def safe(value):
@@ -118,7 +119,7 @@ def validate_before(
         raise RuntimeError("latest source cycle is not a successful matching release")
     if source.get("sample_count", 0) < 20 or source.get("latest_work_units", 0) < 1:
         raise RuntimeError("source evidence is undersampled")
-    if not 0 <= source_age <= 15 * 60:
+    if not 0 <= source_age <= MAX_SOURCE_EVIDENCE_AGE_SECONDS:
         raise RuntimeError("latest source cycle is stale")
     if (database["database_name"], database["database_user"], database["network_connection"]) != (
         "postgres", "postgres", True,
