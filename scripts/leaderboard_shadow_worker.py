@@ -1129,6 +1129,7 @@ def finish_generation(
         return False
     with conn:
         with conn.cursor() as cur:
+            transitioned = False
             if publication_binding is not None:
                 cur.execute(
                     "select leaderboard_rolling_v1.publish_generation_for_run(%s,%s,%s)",
@@ -1136,12 +1137,36 @@ def finish_generation(
                 )
                 # SQL 92 can observe a publication committed after our status
                 # read. Its idempotent published=true is not this run's work.
-                return cur.fetchone()[0].get("transitioned") is True
-            cur.execute(
-                "select leaderboard_shadow_v1.publish_generation(%s)",
-                (generation_id,),
-            )
-            return bool(cur.fetchone()[0])
+                transitioned = cur.fetchone()[0].get("transitioned") is True
+            else:
+                cur.execute(
+                    "select leaderboard_shadow_v1.publish_generation(%s)",
+                    (generation_id,),
+                )
+                transitioned = bool(cur.fetchone()[0])
+            if transitioned:
+                # Commit the compact customer Last-5 read model in the same
+                # transaction as its cohort publication. Readers therefore
+                # see either the prior matched fingerprint or the new one;
+                # they never observe a newly published cohort with stale rows.
+                cur.execute(
+                    """
+                    select leaderboard_shadow_v1.refresh_current_player_last5_rollup(
+                      generation.league_id
+                    )
+                    from leaderboard_shadow_v1.cohort_pending_publications generation
+                    where generation.generation_id=%s
+                    """,
+                    (generation_id,),
+                )
+                evidence = cur.fetchone()[0]
+                if (not isinstance(evidence, dict)
+                        or evidence.get("row_count") is None
+                        or evidence.get("publication_fingerprint") is None):
+                    raise RuntimeError(
+                        f"generation {generation_id} produced incomplete Last-5 rollup evidence"
+                    )
+            return transitioned
 
 
 def process_generations(
@@ -1356,7 +1381,7 @@ def warm_current_player_last_n_reader(conn) -> dict[str, Any]:
                   select array_agg(distinct league_id order by league_id)::integer[] as ids
                   from leaderboard_shadow_v1.current_player_eligibility
                 ), payload as materialized (
-                  select public.player_stat_leaderboard_shadow_v3(
+                  select public.player_stat_leaderboard_shadow_v4(
                     leagues.ids,
                     array_fill(null::integer, array[cardinality(leagues.ids)]),
                     581, 5, 'per90', 1, null, null, 'current', null, null, 1
