@@ -33,7 +33,7 @@ else:
 DATABASE_URL = os.environ.get("SUPABASE_DB_URL_SESSION") or os.environ.get("SUPABASE_DB_URL")
 RELEASE_SHA = os.environ.get("LEADERBOARD_SHADOW_RELEASE_SHA", "development")
 MAX_FIXTURES_PER_RUN = 250
-MAX_SECONDS_PER_RUN = 30.0
+MAX_SECONDS_PER_RUN = 120.0
 LOCK_TIMEOUT_MS = 2_000
 PREFLIGHT_STATEMENT_TIMEOUT_MS = 5_000
 # Leave enough of the hard run deadline for the mandatory resource check and

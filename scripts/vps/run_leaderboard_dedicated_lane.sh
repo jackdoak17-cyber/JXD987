@@ -22,7 +22,7 @@ LANE_QUARANTINE="$STATE_DIRECTORY/quarantine.json"
 PUBLISHER_TICK_SECONDS=900
 PUBLISHER_WINDOW_START_SECONDS=120
 PUBLISHER_WINDOW_END_SECONDS=720
-PUBLISHER_WORK_RESERVE_SECONDS=45
+PUBLISHER_WORK_RESERVE_SECONDS=135
 
 [[ $(id -u) == 0 ]] || { echo "dedicated lane requires root" >&2; exit 1; }
 [[ -r "$ENV_FILE" && -r "$PLATFORM_ENV_FILE" ]] || {
@@ -128,7 +128,7 @@ PY
   export LEADERBOARD_DEDICATED_LANE_TOKEN
   LEADERBOARD_DEDICATED_LANE_TOKEN="$(openssl rand -hex 16)"
   "$ROOT/.venv/bin/python3" "$ROOT/scripts/leaderboard_shadow_worker.py" run-once \
-    --allow-source-p95-yellow --fixture-limit 250 --max-seconds 30 \
+    --allow-source-p95-yellow --fixture-limit 250 --max-seconds 120 \
     --capture-limit 250 --job-limit 250 >"$work/worker.json"
 }
 

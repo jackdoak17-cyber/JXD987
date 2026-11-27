@@ -19,6 +19,7 @@ from psycopg2.extras import RealDictCursor
 P95 = "source_ingestion_processing_p95_regressed_gt_10pct"
 MIB = 1024 * 1024
 MAX_RESOURCE_EVIDENCE_AGE_SECONDS = 4 * 60
+MAX_RUN_DURATION_SECONDS = 125
 
 
 def safe(value):
@@ -154,7 +155,7 @@ def validate_after(snapshot: dict, connection, release_sha: str, run_id: int) ->
     if run["finished_at"] is None or run["resource_window_finished_at"] is None:
         raise RuntimeError("dedicated-lane run or resource window is open")
     duration = (run["finished_at"] - run["started_at"]).total_seconds()
-    if duration > 35:
+    if duration > MAX_RUN_DURATION_SECONDS:
         raise RuntimeError("dedicated-lane run exceeded its bounded duration")
     if run["failed_count"] != 0 or run["failure_summary"] is not None:
         raise RuntimeError("dedicated-lane run recorded a failure")
