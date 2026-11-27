@@ -1,5 +1,8 @@
 """Bounded post-publication cache warming for current Last-N readers."""
 
+import ast
+import inspect
+
 import pytest
 
 import scripts.leaderboard_shadow_worker as worker
@@ -72,3 +75,32 @@ def test_cache_warm_fails_closed_on_incomplete_evidence(row):
     conn = Connection(row)
     with pytest.raises(RuntimeError, match="incomplete evidence"):
         worker.warm_current_player_last_n_reader(conn)
+
+
+def test_normal_run_once_warms_after_publication_before_final_resource_check():
+    """The dedicated lane invokes main's normal run-once branch, not rolling-once."""
+
+    tree = ast.parse(inspect.getsource(worker.main))
+    calls = sorted(
+        [
+            (node.lineno, node.func.id)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        ]
+    )
+    warm_index = next(
+        line for line, name in calls if name == "warm_current_player_last_n_reader"
+    )
+    finish_index = next(
+        line for line, name in calls if name == "finish_worker_run_with_resource_check"
+    )
+
+    assert warm_index < finish_index
+    source = inspect.getsource(worker.main)
+    assert 'if generations["published"]:' in source
+    assert 'guard_check(conn, require_external)' in source[
+        source.index('if generations["published"]:'):source.index(
+            "finish_worker_run_with_resource_check"
+        )
+    ]
+    assert '"reader_cache_warm": reader_cache_warm' in source
