@@ -14,6 +14,11 @@ import scripts.leaderboard_shadow_worker as worker
 GENERATION, FENCE, RUN_ID = 73, 41, 52
 LEGACY_SQL = "select leaderboard_shadow_v1.publish_generation(%s)"
 BOUND_SQL = "select leaderboard_rolling_v1.publish_generation_for_run(%s,%s,%s)"
+ROLLUP_SQL = (
+    "select leaderboard_shadow_v1.refresh_current_player_last5_rollup( "
+    "generation.league_id ) from leaderboard_shadow_v1.cohort_pending_publications "
+    "generation where generation.generation_id=%s"
+)
 
 
 class Cursor:
@@ -34,6 +39,12 @@ class Cursor:
             raise self.connection.publication_error
 
     def fetchone(self):
+        if self.query == ROLLUP_SQL:
+            return ({
+                "league_id": 271,
+                "publication_fingerprint": "f" * 32,
+                "row_count": 500,
+            },)
         if "cohort_pending_publications generation" in self.query:
             return ("processing", 0, 0)
         if "to_regprocedure" in self.query:
@@ -99,6 +110,8 @@ def test_generation_publication_uses_exact_binding_and_counts_only_transitions(
         (LEGACY_SQL, (GENERATION,)) if binding is None
         else (BOUND_SQL, (GENERATION, FENCE, RUN_ID))
     ]
+    rollups = [(query, params) for query, params in conn.queries if query == ROLLUP_SQL]
+    assert rollups == ([(ROLLUP_SQL, (GENERATION,))] if published else [])
     assert conn.transactions == ["commit"]
 
 

@@ -65,7 +65,7 @@ def test_cache_warm_is_bounded_and_uses_the_current_all_league_reader(monkeypatc
         "select set_config('statement_timeout', %s, true)",
         (f"{worker.READER_CACHE_WARM_TIMEOUT_MS}ms",),
     )
-    assert "player_stat_leaderboard_shadow_v3" in queries[2][0]
+    assert "player_stat_leaderboard_shadow_v4" in queries[2][0]
     assert "581, 5, 'per90'" in queries[2][0]
     assert "array_fill(null::integer" in queries[2][0]
 
