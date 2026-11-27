@@ -2045,6 +2045,13 @@ def main() -> int:
                 guard_check=guard_check,
                 league_id=args.league_id, season_id=args.season_id,
             )
+            reader_cache_warm = None
+            if generations["published"]:
+                reader_cache_warm = warm_current_player_last_n_reader(conn)
+                # The dedicated production lane uses run-once. Keep the warm
+                # inside that admitted workload and recheck the complete
+                # resource policy before the durable run can settle.
+                guard_check(conn, require_external)
             claimed = capture["claimed"] + generations["jobs"]
             succeeded = capture["acknowledged"] + generations["jobs"]
             failed = capture["failed"]
@@ -2063,6 +2070,7 @@ def main() -> int:
                 "temp_file_limit_enforced": temp_file_limit_enforced,
                 "resource_guard": resource_evidence,
                 "interrupted_run_recovery": recovery_evidence,
+                "reader_cache_warm": reader_cache_warm,
             }, sort_keys=True))
         except Exception as error:
             # budget.processed advances only after a capture or generation job
