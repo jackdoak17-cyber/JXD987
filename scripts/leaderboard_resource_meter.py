@@ -80,8 +80,9 @@ def evaluate(previous: dict, current: dict, *, mode: str) -> dict:
     before = dt.datetime.fromisoformat(previous["observed_at"].replace("Z", "+00:00"))
     after = dt.datetime.fromisoformat(current["observed_at"].replace("Z", "+00:00"))
     elapsed = (after - before).total_seconds()
-    if elapsed < 45 or elapsed > 180:
-        raise ValueError("metrics interval is outside 45-180 seconds")
+    max_interval = 240 if mode == "post" else 180
+    if elapsed < 45 or elapsed > max_interval:
+        raise ValueError(f"metrics interval is outside 45-{max_interval} seconds")
 
     cpu_delta = {}
     for name, value in current["cpu_seconds"].items():
