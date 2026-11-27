@@ -66,6 +66,18 @@ def test_counter_reset_and_stale_interval_fail_closed():
         evaluate(before, after, mode="admission")
 
 
+def test_post_interval_covers_the_two_minute_worker_and_followup_observation():
+    before, after = pair(
+        metrics(),
+        metrics(cpu=108, idle=116, iowait=11, disk0=32, disk1=48),
+    )
+    after["observed_at"] = (T0 + dt.timedelta(seconds=181)).isoformat()
+    assert evaluate(before, after, mode="post")["ok"] is True
+    after["observed_at"] = (T0 + dt.timedelta(seconds=241)).isoformat()
+    with pytest.raises(ValueError, match="45-240"):
+        evaluate(before, after, mode="post")
+
+
 def test_required_metrics_cannot_be_missing():
     with pytest.raises(ValueError, match="required"):
         build_snapshot("node_memory_MemTotal_bytes 1\n", T0)
