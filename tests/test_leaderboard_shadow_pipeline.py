@@ -1357,3 +1357,13 @@ def test_external_resource_evidence_rejects_unknown_fields(tmp_path):
     path.chmod(0o600)
     with pytest.raises(RuntimeError, match="unexpected or missing"):
         load_external_resource_evidence(FakeConnection(FakeCursor()), str(path))
+
+
+def test_normal_worker_passes_its_optional_scope_to_generation_processing():
+    source = (Path(__file__).parents[1] / "scripts/leaderboard_shadow_worker.py").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        "guard_check=guard_check,\n"
+        "                league_id=args.league_id, season_id=args.season_id,"
+    ) in source
