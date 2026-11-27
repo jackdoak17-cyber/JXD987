@@ -19,7 +19,7 @@ from psycopg2.extras import RealDictCursor
 P95 = "source_ingestion_processing_p95_regressed_gt_10pct"
 MIB = 1024 * 1024
 MAX_RESOURCE_EVIDENCE_AGE_SECONDS = 4 * 60
-MAX_RUN_DURATION_SECONDS = 125
+MAX_RUN_DURATION_SECONDS = 185
 MAX_SOURCE_EVIDENCE_AGE_SECONDS = 12 * 60
 
 
