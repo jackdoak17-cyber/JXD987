@@ -7,6 +7,7 @@ import pytest
 
 from scripts.leaderboard_dedicated_lane_check import (
     MAX_RUN_DURATION_SECONDS,
+    MAX_SOURCE_EVIDENCE_AGE_SECONDS,
     P95,
     validate_before,
     validate_resource_evidence,
@@ -95,7 +96,9 @@ def test_preflight_fails_closed_on_each_changed_condition(section, field, value,
 
 def test_preflight_rejects_stale_source_evidence():
     value = snapshot()
-    value["source"]["latest_observed_at"] = NOW - dt.timedelta(minutes=16)
+    value["source"]["latest_observed_at"] = NOW - dt.timedelta(
+        seconds=MAX_SOURCE_EVIDENCE_AGE_SECONDS + 1
+    )
     with pytest.raises(RuntimeError, match="stale"):
         validate_before(value, RELEASE)
 
