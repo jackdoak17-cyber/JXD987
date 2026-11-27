@@ -1,10 +1,12 @@
 import datetime as dt
 import json
 import os
+from pathlib import Path
 
 import pytest
 
 from scripts.leaderboard_dedicated_lane_check import (
+    MAX_RUN_DURATION_SECONDS,
     P95,
     validate_before,
     validate_resource_evidence,
@@ -125,3 +127,12 @@ def test_resource_evidence_preflight_rejects_an_untrusted_file(tmp_path):
     os.chmod(path, 0o644)
     with pytest.raises(RuntimeError, match="untrusted"):
         validate_resource_evidence(path, NOW)
+
+
+def test_dedicated_wrapper_uses_the_reviewed_two_minute_budget():
+    wrapper = (Path(__file__).parents[1] / "scripts/vps/run_leaderboard_dedicated_lane.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "PUBLISHER_WORK_RESERVE_SECONDS=135" in wrapper
+    assert "--fixture-limit 250 --max-seconds 120" in wrapper
+    assert MAX_RUN_DURATION_SECONDS == 125
