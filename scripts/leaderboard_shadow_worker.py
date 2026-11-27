@@ -909,6 +909,47 @@ def pending_cohorts(
         return [(int(row[0]), int(row[1])) for row in cur.fetchall()]
 
 
+def reconcile_cohort_source_changes(
+    conn, league_id: int, season_id: int,
+) -> int:
+    """Journal every changed fixture before freezing a generation manifest.
+
+    Normal capture records source changes incrementally.  A historical cohort
+    can also contain source-version rows whose canonical snapshot changed
+    before that incremental journal existed.  If generation discovers those
+    rows one at a time, each mismatch safely supersedes the generation but
+    makes the backlog advance only one fixture per run.  Reconcile the bounded
+    cohort first so begin_generation sees one complete cursor.
+    """
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select coalesce(array_agg(candidate.fixture_id order by candidate.fixture_id),
+                                '{}'::bigint[])
+                from (
+                    select fixture_id
+                    from leaderboard_shadow_v1.fixture_source_versions
+                    where league_id=%s and season_id=%s
+                    union
+                    select id
+                    from public.fixtures
+                    where league_id=%s and season_id=%s
+                ) candidate
+                """,
+                (league_id, season_id, league_id, season_id),
+            )
+            fixture_ids = cur.fetchone()[0]
+            if not fixture_ids:
+                return 0
+            cur.execute(
+                "select leaderboard_shadow_v1.capture_fixture_source_changes(%s::bigint[])",
+                (fixture_ids,),
+            )
+            changed = cur.fetchone()[0]
+    return int(changed or 0)
+
+
 def ensure_generation(
     conn, league_id: int, season_id: int, *, max_materialized_jobs: int | None = None,
 ) -> int | None:
@@ -1114,6 +1155,13 @@ def process_generations(
         if league_id is not None else pending_cohorts(conn, cohort_limit)
     )
     for cohort_league_id, cohort_season_id in cohorts:
+        if not budget.available():
+            break
+        budget.apply_database_timeouts(conn)
+        guard_check(conn, require_external)
+        reconcile_cohort_source_changes(
+            conn, cohort_league_id, cohort_season_id,
+        )
         if not budget.available():
             break
         budget.apply_database_timeouts(conn)
