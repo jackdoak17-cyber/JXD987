@@ -703,7 +703,10 @@ def test_generation_reconciles_all_cohort_sources_before_manifest(monkeypatch):
 
 def test_cohort_source_reconciliation_uses_recorded_and_current_fixtures():
     class ReconcileCursor(FakeCursor):
-        answers = iter([([11, 12, 13],), (3,)])
+        answers = iter([
+            ([11, 12, 13],),
+            ([{"fixture_id": 11}, {"fixture_id": 12}, {"fixture_id": 13}],),
+        ])
 
         def fetchone(self):
             return next(self.answers)

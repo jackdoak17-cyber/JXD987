@@ -947,7 +947,13 @@ def reconcile_cohort_source_changes(
                 (fixture_ids,),
             )
             changed = cur.fetchone()[0]
-    return int(changed or 0)
+    if changed is None:
+        return 0
+    if isinstance(changed, list):
+        return len(changed)
+    if isinstance(changed, int) and not isinstance(changed, bool):
+        return changed
+    raise RuntimeError("source reconciliation returned an invalid result")
 
 
 def ensure_generation(
