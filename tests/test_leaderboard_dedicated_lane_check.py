@@ -103,6 +103,15 @@ def test_preflight_rejects_stale_source_evidence():
         validate_before(value, RELEASE)
 
 
+def test_preflight_reserves_the_lane_for_a_just_completed_source_cycle():
+    assert MAX_SOURCE_EVIDENCE_AGE_SECONDS == 5 * 60
+    value = snapshot()
+    value["source"]["latest_observed_at"] = NOW - dt.timedelta(
+        seconds=MAX_SOURCE_EVIDENCE_AGE_SECONDS - 1
+    )
+    assert validate_before(value, RELEASE)["ok"] is True
+
+
 def write_resource_evidence(tmp_path, observed_at):
     path = tmp_path / "resource.json"
     path.write_text(json.dumps({
