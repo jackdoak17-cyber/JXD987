@@ -132,10 +132,10 @@ def test_resource_evidence_preflight_rejects_an_untrusted_file(tmp_path):
         validate_resource_evidence(path, NOW)
 
 
-def test_dedicated_wrapper_uses_the_reviewed_two_minute_budget():
+def test_dedicated_wrapper_uses_the_reviewed_three_minute_budget():
     wrapper = (Path(__file__).parents[1] / "scripts/vps/run_leaderboard_dedicated_lane.sh").read_text(
         encoding="utf-8"
     )
-    assert "PUBLISHER_WORK_RESERVE_SECONDS=135" in wrapper
-    assert "--fixture-limit 250 --max-seconds 120" in wrapper
-    assert MAX_RUN_DURATION_SECONDS == 125
+    assert "PUBLISHER_WORK_RESERVE_SECONDS=195" in wrapper
+    assert "--fixture-limit 250 --max-seconds 180" in wrapper
+    assert MAX_RUN_DURATION_SECONDS == 185
