@@ -21,7 +21,11 @@ LAST_RUN_STATE="$STATE_DIRECTORY/last-run.json"
 LANE_QUARANTINE="$STATE_DIRECTORY/quarantine.json"
 PUBLISHER_TICK_SECONDS=900
 PUBLISHER_WINDOW_START_SECONDS=120
-PUBLISHER_WINDOW_END_SECONDS=720
+# The source reconciliation normally completes around minute 8-9 of each
+# quarter-hour. Admit the leaderboard through minute 10:45, while the 195s
+# reservation still releases database-heavy work more than a minute before
+# the next live publisher tick.
+PUBLISHER_WINDOW_END_SECONDS=840
 PUBLISHER_WORK_RESERVE_SECONDS=195
 
 [[ $(id -u) == 0 ]] || { echo "dedicated lane requires root" >&2; exit 1; }
