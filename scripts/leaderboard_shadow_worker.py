@@ -1928,6 +1928,7 @@ def main() -> int:
             generations = process_generations(
                 conn, worker_id, args.cohort_limit, args.job_limit, budget, require_external,
                 guard_check=guard_check,
+                league_id=args.league_id, season_id=args.season_id,
             )
             claimed = capture["claimed"] + generations["jobs"]
             succeeded = capture["acknowledged"] + generations["jobs"]
