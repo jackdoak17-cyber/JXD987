@@ -24,8 +24,14 @@
   "591": "switzerland-super-league",
   "600": "turkiye-super-lig",
   "648": "brazil-brasileiro-serie-a",
-  "651": "brazil-brasileiro-serie-b",
-  "779": "usa-mls",
+  "651": [
+    "brazil-brasileiro-serie-b",
+    "brazil-brasileiro-serie-b-promotion-playoffs"
+  ],
+  "779": [
+    "usa-mls",
+    "usa-mls-playoffs"
+  ],
   "944": "saudi-arabia-saudi-professional-league",
   "968": "japan-jleague",
   "989": "china-chinese-super-league"

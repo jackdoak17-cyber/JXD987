@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import bindparam, text
 
@@ -277,6 +277,9 @@ class LeagueResult:
     rate_limit_hits: int = 0
     rate_limit_sleeps: int = 0
     last_rate_limit: Optional[Dict[str, object]] = None
+    alias_stats: Dict[str, Dict[str, object]] = field(default_factory=dict)
+    alias_errors: Dict[str, str] = field(default_factory=dict)
+    fixtures_with_odds_payload: int = 0
 
 
 def normalize_slug(value: str) -> str:
@@ -742,11 +745,24 @@ def resolve_market_key(market_name: str) -> Optional[str]:
     return None
 
 
-def load_league_map(path: Path) -> Dict[int, str]:
+def load_league_map(path: Path) -> Dict[int, List[str]]:
     if not path.exists():
         return {}
     raw = json.loads(path.read_text(encoding="utf-8"))
-    return {int(k): str(v) for k, v in raw.items() if v}
+    league_map: Dict[int, List[str]] = {}
+    for key, value in raw.items():
+        values = value if isinstance(value, list) else [value]
+        aliases: List[str] = []
+        seen: Set[str] = set()
+        for candidate in values:
+            alias = str(candidate or "").strip()
+            if not alias or alias in seen:
+                continue
+            seen.add(alias)
+            aliases.append(alias)
+        if aliases:
+            league_map[int(key)] = aliases
+    return league_map
 
 
 def utc_now_naive() -> datetime:
@@ -1006,17 +1022,38 @@ def filter_fixtures_by_priority(
 
 def estimate_api_calls_for_scope(
     fixtures: List[Dict[str, object]],
-    scoped_league_ids: Iterable[int],
+    scoped_league_aliases: Iterable[Sequence[str]],
 ) -> int:
-    # One /events call per league plus a conservative /odds/multi batch estimate.
-    league_count = len({int(league_id) for league_id in scoped_league_ids})
+    # One /events call per configured alias plus a conservative /odds/multi batch estimate.
+    alias_count = sum(len(tuple(aliases)) for aliases in scoped_league_aliases)
     odds_batches = math.ceil(len(fixtures) / 10) if fixtures else 0
-    return league_count + odds_batches
+    return alias_count + odds_batches
+
+
+def league_coverage_gap(result: LeagueResult) -> Optional[Dict[str, object]]:
+    if result.fixtures_fetched <= 0 or result.error is not None:
+        return None
+    if result.events_returned == 0:
+        return {
+            "league_id": result.league_id,
+            "reason": "scheduled_fixtures_but_no_provider_events",
+            "fixtures_in_window": result.fixtures_fetched,
+            "aliases": list(result.alias_stats),
+        }
+    if result.events_matched == 0:
+        return {
+            "league_id": result.league_id,
+            "reason": "provider_events_but_no_fixture_matches",
+            "fixtures_in_window": result.fixtures_fetched,
+            "events_returned": result.events_returned,
+            "aliases": list(result.alias_stats),
+        }
+    return None
 
 
 def fetch_league_odds_payload(
     league_id: int,
-    odds_league: str,
+    odds_leagues: Sequence[str],
     league_fixtures: List[Dict[str, object]],
     sport: str,
     days_back: int,
@@ -1025,12 +1062,16 @@ def fetch_league_odds_payload(
     per_league_limit: int,
     calendar_history: bool = False,
 ) -> LeagueResult:
+    if isinstance(odds_leagues, str):
+        odds_leagues = (odds_leagues,)
+    else:
+        odds_leagues = tuple(odds_leagues)
     started = time.time()
     client = OddsApiClient(base_url=HISTORICAL_ODDS_BASE_URL if calendar_history else None)
     historical_client: Optional[OddsApiClient] = client if calendar_history else None
     result = LeagueResult(
         league_id=league_id,
-        league_name=odds_league,
+        league_name=",".join(odds_leagues),
         fixtures_fetched=len(league_fixtures),
         odds_records=[],
         api_calls_made=0,
@@ -1040,22 +1081,57 @@ def fetch_league_odds_payload(
     event_candidates_by_fixture: Dict[int, List[Dict[str, object]]] = {}
     odds_response_by_event_id: Dict[int, Dict[str, object]] = {}
     provider_event_probe_by_fixture: Dict[int, Dict[str, object]] = {}
+    aliases_by_event_id: Dict[int, Set[str]] = {}
 
     try:
         start_dt, end_dt = fixture_window_bounds(days_back, days_forward, calendar_history)
         event_start_dt = start_dt - timedelta(hours=UPSTREAM_EVENT_WINDOW_PAD_HOURS)
         event_end_dt = end_dt + timedelta(hours=UPSTREAM_EVENT_WINDOW_PAD_HOURS)
-        params = {
-            "sport": sport,
-            "league": odds_league,
-            "from": event_start_dt.isoformat() + "Z",
-            "to": event_end_dt.isoformat() + "Z",
-        }
-        if days_back <= 0:
-            params["status"] = "pending,live"
-        events = client.request("historical/events" if calendar_history else "events", params=params)
-        if not isinstance(events, list):
-            raise OddsApiError(f"Unexpected events response for league {odds_league}")
+        events_by_id: Dict[int, Dict[str, object]] = {}
+        aliases_succeeded = 0
+        for odds_league in odds_leagues:
+            params = {
+                "sport": sport,
+                "league": odds_league,
+                "from": event_start_dt.isoformat() + "Z",
+                "to": event_end_dt.isoformat() + "Z",
+            }
+            if days_back <= 0:
+                params["status"] = "pending,live"
+            try:
+                alias_events = client.request(
+                    "historical/events" if calendar_history else "events",
+                    params=params,
+                )
+                if not isinstance(alias_events, list):
+                    raise OddsApiError(f"Unexpected events response for league {odds_league}")
+            except Exception as exc:
+                result.alias_errors[odds_league] = str(exc)
+                result.alias_stats[odds_league] = {
+                    "events_returned": 0,
+                    "events_matched": 0,
+                    "error": str(exc),
+                }
+                continue
+            aliases_succeeded += 1
+            result.alias_stats[odds_league] = {
+                "events_returned": len(alias_events),
+                "events_matched": 0,
+                "error": None,
+            }
+            for event in alias_events:
+                if not isinstance(event, dict) or event.get("id") is None:
+                    continue
+                event_id = int(event["id"])
+                events_by_id.setdefault(event_id, event)
+                aliases_by_event_id.setdefault(event_id, set()).add(odds_league)
+
+        if aliases_succeeded == 0 and result.alias_errors:
+            raise OddsApiError(
+                "all configured league aliases failed: "
+                + "; ".join(f"{alias}: {error}" for alias, error in result.alias_errors.items())
+            )
+        events = list(events_by_id.values())
 
         event_to_fixture: Dict[int, int] = {}
         historical_backfill: List[Tuple[int, int]] = []
@@ -1147,45 +1223,57 @@ def fetch_league_odds_payload(
                 probe_end = probe_start + timedelta(days=1) - timedelta(seconds=1)
                 probe_from = probe_start.isoformat() + "Z"
                 probe_to = probe_end.isoformat() + "Z"
-                probe_key = (odds_league, probe_from)
-                probe = probe_cache.get(probe_key)
-                if probe is None:
-                    probe_events = client.request(
-                        "events",
-                        params={
-                            "sport": sport,
-                            "league": odds_league,
+                fixture_probe_events: Dict[int, Dict[str, object]] = {}
+                fixture_probe_aliases: Dict[str, Dict[str, object]] = {}
+                for odds_league in odds_leagues:
+                    probe_key = (odds_league, probe_from)
+                    probe = probe_cache.get(probe_key)
+                    if probe is None:
+                        probe_events = client.request(
+                            "events",
+                            params={
+                                "sport": sport,
+                                "league": odds_league,
+                                "from": probe_from,
+                                "to": probe_to,
+                            },
+                        )
+                        if not isinstance(probe_events, list):
+                            raise OddsApiError(
+                                f"Unexpected date-scoped events response for league {odds_league}"
+                            )
+                        probe = {
+                            "endpoint": "events",
+                            "response_status": "ok",
                             "from": probe_from,
                             "to": probe_to,
-                        },
-                    )
-                    if not isinstance(probe_events, list):
-                        raise OddsApiError(
-                            f"Unexpected date-scoped events response for league {odds_league}"
-                        )
-                    probe = {
-                        "endpoint": "events",
-                        "response_status": "ok",
-                        "from": probe_from,
-                        "to": probe_to,
-                        "events_returned": len(probe_events),
-                        "event_ids": [
-                            int(event["id"])
-                            for event in probe_events
-                            if isinstance(event, dict)
-                            and event.get("id") is not None
-                            and str(event.get("id")).isdigit()
-                        ],
-                        "events": probe_events,
+                            "events_returned": len(probe_events),
+                            "event_ids": [
+                                int(event["id"])
+                                for event in probe_events
+                                if isinstance(event, dict)
+                                and event.get("id") is not None
+                                and str(event.get("id")).isdigit()
+                            ],
+                            "events": probe_events,
+                        }
+                        probe_cache[probe_key] = probe
+                    fixture_probe_aliases[odds_league] = {
+                        "events_returned": int(probe["events_returned"]),
+                        "event_ids": list(probe["event_ids"]),
                     }
-                    probe_cache[probe_key] = probe
+                    for event in probe["events"]:
+                        if not isinstance(event, dict) or event.get("id") is None:
+                            continue
+                        event_id = int(event["id"])
+                        fixture_probe_events.setdefault(event_id, event)
+                        aliases_by_event_id.setdefault(event_id, set()).add(odds_league)
+                        if event_id not in events_by_id:
+                            events_by_id[event_id] = event
+                            result.raw_events.append(event)
+                        register_event(event)
 
-                for event in probe["events"]:
-                    if event not in result.raw_events:
-                        result.raw_events.append(event)
-                    register_event(event)
-
-                probe_event_ids = set(int(event_id) for event_id in probe["event_ids"])
+                probe_event_ids = set(fixture_probe_events)
                 matched_probe_event_ids = [
                     int(candidate["event_id"])
                     for candidate in event_candidates_by_fixture.get(fixture_id, [])
@@ -1196,11 +1284,23 @@ def fetch_league_odds_payload(
                     "response_status": probe["response_status"],
                     "from": probe["from"],
                     "to": probe["to"],
-                    "events_returned": int(probe["events_returned"]),
+                    "events_returned": len(fixture_probe_events),
                     "matched_event_ids": sorted(set(matched_probe_event_ids)),
+                    "aliases": fixture_probe_aliases,
                 }
 
         result.events_returned = len(result.raw_events)
+
+        matched_event_ids = {
+            int(candidate["event_id"])
+            for candidates in event_candidates_by_fixture.values()
+            for candidate in candidates
+        }
+        for alias, stats in result.alias_stats.items():
+            stats["events_matched"] = len(
+                matched_event_ids
+                & {event_id for event_id, aliases in aliases_by_event_id.items() if alias in aliases}
+            )
 
         result.events_matched = len(event_to_fixture) + len(historical_backfill)
         if event_to_fixture:
@@ -1318,7 +1418,7 @@ def fetch_league_odds_payload(
                 coverage = {
                     "fixture_id": fixture_id,
                     "league_id": league_id,
-                    "odds_api_league": odds_league,
+                    "odds_api_leagues": list(odds_leagues),
                     "matching_status": "provider_gap" if provider_probe_valid else "unmatched",
                     "event_id": None,
                     "event": None,
@@ -1388,7 +1488,10 @@ def fetch_league_odds_payload(
                 {
                     "fixture_id": fixture_id,
                     "league_id": league_id,
-                    "odds_api_league": odds_league,
+                    "odds_api_league": sorted(
+                        aliases_by_event_id.get(int(selected["event_id"]), set())
+                    )[0] if aliases_by_event_id.get(int(selected["event_id"])) else None,
+                    "odds_api_leagues": list(odds_leagues),
                     "matching_status": "matched",
                     "event_id": int(selected["event_id"]),
                     "event": selected_event,
@@ -1398,6 +1501,9 @@ def fetch_league_odds_payload(
                     "moneyline_sides_by_bookmaker": selected["moneyline_sides_by_bookmaker"],
                 }
             )
+        result.fixtures_with_odds_payload = len(
+            {int(record["fixture_id"]) for record in result.odds_records}
+        )
     except Exception as exc:
         result.error = exc
     finally:
@@ -3152,9 +3258,11 @@ def main() -> None:
     bookmaker_names_seen: set[str] = set()
     bookmaker_names_saved: set[str] = set()
     bookmaker_names_unknown: set[str] = set()
-    league_stats: Dict[int, Dict[str, int]] = {}
+    league_stats: Dict[int, Dict[str, object]] = {}
     moneyline_coverage: List[Dict[str, object]] = []
     fetch_errors: List[str] = []
+    fetch_warnings: List[str] = []
+    coverage_gaps: List[Dict[str, object]] = []
     verified_quotes: List[Dict[str, object]] = []
     stage_writer = (
         OddsStageWriter(
@@ -3167,19 +3275,22 @@ def main() -> None:
     )
 
     fixtures_by_id: Dict[int, Dict[str, object]] = {int(fixture["fixture_id"]): fixture for fixture in fixtures}
-    leagues_with_fixtures: List[Tuple[int, str, List[Dict[str, object]]]] = []
+    leagues_with_fixtures: List[Tuple[int, List[str], List[Dict[str, object]]]] = []
     for league_id in league_ids:
-        odds_league = league_map.get(league_id)
-        if not odds_league:
+        odds_leagues = league_map.get(league_id)
+        if not odds_leagues:
             log.warning("No Odds-API league mapping for league_id=%s (skipping)", league_id)
             continue
         league_fixtures = [fixture for fixture in fixtures if fixture["league_id"] == league_id]
         if not league_fixtures:
             continue
-        leagues_with_fixtures.append((league_id, odds_league, league_fixtures))
+        leagues_with_fixtures.append((league_id, odds_leagues, league_fixtures))
 
     scoped_league_ids = [league_id for league_id, _, _ in leagues_with_fixtures]
-    predicted_calls = estimate_api_calls_for_scope(fixtures, scoped_league_ids)
+    predicted_calls = estimate_api_calls_for_scope(
+        fixtures,
+        [aliases for _, aliases, _ in leagues_with_fixtures],
+    )
     configured_rate_limit = 0
     configured_raw = (os.environ.get("ODDS_API_RATE_LIMIT_PER_HOUR") or "").strip()
     if configured_raw:
@@ -3212,7 +3323,7 @@ def main() -> None:
                 executor.submit(
                     fetch_league_odds_payload,
                     league_id,
-                    odds_league,
+                    odds_leagues,
                     league_fixtures,
                     args.sport,
                     args.days_back,
@@ -3221,7 +3332,7 @@ def main() -> None:
                     args.limit,
                     calendar_history,
                 ): league_id
-                for league_id, odds_league, league_fixtures in leagues_with_fixtures
+                for league_id, odds_leagues, league_fixtures in leagues_with_fixtures
             }
             for future in as_completed(futures):
                 league_id = futures[future]
@@ -3230,7 +3341,7 @@ def main() -> None:
                 except Exception as exc:
                     result = LeagueResult(
                         league_id=league_id,
-                        league_name=league_map.get(league_id, ""),
+                        league_name=",".join(league_map.get(league_id, [])),
                         fixtures_fetched=0,
                         odds_records=[],
                         api_calls_made=0,
@@ -3257,6 +3368,9 @@ def main() -> None:
             "events_returned": result.events_returned,
             "events_matched": result.events_matched,
             "moneyline_evidence": len(result.moneyline_coverage),
+            "fixtures_with_odds_payload": result.fixtures_with_odds_payload,
+            "aliases": result.alias_stats,
+            "alias_errors": result.alias_errors,
         }
         events_matched_total += result.events_matched
         moneyline_coverage.extend(result.moneyline_coverage)
@@ -3281,6 +3395,17 @@ def main() -> None:
             log.error(message)
             fetch_errors.append(message)
             continue
+        if result.alias_errors:
+            message = (
+                f"league {league_id} partial alias failures: "
+                + "; ".join(f"{alias}: {error}" for alias, error in result.alias_errors.items())
+            )
+            log.warning(message)
+            fetch_warnings.append(message)
+        gap = league_coverage_gap(result)
+        if gap is not None:
+            coverage_gaps.append(gap)
+            log.error("Odds coverage gap: %s", gap)
 
         for odds_record in result.odds_records:
             fixture_id = int(odds_record["fixture_id"])
@@ -3429,6 +3554,8 @@ def main() -> None:
             "rate_limit_sleeps": rate_limit_sleeps,
             "last_rate_limit": last_rate_limit,
             "errors": fetch_errors,
+            "warnings": fetch_warnings,
+            "coverage_gaps": coverage_gaps,
             "unmatched_players": len(unmatched_details),
         }
         Path(args.report_out).write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -3466,10 +3593,10 @@ def main() -> None:
             # Monitoring outage must not invalidate a committed bookmaker price.
             log.error("Provider run metrics unavailable: %s", exc)
 
-    if fetch_errors:
+    if fetch_errors or coverage_gaps:
         if stage_writer is not None:
             stage_writer.abort()
-        raise SystemExit("One or more league fetches failed.")
+        raise SystemExit("One or more league fetches or coverage checks failed.")
     if stage_writer is not None:
         stage_writer.complete()
         log.info(
