@@ -1028,6 +1028,87 @@ def fail_release(release_id: str, error_message: str) -> None:
         conn.close()
 
 
+FIXTURE_IDENTITY_FIELDS = (
+    "league_id",
+    "season_id",
+    "starting_at",
+    "home_team_id",
+    "away_team_id",
+    "status",
+    "status_code",
+    "home_score",
+    "away_score",
+    "home_ht_score",
+    "away_ht_score",
+)
+
+
+def reconcile_duplicate_fixtures(
+    rows: list[dict[str, Any]],
+    *,
+    scope: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Suppress exact provider duplicates and fail closed on conflicting identities."""
+    grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for row in rows:
+        key = (
+            row.get("league_id"),
+            row.get("starting_at"),
+            row.get("home_team_id"),
+            row.get("away_team_id"),
+        )
+        grouped.setdefault(key, []).append(row)
+
+    reconciled: list[dict[str, Any]] = []
+    suppressions: list[dict[str, Any]] = []
+    for key, candidates in grouped.items():
+        if len(candidates) == 1:
+            reconciled.append(candidates[0])
+            continue
+        signatures = {
+            tuple(row.get(field) for field in FIXTURE_IDENTITY_FIELDS)
+            for row in candidates
+        }
+        if len(signatures) != 1:
+            raise RuntimeError(
+                f"conflicting duplicate fixtures in {scope}: key={key!r} "
+                f"fixture_ids={sorted(int(row['id']) for row in candidates)}"
+            )
+
+        def rank(row: dict[str, Any]) -> tuple[datetime, int]:
+            value = row.get("source_updated_at")
+            if isinstance(value, str):
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if not isinstance(value, datetime):
+                value = datetime.min.replace(tzinfo=UTC)
+            elif value.tzinfo is None:
+                value = value.replace(tzinfo=UTC)
+            else:
+                value = value.astimezone(UTC)
+            return value, int(row["id"])
+
+        winner = max(candidates, key=rank)
+        reconciled.append(winner)
+        for row in candidates:
+            if row is winner:
+                continue
+            suppressions.append(
+                {
+                    "scope": scope,
+                    "kept_fixture_id": int(winner["id"]),
+                    "suppressed_fixture_id": int(row["id"]),
+                    "league_id": int(row["league_id"]),
+                    "starting_at": row["starting_at"].isoformat()
+                    if isinstance(row.get("starting_at"), datetime)
+                    else str(row.get("starting_at")),
+                    "home_team_id": int(row["home_team_id"]),
+                    "away_team_id": int(row["away_team_id"]),
+                }
+            )
+    reconciled.sort(key=lambda row: (row.get("starting_at"), row.get("league_id"), row.get("id")))
+    return reconciled, suppressions
+
+
 def source_fixtures(cur, start: date, end: date, leagues: list[int]) -> list[dict[str, Any]]:
     cur.execute(
         """
@@ -1038,7 +1119,8 @@ def source_fixtures(cur, start: date, end: date, leagues: list[int]) -> list[dic
                ht.name as home_team_name, ht.short_code as home_team_short_code,
                ht.image_path as home_team_image_path,
                at.name as away_team_name, at.short_code as away_team_short_code,
-               at.image_path as away_team_image_path
+               at.image_path as away_team_image_path,
+               f.updated_at as source_updated_at
           from public.fixtures f
           join public.leagues l on l.id = f.league_id
           join public.teams ht on ht.id = f.home_team_id
@@ -1060,7 +1142,7 @@ def all_completed_fixtures(cur, leagues: list[int]) -> list[dict[str, Any]]:
         """
         select id, starting_at, status, status_code, league_id, season_id,
                home_team_id, away_team_id, home_score, away_score,
-               home_ht_score, away_ht_score
+               home_ht_score, away_ht_score, updated_at as source_updated_at
           from public.fixtures
          where league_id = any(%s)
            and league_id <> all(%s)
@@ -1543,14 +1625,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     current_release_id=current_publication["release_id"],
                     current_pin_expires_at=current_publication["pin_expires_at"].isoformat(),
                 )
-            source = source_fixtures(cur, start, end, leagues)
-            validate_source_fixture_identity(source)
+            raw_source = source_fixtures(cur, start, end, leagues)
+            validate_source_fixture_identity(raw_source)
+            source, schedule_suppressions = reconcile_duplicate_fixtures(
+                raw_source,
+                scope="schedule",
+            )
             valid_schedule = [
                 row
                 for row in source
                 if row["league_id"] not in EXCLUDED_CUPS and not is_hidden(row)
             ]
-            completed = all_completed_fixtures(cur, leagues)
+            raw_completed = all_completed_fixtures(cur, leagues)
+            completed, completed_suppressions = reconcile_duplicate_fixtures(
+                raw_completed,
+                scope="completed_history",
+            )
+            report["duplicate_fixture_suppressions"] = {
+                "schedule": schedule_suppressions,
+                "completed_history": completed_suppressions,
+            }
             semantic_fingerprint = semantic_projection_fingerprint(
                 valid_schedule,
                 completed,
@@ -1576,7 +1670,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         current_release_id,
                         start,
                         end,
-                        len(source),
+                        len(raw_source),
                         len(completed),
                         semantic_fingerprint,
                         source_freshness,
@@ -1597,27 +1691,35 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         with conn.cursor() as cur:
             schedule_run = start_run(cur, "schedule", start, end, release_id)
-            rejected_cups = sum(row["league_id"] in EXCLUDED_CUPS for row in source)
+            rejected_cups = sum(row["league_id"] in EXCLUDED_CUPS for row in raw_source)
             schedule_written = upsert_schedule(cur, valid_schedule, start, end, release_id)
             validate_schedule_projection(cur, valid_schedule, release_id)
             finish_run(cur, schedule_run, "succeeded", {
-                "rows_read": len(source), "rows_written": schedule_written,
-                "rows_rejected": len(source) - len(valid_schedule), "rejected_cup_rows": rejected_cups,
+                "rows_read": len(raw_source), "rows_written": schedule_written,
+                "rows_rejected": len(raw_source) - len(valid_schedule), "rejected_cup_rows": rejected_cups,
+                "duplicate_rows_suppressed": len(schedule_suppressions),
                 "source_watermark": max((row["starting_at"] for row in source), default=None),
             })
-            report["components"]["schedule"] = {"rows_read": len(source), "rows_written": schedule_written, "rejected_cup_rows": rejected_cups}
+            report["components"]["schedule"] = {
+                "rows_read": len(raw_source),
+                "rows_written": schedule_written,
+                "rejected_cup_rows": rejected_cups,
+                "duplicate_rows_suppressed": len(schedule_suppressions),
+            }
             metrics_run = start_run(cur, "metrics", start, end, release_id)
             metrics_written, metrics_coverage = write_metrics(cur, valid_schedule, completed, release_id)
             finish_run(cur, metrics_run, "succeeded", {
-                "rows_read": len(completed),
+                "rows_read": len(raw_completed),
                 "rows_written": metrics_written,
                 "rows_missing": metrics_coverage["venue_none"],
+                "duplicate_rows_suppressed": len(completed_suppressions),
                 "coverage": metrics_coverage,
             })
             report["components"]["metrics"] = {
-                "rows_read": len(completed),
+                "rows_read": len(raw_completed),
                 "rows_written": metrics_written,
                 "coverage": metrics_coverage,
+                "duplicate_rows_suppressed": len(completed_suppressions),
             }
 
             odds_run = start_run(cur, "odds", start, end, release_id)
